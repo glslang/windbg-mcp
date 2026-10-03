@@ -4359,6 +4359,13 @@ were about; a forced-set link keeps `lost` and keeps a forced arm; a forced-clea
 and resolves `forced`. When two conflated things are separated, every site that writes either of
 them is in scope -- not the one where the defect was seen.
 
+**And `own_flags` belongs to one of those arms and not the other**, which is CodeRabbit's single
+finding here and a good one. It is in the predecessor test to stop a forced-**set** arm folding over
+a join whose other paths it cannot speak for; a forced-clear arm admits no code by itself, so
+requiring it for that arm's blind-link marker bought nothing and cost the marker -- a chain whose
+readable link is an edge away reported no case *and* no site, where the comment beside `own_flags`
+says it answers with its site. The marker now asks only whether there were readings.
+
 Also filed there and declined: a duplicate-constant forced-set chain emits two cases for one code,
 which is `docs/structured-results.md`'s documented **case per site** rather than a defect.
 
