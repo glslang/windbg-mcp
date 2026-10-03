@@ -4251,6 +4251,27 @@ no warning at all. A conditional branch that reads those flags commits the site 
 `cbz`/`cbnz` deliberately do not, reading a register rather than the flags, so a chain they end is
 still live for a branch further on.
 
+**And a class fix closes the class only if it can express the whole rule**, which took one more
+round to get right. The commit above recorded the dropped chain by searching the *readings* that
+survived it -- and the forced-clear blind arm it had just added clears those readings and leaves the
+chain represented by its **loss** alone, so `cmp code,A` / `ccmpne w2,w3,#0` / `b.lo` was still
+reported as a complete map with an accepted code in it. Codex filed that against its own fix. What
+the check could not express was a chain with no reading left, so the chain is now a fact the block
+keeps in its own right -- the site of the conditional compare whose flags are live, answered by
+`absorb`, cleared by an ordinary flag write and by a call exactly as the readings are -- and the
+terminator asks *that* and takes either the reading or the loss. **The boundary it must not cross is
+pinned too**: an ordinary flag write after a chain ends it, and the loss it leaves is carried to the
+successor edges and committed only by an equality, as this walk has always done on every target. A
+`b.lo` over a code lost to an `and` gains no `untracked` entry it did not have before.
+
+**What the three rounds cost, as a reading rather than a rule.** The answer never moved: `rdyboost`
+reported 21 codes with nothing `untracked` on the first commit and reports the same 21 after the
+third round, re-measured rather than recalled. The remedies added **612** lines on the **800**
+submitted, all of them in the diagnostic half -- four findings, every one a silently incomplete map
+rather than a wrong code, which is the failure this module is arranged against and so worth the
+surface. The next round's findings decide whether that stays true: a defect in what is here is worth
+fixing, and a request for new machinery is not.
+
 **The first draft of that substitution keyed on the terminator's condition alone**, and a `ccmp`
 carries a condition of its own -- so a block *ending* in one looked like a block whose branch had
 just read an equality, and the chain left the answer with no case and no site. The block-boundary
