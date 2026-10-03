@@ -1744,14 +1744,17 @@ fn simulate(
     // code in it. Both halves have to be asked -- a forced-clear blind link clears the readings and
     // leaves *only* the loss, and a check reading `compared` alone silently dropped it (Codex, #439,
     // against the round that added the commit below).
+    // **The site is the link that made the answer incomplete, so a loss outranks a reading.** With
+    // `cmp code,A` / `ccmpne w2,w3,#4` / `b.lo`, the readable `cmp` is in the readings and the
+    // unread link is in `forced`, and reporting the first sends a reader to the one instruction
+    // here that is fully understood. [`Map::untracked`] is defined as where the code stopped being
+    // followable. Raised as a P2 by Codex on #439.
     let owed = chain.and_then(|_| {
-        compared
+        lost.or(forced).or(compared
             .iter()
             .rev()
             .find(|was| was.chained)
-            .map(|was| was.at)
-            .or(lost)
-            .or(forced)
+            .map(|was| was.at))
     });
     if let Some(site) = owed {
         match last.map(|last| (last.flow, last.condition)) {
@@ -2958,11 +2961,24 @@ fn absorb(
             // recorded below. Raised as a P2 by Codex on #439, whose other remedy -- per-path
             // provenance for the readings -- is declined as a second kind of fact at every join,
             // for a shape no driver here has.
+            //
+            // **And "every path" is the right test only for readings that came from other paths.**
+            // A link of *this* chain is on the same path, so **any** of them matching this code
+            // makes the case unreachable: `cmp code,A` / `ccmpne code,B,#4` / `ccmpne code,A,#0` /
+            // `b.ne` makes equality mean `A || B` by the time the last link's condition is read, so
+            // every value takes the branch and the fall-through is dead -- and reading `all` over
+            // the two left `A` published. [`Compared::chained`] is what tells the two apart, the
+            // edge filter keeping chained readings out of `pending`. Raised as a P2 by Codex on
+            // #439, and it is a hole the round that wrote `all` had already reasoned out and left.
             let unreachable = next.as_ref().is_some_and(|own| {
-                !compared.is_empty()
-                    && compared
+                own.code.is_some()
+                    && (compared
                         .iter()
-                        .all(|was| was.code.is_some() && was.code == own.code)
+                        .any(|was| was.chained && was.code == own.code)
+                        || (!compared.is_empty()
+                            && compared
+                                .iter()
+                                .all(|was| was.code.is_some() && was.code == own.code)))
             });
             let unnamed = compared
                 .iter()
@@ -7252,6 +7268,200 @@ mod tests {
             vec![DISPATCH + 0x1c],
             "the blind link's site is not erased by the readable one: {:?}",
             found.cases
+        );
+    }
+
+    /// **Within one chain, *any* earlier link matching this code makes the case unreachable** --
+    /// "every path" being a test for readings that arrived from other paths.
+    ///
+    /// `cmp w9,w11` / `ccmpne w9,w10,#4` / `ccmpne w9,w11,#0` / `b.ne`: the first two links make
+    /// equality mean `w11 || w10` by the time the last link's condition is read, so every value
+    /// takes the branch and the fall-through is dead. Reading *every* over the two readings saw
+    /// `w10` beside `w11` and published `w11` as accepted. Raised as a P2 by Codex on
+    /// [#439](https://github.com/glslang/windbg-mcp/pull/439) -- and it is a hole the round that
+    /// wrote that rule had already reasoned out and left, which is why the finding was worth more
+    /// than the rule's own argument.
+    #[test]
+    fn any_earlier_link_of_one_chain_excludes_the_code_it_matched() {
+        let block = vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "ldr",
+                vec![reg("w9"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("w11"), imm(0xc008)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "movk",
+                vec![reg("w11"), imm(0x56_0000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x10,
+                "mov",
+                vec![reg("w10"), imm(0xa0)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "movk",
+                vec![reg("w10"), imm(0x7_0000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x18,
+                "cmp",
+                vec![reg("w9"), reg("w11")],
+                Flow::Fallthrough,
+            ),
+            conditional(
+                DISPATCH + 0x1c,
+                "ccmp",
+                "w9",
+                reg("w10"),
+                4,
+                Condition::NotEqual,
+            ),
+            conditional(
+                DISPATCH + 0x20,
+                "ccmp",
+                "w9",
+                reg("w11"),
+                0,
+                Condition::NotEqual,
+            ),
+            insn(
+                DISPATCH + 0x24,
+                "b.ne",
+                Vec::new(),
+                Flow::Branch(Some(0x900)),
+            ),
+            insn(
+                DISPATCH + 0x28,
+                "mov",
+                vec![reg("w0"), imm(1)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x2c, "ret", Vec::new(), Flow::Return),
+        ];
+
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
+
+        assert!(
+            found.cases.is_empty(),
+            "the fall-through is dead on the one path there is: {:?}",
+            found.cases
+        );
+        assert_eq!(found.untracked, vec![DISPATCH + 0x20]);
+    }
+
+    /// **The site reported for a dropped chain is the link that made it incomplete**, not the
+    /// comparison that was understood.
+    ///
+    /// `cmp w9,w11` / `ccmpne w2,w3,#4` / `b.lo`: the readable `cmp` leaves a reading and the blind
+    /// link leaves a forced arm, and reporting the reading's address sends a reader to the one
+    /// instruction here that is fully understood. [`Map::untracked`] is defined as where the
+    /// control code stopped being followable, which is the `ccmp`. Raised as a P2 by Codex on
+    /// [#439](https://github.com/glslang/windbg-mcp/pull/439).
+    #[test]
+    fn a_dropped_chain_reports_the_link_that_made_it_incomplete() {
+        const DEFAULT: u64 = 0xb00;
+        let block = vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "ldr",
+                vec![reg("w9"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("w11"), imm(0xc008)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "movk",
+                vec![reg("w11"), imm(0x56_0000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x10,
+                "mov",
+                vec![reg("w10"), imm(0xa0)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "movk",
+                vec![reg("w10"), imm(0x7_0000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x18,
+                "cmp",
+                vec![reg("w9"), reg("w11")],
+                Flow::Fallthrough,
+            ),
+            // Blind: the link that costs the answer its completeness.
+            conditional(
+                DISPATCH + 0x1c,
+                "ccmp",
+                "w2",
+                reg("w3"),
+                4,
+                Condition::NotEqual,
+            ),
+            insn(
+                DISPATCH + 0x20,
+                "b.lo",
+                Vec::new(),
+                Flow::Branch(Some(DEFAULT)),
+            ),
+            insn(DISPATCH + 0x24, "ret", Vec::new(), Flow::Return),
+        ];
+
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
+
+        assert!(found.cases.is_empty(), "{:?}", found.cases);
+        assert_eq!(
+            found.untracked,
+            vec![DISPATCH + 0x1c],
+            "the blind link, not the `cmp` before it"
         );
     }
 
