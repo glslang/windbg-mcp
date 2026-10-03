@@ -403,6 +403,7 @@ pub(crate) struct VmwpDispatcherState {
     threads_frozen: bool,
     vm_paused: bool,
     completion_kick: Option<VmTransition>,
+    unregister: Option<UnregisterProgress>,
 }
 
 impl VmwpDispatcherState {
@@ -438,6 +439,7 @@ impl VmwpDispatcherState {
             threads_frozen: false,
             vm_paused: false,
             completion_kick: None,
+            unregister: None,
         })
     }
 
@@ -473,6 +475,19 @@ impl VmwpDispatcherState {
     }
 
     fn refuse_unsafe_recovery(&mut self) -> Result<()> {
+        if matches!(self.unregister, Some(UnregisterProgress::Calling)) {
+            let why =
+                "handler unregister did not reach its return boundary; vmwp remains contained"
+                    .to_string();
+            self.phase = DispatcherPhase::Contained(why.clone());
+            bail!("{why}");
+        }
+        if self.unregister.is_some() {
+            bail!(
+                "handler unregister succeeded but deferred cleanup is incomplete; vmwp remains \
+                 attached for a teardown retry"
+            );
+        }
         match &self.phase {
             DispatcherPhase::Registering => {
                 let why = "handler registration did not reach and restore its return boundary; \
@@ -549,6 +564,15 @@ enum DispatcherPhase {
     Detached,
     Contained(String),
     Closed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum UnregisterProgress {
+    Calling,
+    WaitingCleanup,
+    ReturningCleanup { return_address: u64 },
+    CleanupReturned,
+    FreeingScratch,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -915,6 +939,14 @@ impl EventDispatcher for VmwpDispatcher<'_> {
             _ => {}
         }
 
+        // A successful native unregister is irreversible. If its later deferred-cleanup sequence
+        // failed, resume that recorded sequence before any generic breakpoint removal or detach;
+        // neither recovery nor a retry may issue the unregister call a second time.
+        if self.state.unregister.is_some() {
+            self.unregister_handler()?;
+            return self.finish_teardown();
+        }
+
         if self.state.breakpoint.is_some() {
             self.remove_owned_breakpoint()?;
         }
@@ -931,6 +963,12 @@ impl EventDispatcher for VmwpDispatcher<'_> {
         } else if self.state.scratch_allocated {
             self.free_unregistered_scratch()?;
         }
+        self.finish_teardown()
+    }
+}
+
+impl VmwpDispatcher<'_> {
+    fn finish_teardown(&mut self) -> Result<()> {
         if self.state.vm_paused {
             run_vm_action(self.bound_vm_id()?, VmAction::Resume, POWERSHELL_WAIT)?;
             self.state.vm_paused = false;
@@ -938,9 +976,7 @@ impl EventDispatcher for VmwpDispatcher<'_> {
         self.state.phase = DispatcherPhase::Closed;
         Ok(())
     }
-}
 
-impl VmwpDispatcher<'_> {
     fn prepare_held_event(&mut self) -> Result<()> {
         self.state.finish_completion_kick()?;
         if self.state.breakpoint.is_some() {
@@ -1247,6 +1283,32 @@ impl VmwpDispatcher<'_> {
 
     fn unregister_handler(&mut self) -> Result<()> {
         let context = self.state.handler_context.context("no handler context")?;
+        if self.state.unregister.is_none() {
+            self.begin_unregister_call(context)?;
+        }
+        loop {
+            match self.state.unregister.clone() {
+                Some(UnregisterProgress::Calling) => {
+                    bail!("handler unregister return was not proved")
+                }
+                Some(UnregisterProgress::WaitingCleanup) => {
+                    self.wait_for_unregister_cleanup(context)?
+                }
+                Some(UnregisterProgress::ReturningCleanup { return_address }) => {
+                    self.finish_unregister_cleanup_return(return_address)?
+                }
+                Some(UnregisterProgress::CleanupReturned) => {
+                    self.settle_unregister_cleanup(context)?
+                }
+                Some(UnregisterProgress::FreeingScratch) => {
+                    self.verify_unregister_scratch_free()?;
+                }
+                None => return Ok(()),
+            }
+        }
+    }
+
+    fn begin_unregister_call(&mut self, context: u64) -> Result<()> {
         verify_vmwp_pid(self.bound_vm_id()?, self.state.vmwp_pid)?;
         let pending = self
             .engine
@@ -1267,6 +1329,10 @@ impl VmwpDispatcher<'_> {
         self.engine.execute_command("~# u").map_err(debugger)?;
         self.state.threads_frozen = true;
         self.set_dynamic_breakpoint(return_address)?;
+        // From the first register mutation until the return value is proved, a failed call cannot
+        // be retried or detached: either could complete an unregister whose result we no longer
+        // know. Post-return cleanup uses the resumable states below instead.
+        self.state.unregister = Some(UnregisterProgress::Calling);
         self.write_register("rcx", self.state.dispatcher_vnd)?;
         self.write_register("rdx", context)?;
         self.write_register(
@@ -1284,40 +1350,79 @@ impl VmwpDispatcher<'_> {
             bail!("handler unregister returned failure");
         }
 
+        self.state.unregister = Some(UnregisterProgress::WaitingCleanup);
+        Ok(())
+    }
+
+    fn wait_for_unregister_cleanup(&mut self, context: u64) -> Result<()> {
         let cleanup = self.state.profile.deferred_cleanup.clone();
-        self.set_site_breakpoint(&cleanup)?;
-        self.engine.execute_command("~* u").map_err(debugger)?;
-        self.state.threads_frozen = false;
+        let cleanup_address = self.site_address(&cleanup)?;
+        if self.state.breakpoint.is_none() {
+            self.set_site_breakpoint(&cleanup)?;
+        }
+        if self.state.threads_frozen {
+            self.engine.execute_command("~* u").map_err(debugger)?;
+            self.state.threads_frozen = false;
+        }
         let deadline = Instant::now() + Duration::from_millis(u64::from(DEBUG_WAIT));
         loop {
-            self.run_to_current_breakpoint(deadline)?;
-            self.require_site(&cleanup)?;
-            if self.register("rcx")? == context {
+            if self.engine.instruction_pointer().map_err(debugger)? == cleanup_address
+                && self.register("rcx")? == context
+            {
                 break;
             }
+            self.run_to_current_breakpoint(deadline)?;
+            self.require_site(&cleanup)?;
             if Instant::now() >= deadline {
                 bail!("deferred cleanup did not reach the registered handler context");
             }
         }
         let cleanup_return = self.read_u64(self.register("rsp")?)?;
-        self.remove_owned_breakpoint()?;
-        self.set_dynamic_breakpoint(cleanup_return)?;
-        self.run_to_current_breakpoint(
-            Instant::now() + Duration::from_millis(u64::from(DEBUG_WAIT)),
-        )?;
+        self.state.unregister = Some(UnregisterProgress::ReturningCleanup {
+            return_address: cleanup_return,
+        });
+        Ok(())
+    }
+
+    fn finish_unregister_cleanup_return(&mut self, cleanup_return: u64) -> Result<()> {
+        if let Some(owned) = &self.state.breakpoint {
+            let cleanup_address = self.site_address(&self.state.profile.deferred_cleanup)?;
+            if owned.address != cleanup_address && owned.address != cleanup_return {
+                bail!("unregister cleanup owns an unexpected breakpoint");
+            }
+            if owned.address == cleanup_address {
+                self.remove_owned_breakpoint()?;
+            }
+        }
+        if self.state.breakpoint.is_none() {
+            self.set_dynamic_breakpoint(cleanup_return)?;
+        }
+        if self.engine.instruction_pointer().map_err(debugger)? != cleanup_return {
+            self.run_to_current_breakpoint(
+                Instant::now() + Duration::from_millis(u64::from(DEBUG_WAIT)),
+            )?;
+        }
         if self.engine.instruction_pointer().map_err(debugger)? != cleanup_return {
             bail!("deferred cleanup stopped away from its return address");
         }
         self.remove_owned_breakpoint()?;
-        self.detach_handled()?;
+        self.state.unregister = Some(UnregisterProgress::CleanupReturned);
+        Ok(())
+    }
 
+    fn settle_unregister_cleanup(&mut self, context: u64) -> Result<()> {
+        if self.state.attached {
+            self.detach_handled()?;
+        }
         thread::sleep(CLEANUP_SETTLE);
-        let pending = self
-            .engine
-            .attach_process_begin(self.state.vmwp_pid)
-            .map_err(debugger)?;
-        self.state.attached = true;
-        pending.wait().map_err(debugger)?;
+        if !self.state.attached {
+            let pending = self
+                .engine
+                .attach_process_begin(self.state.vmwp_pid)
+                .map_err(debugger)?;
+            self.state.attached = true;
+            pending.wait().map_err(debugger)?;
+        }
         let callback = self.read_u64(
             context
                 .checked_add(u64::from(self.state.profile.layout.callback_pointer))
@@ -1332,15 +1437,26 @@ impl VmwpDispatcher<'_> {
             bail!("old callback record changed before scratch release");
         }
         let scratch = self.state.profile.scratch_base.0;
+        // Claim the free before the fallible command: if DbgEng loses the reply, a teardown retry
+        // verifies the allocation state and never issues a second free against an ambiguous result.
+        self.state.unregister = Some(UnregisterProgress::FreeingScratch);
         self.engine
             .execute_command(&format!(".dvfree {scratch:016x} 0"))
             .map_err(debugger)?;
+        Ok(())
+    }
+
+    fn verify_unregister_scratch_free(&mut self) -> Result<()> {
+        let scratch = self.state.profile.scratch_base.0;
         if self.engine.read_memory(scratch, 1).is_ok() {
             bail!("callback scratch remained readable after .dvfree");
         }
         self.state.scratch_allocated = false;
         self.state.handler_context = None;
-        self.detach_handled()?;
+        self.state.unregister = None;
+        if self.state.attached {
+            self.detach_handled()?;
+        }
         Ok(())
     }
 
@@ -1900,6 +2016,24 @@ mod tests {
         assert!(error.to_string().contains("registration did not reach"));
         assert!(matches!(state.phase, DispatcherPhase::Contained(_)));
         assert!(state.refuse_unsafe_recovery().is_err());
+    }
+
+    #[test]
+    fn unproved_unregister_contains_but_proved_cleanup_remains_retryable() {
+        let mut state =
+            VmwpDispatcherState::new(profile(), 4242, 0x2000_0000_1000, "provider".into()).unwrap();
+        state.unregister = Some(UnregisterProgress::Calling);
+
+        assert!(state.refuse_unsafe_recovery().is_err());
+        assert!(matches!(state.phase, DispatcherPhase::Contained(_)));
+
+        let mut cleanup =
+            VmwpDispatcherState::new(profile(), 4242, 0x2000_0000_1000, "provider".into()).unwrap();
+        cleanup.phase = DispatcherPhase::Detached;
+        cleanup.unregister = Some(UnregisterProgress::WaitingCleanup);
+        let error = cleanup.refuse_unsafe_recovery().unwrap_err();
+        assert!(error.to_string().contains("cleanup is incomplete"));
+        assert!(matches!(cleanup.phase, DispatcherPhase::Detached));
     }
 
     fn target() -> TargetIdentity {

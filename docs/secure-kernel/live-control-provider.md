@@ -58,6 +58,8 @@ Register access is legal only in `Arming` or `Stopped`. `Arming` is entered whil
 already paused the disposable VM and is installing or clearing DR state. `Stopped` requires a held
 dispatcher event. A provider must refuse register access in `Running`, a stale epoch, a different
 target, an unsupported register, and any compare guard which no longer matches.
+Every successful transition must issue a token that has never appeared earlier in that provider
+session; returning to an older non-adjacent token is a protocol fault, not a valid rotation.
 
 The first revision has seven capabilities:
 
@@ -101,8 +103,8 @@ terminating it.
 Offline tests drive the complete running → arming → running → stopped → running sequence through a
 fake provider, including guarded register reads and writes. They also pin fixed-width address
 encoding, running-state refusal, target validation, and the rule that every state transition must
-rotate the epoch. A live acceptance still requires the disposable Hyper-V target and the
-operator-supplied provider.
+issue a session-unique epoch. A live acceptance still requires the disposable Hyper-V target and
+the operator-supplied provider.
 
 ## Worker state machine
 

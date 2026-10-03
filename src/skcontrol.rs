@@ -13,6 +13,7 @@
 //! writes are refused while running. A write carries both the expected and replacement value, so a
 //! changed register is a refusal rather than a blind overwrite.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -102,7 +103,7 @@ impl TargetIdentity {
 }
 
 /// Opaque, bounded token which changes at every running/stopped transition.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 #[schemars(transparent)]
 pub(crate) struct StopEpoch(String);
@@ -406,6 +407,7 @@ pub(crate) struct ControlSession<R: BufRead, W: Write> {
     writer: W,
     target: TargetIdentity,
     epoch: StopEpoch,
+    issued_epochs: HashSet<StopEpoch>,
     next_id: u64,
     capabilities: Option<Capabilities>,
     phase: Phase,
@@ -437,12 +439,14 @@ impl<R: BufRead, W: Write> ControlSession<R, W> {
                     bail!("provider hello does not name the target requested by the operator");
                 }
                 StopEpoch::new(hello.epoch.0.clone())?;
+                let issued_epochs = HashSet::from([hello.epoch.clone()]);
                 return Ok((
                     Self {
                         reader,
                         writer,
                         target: hello.target,
                         epoch: hello.epoch,
+                        issued_epochs,
                         next_id: 1,
                         capabilities: None,
                         phase: Phase::Running,
@@ -698,10 +702,11 @@ impl<R: BufRead, W: Write> ControlSession<R, W> {
                         | ReplyValue::Released
                 );
                 if changes_epoch {
-                    if response.epoch == self.epoch {
-                        bail!("publish/release succeeded without rotating the epoch");
+                    if self.issued_epochs.contains(&response.epoch) {
+                        bail!("a state transition reused an epoch issued earlier in this session");
                     }
                     StopEpoch::new(response.epoch.0.clone())?;
+                    self.issued_epochs.insert(response.epoch.clone());
                     self.epoch = response.epoch;
                 } else if response.epoch != self.epoch {
                     bail!("a non-transitioning operation changed the epoch");
@@ -1143,7 +1148,7 @@ mod tests {
 
     const EPOCH_RUNNING: &str = "running-0000000000000001";
     const EPOCH_STOPPED: &str = "stopped-0000000000000001";
-    const EPOCH_RESUMED: &str = "running-0000000000000002";
+    const EPOCH_RESUMED: &str = "running-0000000000000003";
 
     fn target() -> TargetIdentity {
         TargetIdentity {
@@ -1432,9 +1437,41 @@ mod tests {
         let mut session = scripted(&lines);
         session.capabilities().unwrap();
         let error = session.begin_arm().unwrap_err();
-        assert!(format!("{error}").contains("without rotating"));
+        assert!(format!("{error}").contains("reused an epoch"));
         let error = session.capabilities().unwrap_err();
         assert!(format!("{error}").contains("desynchronised"));
+    }
+
+    #[test]
+    fn a_non_adjacent_reused_epoch_is_refused_before_it_can_become_current_again() {
+        let lines = vec![
+            response(
+                1,
+                EPOCH_RUNNING,
+                ReplyValue::Capabilities {
+                    value: capabilities(),
+                },
+            ),
+            response(2, EPOCH_STOPPED, ReplyValue::ArmBegun),
+            response(3, EPOCH_RESUMED, ReplyValue::ArmFinished),
+            response(4, EPOCH_STOPPED, ReplyValue::ArmBegun),
+        ];
+        let mut session = scripted(&lines);
+        session.capabilities().unwrap();
+        session.begin_arm().unwrap();
+        session.finish_arm().unwrap();
+
+        let error = session.begin_arm().unwrap_err();
+
+        assert!(format!("{error}").contains("reused an epoch"));
+        assert_eq!(session.epoch().0, EPOCH_RESUMED);
+        assert!(
+            session
+                .capabilities()
+                .unwrap_err()
+                .to_string()
+                .contains("desynchronised")
+        );
     }
 
     #[test]
