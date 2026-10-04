@@ -10802,6 +10802,24 @@ fn module_named(e: &DebugEngine, module: &str) -> Result<(String, u64, u32), Fai
 /// call carries rather than that lookup — `FOLLOWUPS.md` item 56's gap, and item 88's worked
 /// example of an op that is mostly bounded with an unbounded step in front of it. Said here so the
 /// next caller inherits the knowledge along with the code.
+///
+/// # What is checked, in full
+///
+/// **Enumerated rather than listed as it grows**, because review on
+/// [#446](https://github.com/glslang/windbg-mcp/pull/446) landed on this function twice — once for
+/// the module and once for the offset — and a third round reading a half-list would find the next
+/// field the same way.
+///
+/// | input | what bounds it |
+/// |---|---|
+/// | `address` | **nothing, deliberately.** The caller named an absolute address and the debugger resolved it; there is no image it is an offset into, so any VA in the target is a legitimate answer. |
+/// | `module` | exactly one entry of the typed inventory, matched on the name rather than as a pattern ([`module_named`]). |
+/// | `rva` | strictly less than that module's size, so the pair names a place **inside** the image it claims. |
+/// | `base + rva` | checked for overflow, which the two bounds above already make unreachable and which stays because it costs nothing to keep true. |
+/// | the two forms | one or the other, never both and never neither — settled in the tool as well, so a malformed pair is an argument error before a session is chosen. |
+///
+/// That is the whole of it. A field added here needs a row, and a row saying "nothing" needs the
+/// reason `address`' row carries.
 fn resolve_code_target(
     e: &DebugEngine,
     address: Option<&str>,
@@ -10854,7 +10872,26 @@ fn resolve_code_target(
             // makes every RVA in the answer wrong with nothing to say so. It also takes this
             // path's last command away: there is no text left to parse and no pattern left to
             // resolve to an arbitrary row.
-            let (_, base, _) = module_named(e, m)?;
+            let (name, base, size) = module_named(e, m)?;
+            // **And the offset has to be inside the image it is an offset into.** `nt`+`0x1800000`
+            // on the checked-in x64 dump is `hal`'s base: the caller said the target was in `nt`,
+            // every bound above was satisfied, and `xrefs_to` scanned `hal` and said so only in a
+            // field nobody reads twice. The other outcome is no better -- an RVA landing in a gap
+            // came back as "no loaded module holds 0x...", which blames the absence of a module
+            // for what is a bad offset.
+            //
+            // This is `guarded_address`' rule, which this crate already applies to an
+            // `ImageCoordinate`; it was simply not applied here.
+            if u64::from(size) <= rva {
+                return Err(Failed::categorised(
+                    structured::ErrorCategory::InvalidArgument,
+                    format!(
+                        "`rva` {rva:#x} is outside `{name}`, which is {size:#x} bytes. An RVA is \
+                         an offset into the image it names; pass `address` instead for an \
+                         absolute address anywhere in the target."
+                    ),
+                ));
+            }
             // Arithmetic over the caller's own two numbers, so this one *is* the argument.
             base.checked_add(rva).ok_or_else(|| {
                 Failed::categorised(
