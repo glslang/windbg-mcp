@@ -133,8 +133,8 @@ The state machine implements both the narrow redirected gate and natural control
    and require TF and RF to have been clear;
 5. accept only the registered dispatcher context, a native event from the selected VP set, VTL1
    CPL0 vector 1, the bound CR3, one exact armed DR6 slot, and two identical held-state reads. The
-   native intercept holds the winning VP, so explicitly pause the whole VM before restoring every
-   non-winning VP and exposing the stop;
+   build-guarded live adapter accepts one selected VP, whose native intercept is the provider-write
+   barrier for the stop;
 6. consume each stop epoch once to arm TF. The first step may reuse the hardware-stop instruction;
    every later step must re-prove the exact current instruction bytes. A step accepts one default
    fall-through address or at most four explicit destinations for a branch;
@@ -149,11 +149,11 @@ epoch is a refusal with no mutation. A changed instruction, unexpected stop reas
 callback context, unstable held state, provider failure, or native-completion failure enters the
 terminal `faulted` phase. Recovery first tries to restore the saved register state. It authorizes
 native completion only when both restoration and event ownership are proven; otherwise the adapter
-must leave the disposable target paused. Conservative pause ownership means a resume may be owed;
-it does not authorize provider writes. If the whole-VM pause barrier fails or times out, recovery
-first finishes any pending resume and retries `Suspend-VM`. It restores provider baselines only
-after that pause completes successfully; otherwise it leaves every baseline untouched and contains
-the session with any native event incomplete.
+must leave the disposable target contained. Conservative pause ownership means a resume may be
+owed; it does not authorize provider writes. Recovery restores the provider baseline only while its
+exact native event remains retained, or when `Suspend-VM` completed before any event was
+outstanding. Otherwise it leaves the baseline untouched and contains the session with the native
+event incomplete.
 Teardown does not erase the fault record.
 
 The offline state-machine tests cover redirected and natural hardware stops, repeated and
@@ -164,20 +164,20 @@ provider transport tests also pin bounded silence and reader death.
 
 ## MCP live-control session
 
-The `securekernel` tool group exposes a selected VP set through one worker-owned live session. The
-adapter pauses the whole disposable VM while it changes their state:
+The `securekernel` tool group exposes one selected VP through a worker-owned live session. The
+adapter uses an initial VM pause and the held native event to keep provider state stable while it
+changes that VP:
 
 1. `open_sk_live_control` binds the exact VM, partition, primary VP, CR3, `vmwp` PID, dispatcher
-   pointer, profile and provider commands. `additional_vps` adds VP numbers; in that form
-   `control_transport` contains a `{vp}` placeholder used to start one identity-bound child per VP.
-   A session accepts at most 16 providers in total. Opening does not pause the VM or install a
-   breakpoint.
-2. `sk_live_arm` re-reads each exact instruction, saves every selected VP's writable baseline and
+   pointer, profile and provider commands. The build-guarded adapter refuses `additional_vps`
+   before loading the profile or starting a provider; multi-provider coordination remains a
+   separate gate. Opening does not pause the VM or install a breakpoint.
+2. `sk_live_arm` re-reads each exact instruction, saves the selected VP's writable baseline and
    installs one to four explicitly slotted execution breakpoints. Redirect mode requires one VP
    and one breakpoint. Natural mode arms the full VP and breakpoint set.
-3. `sk_live_wait` pumps `vmwp` until any selected VP reaches any armed address, re-establishes a
-   VM-wide pause barrier, restores all losing VPs, and returns the winner, exact DR slot and complete
-   stop evidence with a fresh controller epoch.
+3. `sk_live_wait` pumps `vmwp` until the selected VP reaches any armed address. It retains that exact
+   callback thread and returns the winning DR slot with complete stop evidence and a fresh
+   controller epoch.
 4. `sk_live_registers` and `sk_live_read_memory` inspect only that stopped epoch. The memory path
    uses the bound VTL1 CR3 and refuses an unmapped range whole.
 5. `sk_live_step` consumes the stopped epoch once, clears the hardware breakpoint and arms TF.
@@ -225,11 +225,19 @@ scoped crash record. A preceding natural-flow VP1 attempt timed out because that
 scheduled there; bounded recovery restored the baseline and resumed the VM before faulting the
 session.
 
-The later fan-out implementation removes that single-VP session limit: one worker owns several
-VP-bound providers, arms the same guarded slot set on each, accepts the first selected VP reported
-by the native event, and restores every losing VP before returning the stop. Offline tests cover a
-VP1 win with VP0 restoration. A multi-provider live run remains required before treating this
-broader mode as bench-proven; the earlier live result proves selected VP1, one provider at a time.
+The generic controller also has an offline-tested fan-out model, but the concrete adapter now
+refuses it before provider startup. The live two-provider attempt showed why: `Suspend-VM` remained
+blocked while a VID event was outstanding, including after a handled debugger detach, and parking
+the first callback prevented a second selected VP from reaching the serialized native dispatcher
+path. Multi-provider live control therefore needs a release-and-quiesce protocol in separate
+chunks; the bench-proven path selects one VP at a time.
+
+On 2026-10-04 a fresh one-provider run selected the exact profile from a two-entry catalog that also
+contained a wrong-build profile, armed DR0 through DR3 at four guarded
+`securekernel!KiTimerInterrupt` instructions, and classified the natural stop as slot 3. It then
+completed all 16 guarded steps, including the conditional branch, restored both vCPU debug
+baselines and TF/RF state, preserved the guarded text, released the worker, and kept the same
+healthy `vmwp` through the independent 60-second audit before leaving the disposable VM Off.
 
 Two more runs from fresh differencing children repeated the 16-instruction natural-flow lifecycle
 and independent 60-second audit at new partition IDs and Secure Kernel bases. A live wrong-build
@@ -263,7 +271,12 @@ context, event-VP and native-advance offsets; bounded scratch offsets; and no de
 text. The per-boot VND pointer is a separate session input. Before mutation the adapter checks the
 VM GUID against the `vmwp` command line, the image identity, every guarded site, the current VTL1
 CR3, and the selected Secure Kernel instruction. It refuses an existing mapping at the requested
-scratch base or a pre-existing breakpoint at an owned site.
+scratch base or a pre-existing breakpoint at an owned site. On a matching event the adapter records
+the exact `vmwp` system thread before removing its owned breakpoint. Release reselects that thread,
+completes the registered and native callbacks through guarded return boundaries, then gives native
+completion one watchdog-bounded run slice before the handled detach. The delayed Hyper-V completion
+helper is joined only after detach, so its pause request cannot deadlock on a debugger-stopped
+`vmwp`.
 
 All debugger commands are fixed internal operations with validated numeric substitutions. Software
 breakpoints are created and removed through the typed DbgEng API, and their original bytes are read
