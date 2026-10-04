@@ -2337,15 +2337,15 @@ to v2, so a v1 provider is refused at its banner. Redirect mode remains delibera
 Public transitions use a controller-local monotonic epoch prefixed by a per-session 256-bit
 system-RNG nonce, preventing cross-provider and cross-session replay. The generic controller retains
 offline fan-out tests, including a VP1 win with VP0 restoration, but the concrete build-guarded
-adapter now refuses `additional_vps` before profile loading or provider startup.
+adapter and its MCP schema now expose exactly one selected VP.
 
-That refusal follows a live result rather than an untested restriction. `Suspend-VM` did not return
-while the winning VID event was outstanding, even after the event thread was redirected to owned
-scratch and DbgEng performed a handled detach. Holding that first callback and pumping the remaining
-`vmwp` threads also produced no second selected-VP callback before the bounded deadline: the native
-dispatcher path is serialized at this point. The safe narrow path instead treats the one selected
-VP's retained event as its provider-write barrier. It records and later reselects the exact system
-thread, reaches the guarded callback and native return boundaries, gives native completion one
+That single-VP boundary follows a live result rather than an untested restriction. `Suspend-VM` did
+not return while the winning VID event was outstanding, even after the event thread was redirected
+to owned scratch and DbgEng performed a handled detach. Holding that first callback and pumping the
+remaining `vmwp` threads also produced no second selected-VP callback before the bounded deadline:
+the native dispatcher path is serialized at this point. The safe narrow path instead treats the one
+selected VP's retained event as its provider-write barrier. It records and later reselects the exact
+system thread, reaches the guarded callback and native return boundaries, gives native completion one
 watchdog-bounded run slice, detaches handled, and only then joins the delayed Hyper-V helper. A fresh
 run selected the exact entry from an exact-plus-wrong-build catalog, armed all four DR slots, stopped
 naturally on slot 3, completed 16 guarded steps, restored both vCPU debug baselines and TF/RF state,

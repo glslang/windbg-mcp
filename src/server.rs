@@ -1144,7 +1144,7 @@ pub struct SkSymbolArgs {
 pub struct SkLiveOpenArgs {
     /// Exact build profile JSON, or a bounded directory from which the current image is selected.
     pub profile: String,
-    /// Register-control provider command. Use `{vp}` when `additional_vps` is nonempty.
+    /// Register-control provider command. An optional `{vp}` names the selected VP.
     pub control_transport: String,
     /// Command line for the live VTL1 physical-memory source child.
     pub live_transport: String,
@@ -1161,10 +1161,6 @@ pub struct SkLiveOpenArgs {
     /// Virtual processor to control. Defaults to VP 0. The native event must report this VP.
     #[serde(default)]
     pub vp: Option<u32>,
-    /// Further VP numbers which may win a natural stop, at most 15. `control_transport` must
-    /// contain `{vp}`.
-    #[serde(default)]
-    pub additional_vps: Vec<u32>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -4036,53 +4032,10 @@ impl WindbgServer {
                 TargetCreated::No,
             );
         }
-        let mut vp_numbers = vec![target.vp];
-        let mut additional_vps = Vec::with_capacity(args.additional_vps.len());
-        if args.additional_vps.len() >= crate::sklive::MAX_LIVE_CONTROL_VPS {
-            return open_failure(
-                ErrorCategory::InvalidArgument,
-                format!(
-                    "live control accepts at most {} VP providers",
-                    crate::sklive::MAX_LIVE_CONTROL_VPS
-                ),
-                None,
-                TargetCreated::No,
-            );
-        }
-        if !args.additional_vps.is_empty() && !args.control_transport.contains("{vp}") {
-            return open_failure(
-                ErrorCategory::InvalidArgument,
-                "control_transport must contain {vp} when additional_vps are requested".to_string(),
-                None,
-                TargetCreated::No,
-            );
-        }
-        for vp in args.additional_vps {
-            if vp_numbers.contains(&vp) {
-                return open_failure(
-                    ErrorCategory::InvalidArgument,
-                    "live-control VP numbers must be distinct".to_string(),
-                    None,
-                    TargetCreated::No,
-                );
-            }
-            vp_numbers.push(vp);
-            let mut additional_target = target.clone();
-            additional_target.vp = vp;
-            additional_vps.push(crate::skdispatch::AdditionalVp {
-                control_transport: args.control_transport.replace("{vp}", &vp.to_string()),
-                target: additional_target,
-            });
-        }
         let control_transport = args
             .control_transport
             .replace("{vp}", &target.vp.to_string());
-        let vp_list = vp_numbers
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        let what = format!("VM {} VTL1 VPs {vp_list}", target.vm_id);
+        let what = format!("VM {} VTL1 VP {}", target.vm_id, target.vp);
         self.opened(
             SessionKind::SecureKernelLive,
             what,
@@ -4093,7 +4046,7 @@ impl WindbgServer {
                 vmwp_pid: args.vmwp_pid,
                 dispatcher_vnd,
                 target,
-                additional_vps,
+                additional_vps: Vec::new(),
             })),
         )
         .await

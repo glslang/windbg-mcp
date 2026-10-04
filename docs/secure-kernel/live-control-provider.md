@@ -153,7 +153,8 @@ must leave the disposable target contained. Conservative pause ownership means a
 owed; it does not authorize provider writes. Recovery restores the provider baseline only while its
 exact native event remains retained, or when `Suspend-VM` completed before any event was
 outstanding. Otherwise it leaves the baseline untouched and contains the session with the native
-event incomplete.
+event incomplete. A retained event is release-eligible only after its raw advance field and owned
+breakpoint cleanup pass; a failure before that point remains contained after baseline restoration.
 Teardown does not erase the fault record.
 
 The offline state-machine tests cover redirected and natural hardware stops, repeated and
@@ -168,10 +169,9 @@ The `securekernel` tool group exposes one selected VP through a worker-owned liv
 adapter uses an initial VM pause and the held native event to keep provider state stable while it
 changes that VP:
 
-1. `open_sk_live_control` binds the exact VM, partition, primary VP, CR3, `vmwp` PID, dispatcher
-   pointer, profile and provider commands. The build-guarded adapter refuses `additional_vps`
-   before loading the profile or starting a provider; multi-provider coordination remains a
-   separate gate. Opening does not pause the VM or install a breakpoint.
+1. `open_sk_live_control` binds the exact VM, partition, selected VP, CR3, `vmwp` PID, dispatcher
+   pointer, profile and provider commands. Its MCP schema exposes one VP; multi-provider
+   coordination remains a separate gate. Opening does not pause the VM or install a breakpoint.
 2. `sk_live_arm` re-reads each exact instruction, saves the selected VP's writable baseline and
    installs one to four explicitly slotted execution breakpoints. Redirect mode requires one VP
    and one breakpoint. Natural mode arms the full VP and breakpoint set.

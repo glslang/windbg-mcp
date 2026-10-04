@@ -19154,8 +19154,7 @@ fn a_live_secure_kernel_session_stops_steps_inspects_resumes_and_closes() {
         "vm_id": required("vm_id"),
         "partition_id": required("partition_id"),
         "vp": config.get("vp").cloned().unwrap_or(json!(0)),
-        "expected_cr3": required("expected_cr3"),
-        "additional_vps": config.get("additional_vps").cloned().unwrap_or(json!([]))
+        "expected_cr3": required("expected_cr3")
     });
 
     let mut server = Server::started();
