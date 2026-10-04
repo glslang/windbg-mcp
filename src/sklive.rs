@@ -187,6 +187,8 @@ pub(crate) trait EventDispatcher {
     fn finish_arm(&mut self) -> Result<()>;
     /// Re-read a proposed current instruction while the owned event remains held.
     fn verify_instruction(&mut self, instruction: &InstructionGuard) -> Result<()>;
+    /// Return an owned event only after re-establishing a whole-target pause. The controller can
+    /// then restore losing VP state without racing guest execution.
     fn wait_for_stop(
         &mut self,
         targets: &[TargetIdentity],
@@ -283,22 +285,31 @@ impl DispatcherProfile {
     }
 
     fn load_catalog(path: &std::path::Path) -> Result<Self> {
-        let mut entries = std::fs::read_dir(path)
-            .with_context(|| format!("reading dispatcher profile catalog {}", path.display()))?
-            .map(|entry| entry.map(|entry| entry.path()))
-            .collect::<std::io::Result<Vec<_>>>()?;
-        entries.retain(|entry| {
-            entry
+        let directory = std::fs::read_dir(path)
+            .with_context(|| format!("reading dispatcher profile catalog {}", path.display()))?;
+        let mut entries = Vec::new();
+        for (index, entry) in directory.enumerate() {
+            if index == MAX_PROFILE_CATALOG_ENTRIES {
+                bail!(
+                    "dispatcher profile catalog may contain at most {MAX_PROFILE_CATALOG_ENTRIES} total entries"
+                );
+            }
+            let entry = entry
+                .with_context(|| {
+                    format!("enumerating dispatcher profile catalog {}", path.display())
+                })?
+                .path();
+            if entry
                 .extension()
                 .and_then(|extension| extension.to_str())
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
-        });
+            {
+                entries.push(entry);
+            }
+        }
         entries.sort();
-        if entries.is_empty() || entries.len() > MAX_PROFILE_CATALOG_ENTRIES {
-            bail!(
-                "dispatcher profile catalog must contain 1..={MAX_PROFILE_CATALOG_ENTRIES} JSON files, got {}",
-                entries.len()
-            );
+        if entries.is_empty() {
+            bail!("dispatcher profile catalog contains no JSON profiles");
         }
 
         let mut matching = Vec::new();
@@ -753,6 +764,8 @@ struct VpControl<P> {
 pub(crate) struct LiveControl<P> {
     providers: Vec<VpControl<P>>,
     active_provider: Option<usize>,
+    epoch_serial: u64,
+    public_epoch: StopEpoch,
     state: State,
     breakpoints: Vec<BreakpointGuard>,
     arm_mode: Option<ArmMode>,
@@ -805,6 +818,8 @@ impl<P: ControlProvider> LiveControl<P> {
         Ok(Self {
             providers: controls,
             active_provider: None,
+            epoch_serial: 0,
+            public_epoch: StopEpoch::new("control-running-0000000000000000")?,
             state: State::Running,
             breakpoints: Vec::new(),
             arm_mode: None,
@@ -827,9 +842,7 @@ impl<P: ControlProvider> LiveControl<P> {
     }
 
     pub(crate) fn epoch(&self) -> &StopEpoch {
-        self.providers[self.active_provider.unwrap_or(0)]
-            .provider
-            .epoch()
+        &self.public_epoch
     }
 
     pub(crate) fn fault(&self) -> Option<&FaultRecord> {
@@ -862,6 +875,7 @@ impl<P: ControlProvider> LiveControl<P> {
         if mode == ArmMode::Redirect && self.providers.len() != 1 {
             bail!("redirect arming requires exactly one VP provider");
         }
+        let next_epoch = self.next_epoch("running")?;
         self.state = State::Arming;
         // Recovery must know whether RIP is controller-owned even if a later arm write fails.
         self.arm_mode = Some(mode);
@@ -871,7 +885,7 @@ impl<P: ControlProvider> LiveControl<P> {
         self.breakpoints = breakpoints;
         self.expected_stop = Some(ExpectedStop::Hardware);
         self.state = State::Running;
-        Ok(self.epoch().clone())
+        Ok(self.commit_epoch(next_epoch))
     }
 
     fn arm_inner(
@@ -970,6 +984,7 @@ impl<P: ControlProvider> LiveControl<P> {
         if !matches!(self.state, State::Running) || self.expected_stop.is_none() {
             bail!("wait_for_stop requires an armed running session");
         }
+        let next_epoch = self.next_epoch("stopped")?;
         let expected_stop = self
             .expected_stop
             .clone()
@@ -1037,7 +1052,7 @@ impl<P: ControlProvider> LiveControl<P> {
             let mut event = observed.event.clone();
             event.reason = reason;
             Ok(StopRecord {
-                epoch: self.providers[active].provider.epoch().clone(),
+                epoch: next_epoch.1.clone(),
                 target: self.providers[active].target.clone(),
                 event,
                 registers: first,
@@ -1050,6 +1065,7 @@ impl<P: ControlProvider> LiveControl<P> {
             Ok(stop) => {
                 self.dispatcher_event = Some(observed.event);
                 self.expected_stop = None;
+                self.commit_epoch(next_epoch);
                 self.state = State::Stopped(stop.clone());
                 Ok(stop)
             }
@@ -1071,6 +1087,7 @@ impl<P: ControlProvider> LiveControl<P> {
         // This read has no target-side effect. A bad caller guard leaves the current stop and
         // epoch intact so it can be corrected or continued safely.
         dispatcher.verify_instruction(&instruction)?;
+        let next_epoch = self.next_epoch("running")?;
         let dispatcher_event = self
             .dispatcher_event
             .clone()
@@ -1121,7 +1138,7 @@ impl<P: ControlProvider> LiveControl<P> {
             expected_rips,
         });
         self.state = State::Running;
-        Ok(self.providers[active].provider.epoch().clone())
+        Ok(self.commit_epoch(next_epoch))
     }
 
     /// Restore the complete writable baseline and release the exact event once.
@@ -1131,6 +1148,7 @@ impl<P: ControlProvider> LiveControl<P> {
         epoch: &StopEpoch,
     ) -> Result<StopEpoch> {
         self.require_stop_epoch(epoch)?;
+        let next_epoch = self.next_epoch("running")?;
         let dispatcher_event = self
             .dispatcher_event
             .clone()
@@ -1156,7 +1174,7 @@ impl<P: ControlProvider> LiveControl<P> {
         self.dispatcher_event = None;
         self.expected_stop = None;
         self.state = State::Running;
-        Ok(self.providers[active].provider.epoch().clone())
+        Ok(self.commit_epoch(next_epoch))
     }
 
     /// Restore or release anything this session still owns, then remove the handler and detach.
@@ -1526,15 +1544,35 @@ impl<P: ControlProvider> LiveControl<P> {
         Ok(())
     }
 
+    fn next_epoch(&self, phase: &str) -> Result<(u64, StopEpoch)> {
+        let serial = self
+            .epoch_serial
+            .checked_add(1)
+            .context("the live-control epoch counter overflowed")?;
+        Ok((
+            serial,
+            StopEpoch::new(format!("control-{phase}-{serial:016x}"))?,
+        ))
+    }
+
+    fn commit_epoch(&mut self, next: (u64, StopEpoch)) -> StopEpoch {
+        self.epoch_serial = next.0;
+        self.public_epoch = next.1;
+        self.public_epoch.clone()
+    }
+
     fn require_stop_epoch(&self, epoch: &StopEpoch) -> Result<&StopRecord> {
         let State::Stopped(stop) = &self.state else {
             bail!("operation requires a stopped session");
         };
+        if &stop.epoch != epoch || &self.public_epoch != epoch {
+            bail!("the supplied stop epoch is stale");
+        }
         let active = self
             .active_provider
             .context("the stopped session has no active VP provider")?;
-        if &stop.epoch != epoch || self.providers[active].provider.epoch() != epoch {
-            bail!("the supplied stop epoch is stale");
+        if self.providers[active].provider_phase != ProviderPhase::Stopped {
+            bail!("the active provider is not stopped");
         }
         Ok(stop)
     }
@@ -2286,6 +2324,51 @@ mod tests {
     }
 
     #[test]
+    fn controller_epochs_cannot_be_reused_when_a_different_vp_wins() {
+        let vp0 = ObservedStop {
+            event: event(StopReason::DebugException),
+            instructions: vec![instruction()],
+        };
+        let mut vp1_event = event(StopReason::DebugException);
+        vp1_event.vp = 1;
+        let vp1 = ObservedStop {
+            event: vp1_event,
+            instructions: vec![instruction()],
+        };
+        let mut dispatcher = FakeDispatcher::new([vp0, vp1]);
+        let mut control =
+            LiveControl::open_many(vec![FakeProvider::new(), FakeProvider::new().with_vp(1)])
+                .unwrap();
+
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Natural)
+            .unwrap();
+        let first = control.wait_for_stop(&mut dispatcher).unwrap();
+        assert_eq!(first.target.vp, 0);
+        assert_ne!(first.epoch, control.providers[0].provider.epoch);
+        control
+            .continue_from(&mut dispatcher, &first.epoch)
+            .unwrap();
+
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Natural)
+            .unwrap();
+        let second = control.wait_for_stop(&mut dispatcher).unwrap();
+        assert_eq!(second.target.vp, 1);
+        assert_ne!(second.epoch, first.epoch);
+        assert_ne!(second.epoch, control.providers[1].provider.epoch);
+
+        let error = control
+            .continue_from(&mut dispatcher, &first.epoch)
+            .unwrap_err();
+        assert!(error.to_string().contains("stale"), "{error:#}");
+        assert_eq!(control.stopped().unwrap().epoch, second.epoch);
+        control
+            .continue_from(&mut dispatcher, &second.epoch)
+            .unwrap();
+    }
+
+    #[test]
     fn provider_set_rejects_duplicate_vps_and_mismatched_vm_identity() {
         let duplicate = LiveControl::open_many(vec![FakeProvider::new(), FakeProvider::new()])
             .err()
@@ -2802,6 +2885,30 @@ mod tests {
 
         let selected = DispatcherProfile::load(&directory).unwrap();
         assert_eq!(selected, current);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn dispatcher_profile_catalog_bounds_all_directory_entries_while_iterating() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "windbg-mcp-sk-profile-bound-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        for index in 0..=MAX_PROFILE_CATALOG_ENTRIES {
+            std::fs::write(directory.join(format!("unrelated-{index:03}.txt")), []).unwrap();
+        }
+
+        let error = DispatcherProfile::load(&directory).unwrap_err();
+
+        assert!(
+            error.to_string().contains("at most 128 total entries"),
+            "{error:#}"
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 

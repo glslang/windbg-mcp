@@ -60,6 +60,9 @@ dispatcher event. A provider must refuse register access in `Running`, a stale e
 target, an unsupported register, and any compare guard which no longer matches.
 Every successful transition must issue a token that has never appeared earlier in that provider
 session; returning to an older non-adjacent token is a protocol fault, not a valid rotation.
+These provider-local epochs remain inside the worker. The multi-VP controller issues a separate,
+monotonic session epoch for each public running or stopped transition, so equal epoch strings from
+two provider processes can never authorize a replay against a different winning VP.
 
 The first revision has seven capabilities:
 
@@ -128,8 +131,9 @@ The state machine implements both the narrow redirected gate and natural control
 4. in `redirect` mode move RIP to the guarded instruction; in `natural` mode leave RIP untouched
    and require TF and RF to have been clear;
 5. accept only the registered dispatcher context, a native event from the selected VP set, VTL1
-   CPL0 vector 1, the bound CR3, one exact armed DR6 slot, and two identical held-state reads;
-   restore every non-winning VP before exposing the stop;
+   CPL0 vector 1, the bound CR3, one exact armed DR6 slot, and two identical held-state reads. The
+   native intercept holds the winning VP, so explicitly pause the whole VM before restoring every
+   non-winning VP and exposing the stop;
 6. consume each stop epoch once to arm TF. The first step may reuse the hardware-stop instruction;
    every later step must re-prove the exact current instruction bytes. A step accepts one default
    fall-through address or at most four explicit destinations for a branch;
@@ -165,8 +169,9 @@ adapter pauses the whole disposable VM while it changes their state:
 2. `sk_live_arm` re-reads each exact instruction, saves every selected VP's writable baseline and
    installs one to four explicitly slotted execution breakpoints. Redirect mode requires one VP
    and one breakpoint. Natural mode arms the full VP and breakpoint set.
-3. `sk_live_wait` pumps `vmwp` until any selected VP reaches any armed address, restores all losing
-   VPs, and returns the winner, exact DR slot and complete stop evidence with a fresh epoch.
+3. `sk_live_wait` pumps `vmwp` until any selected VP reaches any armed address, re-establishes a
+   VM-wide pause barrier, restores all losing VPs, and returns the winner, exact DR slot and complete
+   stop evidence with a fresh controller epoch.
 4. `sk_live_registers` and `sk_live_read_memory` inspect only that stopped epoch. The memory path
    uses the bound VTL1 CR3 and refuses an unmapped range whole.
 5. `sk_live_step` consumes the stopped epoch once, clears the hardware breakpoint and arms TF.
@@ -180,7 +185,8 @@ adapter pauses the whole disposable VM while it changes their state:
 Ordinary debugger and capture operations are refused on this session: its DbgEng target is the
 host `vmwp`, while its answers describe the guest VTL1. Conversely, the live operations are
 refused on every other session kind. Mutating stopped operations require the exact opaque epoch,
-so a stale or replayed step/continue request is rejected before mutation.
+so a stale or replayed step/continue request is rejected before mutation, including when a later
+stop was won by another selected VP.
 
 Teardown is fail closed. The supervisor does not terminate a worker when restoration, handler
 cleanup and handled detach were not confirmed; the session moves to `live_control_unresolved` and
@@ -241,7 +247,8 @@ engine on the same thread. Its retained state owns the provider child, live-memo
 breakpoint ids, callback scratch allocation, handler context, VM pause state, and delayed completion
 helper.
 
-The profile input may be one JSON file or a directory containing at most 128 JSON profiles. A
+The profile input may be one JSON file or a directory containing at most 128 total entries. JSON
+entries are treated as profiles; other entries count toward the enumeration bound and are ignored. A
 directory must have exactly one entry whose declared `vmwp.exe` path and SHA-256 match the current
 local image; the adapter repeats the identity check against DbgEng's loaded module before mutation.
 Each profile contains an absolute `vmwp.exe` image path, SHA-256 and SizeOfImage;

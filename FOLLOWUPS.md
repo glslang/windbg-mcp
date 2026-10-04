@@ -2336,7 +2336,14 @@ stop is returned and the following TF wait is restricted to the winner. Fan-out 
 providers before any child starts. The raw debug event deliberately advances the provider wire
 contract to v2, so a v1 provider is refused at its banner. Redirect mode remains deliberately one
 VP and one address. Offline tests cover a VP1 win with VP0 restoration, multi-slot classification,
-duplicate refusal and baseline recovery.
+duplicate refusal and baseline recovery. Review then found two cross-provider ownership gaps: a
+provider-local epoch could collide with another provider's token, and a native intercept held only
+the winning VP while losing baselines were restored. Public transitions now use a controller-local
+monotonic epoch, and the dispatcher re-establishes a whole-VM pause barrier before the controller
+touches losing VPs. Step completion retains that pause until the next bounded wait resumes the VM;
+final continue resumes it explicitly after handled detach.
+The catalog bound is also enforced during directory iteration across every entry, including
+non-JSON files, so selection never first materializes an unbounded directory.
 The fan-out path still needs a live multi-provider acceptance run; its predecessor's live proof is
 one selected VP at a time.
 

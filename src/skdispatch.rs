@@ -514,6 +514,15 @@ impl VmwpDispatcherState {
         Ok(())
     }
 
+    fn claim_held_pause(&mut self, event: &HeldEvent) -> Result<()> {
+        if self.phase.held_event() != Some(event) {
+            bail!("the VM-wide pause barrier does not name the held dispatcher event");
+        }
+        // Claim this before Suspend-VM for the same conservative recovery reason as initial arm.
+        self.vm_paused = true;
+        Ok(())
+    }
+
     fn refuse_unsafe_recovery(&mut self) -> Result<()> {
         if matches!(self.unregister, Some(UnregisterProgress::Calling)) {
             let why =
@@ -867,7 +876,10 @@ impl EventDispatcher for VmwpDispatcher<'_> {
             self.set_site_breakpoint(&site)?;
         }
 
-        if self.state.completion_kick.is_none() && self.state.vm_paused {
+        if self.state.vm_paused {
+            // A completed step can leave the delayed native-completion kick pending while the VM
+            // remains paused. Cancel that delay and begin the resume needed for this exact wait.
+            self.state.finish_completion_kick()?;
             self.state.completion_kick = Some(VmTransition::immediate(
                 primary.vm_id.clone(),
                 VmAction::Resume,
@@ -920,6 +932,9 @@ impl EventDispatcher for VmwpDispatcher<'_> {
         self.state.phase = DispatcherPhase::Holding(event.clone());
         self.state.vm_paused = false;
         self.prepare_held_event()?;
+        // The native intercept holds only the winning VP. Re-establish a VM-wide barrier before
+        // the controller restores debug registers on any losing VP or publishes stop evidence.
+        self.pause_held_target(&event)?;
 
         let advance = self.read_u8(
             event_pointer
@@ -969,14 +984,16 @@ impl EventDispatcher for VmwpDispatcher<'_> {
             return Ok(());
         }
 
-        let event = event
-            .cloned()
-            .or_else(|| self.state.phase.held_event().cloned());
-        if let Some(event) = event {
+        if let Some(held) = self.state.phase.held_event().cloned() {
+            if let Some(expected) = event
+                && expected != &held
+            {
+                bail!("recovery event does not match the event held by the dispatcher");
+            }
             if matches!(self.state.phase, DispatcherPhase::Holding(_)) {
                 self.prepare_held_event()?;
             }
-            return self.release_event(&event, ReleaseMode::Resume);
+            return self.release_event(&held, ReleaseMode::Resume);
         }
 
         if self.state.breakpoint.is_some() {
@@ -1061,6 +1078,12 @@ impl VmwpDispatcher<'_> {
             self.remove_owned_breakpoint()?;
         }
         Ok(())
+    }
+
+    fn pause_held_target(&mut self, event: &HeldEvent) -> Result<()> {
+        self.state.claim_held_pause(event)?;
+        run_vm_action(self.bound_vm_id()?, VmAction::Pause, POWERSHELL_WAIT)
+            .context("establishing the VM-wide held-event pause barrier")
     }
 
     fn open_and_register(
@@ -1398,7 +1421,10 @@ impl VmwpDispatcher<'_> {
             ReleaseMode::Resume => {
                 self.detach_handled()?;
                 self.state.finish_completion_kick()?;
-                self.state.vm_paused = false;
+                if self.state.vm_paused {
+                    run_vm_action(self.bound_vm_id()?, VmAction::Resume, POWERSHELL_WAIT)?;
+                    self.state.vm_paused = false;
+                }
                 self.state.phase = DispatcherPhase::Detached;
             }
         }
@@ -2153,6 +2179,31 @@ mod tests {
             Some(&event)
         );
         assert!(DispatcherPhase::ReadyForStop.held_event().is_none());
+    }
+
+    #[test]
+    fn the_held_event_pause_barrier_claims_ownership_before_suspend() {
+        let event = HeldEvent {
+            message_type: HexU64(EVENT_TYPE_VECTOR_1),
+            vector: 1,
+            vp: 1,
+            vtl: 1,
+            cpl: 0,
+            dispatcher_context: HexU64(0x2000_0000_2000),
+            advance_instruction_pointer: false,
+            reason: StopReason::DebugException,
+        };
+        let mut state =
+            VmwpDispatcherState::new(profile(), 4242, 0x2000_0000_1000, "provider".into()).unwrap();
+        state.phase = DispatcherPhase::Holding(event.clone());
+
+        state.claim_held_pause(&event).unwrap();
+
+        assert!(state.vm_paused);
+        let mut unrelated = event;
+        unrelated.vp = 0;
+        assert!(state.claim_held_pause(&unrelated).is_err());
+        assert!(state.vm_paused);
     }
 
     #[test]
