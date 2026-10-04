@@ -425,6 +425,24 @@ pub enum EngineOp {
         /// filled in by the supervisor's pump.
         patience_ms: u32,
     },
+    /// Every site in one image whose decoded control flow reaches one address — the reverse of
+    /// [`Self::Reachability`], and about an **internal** address rather than an import.
+    ///
+    /// One indivisible job for the same reason [`Self::DriverHazards`] is: it decodes a whole
+    /// executable image, which is a run of engine calls rather than one.
+    Xrefs {
+        /// The module to scan, as the module inventory names it. The image holding the target
+        /// unless the caller named another.
+        module: Option<String>,
+        /// The target, exactly as the caller gave it: an absolute address or expression, or a
+        /// module and RVA. Resolved in the worker, which is the side with an engine.
+        address: Option<String>,
+        target_module: Option<String>,
+        rva: Option<String>,
+        /// Whatever is left of the caller's own clock when this reaches the front of the queue,
+        /// filled in by the supervisor's pump.
+        patience_ms: u32,
+    },
     /// What decides who may open a device: the `_DEVICE_OBJECT`'s **own** security descriptor,
     /// the two words of device flags that qualify it, and the symbolic links that reach it.
     ///
@@ -665,6 +683,7 @@ impl EngineOp {
             | Self::Walk(WalkOp { patience_ms, .. })
             | Self::Reachability(ReachabilityOp { patience_ms, .. })
             | Self::DriverHazards { patience_ms, .. }
+            | Self::Xrefs { patience_ms, .. }
             | Self::IoctlMap { patience_ms, .. }
             | Self::IrpStack { patience_ms, .. }
             | Self::IoctlTrace { patience_ms, .. }

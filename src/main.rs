@@ -26,6 +26,7 @@ mod batch;
 mod cast;
 mod cfg;
 mod client;
+mod codewalk;
 mod device;
 mod driver;
 mod engine;
@@ -60,6 +61,7 @@ mod triage;
 mod ttd;
 mod walk;
 mod worker;
+mod xrefs;
 
 use std::time::Duration;
 

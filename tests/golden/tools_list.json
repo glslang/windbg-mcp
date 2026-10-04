@@ -2,7 +2,7 @@
   "schemaDialects": [
     "https://json-schema.org/draft/2020-12/schema"
   ],
-  "toolCount": 74,
+  "toolCount": 75,
   "tools": [
     {
       "hints": {
@@ -2478,6 +2478,44 @@
       ],
       "required": [],
       "title": "Walk a structure in memory"
+    },
+    {
+      "hints": {
+        "destructive": null,
+        "idempotent": null,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "xrefs_to",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/Xrefs",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
+      "params": [
+        "address: string|null",
+        "module: string|null",
+        "rva: string|null",
+        "session_id: string|null",
+        "target_module: string|null"
+      ],
+      "required": [],
+      "title": "Find the sites that call or branch to one address"
     }
   ],
   "usesDefs": true

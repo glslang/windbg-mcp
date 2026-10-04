@@ -96,6 +96,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`xrefs_to` — which sites in an image call or branch to one address** (`FOLLOWUPS.md` item 109).
+  The reverse of `reachable_from_dispatch`'s forward walk, and about an **internal** address rather
+  than an import, which is the question you have when a symbol is absent, a PDB is public and
+  typeless, or the interesting thing is a callback body rather than a named routine. It had been
+  hand-rolled in Python twice before this, once per image it was needed for. Each site carries
+  module+RVA, the transfer kind, the mnemonic and its section — a reference from a discardable
+  section such as `INIT` is dead code once the driver has loaded, which an address alone cannot
+  say. Calls, unconditional jumps and conditional branches are counted apart, and those three
+  counts are exact where the list is capped, so *is it called at all* survives a target reached by
+  four thousand branches.
+
+  **Decoded, never pattern-matched.** The destination is a field on the decoded instruction, so a
+  coincidental call-opcode byte inside an immediate or inside data is not a hit, and the `Flow`
+  match is exhaustive so a variant added upstream is a compile error rather than a silently missed
+  reference. The Python this replaces matched `E8`/`E9` displacements over raw bytes, which is sound
+  enough to generate a lead and not sound enough to be a tool.
+
+  **An empty list is evidence about the scan, not the target**, and the prose says so on every
+  answer rather than when asked: an indirect transfer (`call rax`) carries no destination to
+  compare, an address merely *stored* in a dispatch table or callback slot is never branched to,
+  only the one image is read, and code that did not decode is reported. **Ask it on a dump or a
+  live target** — on an image opened with no debuggee the scan reports ranges it did not really
+  read and answers nothing, which is item 111 and is a defect below this tool rather than in it.
+
+  Verified as a round trip, because nothing else tests a search: the dump tier reads a direct call
+  out of the disassembler first and requires that site back with its kind, module and RVA, with an
+  address one byte inside an instruction as the control. Measured by hand on both samples first —
+  391 sites for `nt!KeBugCheck2` on the ARM64 dump, 383 call and 8 jump.
+
+  Built on the hazard scan's walk rather than beside it, which took an extraction first:
+  `src/codewalk.rs` now owns the bounded section walk, the window boundaries that resume after the
+  last *whole* instruction, the clamped overrunning section, the unreadable-window accounting and
+  the two budgets. `driver_hazards` moved onto it unchanged and its own 16 tests still cover those
+  behaviours — breaking the extracted hex-pair instruction length fails two of them, which is what
+  says the behaviour moved rather than being copied. A second copy of that loop would have been a
+  copy of the defects fourteen rounds of review on
+  [#305](https://github.com/glslang/windbg-mcp/pull/305) and
+  [#307](https://github.com/glslang/windbg-mcp/pull/307) took out of it.
+
+  The model-visible tool surface is now **116,446 B** across **75** tools, from 113,516 across 74;
+  its ceiling moves 114,000 → 118,000, with the arithmetic and the reason the description is the
+  larger half recorded above `MODEL_VISIBLE_CEILING`. The wire ceiling is untouched at 330,000,
+  with 2,385 B left.
+
 - **Live Secure Kernel control is available as an isolated MCP session.** Seven typed tools bind an
   exact disposable VBS VM and selected VTL1 VP, arm one to four guarded hardware breakpoints, wait
   for the owned vector-1 event, inspect stopped registers and memory, step with bounded decoded

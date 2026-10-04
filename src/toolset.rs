@@ -27,13 +27,14 @@
 //!   batch            1   10,842  `debug_batch`
 //!   crash            3    7,514  a bug check, a user-mode fault, and an error code
 //!   ttd              9    7,090  recording, indexing and querying a Time Travel trace
-//!   ioctl           10   13,037  driver objects, IRP stacks, reachability, hazards, IOCTL maps,
-//!                                  device security and the whole-driver survey
+//!   ioctl           11   15,967  driver objects, IRP stacks, reachability, hazards, IOCTL maps,
+//!                                  references to an address, device security and the
+//!                                  whole-driver survey
 //!   securekernel    11   15,573  captured and live VTL1 inspection and execution control
 //! ```
 //!
 //! Those bytes are a measurement of **2026-10-04** and move with any edit to a description — the
-//! whole surface they are shares of is 74 tools and 113,516 B, which is what the rows above sum to.
+//! whole surface they are shares of is 75 tools and 116,446 B, which is what the rows above sum to.
 //! Re-derive rather than quoting them.
 //!
 //! **Those are shares of the whole surface, and they do not sum to a narrowed one.** `crash` reads
@@ -168,6 +169,7 @@ const GROUPS: &[Group] = &[
             "ioctl_trace",
             "reachable_from_dispatch",
             "driver_hazards",
+            "xrefs_to",
             "ioctl_map",
             "device_security",
             "driver_surface",
@@ -539,7 +541,7 @@ mod tests {
         assert!(set.includes("end_session"));
         assert!(!set.includes("ttd_calls"));
         assert!(!set.includes("debug_batch"));
-        assert_eq!(set.summary(), "13 of 74 tools (session, crash)");
+        assert_eq!(set.summary(), "13 of 75 tools (session, crash)");
     }
 
     #[test]
@@ -550,7 +552,7 @@ mod tests {
         assert!(!set.includes("disassemble"));
         assert_eq!(
             set.summary(),
-            "12 of 74 tools (session, backtrace, registers)"
+            "12 of 75 tools (session, backtrace, registers)"
         );
     }
 
@@ -662,7 +664,7 @@ mod tests {
         // Both name the tool and what is served, because those do not depend on who chose it.
         for said in [&run, &own] {
             assert!(said.contains("`debug_batch`"), "{said}");
-            assert!(said.contains("13 of 74 tools (session, crash)"), "{said}");
+            assert!(said.contains("13 of 75 tools (session, crash)"), "{said}");
         }
     }
 

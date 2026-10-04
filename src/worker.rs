@@ -78,6 +78,7 @@ use crate::surface;
 use crate::target::{Arch, Opening};
 use crate::triage::{self, Analysis, AttributedFrame, Attribution};
 use crate::walk;
+use crate::xrefs;
 use dbgscope::pe;
 
 /// The argument that turns this executable into a worker. Not a documented CLI: the supervisor
@@ -3117,6 +3118,41 @@ fn execute(
                          and report back. Nothing was read. It waited {}s behind other work on \
                          this session; issue it when the session is idle, or raise the server's \
                          call timeout (WINDBG_MCP_CALL_TIMEOUT_SECS).",
+                        patience.saturating_sub(queued).as_secs(),
+                        queued.as_secs(),
+                    ),
+                )),
+            }
+        }
+        EngineOp::Xrefs {
+            module,
+            address,
+            target_module,
+            rva,
+            patience_ms,
+        } => {
+            // The same budget arithmetic as the hazard scan's, and not a refusal when there is
+            // none for the same reason: a scan that stops early names the sites it found and says
+            // it stopped, where one with no time reads nothing and reports an address nothing
+            // references.
+            let patience = Duration::from_millis(u64::from(patience_ms));
+            match walk_budget(patience, spent()) {
+                Some(budget) => xrefs_of(
+                    e,
+                    module.as_deref(),
+                    address.as_deref(),
+                    target_module.as_deref(),
+                    rva.as_deref(),
+                    Instant::now() + budget,
+                ),
+                None => Err(Failed::categorised(
+                    structured::ErrorCategory::NotRun,
+                    format!(
+                        "This reference scan was not run: it reached the engine with {}s of its \
+                         caller's timeout left, which is not enough to read an image and report \
+                         back. Nothing was read. It waited {}s behind other work on this session; \
+                         issue it when the session is idle, or raise the server's call timeout \
+                         (WINDBG_MCP_CALL_TIMEOUT_SECS).",
                         patience.saturating_sub(queued).as_secs(),
                         queued.as_secs(),
                     ),
@@ -8410,6 +8446,165 @@ fn run_to_address(e: &DebugEngine, address: &str, wait: u32) -> Result<Output, F
 /// `driver_surface` can have the value without the rendering -- a composite embeds the scan whole
 /// and renders the sections together, and re-parsing a rendering to do that is exactly what
 /// `counts-belong-in-the-type` says not to build.
+/// Every site in one image whose control flow reaches one address.
+///
+/// **The gate is the flow and not the operands**, which is the difference from [`hazards_of`]:
+/// this reads an instruction's `flow` and nothing else, so it answers on every target
+/// `reachable_from_dispatch` answers on. Copying the neighbour's gate is the tempting mistake and
+/// would refuse a target this works perfectly well on.
+///
+/// **That gate buys nothing on the sets that exist today, and saying otherwise would be stale.**
+/// A first draft of this comment had ARM64 as the case, which it stopped being when dbgscope#170
+/// decoded A64's operands — the hazard scan and the IOCTL map pass there now too, as the comment
+/// in `reachable`'s own gate records. The narrower question is still the right one to ask, because
+/// a set whose operands go unread can exist again; it is simply not a difference anyone can
+/// currently measure.
+///
+/// **What *is* measured is [`xrefs_at`]'s reason rather than this one.** On the checked-in ARM64
+/// kernel dump, `driver_hazards { module: "nt" }` is refused — 512 bytes of `nt`'s import
+/// directory are not in that capture — while this answers from the same session, because it reads
+/// the headers and the code and never the import table. That is a test rather than a figure here
+/// (`a_reference_scan_answers_where_the_import_table_cannot_be_read`, dump tier), because the
+/// reading was taken from an uncommitted tree whose build identity no later checkout reproduces.
+fn xrefs_of(
+    e: &DebugEngine,
+    module: Option<&str>,
+    address: Option<&str>,
+    target_module: Option<&str>,
+    rva: Option<&str>,
+    deadline: Instant,
+) -> Result<Output, Failed> {
+    let set = e.instruction_set();
+    if !set.flow_is_read() {
+        return Err(Failed::categorised(
+            structured::ErrorCategory::Debugger,
+            format!(
+                "this target's instructions are machine {machine}, whose control flow this build \
+                 does not decode — so every instruction would read as an unknown transfer and the \
+                 scan would report an address nothing references rather than a question it could \
+                 not ask. `modules` and `read_memory` work here.",
+                machine = machine_label(set),
+            ),
+        ));
+    }
+
+    let target = resolve_code_target(e, address, target_module, rva, deadline)?;
+
+    // **Resolved through the module inventory, exactly as the hazard scan is**, and for the same
+    // reason: `lm m` takes a WinDbg pattern, so a name matching several images would have the
+    // first row's address silently win.
+    let loaded = e.modules().map_err(failed)?;
+    let (name, base, loaded_size) = match module {
+        Some(module) => {
+            let mut matched = loaded
+                .iter()
+                .filter(|candidate| candidate.name.eq_ignore_ascii_case(module));
+            match (matched.next(), matched.next()) {
+                (Some(one), None) => (one.name.clone(), one.base, one.size),
+                (None, _) => {
+                    return Err(Failed::categorised(
+                        structured::ErrorCategory::Debugger,
+                        format!(
+                            "no loaded module is named `{module}`. Names here are the ones \
+                             `modules` lists — the `nt` in `nt!KeBugCheckEx` — and this matches \
+                             one exactly rather than as a pattern."
+                        ),
+                    ));
+                }
+                (Some(_), Some(_)) => {
+                    return Err(Failed::categorised(
+                        structured::ErrorCategory::InvalidArgument,
+                        format!(
+                            "`{module}` matches more than one loaded module, and a scan is about \
+                             one image. Name it exactly; `modules` with a filter lists what is \
+                             loaded."
+                        ),
+                    ));
+                }
+            }
+        }
+        // **The image holding the target, when the caller named none.** That is the answer they
+        // almost always want — a routine's callers are overwhelmingly in its own image — and it is
+        // a fact this side can read rather than a default this side invents.
+        None => {
+            let holding = loaded
+                .iter()
+                .find(|candidate| {
+                    let end = candidate.base.saturating_add(u64::from(candidate.size));
+                    target >= candidate.base && target < end
+                })
+                .ok_or_else(|| {
+                    Failed::categorised(
+                        structured::ErrorCategory::Debugger,
+                        format!(
+                            "no loaded module holds {target:#x}, so there is no image to scan. \
+                             Code in a pool allocation, or in a driver that has unloaded, is in \
+                             none; name the image with `module` if the caller of this address is \
+                             in one."
+                        ),
+                    )
+                })?;
+            (holding.name.clone(), holding.base, holding.size)
+        }
+    };
+
+    let report = xrefs_at(e, &name, base, loaded_size, target, deadline)?;
+    Ok(Output::typed(fenced(&xrefs::render(&report)), report))
+}
+
+/// The scan itself, against an image already located.
+///
+/// Reads the headers the way [`hazards_at`] does, through a closure confined to the module so that
+/// no header field can send the reader out of it, and clamps `SizeOfImage` to the loader's extent
+/// because the header's own number is memory an untrusted driver may have written.
+fn xrefs_at(
+    e: &DebugEngine,
+    module: &str,
+    base: u64,
+    loaded_size: u32,
+    target: u64,
+    deadline: Instant,
+) -> Result<structured::Xrefs, Failed> {
+    let read = |at: u64, len: usize| {
+        within_module(base, loaded_size, at, len).then(|| e.read_memory(at, len).ok())?
+    };
+    let mut image =
+        pe::read_image(base, read).map_err(|why| pe_failure(module, &why, None, None))?;
+    image.size_of_image = smaller_extent(image.size_of_image, loaded_size);
+
+    // **No import table is read here**, which is the whole of why this answers where the hazard
+    // scan cannot: the question is about decoded control flow, so the imports — and every way a
+    // bound or unnameable one qualifies that scan's answer — are nothing to do with it.
+    let found = xrefs::find(
+        &image,
+        target,
+        |at, len| e.decode_range(at, len).ok(),
+        || {
+            if matches!(e.interrupted(), Ok(true)) {
+                Some(walk::Halt::Interrupted)
+            } else if Instant::now() >= deadline {
+                Some(walk::Halt::Deadline)
+            } else {
+                None
+            }
+        },
+    );
+
+    let mut attributor = Attributor::default();
+    let stopped = std::cell::Cell::new(None);
+    let stop = || attribution_stop(e, deadline);
+    let mut report = xrefs::structured_report(module, base, &found, |address| {
+        locate_within(address, &stopped, stop, |address| {
+            attributor.locate(e, address)
+        })
+    });
+    // A scan whose attribution stopped says so, whatever the decode did. **`or` rather than an
+    // assignment**: the scan may have stopped for a reason of its own — an interrupt, where this
+    // is a deadline — and the first stop is the one that happened.
+    report.stopped = report.stopped.or_else(|| stopped.get());
+    Ok(report)
+}
+
 fn driver_hazards(e: &DebugEngine, module: &str, deadline: Instant) -> Result<Output, Failed> {
     let report = hazards_of(e, module, deadline)?;
     // **Fenced, which is the other half of `structured::renderable`.** That helper escapes a
@@ -10581,43 +10776,26 @@ fn enumeration_decided_the_answer(
     needed_modules && !verdict_reachable && halted.is_none()
 }
 
-fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result<Output, Failed> {
-    // Refused outright on an instruction set whose **flow** this build does not decode. Every
-    // instruction there decodes to `Flow::Unknown`, and the walk stops at those, so the answer
-    // would be a NOT REACHABLE that says nothing: not "the graph was explored and it is not
-    // there" but "nothing could be read". An honest refusal beats a verdict shaped like an answer.
-    //
-    // **The gate is the flow and no longer the operands**, which is what issue #297 was: ARM64
-    // used to fail this test and now passes it, dbgscope decoding A64's six branch classes
-    // (dbgscope#148) and its two-word unwind record (dbgscope#146). Nothing in the walk changed —
-    // it reads `Instruction::flow` and has never known which architecture produced one.
-    //
-    // The IOCTL map and the hazard scan keep the narrower `operands_are_read` gate, which is
-    // still a different question and is no longer a different *answer*: dbgscope#170 decoded
-    // A64's operands, so all three of these now pass on ARM64. The gates stay because the
-    // question is real — a set whose operands go unread still exists, and both tools need them
-    // — and because each says what it could not do rather than reporting an empty scan. What
-    // arrived with that, and had to, is `ioctl::Layout::ARM64` and the slot formation in
-    // `hazards`: both tools were correct on ARM64 only for as long as they refused it.
-    let set = e.instruction_set();
-    if !set.flow_is_read() {
-        // `Debugger` rather than `InvalidArgument`, which is the tempting one because the call is
-        // refused before the walk starts. No change to an *argument* helps: the refusal is about
-        // the target this session holds, and that is what `Debugger` names — actionable by
-        // changing what is asked, not how it is spelt.
-        return Err(Failed::categorised(
-            structured::ErrorCategory::Debugger,
-            format!(
-                "this target's instructions are machine {machine}, whose control flow this \
-                 build does not decode — so a reachability walk over it cannot follow that flow, \
-                 and any verdict would be about what could not be read rather than about the \
-                 target. Analysis that needs no flow is unaffected: modules, memory, stacks and \
-                 `disassemble` all work here.",
-                machine = machine_label(set),
-            ),
-        ));
-    }
-
+/// The absolute VA a caller named, from an `address` **or** a `module`+`rva` pair.
+///
+/// **Shared rather than copied**, which is the only reason it is a function: `reachable` grew it
+/// and [`xrefs_at`] needs exactly the same thing, down to the reasons in the comments below — a
+/// wrong base makes every RVA in an answer wrong with nothing to say so, and a conflicting pair
+/// has to be refused rather than settled by precedence. A second copy would be a second place for
+/// those to drift apart.
+///
+/// **It carries an unbounded step, named here rather than fixed.** Both sides go through
+/// `resolve`, whose symbol lookup can reach a symbol server, and `remaining` bounds the clock this
+/// call carries rather than that lookup — `FOLLOWUPS.md` item 56's gap, and item 88's worked
+/// example of an op that is mostly bounded with an unbounded step in front of it. Said here so the
+/// next caller inherits the knowledge along with the code.
+fn resolve_code_target(
+    e: &DebugEngine,
+    address: Option<&str>,
+    module: Option<&str>,
+    rva: Option<&str>,
+    deadline: Instant,
+) -> Result<u64, Failed> {
     // Resolve the target VA: an absolute address, or module+RVA rebased against the module's
     // live base from `lm m <module>`. Both sides go through `resolve`, so a value pasted from
     // WinDbg — a `hi`lo` backtick address or a digit-only 32-bit address — reads consistently.
@@ -10625,7 +10803,7 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
     // keeps a malformed pair from arriving here as an architecture refusal. They are matched again
     // rather than assumed: this is the one place the target VA is computed, and a match that
     // cannot fail is a match whose arms nobody has to reason about.
-    let target = match (&args.address, &args.module, &args.rva) {
+    let target = match (address, module, rva) {
         // Reject conflicting target forms rather than silently ignoring one — analysing the
         // wrong target would give a misleading verdict.
         (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
@@ -10694,6 +10872,54 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
             ));
         }
     };
+
+    Ok(target)
+}
+
+fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result<Output, Failed> {
+    // Refused outright on an instruction set whose **flow** this build does not decode. Every
+    // instruction there decodes to `Flow::Unknown`, and the walk stops at those, so the answer
+    // would be a NOT REACHABLE that says nothing: not "the graph was explored and it is not
+    // there" but "nothing could be read". An honest refusal beats a verdict shaped like an answer.
+    //
+    // **The gate is the flow and no longer the operands**, which is what issue #297 was: ARM64
+    // used to fail this test and now passes it, dbgscope decoding A64's six branch classes
+    // (dbgscope#148) and its two-word unwind record (dbgscope#146). Nothing in the walk changed —
+    // it reads `Instruction::flow` and has never known which architecture produced one.
+    //
+    // The IOCTL map and the hazard scan keep the narrower `operands_are_read` gate, which is
+    // still a different question and is no longer a different *answer*: dbgscope#170 decoded
+    // A64's operands, so all three of these now pass on ARM64. The gates stay because the
+    // question is real — a set whose operands go unread still exists, and both tools need them
+    // — and because each says what it could not do rather than reporting an empty scan. What
+    // arrived with that, and had to, is `ioctl::Layout::ARM64` and the slot formation in
+    // `hazards`: both tools were correct on ARM64 only for as long as they refused it.
+    let set = e.instruction_set();
+    if !set.flow_is_read() {
+        // `Debugger` rather than `InvalidArgument`, which is the tempting one because the call is
+        // refused before the walk starts. No change to an *argument* helps: the refusal is about
+        // the target this session holds, and that is what `Debugger` names — actionable by
+        // changing what is asked, not how it is spelt.
+        return Err(Failed::categorised(
+            structured::ErrorCategory::Debugger,
+            format!(
+                "this target's instructions are machine {machine}, whose control flow this \
+                 build does not decode — so a reachability walk over it cannot follow that flow, \
+                 and any verdict would be about what could not be read rather than about the \
+                 target. Analysis that needs no flow is unaffected: modules, memory, stacks and \
+                 `disassemble` all work here.",
+                machine = machine_label(set),
+            ),
+        ));
+    }
+
+    let target = resolve_code_target(
+        e,
+        args.address.as_deref(),
+        args.module.as_deref(),
+        args.rva.as_deref(),
+        deadline,
+    )?;
 
     // Resolve `from` to a numeric VA so a mid-function start (a handler scoped past a switch)
     // is honored; `None` (unresolvable) starts at the entry.

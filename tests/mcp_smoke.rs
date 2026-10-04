@@ -2060,7 +2060,34 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// Natural arming and guarded repeated steps then move 111,056 -> 112,429 B without another
 /// ceiling raise. The 1,373 B is the `mode`, current-instruction and bounded-destination inputs plus
 /// the descriptions that explain their fail-closed use. The ceiling now leaves 1,571 B (1.4%).
-const MODEL_VISIBLE_CEILING: usize = 114_000;
+///
+/// **114,000 -> 118,000 for the reverse call-graph question** (2026-10-04, item 109). One tool
+/// takes the measured surface from 113,516 to 116,446 B, and the whole 2,930 B is `xrefs_to`:
+/// 1,718 B of description, 1,163 B of input schema, and 49 B of the JSON around them. Nothing else
+/// moved, which is what says the figure is the tool rather than a reading taken on a different
+/// build.
+///
+/// It buys the one question this server could not ask: **who reaches this address**. The forward
+/// walk (`reachable_from_dispatch`, 2,657 B) and the import-slot scan (`driver_hazards`, 1,239 B)
+/// are the two it already had, and neither answers it for an *internal* address — which is the
+/// address you have when a symbol is absent or a PDB is public and typeless. It had been
+/// hand-rolled in Python twice before this, once per image it was needed for.
+///
+/// **Its description is the larger half, and deliberately so**: 1,718 B against those two
+/// neighbours' 614 and 556. Five hundred of it is the two sentences saying what an *empty* list
+/// does not mean — an indirect transfer carries no destination, an address merely stored in a
+/// dispatch table is never branched to, one image is read, undecoded code says nothing, and an
+/// image target opened with no debuggee answers nothing at all (item 111). That is the tool's main
+/// failure mode rather than a caveat: a model reading an empty answer as "nothing calls this"
+/// would draw a conclusion the scan does not support, and the bytes that prevent it are worth more
+/// than the bytes they cost. A first draft was 3,281 B; the trim took the prose down and kept
+/// those sentences.
+///
+/// [`WIRE_CEILING`] is **not** raised with it: the payload moved to 327,615 and has 2,385 B left,
+/// and a ceiling raised before something needs it absorbs the next regression in silence. The new
+/// model-visible ceiling leaves 1,554 B (1.3%), which is the headroom the last raise left and for
+/// the same reason.
+const MODEL_VISIBLE_CEILING: usize = 118_000;
 
 /// Ceiling on the whole `tools/list` payload — the serialized result, not the sum of its tools, so
 /// the array's own punctuation and every result-level field are inside it. 216,839 bytes as of
@@ -3359,6 +3386,11 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
         ),
         // Well-formed, so it takes the session refusal rather than its own argument one.
         ("driver_hazards", json!({ "module": "mydriver" }), "error"),
+        // Likewise well-formed: one target form and no second one, so this is the session refusal.
+        // Both of its argument refusals -- a command breaker in any field, and a target given as
+        // neither form or as both -- are answered before a session is looked for, and are covered
+        // by `a_reference_scan_with_a_malformed_target_is_refused_before_a_session_is_needed`.
+        ("xrefs_to", json!({ "address": "nt!KeBugCheckEx" }), "error"),
         // Likewise: the command-breaker screen on `dispatch` answers before a session is
         // looked for, and this row is here for the session refusal after it.
         (
@@ -3762,6 +3794,65 @@ fn bad_calls_are_rejected_without_killing_the_session() {
     assert!(
         text.contains("METHOD_BUFFERED"),
         "the session must still work after bad calls, got:\n{text}"
+    );
+}
+
+/// A reference scan's two argument refusals are answered before a session is looked for.
+///
+/// **The ordering is the point, not the refusals.** The worker refuses an instruction set whose
+/// control flow it cannot decode, and that check runs before the target forms are matched there —
+/// so a malformed pair on such a target would come back as `debugger` and send a caller to change
+/// their target rather than their call. Settling the forms in the tool keeps the category honest
+/// on every target, which is the same ordering `reachable_from_dispatch` needed.
+#[test]
+fn a_reference_scan_with_a_malformed_target_is_refused_before_a_session_is_needed() {
+    let mut server = Server::started();
+
+    for (what, args) in [
+        (
+            "both forms",
+            json!({ "address": "nt!KeBugCheckEx", "rva": "0x10" }),
+        ),
+        ("neither form", json!({ "module": "mydriver" })),
+    ] {
+        let refused = server.call_tool("xrefs_to", args, STEP);
+        assert!(is_tool_error(&refused), "{what} must be refused");
+        let text = text_of(&refused["result"]);
+        assert!(
+            text.contains("address"),
+            "the refusal for {what} must name the fields, got:\n{text}"
+        );
+        assert!(
+            !text.contains("session"),
+            "{what} is refused before any session is needed, got:\n{text}"
+        );
+        assert_eq!(
+            refused["result"]["structuredContent"]["error"]["category"], "invalid_argument",
+            "a caller branches on the category, not the wording: {refused}"
+        );
+    }
+
+    // A command breaker in any field is screened the same way, and on the same side of the
+    // session: `module` is matched against the module inventory rather than interpolated, and is
+    // screened anyway so the four fields need no exception a reader cannot see the edge of.
+    let injected = server.call_tool(
+        "xrefs_to",
+        json!({ "address": "nt!KeBugCheckEx; .kill" }),
+        STEP,
+    );
+    assert!(is_tool_error(&injected), "a command breaker is refused");
+    assert_eq!(
+        injected["result"]["structuredContent"]["error"]["category"], "invalid_argument",
+        "{injected}"
+    );
+    // **Not asserted by the absence of the word "session"**, which the two arms above can use and
+    // this one cannot: the shared screen's wording points at `execute` and says that retires the
+    // session handle, so the word appears in a refusal that never looked for a session. What says
+    // this one was screened is the field it names and the category it carries.
+    assert!(
+        text_of(&injected["result"]).contains("`address`"),
+        "the screen must name the field it refused, got:\n{}",
+        text_of(&injected["result"])
     );
 }
 
@@ -4389,7 +4480,7 @@ fn a_listener_serves_the_narrowed_surface_it_was_started_with() {
     // was typed — `session` is added whatever it said.
     let log = listener.stderr();
     assert!(
-        log.contains("serving 13 of 74 tools (session, crash)"),
+        log.contains("serving 13 of 75 tools (session, crash)"),
         "the listener does not report the surface it ended up with: {log}"
     );
 }
@@ -4421,7 +4512,7 @@ fn two_clients_on_one_listener_are_served_two_surfaces() {
     let local_token = server.token.clone();
     assert!(
         server.wait_for_stderr(
-            "serving 20 of 74 tools (session, inspect) — except bench serves 13 of 74 tools \
+            "serving 20 of 75 tools (session, inspect) — except bench serves 13 of 75 tools \
              (session, crash)",
             Duration::from_secs(30)
         ),
@@ -5823,6 +5914,145 @@ fn launch_tier() -> bool {
         return false;
     }
     true
+}
+
+/// **A reference scan is a round trip, and that is the only way to test one.**
+///
+/// A tool that answered an empty list for everything would pass every "did it error" check ever
+/// written. So the fact is read from the **disassembler** first — a direct call in `nt`, and the
+/// routine it names — and then `xrefs_to` has to hand that same site back, with the kind, the
+/// module and the RVA on it.
+///
+/// **Which call is not written down here, because it is per architecture.** On the x64 sample
+/// `nt!KeBugCheckEx` opens with calls to `RtlCaptureContext` and `KiSaveProcessorControlState`; on
+/// the ARM64 one it reaches `KeBugCheck2` four instructions in. A fixture naming either would pass
+/// on one host and stand down on the other — which it did, as a `SKIPPED` line that read like a
+/// missing symbol and was a hard-coded callee.
+///
+/// **The only thing taken from the rendering is which routine to ask about**, and that is the
+/// disassembler acting as the oracle rather than this test parsing a result: the callee is handed
+/// back to the debugger as a *symbol* and resolved independently, and the site compared afterwards
+/// is the structured `address` field. The standing rule against reading a disassembler's prose is
+/// about deriving a fact from it, and nothing here does.
+///
+/// **The control is the half that makes the positive mean anything.** One byte into the callee is
+/// never an instruction boundary — A64 instructions are four bytes and no x64 prologue opens with
+/// a one-byte instruction — so nothing decodes a transfer there, and it has to come back with no
+/// sites. A scan matching a neighbourhood rather than a destination would satisfy the assertion
+/// above and fail this one.
+///
+/// **And the import-table difference is measured here rather than claimed in a comment.** Where
+/// `driver_hazards` is refused on this same session — part of `nt`'s import directory is outside
+/// the capture — this still answers, because it reads the headers and the code and never the
+/// imports. That is `xrefs_at`'s reason for existing beside the hazard scan.
+#[test]
+fn a_reference_scan_answers_where_the_import_table_cannot_be_read() {
+    let Some(dump) = target_tier() else {
+        return;
+    };
+    let mut server = Server::started();
+    let session = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
+
+    let listing = server.tool_data(
+        "disassemble",
+        json!({ "session_id": session, "address": "nt!KeBugCheckEx", "count": 40 }),
+        TARGET_STEP,
+    );
+    let instructions = listing["instructions"]
+        .as_array()
+        .expect("a disassembly lists instructions");
+
+    // A direct call whose destination the engine named: `call nt!Foo (fffff80...)`, or `bl` on
+    // A64. The parenthesised address is what makes it a *direct* one — an indirect call renders
+    // its operand instead and names no routine.
+    let found_call = instructions.iter().find_map(|i| {
+        let line = i["text"].as_str()?;
+        let (head, rest) = line.split_once(" nt!")?;
+        if !matches!(head.trim(), "call" | "bl") {
+            return None;
+        }
+        let (callee, _) = rest.split_once(" (")?;
+        Some((
+            i["address"].as_str()?.to_string(),
+            i["rva"].as_str()?.to_string(),
+            format!("nt!{callee}"),
+        ))
+    });
+    let Some((site, site_rva, callee)) = found_call else {
+        // Without symbols for `nt` there is no routine name to ask about, which is the same
+        // condition this tier's other target-reading tests stand down on.
+        skip("no direct call to a named nt routine resolves in nt!KeBugCheckEx on this host");
+        return;
+    };
+    eprintln!("RAN: {site} ({site_rva}) calls {callee}");
+
+    let found = server.tool_data(
+        "xrefs_to",
+        json!({ "session_id": session, "address": callee, "module": "nt" }),
+        TARGET_STEP,
+    );
+
+    let sites = found["sites"].as_array().expect("an answer lists sites");
+    let hit = sites
+        .iter()
+        .find(|s| s["at"]["address"] == site.as_str())
+        .unwrap_or_else(|| {
+            panic!(
+                "the call at {site} ({site_rva}) to {callee} was read off the disassembly and has \
+                 to come back from the scan; got {} listed of {} found:\n{found:#}",
+                sites.len(),
+                found["site_count"],
+            )
+        });
+    assert_eq!(hit["kind"], "call", "a `call`/`bl` is a call: {hit}");
+    assert_eq!(hit["at"]["module"], "nt", "{hit}");
+    assert_eq!(hit["at"]["rva"], site_rva.as_str(), "{hit}");
+    assert!(
+        hit["section"].as_str().is_some_and(|s| !s.is_empty()),
+        "every site names the section it is in: {hit}"
+    );
+
+    // The three kinds account for every site, listed or not.
+    let (calls, jumps, branches) = (
+        found["calls"].as_u64().unwrap(),
+        found["jumps"].as_u64().unwrap(),
+        found["branches"].as_u64().unwrap(),
+    );
+    assert_eq!(
+        calls + jumps + branches,
+        found["site_count"].as_u64().unwrap(),
+        "the per-kind counts have to sum to the total: {found:#}"
+    );
+    assert!(
+        calls > 0,
+        "the call this test read off the disassembly is a call: {found:#}"
+    );
+
+    // The control: one byte into the callee, which is never an instruction boundary.
+    let inside = server.tool_data(
+        "xrefs_to",
+        json!({ "session_id": session, "address": format!("{callee}+0x1"), "module": "nt" }),
+        TARGET_STEP,
+    );
+    assert_eq!(
+        inside["site_count"], 0,
+        "an address inside an instruction is referenced by nothing, or this scan is matching a \
+         neighbourhood rather than a destination: {inside:#}"
+    );
+
+    // And the difference from the hazard scan, on this same session.
+    let hazards = server.call_tool(
+        "driver_hazards",
+        json!({ "session_id": session, "module": "nt" }),
+        TARGET_STEP,
+    );
+    if is_tool_error(&hazards) {
+        assert!(
+            found["site_count"].as_u64().unwrap() > 0,
+            "the hazard scan is refused on this image and this one answered, which is the whole \
+             reason the two read different things"
+        );
+    }
 }
 
 /// **A read that crosses pages is the range it asked for, in order.**

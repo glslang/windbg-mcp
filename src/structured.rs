@@ -3142,6 +3142,73 @@ pub struct ImportedSink {
     pub call_site_count: usize,
 }
 
+/// One site whose decoded control flow names the address that was asked about.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct XrefSite {
+    /// Where the referencing instruction is — not the address asked about.
+    pub at: CodeLocation,
+    /// `call`, `jump` or `branch`. A `call` expects to be returned to, a `jump` is unconditional
+    /// and usually a tail call, and a `branch` reaches the target or falls through — which is the
+    /// distinction between an address that is a routine and one that is a label inside another.
+    pub kind: String,
+    /// The mnemonic, for a reader who wants to know which branch it was.
+    pub mnemonic: String,
+    /// The section the site is in. **A reference from a discardable section is dead code at run
+    /// time** — a driver's `INIT` is freed once it has run — and an address alone cannot say so.
+    pub section: String,
+}
+
+/// Every site in one image whose control flow reaches one address.
+///
+/// The reverse of the question `reachable_from_dispatch` answers, and about an **internal**
+/// address rather than an import, which is the one `driver_hazards` cannot be asked.
+///
+/// **Four ways a real caller is not in `sites`**, none of them exotic, and an empty list is
+/// evidence about the scan rather than about the target:
+///
+/// - **An indirect transfer is not matched.** `call rax` carries no destination to compare, so a
+///   callback reached through a stored pointer is invisible — for driver work the common case.
+/// - **A pointer in data is not a reference.** A dispatch table or a `MajorFunction` slot *stores*
+///   the address and never branches to it, so no executable section names it.
+/// - **Only this image was read.** A caller in another module is not found.
+/// - **And code that did not decode says nothing**: `unreadable`, `stopped` and `cap_hit` are what
+///   qualify a short answer.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct Xrefs {
+    /// The module scanned, and where it was loaded.
+    pub module: String,
+    pub base: String,
+    /// The address asked about, with its module and RVA — the coordinate that survives a reboot.
+    pub target: CodeLocation,
+    /// The sites found, in address order, bounded like every list here with an exact count beside
+    /// it.
+    pub sites: Vec<XrefSite>,
+    /// How many sites were found, exact however many are listed.
+    pub site_count: usize,
+    /// How many of each kind were found, each exact however many of that kind are listed.
+    ///
+    /// **Not derivable from a capped `sites`**, which is why they are separate fields: the list is
+    /// in address order, so a target reached by four thousand branches and two calls lists
+    /// branches alone — and *is it called at all* is the question a reader arrived with. These
+    /// three answer it whatever the cap did, and they sum to [`Self::site_count`].
+    pub calls: usize,
+    pub jumps: usize,
+    pub branches: usize,
+    /// What was decoded, one entry per **contiguous** run. A section with a hole in it appears
+    /// twice, which is what lets a reader see where the hole was.
+    pub scanned: Vec<ScannedRange>,
+    /// Executable ranges that were **not** decoded and therefore say nothing. This is what
+    /// qualifies an empty `sites`: without it, a dump missing one page reports an address nothing
+    /// calls and nothing says a page was missing.
+    pub unreadable: Vec<ScannedRange>,
+    /// Why the scan stopped early, when it did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stopped: Option<WalkHalt>,
+    /// True when the scan's own byte cap stopped it rather than the code running out.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cap_hit: bool,
+}
+
 /// One privileged instruction, and what it reaches.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PrivilegedInstruction {

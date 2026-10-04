@@ -94,8 +94,8 @@ line is simply open.
 - [Item 105](#105-windbg-mcp-opendump-is-documented-as-replacing-the-target-and-the-one-measurement-of-it-says-it-adds-one) — [windbg-mcp] `.opendump` is documented as replacing the target, and the one measurement of it says it adds one
 - [Item 106](#106-windbg-mcp-a-tool-group-every-caller-pays-for-and-few-can-use) — [windbg-mcp] A tool group every caller pays for and few can use — **blocked**
 - [Item 108](#108-windbg-mcp-a-kmdf-drivers-real-callbacks--step-1-landed-the-frameworks-per-device-config-is-what-is-left) — [windbg-mcp] A KMDF driver's real callbacks — step 1 landed, the framework's per-device config is what is left
-- [Item 109](#109-windbg-mcp-the-server-can-walk-a-call-graph-forward-and-find-calls-to-imports-and-cannot-answer-who-calls-this-address) — [windbg-mcp] The server can walk a call graph forward and find calls to imports, and cannot answer "who calls this address"
 - [Item 110](#110-windbg-mcp-initialized-secure-kernel-stopstep--hardening-remains) — [windbg-mcp] Initialized Secure Kernel stop/step — hardening remains
+- [Item 111](#111-windbg-mcp--dbgscope-an-image-targets-memory-reads-only-after-something-else-has-read-it-and-a-walk-counts-what-it-did-not-get-as-scanned) — [windbg-mcp + dbgscope] An image target's memory reads only after something else has read it, and a walk counts what it did not get as scanned
 
 ## 2. [dbgscope] Typed write primitives
 
@@ -2177,45 +2177,6 @@ rule admits any image importing something *called* `WdfVersionBind` from anywher
 that name twice — the routine and an inline caller inside `DispatchWithLock` — so anything driving
 the framework by symbol wants module+RVA.
 
-## 109. [windbg-mcp] The server can walk a call graph forward and find calls to imports, and cannot answer "who calls this address"
-
-**Origin:** gate S5q arm 1 needed the callers of one internal function in `securekernel.exe` and had
-to hand-roll it in Python, then hand-roll it a second time for `winhvr.sys`
-([`tools/winhv_partition_readers.py`](tools/winhv_partition_readers.py)). Both are analyses this
-server is otherwise well placed to do, and neither is Secure Kernel-specific: *who calls this
-internal helper* is a constant question in the IOCTL work the driver tools exist for.
-
-**What exists, and the shape of the gap.** `reachable_from_dispatch` walks **forward** from a known
-root — is this block reachable from the dispatch routine — over a bounded breadth-first call graph.
-`driver_hazards` finds call sites **to imports**, by IAT slot, with decoded instructions, bounded
-output and explicit accounting for windows it could not read. Neither answers the reverse question
-about an **internal** address, which is the one you have when a symbol is absent, a PDB is public
-and typeless, or the interesting thing is a callback slot rather than a named routine.
-
-**A tool would be `xrefs_to <address>`**, reporting call and jump sites with module and RVA beside
-each, and it should be built on `hazards.rs`'s scan rather than beside it: the bounded section walk,
-the decoded-instruction loop, the unreadable-window accounting and the cap-with-exact-count pattern
-are all there and are the parts that took the review rounds to get right.
-
-**Two things to get right that the ad-hoc versions did not.**
-
-- **Decode, do not pattern-match.** S5q's Python matched `E8`/`E9` displacements over raw bytes,
-  computing for each offset whether `i + 5 + rel32` hit the target. That is cheap and **unsound**: a
-  coincidental `0xE8` inside another instruction's immediate, or inside data, matches exactly as
-  well. It was adequate as a *lead generator* because both hits were then verified by disassembling
-  them, and it is not adequate as a tool. The house style is already right — `hazards.rs` decodes,
-  and `reachable_from_dispatch` parsing `uf` **text** is the habit not to extend
-  (`.claude/rules/tool-surface.md`, and the standing lesson about reading a disassembler's prose).
-- **Answering for an address is not answering for an object.** The winhvr census had to filter by
-  *provenance of the base pointer* before a field offset meant anything, because `+0x10` alone had
-  365 accesses in one image. A call-site tool does not have that problem — a call target is
-  unambiguous — but any sibling that censuses a **field** does, and shipping the second without the
-  first would repeat S5p's review rounds.
-
-**Why it is worth doing beyond this gate:** it works with **no debuggee** against an image target,
-so `securekernel.exe`, `winhvr.sys`, `Vid.sys` and any driver answer offline — which is the mode
-most of item 103's static work has actually run in.
-
 ## 110. [windbg-mcp] Initialized Secure Kernel stop/step — hardening remains
 
 **Repo:** `windbg-mcp`. **Origin:** item 103's control axis, 2026-10-01, after the owner-partition
@@ -2530,6 +2491,54 @@ The gated route in full — its bench facts, device-contract recovery and binary
 private plan at `target/private/vtl1-kernel-controlled-stop-plan.md`. It is deliberately untracked,
 and the guest configuration, disk lineage and host component detail stay there rather than in this
 public repository.
+
+## 111. [windbg-mcp + dbgscope] An image target's memory reads only after something else has read it, and a walk counts what it did not get as scanned
+
+**Repo:** `windbg-mcp` (and probably `dbgscope`). **Origin:** item 109's verification, 2026-10-04 —
+found by running the control rather than by a reviewer, and it is the reason that item's
+image-target claim did not survive it.
+
+**What was measured, on `C:\Windows\System32\securekernel.exe` opened with `open_dump` as a PE
+image with no debuggee.** `read_memory { address: "0x140001000", size: 16 }` — the first instruction
+of `.text` — fails with *"The system cannot read from the specified device"* (`0x8007001E`). The
+**same call, in the same session, after a `xrefs_to` and a `driver_hazards` have run, succeeds** and
+returns the expected `cc cc cc cc cc cc cc cc 48 ba …`. So an image target's virtual memory is not
+readable until something has caused the engine to map it, and nothing in this server knows that.
+
+**The damaging half is the accounting, not the failure.** A scan over that image reports its four
+code sections **covered** — `.text` 1,002,088 bytes, `KVASCODE` 4,808, `PAGELK` 1,579, `fothk` 4,096
+— with **no** unreadable range, no halt and no cap, and finds **nothing**. Meanwhile
+`reachable_from_dispatch`, on the same session, proves `securekernel!SkmiInitializePool+0x27`
+(`0x14005723b`) holds `e8 30 00 00 00`, a direct `call` to `SkmiInitializePoolDescriptor`
+(`0x140057270`) — and `disassemble` renders it. So the walk was fed something that decoded, counted
+it as read, and reported a complete scan of code it had not got. **That is the one shape
+`codewalk::Covered` exists to prevent**, which is what makes this worth a number: every analysis
+built on that walk inherits it.
+
+**It is not one tool's defect.** `driver_hazards` on the same image answers `privileged_count: 1182`
+off the same path, and those 1,182 are no more trustworthy than the empty reference list beside
+them. `xrefs_to` only made it visible, because an empty answer is conspicuous where a plausible
+count is not. Both tools now say "ask this on a dump or a live target"; neither refuses, because the
+refusal wants this measured first.
+
+**What is not established.** Which call returns the bytes that decode — a chunked read filling
+short, a cached page, or `decode_range`'s own read succeeding where the 16-byte one fails — is
+**unknown**, and the three have different fixes. Nor is it known whether the first *successful*
+read is what maps the image or whether the mapping is time-based; the interleaved run only shows
+that reads work after two scans have run, and the two scans are not separated as the cause. And
+nothing here says whether a **live** target shares it: that is the other half of the standing rule
+that one DbgEng method is a different implementation per target kind.
+
+- **What closes it:** separate those three candidates — one read at a time, in a fresh session,
+  with the failure recorded per call — and then either make an image target's first read map the
+  image, or make an unreadable window unreadable *in the report* rather than scanned. The second is
+  the one that matters even if the first turns out to be the engine's own rule, because a walk that
+  cannot read is allowed to say so and is not allowed to say the opposite.
+- **Where it picks up:** `worker::xrefs_at` and `worker::hazards_at` build the decode closure
+  (`|at, len| e.decode_range(at, len).ok()`); `codewalk::walk_code` is where a `None` becomes an
+  `unreadable` range and a `Some` becomes a scanned one; `dbgscope`'s `decode_range` is where the
+  read actually happens. The reproduction needs no fixture — any `System32` binary and
+  `open_dump` on it.
 
 ## Where these items came from
 
