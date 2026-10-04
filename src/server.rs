@@ -1906,8 +1906,9 @@ pub struct ReachabilityArgs {
     /// also work. Provide this OR `module`+`rva`, not both.
     #[serde(default)]
     pub address: Option<String>,
-    /// Module name for a module+RVA target, e.g. "mydriver". Its live base is read from
-    /// `lm m <module>` and added to `rva`. Required (with `rva`) when `address` is omitted.
+    /// Module name for a module+RVA target, e.g. "mydriver". Its live base comes from
+    /// the module inventory and is added to `rva`; the name has to match one module
+    /// exactly rather than as a pattern. Required (with `rva`) when `address` is omitted.
     #[serde(default)]
     pub module: Option<String>,
     /// Relative virtual address added to `module`'s live base, in WinDbg form (a bare
@@ -6024,16 +6025,18 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<XrefsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        // Screened for the separators that would run a second command, because the target forms
-        // reach the debugger's expression evaluator and `module`'s base is read through `lm m`.
-        // `module` itself is matched against the module inventory rather than interpolated, and is
-        // screened anyway: the pair of them arriving from one caller is easier to reason about
-        // screened together than with an exception nobody can see the edge of.
+        // **Screened where the text reaches a grammar, and nowhere else.** `address` and `rva` go
+        // to the debugger's expression evaluator, so a separator in either would run a second
+        // command. The two module names reach only the typed module inventory — they are compared,
+        // never interpolated — so screening them would protect nothing and refuse something: a
+        // loaded module whose name legally contains a separator would be listed by `modules` and
+        // then rejected here as an injection attempt. That is the distinction `driver_hazards`
+        // records above its own missing screen, and it became true of `target_module` when its
+        // base stopped being read through `lm m` (review on
+        // [#446](https://github.com/glslang/windbg-mcp/pull/446)).
         for (field, value) in [
             ("address", args.address.as_ref()),
-            ("target_module", args.target_module.as_ref()),
             ("rva", args.rva.as_ref()),
-            ("module", args.module.as_ref()),
         ] {
             if let Some(value) = value
                 && let Err(e) = reject_command_breakers(field, value, Quotes::Rejected)

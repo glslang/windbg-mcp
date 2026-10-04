@@ -344,18 +344,18 @@ None of these is a bug. They are recorded because they were invisible, and
    | group | tools | bytes | share |
    |---|---:|---:|---:|
    | `allocator` | 10 | 16,868 | 14.5% |
-   | `ioctl` | 11 | 15,967 | 13.7% |
+   | `ioctl` | 11 | 16,041 | 13.8% |
    | `securekernel` | 11 | 15,573 | 13.4% |
    | `exec` | 10 | 15,137 | 13% |
    | `session` | 10 | 14,013 | 12% |
    | `inspect` | 10 | 13,442 | 11.5% |
    | `batch` | 1 | 10,842 | 9.3% |
-   | `crash` | 3 | 7,514 | 6.5% |
+   | `crash` | 3 | 7,514 | 6.4% |
    | `ttd` | 9 | 7,090 | 6.1% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 75 | 116,446 |
+   | *(absent)* | 75 | 116,520 |
    | `session,inspect,exec,crash` | 33 | 49,185 |
    | `session,inspect,crash` | 23 | 33,895 |
    | `crash` | 13 | 20,361 |

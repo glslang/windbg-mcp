@@ -408,11 +408,11 @@
     {
       "annotations": 90,
       "description": 556,
-      "inputSchema": 2037,
-      "modelVisible": 2657,
+      "inputSchema": 2111,
+      "modelVisible": 2731,
       "name": "reachable_from_dispatch",
       "outputSchema": 5156,
-      "wire": 7934
+      "wire": 8008
     },
     {
       "annotations": 64,
@@ -679,13 +679,13 @@
   "totals": {
     "annotations": 8184,
     "description": 44142,
-    "inputSchema": 68331,
+    "inputSchema": 68405,
     "instructions": 2022,
-    "modelVisible": 116446,
+    "modelVisible": 116520,
     "outputSchema": 200814,
-    "payload": 327615,
+    "payload": 327689,
     "tools": 75,
-    "wire": 327529,
+    "wire": 327603,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10842
   }

@@ -135,10 +135,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [#305](https://github.com/glslang/windbg-mcp/pull/305) and
   [#307](https://github.com/glslang/windbg-mcp/pull/307) took out of it.
 
-  The model-visible tool surface is now **116,446 B** across **75** tools, from 113,516 across 74;
+  The model-visible tool surface is now **116,520 B** across **75** tools, from 113,516 across 74
+  — 2,930 B of it this tool and 74 B `reachable_from_dispatch`'s rewritten `module` argument;
   its ceiling moves 114,000 → 118,000, with the arithmetic and the reason the description is the
   larger half recorded above `MODEL_VISIBLE_CEILING`. The wire ceiling is untouched at 330,000,
-  with 2,385 B left.
+  with 2,311 B left.
 
 - **Live Secure Kernel control is available as an isolated MCP session.** Seven typed tools bind an
   exact disposable VBS VM and selected VTL1 VP, arm one to four guarded hardware breakpoints, wait
