@@ -5365,16 +5365,33 @@ mod tests {
              the scanner no longer matches, so this test is checking nothing"
         );
 
-        // The landing page: a reader who followed a citation to FOLLOWUPS.md is sent here, so the
-        // index has to name everything the file holds, at an anchor that resolves.
-        let done = std::fs::read_to_string(root.join("DONE.md")).expect("read DONE.md");
+        // Both files are landing pages: whoever follows a citation arrives at one of them, so each
+        // has to name every entry it holds at an anchor that resolves. Held to the same rule
+        // because the failure is the same one — `FOLLOWUPS.md` simply had no index to hold until
+        // its open items outgrew being read front to back.
+        for name in ["FOLLOWUPS.md", "DONE.md"] {
+            index_names_every_entry(&root.join(name), name);
+        }
+    }
+
+    /// Every `## N. …` entry in one of the two follow-up files is named by that file's own index,
+    /// at an anchor that resolves to the heading.
+    ///
+    /// **Nothing else checks these fragments.** CI's markdownlint globs are `README.md`,
+    /// `CHANGELOG.md`, `docs/**` and `skills/**`, so MD051 — the rule that catches a link fragment
+    /// with no matching heading, and the one that has actually bitten here — never sees either
+    /// file. [`every_relative_markdown_link_resolves`] does not either: it skips a target starting
+    /// `#`, deliberately, because a fragment addresses a heading rather than a file.
+    fn index_names_every_entry(path: &PathBuf, name: &str) {
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         let mut entries = std::collections::BTreeMap::new();
         let mut indexed = std::collections::BTreeMap::new();
         // A number listed twice is refused rather than overwritten, for the same reason as a
         // heading filed twice: the map would keep one of them and every check below would agree
         // with itself about an index that names an entry twice.
         let mut twice = Vec::new();
-        for line in done.lines() {
+        for line in text.lines() {
             if let Some(title) = line.strip_prefix("## ")
                 && let Some(n) = leading_item_number(title)
             {
@@ -5391,12 +5408,12 @@ mod tests {
         }
         assert!(
             twice.is_empty(),
-            "DONE.md's index lists these item numbers more than once: {twice:?}"
+            "{name}'s index lists these item numbers more than once: {twice:?}"
         );
         assert_eq!(
             entries.keys().collect::<Vec<_>>(),
             indexed.keys().collect::<Vec<_>>(),
-            "DONE.md's index and its entries disagree — an entry moved in without an index line, \
+            "{name}'s index and its entries disagree — an entry moved in without an index line, \
              or the other way round"
         );
         let broken: Vec<_> = indexed
@@ -5406,8 +5423,8 @@ mod tests {
             .collect();
         assert!(
             broken.is_empty(),
-            "these index links do not match the heading they name, so they resolve to nothing: \
-             {broken:?}"
+            "{name}: these index links do not match the heading they name, so they resolve to \
+             nothing: {broken:?}"
         );
     }
 
