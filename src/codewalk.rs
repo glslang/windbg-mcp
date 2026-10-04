@@ -129,6 +129,23 @@ pub fn walk_code(
     let mut past = 0u64;
 
     'sections: for section in code {
+        // **The row cap is checked here as well as inside the decode loop**, because the two
+        // paths below that record a malformed span never reach that loop: a section beginning
+        // outside the image `continue`s, so a cap enforced only in the loop bounded every image
+        // except the one it was written for (review on
+        // [#446](https://github.com/glslang/windbg-mcp/pull/446)).
+        //
+        // **It bounds this walk rather than closing a hole**, and the difference is worth stating
+        // because the finding claimed the second. `dbgscope::pe::read_image` refuses an image
+        // declaring more than 96 sections outright — `PeError::Malformed`, not a truncation — so
+        // no image it hands over can produce more than 96 rows here, and 96 is under this cap.
+        // What this check buys is that [`MAX_RANGES`] is a property of *this* function, true for
+        // any caller and any fixture, rather than one that has to be re-derived from a bound in
+        // another crate that nothing at this seam mentions.
+        if covered.scanned.len() + covered.unreadable.len() >= MAX_RANGES {
+            covered.cap_hit = true;
+            break 'sections;
+        }
         // **The whole span, not just its start.** `checked_va(rva, 0)` asks only whether the
         // section begins inside the image, and a header claiming a `virtual_size` that runs past
         // `SizeOfImage` would then have this decode straight out of the module and into whatever
@@ -288,5 +305,119 @@ pub fn range_report(range: &Scanned) -> crate::structured::ScannedRange {
         section: range.section.clone(),
         start: crate::structured::addr(range.start),
         bytes: range.bytes,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dbgscope::dbgeng::{Effect, Flow};
+
+    const BASE: u64 = 0xffff_f800_0000_0000;
+
+    /// An image whose `count` executable sections all begin **outside** `SizeOfImage`, which is
+    /// the one shape that records a range and never reaches the decode loop.
+    fn sections_outside_the_image(count: usize) -> pe::Image {
+        pe::Image {
+            base: BASE,
+            bitness: pe::Bitness::Bits64,
+            machine: 0x8664,
+            size_of_image: 0x1000,
+            section_alignment: 0x1000,
+            sections: (0..count)
+                .map(|i| pe::Section {
+                    name: format!(".text{i}"),
+                    // Past `size_of_image`, so `checked_va` refuses the start.
+                    rva: 0x2000 + (i as u32) * 0x1000,
+                    virtual_size: 0x100,
+                    characteristics: 0x6000_0020,
+                })
+                .collect(),
+            export_directory: (0, 0),
+            import_directory: (0, 0),
+        }
+    }
+
+    /// **[`MAX_RANGES`] is this function's bound, not its caller's.**
+    ///
+    /// The row cap used to be checked only inside the decode loop, and a section beginning outside
+    /// the image records a range and `continue`s without entering it — so an image made of nothing
+    /// but those was unbounded here. It was not *reachable*: `dbgscope::pe::read_image` refuses an
+    /// image declaring more than 96 sections, so the real worst case was 96 rows against a cap of
+    /// 256. This asserts the property anyway, with a fixture that bypasses that parser exactly as
+    /// any other caller could.
+    #[test]
+    fn the_range_rows_are_bounded_even_when_no_section_decodes() {
+        let covered = walk_code(
+            &sections_outside_the_image(MAX_RANGES * 2),
+            |_, _| panic!("no section begins inside the image, so nothing should be decoded"),
+            || None,
+            |_| {},
+        );
+
+        assert_eq!(
+            covered.scanned.len() + covered.unreadable.len(),
+            MAX_RANGES,
+            "the two range lists share one bound"
+        );
+        assert!(covered.cap_hit, "a bounded answer says it was bounded");
+        assert!(
+            covered.halted.is_none(),
+            "a cap is not a halt, and the two have different remedies"
+        );
+    }
+
+    /// And the ordinary case is unaffected: a sane section table produces a row per contiguous
+    /// run, nowhere near the cap.
+    #[test]
+    fn a_plausible_section_table_is_not_capped() {
+        let image = pe::Image {
+            base: BASE,
+            bitness: pe::Bitness::Bits64,
+            machine: 0x8664,
+            size_of_image: 0x4000,
+            section_alignment: 0x1000,
+            sections: vec![pe::Section {
+                name: ".text".to_string(),
+                rva: 0x1000,
+                virtual_size: 0x20,
+                characteristics: 0x6000_0020,
+            }],
+            export_directory: (0, 0),
+            import_directory: (0, 0),
+        };
+        let mut seen = 0usize;
+        let covered = walk_code(
+            &image,
+            |at, _| {
+                Some(vec![Instruction {
+                    address: at,
+                    // Four hex pairs: a four-byte instruction, so eight of them cover the section.
+                    bytes: "d503237f".to_string(),
+                    text: String::new(),
+                    mnemonic: "nop".to_string(),
+                    operands: Vec::new(),
+                    flow: Flow::Fallthrough,
+                    privileged: false,
+                    effect: Effect::Other,
+                    condition: None,
+                    writes_flags: false,
+                    writes: Vec::new(),
+                    reads: Vec::new(),
+                }])
+            },
+            || None,
+            |step| {
+                if matches!(step, Step::At(..)) {
+                    seen += 1;
+                }
+            },
+        );
+
+        assert!(!covered.cap_hit, "{covered:?}");
+        assert!(covered.unreadable.is_empty(), "{covered:?}");
+        assert_eq!(covered.scanned.len(), 1, "one contiguous run: {covered:?}");
+        assert_eq!(covered.scanned[0].bytes, 0x20, "{covered:?}");
+        assert_eq!(seen, 8, "0x20 bytes of four-byte instructions");
     }
 }
