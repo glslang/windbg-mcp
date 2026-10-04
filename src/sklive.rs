@@ -187,6 +187,8 @@ pub(crate) trait EventDispatcher {
     fn finish_arm(&mut self) -> Result<()>;
     /// Whether a completed whole-target pause currently makes provider register access safe.
     fn provider_writes_quiesced(&self) -> bool;
+    /// Finish any pending resume and establish a new whole-target pause for fault recovery.
+    fn establish_recovery_pause(&mut self, targets: &[TargetIdentity]) -> Result<()>;
     /// Re-read a proposed current instruction while the owned event remains held.
     fn verify_instruction(&mut self, instruction: &InstructionGuard) -> Result<()>;
     /// Return an owned event only after re-establishing a whole-target pause. The controller can
@@ -1604,6 +1606,14 @@ impl<P: ControlProvider> LiveControl<P> {
             .any(|provider| provider.baseline.is_some());
         let mut safe_to_resume = !owns_provider_state || dispatcher.provider_writes_quiesced();
         if owns_provider_state && !safe_to_resume {
+            if let Err(error) = dispatcher.establish_recovery_pause(&self.targets()) {
+                recovery_errors.push(format!(
+                    "establish whole-VM pause for VTL1 recovery: {error:#}"
+                ));
+            }
+            safe_to_resume = dispatcher.provider_writes_quiesced();
+        }
+        if owns_provider_state && !safe_to_resume {
             recovery_errors.push(
                 "skipped VTL1 baseline restoration because whole-VM quiescence was not proved"
                     .to_string(),
@@ -1968,6 +1978,7 @@ mod tests {
         FinishArm,
         Verify(InstructionGuard),
         Wait,
+        EstablishRecoveryPause,
         Release(ReleaseMode),
         Recover { safe: bool, owned_event: bool },
         Teardown,
@@ -1981,6 +1992,7 @@ mod tests {
         fail_begin: Option<&'static str>,
         fail_wait: Option<&'static str>,
         fail_wait_quiesced: bool,
+        fail_recovery_pause: Option<&'static str>,
         provider_writes_quiesced: bool,
         fail_recover: Option<&'static str>,
         fail_teardown: Option<&'static str>,
@@ -1996,6 +2008,7 @@ mod tests {
                 fail_begin: None,
                 fail_wait: None,
                 fail_wait_quiesced: true,
+                fail_recovery_pause: None,
                 provider_writes_quiesced: false,
                 fail_recover: None,
                 fail_teardown: None,
@@ -2024,6 +2037,16 @@ mod tests {
 
         fn provider_writes_quiesced(&self) -> bool {
             self.provider_writes_quiesced
+        }
+
+        fn establish_recovery_pause(&mut self, _targets: &[TargetIdentity]) -> Result<()> {
+            self.actions.push(Action::EstablishRecoveryPause);
+            self.provider_writes_quiesced = false;
+            if let Some(reason) = self.fail_recovery_pause {
+                bail!("{reason}");
+            }
+            self.provider_writes_quiesced = true;
+            Ok(())
         }
 
         fn verify_instruction(&mut self, instruction: &InstructionGuard) -> Result<()> {
@@ -2459,10 +2482,11 @@ mod tests {
     }
 
     #[test]
-    fn multi_vp_timeout_restores_every_provider_before_resuming() {
+    fn multi_vp_timeout_repauses_and_restores_every_provider_before_resuming() {
         let baseline = register_values(BASE_RIP, 0xffff_0ff0, 0x400, 0x46);
         let mut dispatcher = FakeDispatcher::new([]);
         dispatcher.fail_wait = Some("dispatcher wait timed out");
+        dispatcher.fail_wait_quiesced = false;
         let mut control =
             LiveControl::open_many(vec![FakeProvider::new(), FakeProvider::new().with_vp(1)])
                 .unwrap();
@@ -2477,13 +2501,13 @@ mod tests {
         assert!(control.providers.iter().all(|provider| {
             provider.provider.phase == FakePhase::Running && provider.provider.registers == baseline
         }));
-        assert_eq!(
-            dispatcher.actions.last(),
-            Some(&Action::Recover {
+        assert!(dispatcher.actions.ends_with(&[
+            Action::EstablishRecoveryPause,
+            Action::Recover {
                 safe: true,
                 owned_event: false,
-            })
-        );
+            },
+        ]));
     }
 
     #[test]
@@ -2491,6 +2515,7 @@ mod tests {
         let mut dispatcher = FakeDispatcher::new([]);
         dispatcher.fail_wait = Some("Suspend-VM timed out after the winning intercept");
         dispatcher.fail_wait_quiesced = false;
+        dispatcher.fail_recovery_pause = Some("recovery Suspend-VM timed out");
         let mut control =
             LiveControl::open_many(vec![FakeProvider::new(), FakeProvider::new().with_vp(1)])
                 .unwrap();
@@ -2502,6 +2527,14 @@ mod tests {
 
         assert!(error.to_string().contains("Suspend-VM"), "{error:#}");
         assert!(control.fault().unwrap().target_left_paused);
+        assert!(
+            control
+                .fault()
+                .unwrap()
+                .recovery_errors
+                .iter()
+                .any(|error| error.contains("recovery Suspend-VM timed out"))
+        );
         assert!(
             control
                 .fault()

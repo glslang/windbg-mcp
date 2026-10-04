@@ -875,6 +875,27 @@ impl EventDispatcher for VmwpDispatcher<'_> {
         self.state.provider_writes_quiesced
     }
 
+    fn establish_recovery_pause(&mut self, targets: &[TargetIdentity]) -> Result<()> {
+        // A wait may fail while its asynchronous Resume-VM is still outstanding. Join that helper
+        // before issuing the recovery pause, but attempt the pause even when the helper reports an
+        // ambiguous failure: only the new successful Suspend-VM can authorize provider writes.
+        let transition_error = self.state.finish_completion_kick().err();
+        let pause = if let Some(event) = self.state.phase.held_event().cloned() {
+            self.pause_held_target(&event)
+        } else {
+            self.pause_for_provider_writes(targets)
+        };
+        match (transition_error, pause) {
+            (None, result) => result,
+            (Some(error), Ok(())) => Err(error
+                .context("the pending VM transition failed before a successful recovery pause")),
+            (Some(transition), Err(pause)) => bail!(
+                "the pending VM transition failed: {transition:#}; the recovery pause also failed: \
+                 {pause:#}"
+            ),
+        }
+    }
+
     fn verify_instruction(&mut self, instruction: &InstructionGuard) -> Result<()> {
         VmwpDispatcher::verify_instruction(self, instruction)
     }

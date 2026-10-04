@@ -151,7 +151,9 @@ terminal `faulted` phase. Recovery first tries to restore the saved register sta
 native completion only when both restoration and event ownership are proven; otherwise the adapter
 must leave the disposable target paused. Conservative pause ownership means a resume may be owed;
 it does not authorize provider writes. If the whole-VM pause barrier fails or times out, recovery
-does not touch any losing VP baseline and contains the session with the native event incomplete.
+first finishes any pending resume and retries `Suspend-VM`. It restores provider baselines only
+after that pause completes successfully; otherwise it leaves every baseline untouched and contains
+the session with any native event incomplete.
 Teardown does not erase the fault record.
 
 The offline state-machine tests cover redirected and natural hardware stops, repeated and
