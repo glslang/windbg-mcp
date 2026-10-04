@@ -35,9 +35,9 @@ windbg-mcp-sk-control/1
 {"protocol":1,"target":{...},"epoch":"running-..."}
 ```
 
-The target object contains the VM GUID, hypervisor partition ID, VP, VTL, and expected CR3. Every
-request and response repeats the full target and current opaque epoch. Addresses are fixed-width
-hex strings so JSON implementations cannot round 64-bit values.
+Each provider target contains the VM GUID, hypervisor partition ID, VP, VTL, and expected CR3.
+Every request and response repeats that target and the current opaque epoch. A session may own one
+provider per selected VP; their VM, partition, VTL and CR3 coordinates must agree.
 
 Provider stdout is read on a dedicated non-DbgEng thread. Each complete protocol line has a
 10-second deadline, including the startup banner and hello, so a provider which remains alive but
@@ -78,9 +78,10 @@ failure in that interval faults the session and runs bounded recovery.
 
 The readable bank is `rip`, `rsp`, `rflags`, `cr3`, `cs`, `dr0` through `dr3`, `dr6`, `dr7`, and
 `vsm_vp_status`. `cr3`, `cs`, and `vsm_vp_status` are read-only. A held event records message type,
-vector, VP, VTL, CPL, dispatcher context, advance flag, and either a hardware-breakpoint slot or a
-single-step reason. Revision 1 accepts only mapped exception type `0x01000002`, vector 1, the bound
-VP at VTL1 CPL0, a nonzero dispatcher context, and native advance clear.
+vector, VP, VTL, CPL, dispatcher context, advance flag, and an unclassified debug-exception reason.
+The worker reads DR6 only after publication and reports the validated hardware slot or single-step
+cause in the MCP stop record. Revision 1 accepts only mapped exception type `0x01000002`, vector 1,
+a selected VP at VTL1 CPL0, a nonzero dispatcher context, and native advance clear.
 
 ## Probe
 
@@ -108,7 +109,7 @@ the operator-supplied provider.
 
 ## Worker state machine
 
-`src/sklive.rs` joins one provider to one debugger-owned dispatcher. It contains no DbgEng engine
+`src/sklive.rs` joins one or more VP-bound providers to one debugger-owned dispatcher. It contains no DbgEng engine
 and no private VID layout; its owner is the existing engine worker, on the thread which created
 that worker's engine. The dispatcher boundary must return the exact registered
 callback context, a bounded observation of the held event, and a second read of the guarded guest
@@ -117,12 +118,14 @@ instruction.
 The state machine implements both the narrow redirected gate and natural control-flow stepping:
 
 1. pause the disposable target and enter the provider's arming epoch;
-2. save RIP, RSP, RFLAGS, CR3, CS, DR0–DR3, DR6, DR7 and VSM VP status;
-3. refuse an already-enabled hardware breakpoint and install one DR0 execution breakpoint;
+2. save RIP, RSP, RFLAGS, CR3, CS, DR0–DR3, DR6, DR7 and VSM VP status on every selected VP;
+3. refuse an already-enabled hardware breakpoint and install one to four distinct execution
+   breakpoints on every selected VP;
 4. in `redirect` mode move RIP to the guarded instruction; in `natural` mode leave RIP untouched
    and require TF and RF to have been clear;
-5. accept only the registered dispatcher context, the native event's selected VP, VTL1 CPL0
-   vector 1, the bound CR3, the expected DR6 cause, and two identical held-state reads;
+5. accept only the registered dispatcher context, a native event from the selected VP set, VTL1
+   CPL0 vector 1, the bound CR3, one exact armed DR6 slot, and two identical held-state reads;
+   restore every non-winning VP before exposing the stop;
 6. consume each stop epoch once to arm TF. The first step may reuse the hardware-stop instruction;
    every later step must re-prove the exact current instruction bytes. A step accepts one default
    fall-through address or at most four explicit destinations for a branch;
@@ -147,16 +150,18 @@ provider transport tests also pin bounded silence and reader death.
 
 ## MCP live-control session
 
-The `securekernel` tool group exposes one selected VP through a worker-owned live session. The
-adapter pauses the whole disposable VM while it changes that VP's state:
+The `securekernel` tool group exposes a selected VP set through one worker-owned live session. The
+adapter pauses the whole disposable VM while it changes their state:
 
-1. `open_sk_live_control` binds the exact VM, partition, VP, CR3, `vmwp` PID, dispatcher pointer,
-   profile and two provider commands. It validates and starts the provider but does not pause the
-   VM or install a breakpoint.
-2. `sk_live_arm` re-reads one exact instruction, saves the complete writable baseline and installs
-   the slot-0 execution breakpoint. Its `mode` chooses guarded RIP redirection or natural flow.
-3. `sk_live_wait` pumps `vmwp` until it owns the matching vector-1 event and returns the complete
-   stop evidence with a fresh epoch.
+1. `open_sk_live_control` binds the exact VM, partition, primary VP, CR3, `vmwp` PID, dispatcher
+   pointer, profile and provider commands. `additional_vps` adds VP numbers; in that form
+   `control_transport` contains a `{vp}` placeholder used to start one identity-bound child per VP.
+   Opening does not pause the VM or install a breakpoint.
+2. `sk_live_arm` re-reads each exact instruction, saves every selected VP's writable baseline and
+   installs one to four explicitly slotted execution breakpoints. Redirect mode requires one VP
+   and one breakpoint. Natural mode arms the full VP and breakpoint set.
+3. `sk_live_wait` pumps `vmwp` until any selected VP reaches any armed address, restores all losing
+   VPs, and returns the winner, exact DR slot and complete stop evidence with a fresh epoch.
 4. `sk_live_registers` and `sk_live_read_memory` inspect only that stopped epoch. The memory path
    uses the bound VTL1 CR3 and refuses an unmapped range whole.
 5. `sk_live_step` consumes the stopped epoch once, clears the hardware breakpoint and arms TF.
@@ -203,6 +208,12 @@ scoped crash record. A preceding natural-flow VP1 attempt timed out because that
 scheduled there; bounded recovery restored the baseline and resumed the VM before faulting the
 session.
 
+The later fan-out implementation removes that single-VP session limit: one worker owns several
+VP-bound providers, arms the same guarded slot set on each, accepts the first selected VP reported
+by the native event, and restores every losing VP before returning the stop. Offline tests cover a
+VP1 win with VP0 restoration. A multi-provider live run remains required before treating this
+broader mode as bench-proven; the earlier live result proves selected VP1, one provider at a time.
+
 Two more runs from fresh differencing children repeated the 16-instruction natural-flow lifecycle
 and independent 60-second audit at new partition IDs and Secure Kernel bases. A live wrong-build
 injection then changed the profiled `vmwp` SHA: the adapter refused before provider mutation,
@@ -225,7 +236,10 @@ engine on the same thread. Its retained state owns the provider child, live-memo
 breakpoint ids, callback scratch allocation, handler context, VM pause state, and delayed completion
 helper.
 
-The local dispatcher profile contains an absolute `vmwp.exe` image path, SHA-256 and SizeOfImage;
+The profile input may be one JSON file or a directory containing at most 128 JSON profiles. A
+directory must have exactly one entry whose declared `vmwp.exe` path and SHA-256 match the current
+local image; the adapter repeats the identity check against DbgEng's loaded module before mutation.
+Each profile contains an absolute `vmwp.exe` image path, SHA-256 and SizeOfImage;
 function and stop-site RVAs; original bytes for every software-breakpoint site; exact-build event
 context, event-VP and native-advance offsets; bounded scratch offsets; and no debugger command
 text. The per-boot VND pointer is a separate session input. Before mutation the adapter checks the

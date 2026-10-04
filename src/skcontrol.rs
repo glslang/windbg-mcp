@@ -250,7 +250,12 @@ impl Capabilities {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "reason", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum StopReason {
-    HardwareBreakpoint { slot: u8 },
+    /// Raw vector-1 event as observed by the dispatcher. The worker replaces this with the exact
+    /// architectural cause after it has published the held event and can read the VP's DR6.
+    DebugException,
+    HardwareBreakpoint {
+        slot: u8,
+    },
     SingleStep,
 }
 

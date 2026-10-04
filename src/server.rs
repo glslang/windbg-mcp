@@ -1139,13 +1139,12 @@ pub struct SkSymbolArgs {
     pub session_id: Option<String>,
 }
 
-/// Bind an operator-supplied live VTL1 provider to one exact disposable VM and `vmwp` build.
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SkLiveOpenArgs {
-    /// Local build profile containing the guarded `vmwp.exe` identity, RVAs and original bytes.
+    /// Exact build profile JSON, or a bounded directory from which the current image is selected.
     pub profile: String,
-    /// Command line for the privileged register-control provider child.
+    /// Register-control provider command. Use `{vp}` when `additional_vps` is nonempty.
     pub control_transport: String,
     /// Command line for the live VTL1 physical-memory source child.
     pub live_transport: String,
@@ -1162,6 +1161,20 @@ pub struct SkLiveOpenArgs {
     /// Virtual processor to control. Defaults to VP 0. The native event must report this VP.
     #[serde(default)]
     pub vp: Option<u32>,
+    /// Further VP numbers which may win a natural stop. `control_transport` must contain `{vp}`.
+    #[serde(default)]
+    pub additional_vps: Vec<u32>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SkLiveBreakpointArgs {
+    /// Architectural debug-register slot, in `0..=3`.
+    pub slot: u8,
+    /// Exact VTL1 virtual address to stop before, decimal or `0x` hexadecimal.
+    pub address: String,
+    /// Exact 1..=15 instruction bytes expected there, as hexadecimal with optional spaces or `-`.
+    pub bytes: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1171,6 +1184,13 @@ pub struct SkLiveArmArgs {
     pub address: String,
     /// Exact 1..=15 instruction bytes expected there, as hexadecimal with optional spaces or `-`.
     pub bytes: String,
+    /// Debug-register slot for the primary breakpoint. Defaults to DR0.
+    #[serde(default)]
+    pub slot: Option<u8>,
+    /// Further guarded execution breakpoints. Natural mode can arm up to four distinct slots and
+    /// addresses; redirect mode accepts only the primary breakpoint.
+    #[serde(default)]
+    pub additional_breakpoints: Vec<SkLiveBreakpointArgs>,
     /// How the breakpoint is reached. `redirect` moves RIP to the guarded instruction and later
     /// restores it; `natural` leaves RIP untouched and preserves real guest progress.
     #[serde(default)]
@@ -4015,25 +4035,61 @@ impl WindbgServer {
                 TargetCreated::No,
             );
         }
-        let what = format!("VM {} VTL1 VP {}", target.vm_id, target.vp);
+        let mut vp_numbers = vec![target.vp];
+        let mut additional_vps = Vec::with_capacity(args.additional_vps.len());
+        if !args.additional_vps.is_empty() && !args.control_transport.contains("{vp}") {
+            return open_failure(
+                ErrorCategory::InvalidArgument,
+                "control_transport must contain {vp} when additional_vps are requested".to_string(),
+                None,
+                TargetCreated::No,
+            );
+        }
+        for vp in args.additional_vps {
+            if vp_numbers.contains(&vp) {
+                return open_failure(
+                    ErrorCategory::InvalidArgument,
+                    "live-control VP numbers must be distinct".to_string(),
+                    None,
+                    TargetCreated::No,
+                );
+            }
+            vp_numbers.push(vp);
+            let mut additional_target = target.clone();
+            additional_target.vp = vp;
+            additional_vps.push(crate::skdispatch::AdditionalVp {
+                control_transport: args.control_transport.replace("{vp}", &vp.to_string()),
+                target: additional_target,
+            });
+        }
+        let control_transport = args
+            .control_transport
+            .replace("{vp}", &target.vp.to_string());
+        let vp_list = vp_numbers
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let what = format!("VM {} VTL1 VPs {vp_list}", target.vm_id);
         self.opened(
             SessionKind::SecureKernelLive,
             what,
             EngineOp::OpenSecureKernelLive(Box::new(crate::skdispatch::OpenRequest {
                 profile: PathBuf::from(args.profile),
-                control_transport: args.control_transport,
+                control_transport,
                 live_transport: args.live_transport,
                 vmwp_pid: args.vmwp_pid,
                 dispatcher_vnd,
                 target,
+                additional_vps,
             })),
         )
         .await
     }
 
-    /// Save the VTL1 register baseline and arm slot-0 DR0 for one exact instruction. Redirect mode
-    /// moves RIP deliberately; natural mode leaves RIP untouched. The address and bytes are
-    /// re-read from live guest memory before any register changes.
+    /// Save the VTL1 register baseline and arm up to four exact execution breakpoints. Redirect
+    /// mode accepts one breakpoint and moves RIP deliberately; natural mode leaves RIP untouched.
+    /// Every address and byte guard is re-read from live guest memory before register changes.
     #[rmcp::tool(
         annotations(
             title = "Arm live Secure Kernel stop",
@@ -4064,11 +4120,39 @@ impl WindbgServer {
                 );
             }
         };
-        let instruction = crate::sklive::InstructionGuard {
-            address: crate::skcontrol::HexU64(address),
-            bytes,
-        };
-        if let Err(error) = instruction.validate() {
+        let mut breakpoints = vec![crate::sklive::BreakpointGuard {
+            slot: args.slot.unwrap_or(0),
+            instruction: crate::sklive::InstructionGuard {
+                address: crate::skcontrol::HexU64(address),
+                bytes,
+            },
+        }];
+        for breakpoint in args.additional_breakpoints {
+            let address = match parse_u64(&breakpoint.address) {
+                Ok(value) => value,
+                Err(why) => {
+                    return typed_error(ErrorCategory::InvalidArgument, why, args.session_id);
+                }
+            };
+            let bytes = match crate::skdispatch::parse_hex_bytes(&breakpoint.bytes) {
+                Ok(value) => value,
+                Err(error) => {
+                    return typed_error(
+                        ErrorCategory::InvalidArgument,
+                        error.to_string(),
+                        args.session_id,
+                    );
+                }
+            };
+            breakpoints.push(crate::sklive::BreakpointGuard {
+                slot: breakpoint.slot,
+                instruction: crate::sklive::InstructionGuard {
+                    address: crate::skcontrol::HexU64(address),
+                    bytes,
+                },
+            });
+        }
+        if let Err(error) = crate::sklive::validate_breakpoints(&breakpoints, args.mode) {
             return typed_error(
                 ErrorCategory::InvalidArgument,
                 error.to_string(),
@@ -4079,7 +4163,7 @@ impl WindbgServer {
             .run(
                 args.session_id.as_deref(),
                 EngineOp::SkLiveArm {
-                    instruction,
+                    breakpoints,
                     mode: args.mode,
                 },
             )

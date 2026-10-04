@@ -2817,9 +2817,9 @@ fn execute(
             ))
         }
 
-        EngineOp::SkLiveArm { instruction, mode } => {
+        EngineOp::SkLiveArm { breakpoints, mode } => {
             let transition = held_live_control(sk_live)?
-                .arm(e, instruction, mode)
+                .arm(e, breakpoints, mode)
                 .map_err(failed)?;
             Ok(Output::typed(
                 crate::skdispatch::render_transition(&transition),
@@ -11024,6 +11024,7 @@ mod tests {
                 vtl: 1,
                 expected_cr3: crate::skcontrol::HexU64(0x1000),
             },
+            additional_vps: Vec::new(),
         }))
     }
 
@@ -14924,10 +14925,13 @@ mod tests {
             },
             live_control_open(),
             EngineOp::SkLiveArm {
-                instruction: crate::sklive::InstructionGuard {
-                    address: crate::skcontrol::HexU64(0xfffff80000001000),
-                    bytes: vec![0x90],
-                },
+                breakpoints: vec![crate::sklive::BreakpointGuard {
+                    slot: 0,
+                    instruction: crate::sklive::InstructionGuard {
+                        address: crate::skcontrol::HexU64(0xfffff80000001000),
+                        bytes: vec![0x90],
+                    },
+                }],
                 mode: crate::sklive::ArmMode::Redirect,
             },
             EngineOp::SkLiveRegisters,
