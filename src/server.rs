@@ -5999,8 +5999,6 @@ impl WindbgServer {
     /// The question you have when a symbol is absent, a PDB is public and typeless,
     /// or the interesting thing is a callback body rather than a named routine.
     /// Needs only control flow, so it answers where operand decoding does not.
-    /// **Ask it on a dump or a live target**: on an image opened with no debuggee
-    /// the scan reports ranges it did not really read, and answers nothing.
     ///
     /// Each site carries module+RVA, the transfer kind, the mnemonic and its
     /// section; a reference from a discardable section such as `INIT` is dead once

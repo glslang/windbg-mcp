@@ -1911,6 +1911,7 @@ fn refuse_when_the_target_is_gone(e: &DebugEngine, op: &EngineOp) -> Option<Fail
 /// |---|---|---|---|---|---|
 /// | `open_dump`, user | 2 / 1024 | the file | the dumped pid | — | **dumps** |
 /// | `open_dump`, kernel | 1 / 1024+ | the file | — | — | **dumps** |
+/// | `open_dump`, a PE image | 3 / 1027 | the image | `[0xf0f0f0f0]` | — | **dumps** |
 /// | `open_trace` | 2 / dump | the `.run` | the pid | — | **dumps** |
 /// | `attach_process`, `launch` | 2 / 0 | `[]` | `[the pid]` | — | **processes** |
 /// | `attach_kernel_local` | 1 / 1 | `[]` | — | — | **qualifier** |
@@ -1921,9 +1922,17 @@ fn refuse_when_the_target_is_gone(e: &DebugEngine, op: &EngineOp) -> Option<Fail
 /// of targets and was wrong three rounds running. An opener added to `EngineOp` with no row here
 /// is covered by nothing.
 ///
-/// The bottom row is the one that had to be added: **every live kernel looks alike** — same class,
-/// same qualifier, no files, no process set — so until the connection field a live kernel swapped
-/// for another was invisible, which is precisely what this mechanism exists to see.
+/// The live-kernel row is the one that had to be added: **every live kernel looks alike** — same
+/// class, same qualifier, no files, no process set — so until the connection field a live kernel
+/// swapped for another was invisible, which is precisely what this mechanism exists to see.
+///
+/// The **image** row was the one that was missing: `open_dump` has three shapes and the table had
+/// two, so a PE opened as a target was an opener no row covered. Measured 2026-10-04 on the same
+/// bench, alongside `FOLLOWUPS.md` item 111 — `DEBUG_CLASS_IMAGE_FILE` / `DEBUG_DUMP_IMAGE_FILE`,
+/// one module, the image's own path as the dump file, and a process set of one entry whose pid is
+/// the engine's `0xf0f0f0f0` placeholder rather than anything on this machine. It is identified by
+/// the file like the other two, so nothing about replacement detection turns on it; what the row
+/// buys is that the opener is *covered* rather than assumed to behave like a dump.
 ///
 /// An engine holding **nothing** reads class 0 / qualifier 0 and *refuses* the rest, which is why
 /// [`watch_the_target`] asks `has_target` first and none of this is read there:
@@ -2062,6 +2071,75 @@ fn process_set(held: Vec<(u32, u32)>) -> Vec<u32> {
 /// `g`.
 fn fingerprints_the_process(kind: Option<DebuggeeType>) -> bool {
     matches!(kind, Some(kind) if !kind.is_kernel())
+}
+
+/// `DEBUG_CLASS_IMAGE_FILE` from `dbgeng.h`, which is what `GetDebuggeeType` answers for a PE
+/// opened as a target with nothing behind it.
+///
+/// **Spelled out rather than imported.** The constant lives in `windows-sys`'s
+/// `Win32_System_Diagnostics_Debug_Extensions`, a feature this crate does not take and should not:
+/// the DbgEng bindings are `dbgscope`'s, and what crosses that seam is the typed [`DebuggeeType`]
+/// this compares against, not the COM surface behind it. Measured on this bench rather than read
+/// off the header — `securekernel.exe` and `ACPI.sys` both answer class **3**, qualifier **1027**
+/// (`DEBUG_DUMP_IMAGE_FILE`), on dbgeng 10.0.26100.x, ARM64, 2026-10-04.
+const IMAGE_FILE_CLASS: u32 = 3;
+
+/// Whether the target is a **PE image opened with no debuggee**.
+///
+/// The class alone, with the qualifier left out deliberately: the class is the thing that names
+/// this kind of target, and 1027 is `1024 | 3` — the qualifier restating it. A pair would refuse
+/// an engine that spelled the second half differently, where the cost of a false negative here is
+/// the session going back to the behaviour this predicate exists to fix.
+///
+/// A pure function over the reading, for [`fingerprints_the_process`]'s reason: the rule is then
+/// statable in a test with no engine in it. A kind the engine would not report is **not** an
+/// image, and that direction is the cheap one — a false negative costs the first read, a false
+/// positive costs every dump a `.reload` it did not need.
+fn is_an_image_file(kind: Option<DebuggeeType>) -> bool {
+    matches!(kind, Some(kind) if kind.class == IMAGE_FILE_CLASS)
+}
+
+/// Loads an image target's module, which is what makes its memory readable.
+///
+/// **Measured on this bench, 2026-10-04** (`FOLLOWUPS.md` item 111, in `DONE.md`). A PE opened
+/// with `open_dump` and no debuggee answers a virtual read with `0x8007001E` — *the system cannot
+/// read from the specified device* — until something makes the engine load the module behind it,
+/// and `read_memory` is never that something. Sixteen bytes, 4 KiB and 64 KiB at `.text`, a second
+/// identical call, the same read at the image base, and a read taken 25 seconds after the open all
+/// failed, on `securekernel.exe` (ARM64) and on `ACPI.sys` (x64) alike, and the image base read
+/// failed on `kernel32.dll`, `notepad.exe`, `ntoskrnl.exe` and `drivers\acpi.sys` too. **Not on
+/// every image**: `ntdll.dll` answered cold, alone among six surveyed, for a reason nothing here
+/// establishes — so this is a property of the target kind that one image does not exhibit, rather
+/// than a rule without exceptions. What makes the rest read is a module load: `.reload`, which is
+/// what `modules { refresh: true }` runs, and which anything resolving an address through the
+/// expression evaluator or the disassembler triggers on the way past. So the tools that happened
+/// to answer on such a target were the ones that resolve something first, and the ones that read
+/// memory were the ones that did not.
+///
+/// **Here rather than at each reader.** A caller cannot be expected to know that
+/// `modules { refresh: true }` is the precondition for `read_memory`, and every reader needing the
+/// same retry is a list of places to forget it.
+///
+/// **Conditional, and the condition is paid for by a measurement.** `modules { refresh: true }`
+/// — this `.reload` plus an enumeration, which is the closest a tool call comes to timing it —
+/// took **2,159 ms** on the checked-in x64 kernel dump against **11 ms** on the image, so doing
+/// it to every target would put something like two seconds on the open of the one kind that does
+/// not need it.
+///
+/// **Best effort, and silent when it works.** A `.reload` that fails leaves the session exactly as
+/// it was before this existed — a target that opens and reads nothing — so it is logged and never
+/// fatal, for [`resynchronise`]'s reason: the open succeeded, and everything that does not read
+/// memory still answers.
+fn load_an_image_targets_module(e: &DebugEngine) {
+    if !is_an_image_file(e.debuggee_type().ok()) {
+        return;
+    }
+    if let Err(why) = e.reload_symbols("") {
+        tracing::warn!(
+            "worker: an image target's module could not be loaded, so its memory will not read: \
+             {why}"
+        );
+    }
 }
 
 /// The reading taken when this worker's target was opened, which every later op is measured
@@ -2675,6 +2753,11 @@ fn execute(
                 // engine without a bundled `winext\` directory simply won't have ext.dll, which
                 // must not fail the open (live/dump state is still usable).
                 let _ = e.execute_command(".load ext");
+                // **An image target's memory does not read until its module is loaded**, and
+                // opening one does not load it. Here rather than at each reader, and before
+                // `vertarget` so that nothing between the open and the caller's first call sees
+                // the unmapped state.
+                load_an_image_targets_module(e);
                 // `vertarget`, not `lm`: which build this dump is from, and — on a kernel dump —
                 // where the kernel is loaded, in six lines rather than the couple of hundred the
                 // module table took (#105). The bug check and the module count come from
@@ -11730,6 +11813,44 @@ mod tests {
             DEBUG_CLASS_USER_WINDOWS,
             DEBUG_USER_WINDOWS_SMALL_DUMP
         )));
+    }
+
+    /// **An image target is the only kind whose memory has to be mapped before it reads**, and
+    /// the rule that decides is a reading rather than the opener.
+    ///
+    /// The pair measured on this bench is class 3 / qualifier 1027 (`FOLLOWUPS.md` item 111, in
+    /// `DONE.md`), and the predicate reads the class alone — so this asserts the measured pair
+    /// *and* the class with another qualifier, which is the claim being made rather than the
+    /// sample that was taken. The three rows below it are every other target this server opens:
+    /// a `.reload` on any of them is the 2,159 ms the item measured on the kernel dump, paid for
+    /// nothing.
+    ///
+    /// Mutation-verified against the engine by `an_image_targets_memory_reads_on_the_first_call`
+    /// in `mcp_smoke`'s debugger tier, which is where a wrong constant shows up: this test would
+    /// go on passing against a class nothing answers with.
+    #[test]
+    fn only_a_pe_image_opened_with_no_debuggee_needs_its_module_loaded() {
+        assert!(super::is_an_image_file(kind(super::IMAGE_FILE_CLASS, 1027)));
+        assert!(
+            super::is_an_image_file(kind(super::IMAGE_FILE_CLASS, 0)),
+            "the class names this kind of target; the qualifier restates it"
+        );
+
+        assert!(!super::is_an_image_file(kind(
+            DEBUG_CLASS_USER_WINDOWS,
+            DEBUG_USER_WINDOWS_SMALL_DUMP
+        )));
+        assert!(!super::is_an_image_file(kind(
+            DEBUG_CLASS_KERNEL,
+            DEBUG_KERNEL_FULL_DUMP
+        )));
+        assert!(!super::is_an_image_file(kind(
+            DEBUG_CLASS_KERNEL,
+            DEBUG_KERNEL_CONNECTION
+        )));
+        // An engine that would not say is not an image: the cost of being wrong that way is one
+        // target that reads nothing, against a `.reload` on every target that did not need one.
+        assert!(!super::is_an_image_file(None));
     }
 
     /// **One list decides both ends**, so an op cannot be refused on the way in and never

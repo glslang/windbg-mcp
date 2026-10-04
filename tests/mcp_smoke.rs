@@ -2068,7 +2068,8 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// by the review fix on that PR — it had promised the base was read from `lm m <module>`, which it
 /// no longer is, and the sentence that replaced it says the name must match one module exactly.
 /// Nothing else moved, which is what says these are the two changes rather than a reading taken on
-/// a different build.
+/// a different build. **Those two figures are the raise's arithmetic and not today's**: item 111
+/// took 146 B of `xrefs_to`'s description back the same day, which is the paragraph below.
 ///
 /// It buys the one question this server could not ask: **who reaches this address**. The forward
 /// walk (`reachable_from_dispatch`, 2,657 B) and the import-slot scan (`driver_hazards`, 1,239 B)
@@ -2076,19 +2077,24 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// address you have when a symbol is absent or a PDB is public and typeless. It had been
 /// hand-rolled in Python twice before this, once per image it was needed for.
 ///
-/// **Its description is the larger half, and deliberately so**: 1,718 B against those two
-/// neighbours' 614 and 556. Five hundred of it is the two sentences saying what an *empty* list
-/// does not mean — an indirect transfer carries no destination, an address merely stored in a
-/// dispatch table is never branched to, one image is read, undecoded code says nothing, and an
-/// image target opened with no debuggee answers nothing at all (item 111). That is the tool's main
-/// failure mode rather than a caveat: a model reading an empty answer as "nothing calls this"
-/// would draw a conclusion the scan does not support, and the bytes that prevent it are worth more
-/// than the bytes they cost. A first draft was 3,281 B; the trim took the prose down and kept
-/// those sentences.
+/// **Its description is the larger half, and deliberately so**: 1,572 B against those two
+/// neighbours' 614 and 556. Four hundred of it is the sentence saying what an *empty* list does
+/// not mean — an indirect transfer carries no destination, an address merely stored in a dispatch
+/// table is never branched to, one image is read, and undecoded code says nothing. That is the
+/// tool's main failure mode rather than a caveat: a model reading an empty answer as "nothing
+/// calls this" would draw a conclusion the scan does not support, and the bytes that prevent it
+/// are worth more than the bytes they cost. A first draft was 3,281 B; the trim took the prose
+/// down and kept those sentences.
 ///
-/// [`WIRE_CEILING`] is **not** raised with it: the payload moved to 327,689 and has 2,311 B left,
-/// and a ceiling raised before something needs it absorbs the next regression in silence. The new
-/// model-visible ceiling leaves 1,480 B (1.3%), which is the headroom the last raise left and for
+/// It shipped at **1,718 B** with a fifth clause — *ask it on a dump or a live target, an image
+/// target answers nothing* — which came off two days later with item 111, whose measurement
+/// withdrew it: the scan was never the thing misreading an image target, and the read underneath
+/// it is fixed at the open. 146 B back, and worth recording because the clause was added for the
+/// right reason on a reading that did not survive its own re-run.
+///
+/// [`WIRE_CEILING`] is **not** raised with it: the payload is 327,543 and has 2,457 B left, and a
+/// ceiling raised before something needs it absorbs the next regression in silence. The
+/// model-visible ceiling leaves 1,626 B (1.4%), which is the headroom the last raise left and for
 /// the same reason.
 const MODEL_VISIBLE_CEILING: usize = 118_000;
 
@@ -6031,6 +6037,90 @@ fn a_module_rva_target_refuses_an_rva_outside_the_named_image() {
         edge["target"]["module"], "nt",
         "the last byte of `nt` is in `nt`: {edge:#}"
     );
+}
+
+/// The debugger tier's gate for a test that needs an **image target**: a PE opened with
+/// `open_dump` and no debuggee.
+///
+/// **No checked-in fixture, deliberately** — the behaviour is a property of the target *kind*
+/// rather than of any one image, and `FOLLOWUPS.md` item 111 measured it on two of them on two
+/// architectures. So this names a file every Windows install has, rather than adding a megabyte
+/// to `docs/samples/` for a test that reads two bytes of it. The existence check is still here for
+/// the same reason [`target_tier`]'s is: a tier that cannot find its target stands down with a
+/// line rather than failing about something else.
+///
+/// **Not `ntdll.dll`, and that is the whole of why this is a named constant with a paragraph
+/// against it.** It was `ntdll.dll` for one round, and the test passed with the fix **backed
+/// out** — because `ntdll` is the one image measured that answers a cold read anyway. Surveyed
+/// 2026-10-04 against a build with the fix removed: `kernel32.dll`, `securekernel.exe`,
+/// `notepad.exe`, `ntoskrnl.exe` and `drivers\acpi.sys` all failed `0x8007001E` at their own image
+/// base, and `ntdll.dll` returned its `MZ`. Why it is different is not established and is not
+/// needed here; what is needed is a fixture that fails without the fix, which is any of the other
+/// five.
+fn image_target_tier() -> Option<&'static str> {
+    if std::env::var_os("WINDBG_MCP_SMOKE_DUMP").is_none() {
+        skip("set WINDBG_MCP_SMOKE_DUMP=1 to run the debugger tier");
+        return None;
+    }
+    const IMAGE: &str = r"C:\Windows\System32\kernel32.dll";
+    if !std::path::Path::new(IMAGE).exists() {
+        skip(&format!("no image to open at {IMAGE}"));
+        return None;
+    }
+    Some(IMAGE)
+}
+
+/// **A target that is open is a target that reads**, on an image as on everything else.
+///
+/// `FOLLOWUPS.md` item 111 (now in `DONE.md`): a PE opened with no debuggee answered every virtual
+/// read with `0x8007001E` until something made the engine load the module behind it, and nothing
+/// a caller would reach for first does that. `worker::load_an_image_targets_module` does it at the
+/// open; this is the assertion that it ran.
+///
+/// Two things about the shape. **`modules` without `refresh`** — a refresh is the `.reload` this
+/// is about, so asking for one would supply at the call site the very thing the open is being
+/// tested for. And the read is at the module's **base**, so the expected bytes are `MZ` and no
+/// part of this test depends on which image it opened or what is in its `.text`.
+///
+/// Mutation-verified: with `load_an_image_targets_module` backed out, the `read_memory` here fails
+/// with *the system cannot read from the specified device* — which is exactly how item 111 was
+/// measured before it was fixed. That verification is what chose the fixture, and the first one
+/// did not survive it — see [`image_target_tier`].
+#[test]
+fn an_image_targets_memory_reads_on_the_first_call() {
+    let Some(image) = image_target_tier() else {
+        return;
+    };
+    let mut server = Server::started();
+    let session = server.open_session("open_dump", json!({ "path": image }), TARGET_STEP);
+
+    let listed = server.tool_data(
+        "modules",
+        json!({ "session_id": session, "limit": 4 }),
+        TARGET_STEP,
+    );
+    let rows = listed["modules"].as_array().expect("a module list");
+    assert_eq!(
+        rows.len(),
+        1,
+        "an image target carries exactly one module: {listed:#}"
+    );
+    let base = rows[0]["start"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the module row carries no base: {listed:#}"))
+        .to_string();
+
+    let read = server.tool_data(
+        "read_memory",
+        json!({ "session_id": session, "address": base, "size": 2 }),
+        TARGET_STEP,
+    );
+    assert_eq!(
+        read["data"].as_str(),
+        Some("4d5a"),
+        "the first call of the session must read the image's own `MZ`: {read:#}"
+    );
+    eprintln!("RAN: {image} read `MZ` at {base} on the session's first memory call");
 }
 
 /// **A module+RVA target names one image, and a pattern is refused rather than resolved.**

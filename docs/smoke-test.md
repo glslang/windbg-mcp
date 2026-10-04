@@ -397,6 +397,16 @@ default page, against 53933 B / 74052 B for all 227 modules` — the same dump
 [`token-budget.md`](./token-budget.md) records its baseline against, so the two can be read
 together.
 
+**A target that is open is a target that reads, and an image target was not.** The tier also
+opens a PE with no debuggee behind it — `C:\Windows\System32\kernel32.dll`, no checked-in
+fixture — and asserts that the session's **first** memory call answers the image's own `MZ`. Until
+`FOLLOWUPS.md` item 111 (in [`DONE.md`](../DONE.md)) it answered `0x8007001E` instead, on every
+read, until some other call happened to make the engine load the module; the open does that now.
+The fixture is named rather than taken as *any System32 binary*, because the first one chosen was
+`ntdll.dll` and the test passed with the fix backed out: of six images surveyed, `ntdll` is the
+only one that answers a cold read anyway. Mutation-verify this one by removing
+`worker::load_an_image_targets_module`, not by reading it.
+
 **A refresh is asked for as the first call on a freshly opened session**
 (`a_module_listing_can_resynchronise_the_inventory_before_it_lists_it`), which is the ordering
 [#85](https://github.com/glslang/windbg-mcp/issues/85) is about: DbgEng's inventory holds the

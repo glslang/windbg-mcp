@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An image target's memory reads on the first call** (`FOLLOWUPS.md` item 111, in `DONE.md`). A
+  PE opened with `open_dump` and no debuggee answered a virtual read with `0x8007001E` — *the
+  system cannot read from the specified device* — until something made the engine load the module
+  behind it, and `read_memory` was never that something: 16 bytes, 4 KiB and 64 KiB at `.text`, a
+  second identical call, the same read at the image base, and a read taken 25 seconds after the
+  open all failed, on `securekernel.exe` (ARM64) and `ACPI.sys` (x64) alike, while
+  `modules { refresh: true }`, `disassemble`, `xrefs_to` and `reachable_from_dispatch` all made the
+  next read work. What they have in common is a module load, so `worker::load_an_image_targets_module`
+  does one at the open. **Gated on the target kind** — `GetDebuggeeType` answers
+  `DEBUG_CLASS_IMAGE_FILE` / `DEBUG_DUMP_IMAGE_FILE`, measured 3 / 1027 — because
+  `modules { refresh: true }`, which is that `.reload` plus an enumeration, took 2,159 ms on the
+  checked-in x64 kernel dump against 11 ms on the image. A fresh
+  session's first memory call now answers `kernel32!.text`'s own bytes, checked against the file.
+  **The item's second claim is withdrawn**: no walk reported a scan it had not taken. A cold
+  `xrefs_to` is byte-for-byte a warm one on both images, and `driver_hazards` refuses at the PE
+  header rather than scanning — so `xrefs_to`'s *ask this on a dump or a live target* caveat is
+  gone from its description rather than reworded.
+
 - **An A64 conditional-compare chain is a compare chain, and `ioctl_map` reads it** (`FOLLOWUPS.md`
   item 92). A64 has `ccmp`, so a compiler writes `code == A || code == B || code == C` as **one**
   branch fed by several compares; this walk read the instruction before the branch, filed the rest in
@@ -135,11 +153,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [#305](https://github.com/glslang/windbg-mcp/pull/305) and
   [#307](https://github.com/glslang/windbg-mcp/pull/307) took out of it.
 
-  The model-visible tool surface is now **116,520 B** across **75** tools, from 113,516 across 74
+  The model-visible tool surface went **116,520 B** across **75** tools, from 113,516 across 74
   — 2,930 B of it this tool and 74 B `reachable_from_dispatch`'s rewritten `module` argument;
   its ceiling moves 114,000 → 118,000, with the arithmetic and the reason the description is the
-  larger half recorded above `MODEL_VISIBLE_CEILING`. The wire ceiling is untouched at 330,000,
-  with 2,311 B left.
+  larger half recorded above `MODEL_VISIBLE_CEILING`. The wire ceiling is untouched at 330,000.
+  Item 111 below then took 146 B of this tool's description back off again, so the figures this
+  release ships are **116,374 B** and 327,543 on the wire.
 
 - **Live Secure Kernel control is available as an isolated MCP session.** Seven typed tools bind an
   exact disposable VBS VM and selected VTL1 VP, arm one to four guarded hardware breakpoints, wait

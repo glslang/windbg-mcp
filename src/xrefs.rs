@@ -33,21 +33,32 @@
 //!   is the one scanned, because scanning every loaded image is unbounded work.
 //! - **And code that did not decode says nothing**, which is what [`Found::covered`] is for.
 //!
-//! # Not on an image target
-//!
-//! **Ask this on a dump or a live target.** On a PE image opened with no debuggee the answer is
-//! wrong and does not say so: measured on `securekernel.exe` (2026-10-04), the scan reports its
-//! four code sections covered with **no** unreadable range and finds **nothing**, while
-//! `reachable_from_dispatch` proves on the same session that `SkmiInitializePool+0x27` calls
-//! `SkmiInitializePoolDescriptor`. The cause is below this module: `read_memory` on such a target
-//! fails with `0x8007001E` on first use and succeeds once other calls have run, so the walk is
-//! fed bytes it did not read and counts them scanned. It is not this analysis' defect and not this
-//! analysis' to fix — `driver_hazards` reports 1,182 privileged instructions on the same image off
-//! the same path — and it is recorded as `FOLLOWUPS.md` item 111 rather than left for a reader to
-//! discover from an empty list.
-//!
 //! So a site here is evidence that something reaches the address; an empty list is evidence about
 //! this scan, never about the target.
+//!
+//! # On an image target, and a warning this module carried that was wrong
+//!
+//! **A PE opened with no debuggee is an ordinary target for this**, and the four ways above are
+//! still the whole of what an empty list means on one. This said the opposite until 2026-10-04,
+//! and the claim did not survive being re-run. `FOLLOWUPS.md` item 111 (now in `DONE.md`) was
+//! filed saying the scan reported `securekernel.exe`'s code sections covered, with no unreadable
+//! range, and found nothing. Half of that reproduced and half did not: an image target's memory
+//! really would not read — `0x8007001E` on five of six images surveyed, until something made the
+//! engine load the module — but **this scan was never the thing reading it wrong.** A cold
+//! `xrefs_to` is byte-for-byte a warm one, measured on `securekernel.exe` (ARM64, two sites) and
+//! on `ACPI.sys` (x64, 242), because the target address is resolved through the debugger's
+//! expression evaluator before any of this runs and that resolution is itself the module load.
+//! What the original empty answer *was* evidence of is not established — its figures are from an
+//! x64 `securekernel.exe` on another host, which this bench cannot re-derive.
+//!
+//! The read is fixed where it belonged, at the open (`worker::load_an_image_targets_module`), so
+//! nothing here turns on the order a session's calls arrive in. Two things worth keeping from it.
+//! A walk that cannot read a window records it (`Covered::unreadable`) and that is the whole of
+//! the guarantee — `dbgscope`'s `read_memory` is strict, so a short read is an error and an error
+//! is a recorded gap, never a scanned one. And the neighbour that *did* fail closed is
+//! [`crate::hazards`], which refuses at the PE header rather than scanning: a refusal naming the
+//! 64 bytes it could not read at the image base, which is what an analysis owes when the bytes
+//! are not there.
 //!
 //! # Engine-free
 //!
