@@ -8697,5 +8697,6 @@ and 111 opened rather than this staying half-landed: the thing asked for exists 
 what is left is a defect in a layer underneath it.
 
 **The surface cost is 2,930 B** — 1,718 of description, 1,163 of input schema — taking the model-visible
-surface from 113,516 to 116,446 and its ceiling from 114,000 to 118,000, with the arithmetic and the
+surface from 113,516 to 116,520 — 74 B of that `reachable_from_dispatch`'s rewritten `module`
+argument, from the review fix below — and its ceiling from 114,000 to 118,000, with the arithmetic and the
 reason the description is the larger half recorded above `MODEL_VISIBLE_CEILING`.

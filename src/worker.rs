@@ -59,8 +59,8 @@ use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 use crate::batch::{self, BatchOp, Debuggee, Held, Ran, Sealed};
 use crate::device;
 use crate::driver::{
-    fmt_addr, format_recipe, format_report, in_listing_order, listing_runs, parse_lm_base,
-    parse_windbg_addr, path_recipe, qualified_with_framework, reachability, structured_report,
+    fmt_addr, format_recipe, format_report, in_listing_order, listing_runs, parse_windbg_addr,
+    path_recipe, qualified_with_framework, reachability, structured_report,
 };
 use crate::fault;
 use crate::hazards;
@@ -8495,34 +8495,7 @@ fn xrefs_of(
     // first row's address silently win.
     let loaded = e.modules().map_err(failed)?;
     let (name, base, loaded_size) = match module {
-        Some(module) => {
-            let mut matched = loaded
-                .iter()
-                .filter(|candidate| candidate.name.eq_ignore_ascii_case(module));
-            match (matched.next(), matched.next()) {
-                (Some(one), None) => (one.name.clone(), one.base, one.size),
-                (None, _) => {
-                    return Err(Failed::categorised(
-                        structured::ErrorCategory::Debugger,
-                        format!(
-                            "no loaded module is named `{module}`. Names here are the ones \
-                             `modules` lists — the `nt` in `nt!KeBugCheckEx` — and this matches \
-                             one exactly rather than as a pattern."
-                        ),
-                    ));
-                }
-                (Some(_), Some(_)) => {
-                    return Err(Failed::categorised(
-                        structured::ErrorCategory::InvalidArgument,
-                        format!(
-                            "`{module}` matches more than one loaded module, and a scan is about \
-                             one image. Name it exactly; `modules` with a filter lists what is \
-                             loaded."
-                        ),
-                    ));
-                }
-            }
-        }
+        Some(module) => module_named(e, module)?,
         // **The image holding the target, when the caller named none.** That is the answer they
         // almost always want — a routine's callers are overwhelmingly in its own image — and it is
         // a fact this side can read rather than a default this side invents.
@@ -10776,6 +10749,46 @@ fn enumeration_decided_the_answer(
     needed_modules && !verdict_reachable && halted.is_none()
 }
 
+/// The one loaded module with this name, as the typed inventory lists it: its name, base and size.
+///
+/// **Exactly one, matched on the name rather than as a pattern**, which is the rule `lm m` cannot
+/// keep. That command takes a WinDbg pattern, so `Wd*` matches five images on the checked-in x64
+/// dump and `parse_lm_base` takes the **first address token** it finds — so a caller asking about
+/// `Wd*`+`0x0` was answered about `Wdf01000`'s base, labelled with their own pattern and refused
+/// nothing. A wrong answer wearing a right one's clothes, which is how `hazards_of` put it when it
+/// made the same move.
+///
+/// **Shared because the third copy is what the review found.** `hazards_of` and `xrefs_of` each
+/// resolved their scanned image this way and `resolve_code_target` did not, so one call could
+/// enforce the rule for the image it read and break it for the address it was given
+/// ([#446](https://github.com/glslang/windbg-mcp/pull/446)). The wording below is deliberately
+/// about *an address belonging to one image* rather than about a scan, because all three callers
+/// have to be able to say it.
+fn module_named(e: &DebugEngine, module: &str) -> Result<(String, u64, u32), Failed> {
+    let loaded = e.modules().map_err(failed)?;
+    let mut matched = loaded
+        .iter()
+        .filter(|candidate| candidate.name.eq_ignore_ascii_case(module));
+    match (matched.next(), matched.next()) {
+        (Some(one), None) => Ok((one.name.clone(), one.base, one.size)),
+        (None, _) => Err(Failed::categorised(
+            structured::ErrorCategory::Debugger,
+            format!(
+                "no loaded module is named `{module}`. Names here are the ones `modules` lists \
+                 — the `nt` in `nt!KeBugCheckEx` — and this matches one exactly rather than as a \
+                 pattern."
+            ),
+        )),
+        (Some(_), Some(_)) => Err(Failed::categorised(
+            structured::ErrorCategory::InvalidArgument,
+            format!(
+                "`{module}` matches more than one loaded module, and an address belongs to one \
+                 image. Name it exactly; `modules` with a filter lists what is loaded."
+            ),
+        )),
+    }
+}
+
 /// The absolute VA a caller named, from an `address` **or** a `module`+`rva` pair.
 ///
 /// **Shared rather than copied**, which is the only reason it is a function: `reachable` grew it
@@ -10837,26 +10850,11 @@ fn resolve_code_target(
                         format!("could not resolve rva `{r}`"),
                     )
                 })?;
-            // The listing goes through the same door as the evaluation, and for the sharper half
-            // of its reason: a prefix of `lm` can carry enough of an address token to parse as a
-            // base, and a wrong base makes every RVA in the answer wrong with nothing to say so.
-            let lm = e
-                .execute_command_bounded(
-                    &format!("lm m {m}"),
-                    remaining(deadline, "the module's base was read")?,
-                )
-                .map_err(|why| Failed::from(es(why)))
-                .and_then(|run| {
-                    finished(run)
-                        .map_err(|why| cut_short_failure(why, &format!("reading `{m}`'s base")))
-                })?
-                .unwrap_or_default();
-            let base = parse_lm_base(&lm).ok_or_else(|| {
-                Failed::categorised(
-                    structured::ErrorCategory::Debugger,
-                    format!("module `{m}` not found (`lm m {m}` returned):\n{lm}"),
-                )
-            })?;
+            // **The base comes from the module inventory, not from `lm m`**, and a wrong base
+            // makes every RVA in the answer wrong with nothing to say so. It also takes this
+            // path's last command away: there is no text left to parse and no pattern left to
+            // resolve to an arbitrary row.
+            let (_, base, _) = module_named(e, m)?;
             // Arithmetic over the caller's own two numbers, so this one *is* the argument.
             base.checked_add(rva).ok_or_else(|| {
                 Failed::categorised(

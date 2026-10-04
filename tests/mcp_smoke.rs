@@ -2061,11 +2061,14 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// ceiling raise. The 1,373 B is the `mode`, current-instruction and bounded-destination inputs plus
 /// the descriptions that explain their fail-closed use. The ceiling now leaves 1,571 B (1.4%).
 ///
-/// **114,000 -> 118,000 for the reverse call-graph question** (2026-10-04, item 109). One tool
-/// takes the measured surface from 113,516 to 116,446 B, and the whole 2,930 B is `xrefs_to`:
-/// 1,718 B of description, 1,163 B of input schema, and 49 B of the JSON around them. Nothing else
-/// moved, which is what says the figure is the tool rather than a reading taken on a different
-/// build.
+/// **114,000 -> 118,000 for the reverse call-graph question** (2026-10-04, item 109). The
+/// measured surface goes 113,516 -> 116,520 B, and the +3,004 has two terms rather than one.
+/// **2,930 B is `xrefs_to`**: 1,718 B of description, 1,163 B of input schema, and 49 B of the
+/// JSON around them. The other **74 B is `reachable_from_dispatch`'s `module` argument**, rewritten
+/// by the review fix on that PR — it had promised the base was read from `lm m <module>`, which it
+/// no longer is, and the sentence that replaced it says the name must match one module exactly.
+/// Nothing else moved, which is what says these are the two changes rather than a reading taken on
+/// a different build.
 ///
 /// It buys the one question this server could not ask: **who reaches this address**. The forward
 /// walk (`reachable_from_dispatch`, 2,657 B) and the import-slot scan (`driver_hazards`, 1,239 B)
@@ -2083,9 +2086,9 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// than the bytes they cost. A first draft was 3,281 B; the trim took the prose down and kept
 /// those sentences.
 ///
-/// [`WIRE_CEILING`] is **not** raised with it: the payload moved to 327,615 and has 2,385 B left,
+/// [`WIRE_CEILING`] is **not** raised with it: the payload moved to 327,689 and has 2,311 B left,
 /// and a ceiling raised before something needs it absorbs the next regression in silence. The new
-/// model-visible ceiling leaves 1,554 B (1.3%), which is the headroom the last raise left and for
+/// model-visible ceiling leaves 1,480 B (1.3%), which is the headroom the last raise left and for
 /// the same reason.
 const MODEL_VISIBLE_CEILING: usize = 118_000;
 
@@ -5914,6 +5917,112 @@ fn launch_tier() -> bool {
         return false;
     }
     true
+}
+
+/// **A module+RVA target names one image, and a pattern is refused rather than resolved.**
+///
+/// `lm m` takes a WinDbg pattern and `parse_lm_base` took the **first address token** in its
+/// output, so `Wd*`+`0x0` on the x64 sample was answered about `Wdf01000` — the first of five
+/// matches — labelled with the caller's own pattern and refused nothing. Found by review on
+/// [#446](https://github.com/glslang/windbg-mcp/pull/446) against `xrefs_to`, and it had been
+/// `reachable_from_dispatch`' behaviour since that path was written: both now resolve the name
+/// through the typed inventory, so **both** are asserted here rather than the one the finding
+/// happened to name.
+///
+/// The pattern is derived from this target's own module list rather than written down, because
+/// which names collide is per dump: `Wd*` matches five on the x64 sample and nothing says the
+/// ARM64 one has it.
+#[test]
+fn a_module_rva_target_refuses_a_pattern_matching_several_images() {
+    let Some(dump) = target_tier() else {
+        return;
+    };
+    let mut server = Server::started();
+    let session = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
+
+    let listed = server.tool_data(
+        "modules",
+        json!({ "session_id": session, "limit": 400 }),
+        TARGET_STEP,
+    );
+    let names: Vec<String> = listed["modules"]
+        .as_array()
+        .expect("a module list")
+        .iter()
+        .filter_map(|m| m["name"].as_str().map(str::to_ascii_lowercase))
+        .collect();
+
+    // The shortest prefix two of them share, so the pattern is this target's rather than a
+    // fixture's. Two characters, because one would match most of a kernel's module list and
+    // nothing is learned from a wider net.
+    let mut prefix = None;
+    for candidate in &names {
+        if candidate.len() < 2 {
+            continue;
+        }
+        let head = &candidate[..2];
+        if names.iter().filter(|n| n.starts_with(head)).count() >= 2 {
+            prefix = Some(head.to_string());
+            break;
+        }
+    }
+    let Some(prefix) = prefix else {
+        skip("no two loaded modules share a two-character prefix on this target");
+        return;
+    };
+    let pattern = format!("{prefix}*");
+    eprintln!(
+        "RAN: `{pattern}` matches {} of {} loaded modules",
+        names.iter().filter(|n| n.starts_with(&prefix)).count(),
+        names.len(),
+    );
+
+    for tool in ["xrefs_to", "reachable_from_dispatch"] {
+        let args = match tool {
+            "xrefs_to" => json!({
+                "session_id": session,
+                "target_module": pattern,
+                "rva": "0x0",
+                "module": "nt",
+            }),
+            _ => json!({
+                "session_id": session,
+                "from": "nt!KeBugCheckEx",
+                "module": pattern,
+                "rva": "0x0",
+            }),
+        };
+        let refused = server.call_tool(tool, args, TARGET_STEP);
+        assert!(
+            is_tool_error(&refused),
+            "`{tool}` must refuse a pattern rather than answer about the first match: {refused}"
+        );
+        let text = text_of(&refused["result"]);
+        // **Refused as a name that does not exist, not as an ambiguous one**, because the
+        // inventory is matched exactly: `kd*` is zero modules rather than two. The "more than
+        // one" branch wants two images carrying the *same* name, which is a crafted target rather
+        // than anything the checked-in dumps have. What matters to a caller is that the pattern is
+        // turned away and told why instead of silently becoming the first row.
+        assert!(
+            text.contains("exactly rather than as a pattern"),
+            "`{tool}`'s refusal must say a name is matched exactly, got:\n{text}"
+        );
+        assert!(
+            text.contains(&pattern),
+            "`{tool}`'s refusal must name what it refused, got:\n{text}"
+        );
+    }
+
+    // And the exact name still resolves, so the rule refuses a pattern rather than the argument.
+    let exact = server.tool_data(
+        "xrefs_to",
+        json!({ "session_id": session, "target_module": "nt", "rva": "0x0", "module": "nt" }),
+        TARGET_STEP,
+    );
+    assert_eq!(
+        exact["target"]["module"], "nt",
+        "an exact name is still a target: {exact:#}"
+    );
 }
 
 /// **A reference scan is a round trip, and that is the only way to test one.**

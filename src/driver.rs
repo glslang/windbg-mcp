@@ -337,14 +337,6 @@ pub(crate) fn listing_runs(addresses: &[u64]) -> Vec<(u64, usize)> {
     runs
 }
 
-/// The first address token in `lm m <module>` output is the module's live start
-/// (its base). Header lines ("Browse full module list", the "start end module"
-/// legend) have no leading address and are skipped by the >= 8 hex-digit rule.
-pub(crate) fn parse_lm_base(text: &str) -> Option<u64> {
-    text.lines()
-        .find_map(|l| l.split_whitespace().next().and_then(parse_windbg_addr))
-}
-
 // ---- Directional path recipe (which input keeps control on the path) ------
 //
 // A REACHABLE verdict proves a static path exists, but not *which way* each on-path
@@ -1732,17 +1724,6 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), v.clone()))
             .collect()
-    }
-
-    #[test]
-    fn parse_lm_base_reads_module_start() {
-        let text = "\
-Browse full module list
-start             end                 module name
-fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
-";
-        assert_eq!(parse_lm_base(text), Some(0xfffff803_3e250000));
-        assert_eq!(parse_lm_base("Unable to enumerate modules\n"), None);
     }
 
     /// A walk that is asked to stop, stops — and says so instead of reporting a clean sweep.
