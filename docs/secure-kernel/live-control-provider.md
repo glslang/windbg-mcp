@@ -61,8 +61,9 @@ target, an unsupported register, and any compare guard which no longer matches.
 Every successful transition must issue a token that has never appeared earlier in that provider
 session; returning to an older non-adjacent token is a protocol fault, not a valid rotation.
 These provider-local epochs remain inside the worker. The multi-VP controller issues a separate,
-monotonic session epoch for each public running or stopped transition, so equal epoch strings from
-two provider processes can never authorize a replay against a different winning VP.
+monotonic session epoch for each public running or stopped transition. Each controller instance
+also carries a 256-bit nonce from the Windows system RNG, so equal epoch strings from two provider
+processes or two concurrent MCP sessions cannot authorize a replay against another VP or VM.
 
 The first revision has seven capabilities:
 

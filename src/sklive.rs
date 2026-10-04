@@ -764,6 +764,7 @@ struct VpControl<P> {
 pub(crate) struct LiveControl<P> {
     providers: Vec<VpControl<P>>,
     active_provider: Option<usize>,
+    epoch_nonce: String,
     epoch_serial: u64,
     public_epoch: StopEpoch,
     state: State,
@@ -787,6 +788,8 @@ impl<P: ControlProvider> LiveControl<P> {
         if providers.len() > MAX_LIVE_CONTROL_VPS {
             bail!("live control accepts at most {MAX_LIVE_CONTROL_VPS} VP providers");
         }
+        let epoch_nonce = crate::client::generate_token()
+            .context("generating the live-control session epoch nonce")?;
         let mut controls = Vec::with_capacity(providers.len());
         for mut provider in providers.drain(..) {
             provider.target().validate()?;
@@ -818,8 +821,11 @@ impl<P: ControlProvider> LiveControl<P> {
         Ok(Self {
             providers: controls,
             active_provider: None,
+            epoch_nonce: epoch_nonce.clone(),
             epoch_serial: 0,
-            public_epoch: StopEpoch::new("control-running-0000000000000000")?,
+            public_epoch: StopEpoch::new(format!(
+                "control-{epoch_nonce}-running-0000000000000000"
+            ))?,
             state: State::Running,
             breakpoints: Vec::new(),
             arm_mode: None,
@@ -1551,7 +1557,10 @@ impl<P: ControlProvider> LiveControl<P> {
             .context("the live-control epoch counter overflowed")?;
         Ok((
             serial,
-            StopEpoch::new(format!("control-{phase}-{serial:016x}"))?,
+            StopEpoch::new(format!(
+                "control-{}-{phase}-{serial:016x}",
+                self.epoch_nonce
+            ))?,
         ))
     }
 
@@ -2365,6 +2374,32 @@ mod tests {
         assert_eq!(control.stopped().unwrap().epoch, second.epoch);
         control
             .continue_from(&mut dispatcher, &second.epoch)
+            .unwrap();
+    }
+
+    #[test]
+    fn controller_epochs_are_unique_across_concurrent_live_sessions() {
+        let mut first_dispatcher = FakeDispatcher::new([observed(StopReason::DebugException)]);
+        let mut second_dispatcher = FakeDispatcher::new([observed(StopReason::DebugException)]);
+        let mut first = LiveControl::open(FakeProvider::new()).unwrap();
+        let mut second = LiveControl::open(FakeProvider::new()).unwrap();
+
+        first
+            .arm(&mut first_dispatcher, breakpoints(), ArmMode::Redirect)
+            .unwrap();
+        second
+            .arm(&mut second_dispatcher, breakpoints(), ArmMode::Redirect)
+            .unwrap();
+        let first_stop = first.wait_for_stop(&mut first_dispatcher).unwrap();
+        let second_stop = second.wait_for_stop(&mut second_dispatcher).unwrap();
+
+        assert_ne!(first.epoch_nonce, second.epoch_nonce);
+        assert_ne!(first_stop.epoch, second_stop.epoch);
+        first
+            .continue_from(&mut first_dispatcher, &first_stop.epoch)
+            .unwrap();
+        second
+            .continue_from(&mut second_dispatcher, &second_stop.epoch)
             .unwrap();
     }
 
