@@ -2494,12 +2494,14 @@ fn update(
             // `add x22,x8,#0x4E8`, four instructions after one of its jump tables). Raised on
             // review of windbg-mcp#347.
             //
-            // **At the pointer's width, because a truncated base is not the base.** `add w8,w8,#K`
-            // writes four bytes of a 64-bit address and zeroes the rest, so a table read there is
-            // read at an address execution never formed -- the question [`Value::carried_by`]
-            // asks of a copy, asked here of arithmetic. The *destination's* width answers it for
-            // both shapes: A64 takes both registers of an `add` from one `wide` bit, and x86's
-            // two-operand form has the source and the destination as the same register.
+            // **And the offset has to land in a register wide enough to hold the address.**
+            // `add w8,w8,#K` writes four bytes of a 64-bit base and zeroes the rest, so what the
+            // register holds afterwards is not the address -- while this, computing at the
+            // pointer's width, would carry the whole of it and have a table read at an address
+            // execution never formed. The question [`Value::carried_by`] asks of a copy, asked
+            // here of arithmetic. The *destination's* width answers it for both shapes: A64 takes
+            // both registers of an `add` from one `wide` bit, and x86's two-operand form has the
+            // source and the destination as the same register.
             (Some(Value::Address(base)), Some(immediate)) if written.width >= layout.pointer => {
                 // Wrapped in the width the address has, by the same rule the dispatch arithmetic
                 // steps an offset with: a 32-bit target computes a base modulo 2^32, and carrying
