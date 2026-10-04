@@ -5919,6 +5919,117 @@ fn launch_tier() -> bool {
     true
 }
 
+/// **An RVA is an offset into the image it names, and one past the end is refused.**
+///
+/// Not a theoretical bound. On the checked-in x64 dump `nt` is `0x1450000` bytes and `hal` sits at
+/// `nt`+`0x1800000`, so `target_module: "nt", rva: "0x1800000"` satisfied every other check,
+/// resolved to `hal`'s base, and had `xrefs_to` scan **`hal`** — reporting which image it read in
+/// a field beside the answer rather than refusing the coordinate. An RVA landing in a gap instead
+/// came back as "no loaded module holds 0x…", blaming the absence of a module for a bad offset.
+/// Both are the same missing bound (review on
+/// [#446](https://github.com/glslang/windbg-mcp/pull/446)), and `guarded_address` had been
+/// applying it to an `ImageCoordinate` all along.
+///
+/// The offending RVA is computed from this target's own module list, because which image follows
+/// `nt` and how far away it sits is per dump.
+#[test]
+fn a_module_rva_target_refuses_an_rva_outside_the_named_image() {
+    let Some(dump) = target_tier() else {
+        return;
+    };
+    let mut server = Server::started();
+    let session = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
+
+    let listed = server.tool_data(
+        "modules",
+        json!({ "session_id": session, "limit": 400 }),
+        TARGET_STEP,
+    );
+    let rows = listed["modules"].as_array().expect("a module list");
+    let read = |row: &serde_json::Value, field: &str| -> Option<u64> {
+        let text = row[field].as_str()?;
+        u64::from_str_radix(text.trim_start_matches("0x"), 16).ok()
+    };
+    let Some(nt) = rows.iter().find(|r| {
+        r["name"]
+            .as_str()
+            .is_some_and(|n| n.eq_ignore_ascii_case("nt"))
+    }) else {
+        skip("no `nt` in this target's module list");
+        return;
+    };
+    let (Some(start), Some(size)) = (read(nt, "start"), nt["size"].as_u64()) else {
+        skip("`nt`'s row carries no start or size on this target");
+        return;
+    };
+
+    // The nearest image loaded above `nt`'s end, so the offending RVA lands *inside* another
+    // module rather than in a gap — the quiet half of the defect rather than the loud one.
+    let beyond = rows
+        .iter()
+        .filter_map(|r| read(r, "start").map(|s| (s, r)))
+        .filter(|(s, _)| *s > start + size)
+        .min_by_key(|(s, _)| *s);
+    let Some((victim_start, victim)) = beyond else {
+        skip("nothing is loaded above `nt` on this target");
+        return;
+    };
+    let rva = victim_start - start;
+    eprintln!(
+        "RAN: nt is {size:#x} bytes; nt+{rva:#x} is {}'s base",
+        victim["name"].as_str().unwrap_or("?"),
+    );
+    assert!(rva >= size, "the construction needs an out-of-range rva");
+
+    for tool in ["xrefs_to", "reachable_from_dispatch"] {
+        let args = match tool {
+            "xrefs_to" => json!({
+                "session_id": session,
+                "target_module": "nt",
+                "rva": format!("{rva:#x}"),
+            }),
+            _ => json!({
+                "session_id": session,
+                "from": "nt!KeBugCheckEx",
+                "module": "nt",
+                "rva": format!("{rva:#x}"),
+            }),
+        };
+        let refused = server.call_tool(tool, args, TARGET_STEP);
+        assert!(
+            is_tool_error(&refused),
+            "`{tool}` must refuse an rva outside the image it names rather than answer about \
+             whatever holds the sum: {refused}"
+        );
+        let text = text_of(&refused["result"]);
+        assert!(
+            text.contains("outside `nt`"),
+            "`{tool}`'s refusal must name the image the offset was into, got:\n{text}"
+        );
+        assert_eq!(
+            refused["result"]["structuredContent"]["error"]["category"], "invalid_argument",
+            "the caller's argument is what is wrong: {refused}"
+        );
+    }
+
+    // The last byte of the image is still inside it, so the bound refuses what is out and nothing
+    // that is in.
+    let edge = server.tool_data(
+        "xrefs_to",
+        json!({
+            "session_id": session,
+            "target_module": "nt",
+            "rva": format!("{:#x}", size - 1),
+            "module": "nt",
+        }),
+        TARGET_STEP,
+    );
+    assert_eq!(
+        edge["target"]["module"], "nt",
+        "the last byte of `nt` is in `nt`: {edge:#}"
+    );
+}
+
 /// **A module+RVA target names one image, and a pattern is refused rather than resolved.**
 ///
 /// `lm m` takes a WinDbg pattern and `parse_lm_base` took the **first address token** in its
