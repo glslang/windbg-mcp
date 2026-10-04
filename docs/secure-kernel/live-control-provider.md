@@ -31,8 +31,8 @@ flowchart LR
 The provider process starts with an exact target fixed by operator configuration. It prints:
 
 ```text
-windbg-mcp-sk-control/1
-{"protocol":1,"target":{...},"epoch":"running-..."}
+windbg-mcp-sk-control/2
+{"protocol":2,"target":{...},"epoch":"running-..."}
 ```
 
 Each provider target contains the VM GUID, hypervisor partition ID, VP, VTL, and expected CR3.
@@ -80,8 +80,12 @@ The readable bank is `rip`, `rsp`, `rflags`, `cr3`, `cs`, `dr0` through `dr3`, `
 `vsm_vp_status`. `cr3`, `cs`, and `vsm_vp_status` are read-only. A held event records message type,
 vector, VP, VTL, CPL, dispatcher context, advance flag, and an unclassified debug-exception reason.
 The worker reads DR6 only after publication and reports the validated hardware slot or single-step
-cause in the MCP stop record. Revision 1 accepts only mapped exception type `0x01000002`, vector 1,
+cause in the MCP stop record. Revision 2 accepts only mapped exception type `0x01000002`, vector 1,
 a selected VP at VTL1 CPL0, a nonzero dispatcher context, and native advance clear.
+
+Revision 2 changes the `publish_stop` event reason from the already-classified v1 hardware or step
+cause to `debug_exception`. This is an intentional incompatible revision: a v1 provider is refused
+at its ready banner instead of receiving a value outside its declared event schema.
 
 ## Probe
 
@@ -156,7 +160,8 @@ adapter pauses the whole disposable VM while it changes their state:
 1. `open_sk_live_control` binds the exact VM, partition, primary VP, CR3, `vmwp` PID, dispatcher
    pointer, profile and provider commands. `additional_vps` adds VP numbers; in that form
    `control_transport` contains a `{vp}` placeholder used to start one identity-bound child per VP.
-   Opening does not pause the VM or install a breakpoint.
+   A session accepts at most 16 providers in total. Opening does not pause the VM or install a
+   breakpoint.
 2. `sk_live_arm` re-reads each exact instruction, saves every selected VP's writable baseline and
    installs one to four explicitly slotted execution breakpoints. Redirect mode requires one VP
    and one breakpoint. Natural mode arms the full VP and breakpoint set.

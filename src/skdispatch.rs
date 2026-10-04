@@ -49,6 +49,12 @@ pub(crate) struct Session {
 
 impl Session {
     pub(crate) fn open(request: &OpenRequest) -> Result<(Self, Vec<String>)> {
+        if request.additional_vps.len() >= crate::sklive::MAX_LIVE_CONTROL_VPS {
+            bail!(
+                "live control accepts at most {} VP providers",
+                crate::sklive::MAX_LIVE_CONTROL_VPS
+            );
+        }
         request.target.validate()?;
         let profile = DispatcherProfile::load(&request.profile)?;
         let dispatcher = VmwpDispatcherState::new(
@@ -843,7 +849,11 @@ impl EventDispatcher for VmwpDispatcher<'_> {
         targets: &[TargetIdentity],
         instructions: &[InstructionGuard],
     ) -> Result<ObservedStop> {
-        if self.state.targets != targets {
+        if targets.is_empty()
+            || targets
+                .iter()
+                .any(|target| !self.state.targets.contains(target))
+        {
             bail!("the stop request does not match the dispatcher target");
         }
         let primary = targets.first().context("no live-control VP targets")?;

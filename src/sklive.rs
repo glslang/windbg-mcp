@@ -30,6 +30,7 @@ const DR6_CAUSE_MASK: u64 = 0xe00f;
 const DR7_ENABLE_MASK: u64 = 0xff;
 const MAX_INSTRUCTION_BYTES: usize = 15;
 const MAX_HARDWARE_BREAKPOINTS: usize = 4;
+pub(crate) const MAX_LIVE_CONTROL_VPS: usize = 16;
 const MAX_STEP_DESTINATIONS: usize = 4;
 const PROFILE_SCHEMA: &str = "windbg-mcp.sk-live-dispatcher-profile.v1";
 const MAX_PROFILE_BYTES: u64 = 64 * 1024;
@@ -770,6 +771,9 @@ impl<P: ControlProvider> LiveControl<P> {
         if providers.is_empty() {
             bail!("live control requires at least one VP provider");
         }
+        if providers.len() > MAX_LIVE_CONTROL_VPS {
+            bail!("live control accepts at most {MAX_LIVE_CONTROL_VPS} VP providers");
+        }
         let mut controls = Vec::with_capacity(providers.len());
         for mut provider in providers.drain(..) {
             provider.target().validate()?;
@@ -978,7 +982,19 @@ impl<P: ControlProvider> LiveControl<P> {
                 .collect::<Vec<_>>(),
             ExpectedStop::SingleStep { instruction, .. } => vec![instruction.clone()],
         };
-        let targets = self.targets();
+        let targets = match &expected_stop {
+            ExpectedStop::Hardware => self.targets(),
+            ExpectedStop::SingleStep { .. } => {
+                let Some(active) = self.active_provider else {
+                    return Err(self.enter_fault(
+                        dispatcher,
+                        anyhow!("a single-step wait has no active VP provider"),
+                        None,
+                    ));
+                };
+                vec![self.providers[active].target.clone()]
+            }
+        };
         let observed = match dispatcher.wait_for_stop(&targets, &expected_instructions) {
             Ok(observed) => observed,
             Err(error) => return Err(self.enter_fault(dispatcher, error, None)),
@@ -1896,6 +1912,7 @@ mod tests {
     struct FakeDispatcher {
         stops: VecDeque<ObservedStop>,
         actions: Vec<Action>,
+        wait_targets: Vec<Vec<u32>>,
         fail_release: bool,
         fail_begin: Option<&'static str>,
         fail_wait: Option<&'static str>,
@@ -1908,6 +1925,7 @@ mod tests {
             Self {
                 stops: stops.into_iter().collect(),
                 actions: Vec::new(),
+                wait_targets: Vec::new(),
                 fail_release: false,
                 fail_begin: None,
                 fail_wait: None,
@@ -1942,10 +1960,12 @@ mod tests {
 
         fn wait_for_stop(
             &mut self,
-            _targets: &[TargetIdentity],
+            targets: &[TargetIdentity],
             _instructions: &[InstructionGuard],
         ) -> Result<ObservedStop> {
             self.actions.push(Action::Wait);
+            self.wait_targets
+                .push(targets.iter().map(|target| target.vp).collect());
             if let Some(reason) = self.fail_wait {
                 bail!("{reason}");
             }
@@ -2222,12 +2242,20 @@ mod tests {
 
     #[test]
     fn natural_flow_accepts_the_first_selected_vp_and_disarms_the_rest() {
-        let mut vp1_event = event(StopReason::DebugException);
-        vp1_event.vp = 1;
-        let mut dispatcher = FakeDispatcher::new([ObservedStop {
-            event: vp1_event,
-            instructions: vec![instruction()],
-        }]);
+        let mut vp1_hardware = event(StopReason::DebugException);
+        vp1_hardware.vp = 1;
+        let mut vp1_step = event(StopReason::DebugException);
+        vp1_step.vp = 1;
+        let mut dispatcher = FakeDispatcher::new([
+            ObservedStop {
+                event: vp1_hardware,
+                instructions: vec![instruction()],
+            },
+            ObservedStop {
+                event: vp1_step,
+                instructions: vec![instruction()],
+            },
+        ]);
         let mut control =
             LiveControl::open_many(vec![FakeProvider::new(), FakeProvider::new().with_vp(1)])
                 .unwrap();
@@ -2245,7 +2273,12 @@ mod tests {
             register_values(BASE_RIP, 0xffff_0ff0, 0x400, 0x46)
         );
         control
-            .continue_from(&mut dispatcher, &stopped.epoch)
+            .step(&mut dispatcher, &stopped.epoch, straight_step())
+            .unwrap();
+        let stepped = control.wait_for_stop(&mut dispatcher).unwrap();
+        assert_eq!(dispatcher.wait_targets, vec![vec![0, 1], vec![1]]);
+        control
+            .continue_from(&mut dispatcher, &stepped.epoch)
             .unwrap();
         assert!(control.providers.iter().all(|provider| {
             provider.baseline.is_none() && provider.provider.phase == FakePhase::Running
@@ -2265,6 +2298,15 @@ mod tests {
             .err()
             .unwrap();
         assert!(mismatch.to_string().contains("one VM"), "{mismatch:#}");
+
+        let too_many = (0..=MAX_LIVE_CONTROL_VPS)
+            .map(|vp| FakeProvider::new().with_vp(vp as u32))
+            .collect();
+        let excessive = LiveControl::open_many(too_many).err().unwrap();
+        assert!(
+            excessive.to_string().contains("at most 16"),
+            "{excessive:#}"
+        );
     }
 
     #[test]

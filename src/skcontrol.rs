@@ -25,9 +25,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 pub(crate) const CONTROL_PROBE_FLAG: &str = "--sk-control-probe";
-pub(crate) const READY_LINE: &str = "windbg-mcp-sk-control/1";
+pub(crate) const READY_LINE: &str = "windbg-mcp-sk-control/2";
 
-const PROTOCOL_VERSION: u32 = 1;
+const PROTOCOL_VERSION: u32 = 2;
 const MAX_BANNER_LINES: usize = 64;
 const MAX_LINE_BYTES: u64 = 64 * 1024;
 const MAX_REGISTERS: usize = 32;
@@ -429,7 +429,11 @@ impl<R: BufRead, W: Write> ControlSession<R, W> {
         let mut skipped = Vec::new();
         for _ in 0..MAX_BANNER_LINES {
             let line = read_line(&mut reader)?;
-            if line.trim() == READY_LINE {
+            let ready = line.trim();
+            if ready.starts_with("windbg-mcp-sk-control/") && ready != READY_LINE {
+                bail!("provider ready line is {ready:?}, expected {READY_LINE:?}");
+            }
+            if ready == READY_LINE {
                 let hello_line = read_line(&mut reader).context("provider omitted its hello")?;
                 let hello: Hello = serde_json::from_str(&hello_line)
                     .with_context(|| format!("invalid provider hello: {hello_line:?}"))?;
@@ -1174,7 +1178,7 @@ mod tests {
             cpl: 0,
             dispatcher_context: HexU64(0x236_c8b4_53d0),
             advance_instruction_pointer: false,
-            reason: StopReason::HardwareBreakpoint { slot: 0 },
+            reason: StopReason::DebugException,
         }
     }
 
@@ -1543,6 +1547,21 @@ mod tests {
         .err()
         .unwrap();
         assert!(format!("{error}").contains("requested by the operator"));
+    }
+
+    #[test]
+    fn the_raw_debug_exception_schema_requires_protocol_two() {
+        let old_ready = "windbg-mcp-sk-control/1";
+        let error = ControlSession::open(
+            Cursor::new(format!("{old_ready}\n").into_bytes()),
+            Vec::new(),
+            target(),
+        )
+        .err()
+        .unwrap();
+
+        assert_ne!(old_ready, READY_LINE);
+        assert!(format!("{error:#}").contains(READY_LINE));
     }
 
     #[test]

@@ -347,7 +347,7 @@ None of these is a bug. They are recorded because they were invisible, and
    | `exec` | 10 | 15,137 | 13.3% |
    | `session` | 10 | 14,013 | 12.3% |
    | `inspect` | 10 | 13,442 | 11.8% |
-   | `securekernel` | 11 | 15,682 | 13.8% |
+   | `securekernel` | 11 | 15,695 | 13.8% |
    | `ioctl` | 10 | 13,037 | 11.5% |
    | `batch` | 1 | 10,842 | 9.5% |
    | `crash` | 3 | 7,514 | 6.6% |
@@ -355,7 +355,7 @@ None of these is a bug. They are recorded because they were invisible, and
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 74 | 113,625 |
+   | *(absent)* | 74 | 113,638 |
    | `session,inspect,exec,crash` | 33 | 49,185 |
    | `session,inspect,crash` | 23 | 33,895 |
    | `crash` | 13 | 20,361 |
