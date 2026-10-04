@@ -14,7 +14,8 @@ full, every time, and length here is paid for by every other instruction competi
 
 ## What this is
 
-**Unresolved remote kernel workers intentionally survive automatic cleanup and supervisor loss.**
+**Unresolved remote kernel and live Secure Kernel workers intentionally survive automatic cleanup
+and supervisor loss.**
 Never bulk-kill them to unlock a development executable. Use the exact session/PID recovery handoff
 while its supervisor still owns it, or inspect orphan ownership and target health out of band.
 Worker termination does not resume/detach a target; see `docs/sessions.md`.
@@ -42,7 +43,7 @@ worker supervision, routing), `src/worker.rs` (the child process and the engine 
 Practical consequences when debugging this server: a stack trace or log line can come from either
 role (both write to the supervisor's stderr, told apart by `tracing` target — `windbg_mcp::worker`
 against `windbg_mcp::engine` and friends). Request-channel EOF initiates cleanup, except for
-unresolved remote kernel controllers, which remain for operator recovery.
+unresolved remote kernel and live Secure Kernel controllers, which remain for operator recovery.
 
 The same records are also readable **through the tool surface**: `server_log` serves a bounded ring
 of them (`src/logbridge.rs`), with a worker's tagged by session, which is the only way to see them

@@ -16,10 +16,10 @@ and S2).
 worker holds the file rather than a debuggee, and the debugger tools are refused on it because the
 engine beside it has at most `securekernel.exe` open for symbols —
 [`docs/sessions.md`](../sessions.md#secure-kernel-captures) is the caller's half. What that reaches
-is a **capture**. No released MCP tool here drives a live guest: a session reads a file, and a file
-does not execute.
+is a **capture**: its session reads a file, and a file does not execute. The separate live-control
+session below drives a running guest through operator-supplied providers.
 
-**A live source does exist since gate S5w, as a command-line role rather than a tool.**
+**A live decode source exists since gate S5w, as a command-line role rather than a tool.**
 `src/livesrc.rs` implements the same [`sk::RawSource`] seam over a transport the **operator**
 supplies — a child process speaking a line protocol on its stdio — and
 `windbg-mcp --sk-live --transport "<command>" --image <path>` runs gate S1's whole decode through
@@ -35,8 +35,9 @@ travel on every request; reads and compare-and-write register updates are refuse
 and the debugger-owned process publishes the exact held dispatcher event without giving the
 provider a VID receive loop. `--sk-control-probe` validates the non-mutating handshake. The contract
 and its state machine are documented in
-[`live-control-provider.md`](live-control-provider.md). The live-control worker and MCP tools now
-expose the documented live-control session.
+[`live-control-provider.md`](live-control-provider.md). Seven MCP tools open and drive that
+dedicated worker session: `open_sk_live_control`, `sk_live_arm`, `sk_live_wait`,
+`sk_live_registers`, `sk_live_read_memory`, `sk_live_step` and `sk_live_continue`.
 
 ## The answer so far
 

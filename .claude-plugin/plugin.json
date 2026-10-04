@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "windbg-mcp",
   "displayName": "WinDbg MCP",
-  "description": "WinDbg/DbgEng debugging: crash dumps, live user-mode and kernel, Time Travel Debugging (TTD), and a Hyper-V checkpoint's Secure Kernel (VTL1) — MCP server plus skills that drive it: WinDbg debugging and MSRC patch comparison.",
+  "description": "WinDbg/DbgEng debugging: crash dumps, live user-mode and kernel, Time Travel Debugging (TTD), and Secure Kernel (VTL1) capture inspection and disposable live control — MCP server plus skills that drive it: WinDbg debugging and MSRC patch comparison.",
   "version": "0.21.0",
   "author": { "name": "glslang", "email": "glslang@gmail.com" },
   "homepage": "https://github.com/glslang/windbg-mcp",

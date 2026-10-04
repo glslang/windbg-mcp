@@ -96,6 +96,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Live Secure Kernel control is available as an isolated MCP session.** Seven typed tools bind an
+  exact disposable VBS VM and selected VTL1 VP, arm one to four guarded hardware breakpoints, wait
+  for the owned vector-1 event, inspect stopped registers and memory, step with bounded decoded
+  destinations, restore the baseline and continue. The worker owns the operator-supplied register
+  and memory providers plus the exact-build `vmwp` adapter; ordinary debugger tools are refused on
+  the session, and uncertain teardown retains the worker and target reservation for recovery.
+
 - **The immutable minimum Windows/VBS boot inputs pass (`FOLLOWUPS.md` item
   110, K1.0).** Private flattened bases from the VBS and VBS-off sources each
   cold-boot three times through disposable differencing children with one VP,

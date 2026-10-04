@@ -1,6 +1,6 @@
 {
   "name": "windbg-mcp",
-  "description": "WinDbg/DbgEng debugging tools for Claude Code: an MCP server plus a skill that drives crash-dump, live, Time Travel Debugging and Secure Kernel (VTL1) checkpoint workflows.",
+  "description": "WinDbg/DbgEng debugging tools for Claude Code: an MCP server plus a skill that drives crash-dump, live, Time Travel Debugging and Secure Kernel (VTL1) capture and control workflows.",
   "owner": { "name": "glslang", "email": "glslang@gmail.com" },
   "plugins": [
     {
