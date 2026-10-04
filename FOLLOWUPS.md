@@ -2343,6 +2343,9 @@ monotonic epoch prefixed by a per-session 256-bit system-RNG nonce, preventing b
 and cross-session replay. The dispatcher re-establishes a whole-VM pause barrier before the
 controller touches losing VPs. Step completion retains that pause until the next bounded wait
 resumes the VM; final continue resumes it explicitly after handled detach.
+Pause ownership and proved quiescence are tracked separately. A failed or timed-out pause may still
+owe an idempotent resume, but fault recovery skips every provider register transition and contains
+the native event unless `Suspend-VM` completed successfully.
 The catalog bound is also enforced during directory iteration across every entry, including
 non-JSON files, so selection never first materializes an unbounded directory.
 The fan-out path still needs a live multi-provider acceptance run; its predecessor's live proof is

@@ -443,7 +443,10 @@ pub(crate) struct VmwpDispatcherState {
     phase: DispatcherPhase,
     attached: bool,
     threads_frozen: bool,
+    /// A pause may have taken effect, so an idempotent resume is owed during safe cleanup.
     vm_paused: bool,
+    /// Suspend-VM completed successfully and provider register access cannot race guest execution.
+    provider_writes_quiesced: bool,
     completion_kick: Option<VmTransition>,
     unregister: Option<UnregisterProgress>,
 }
@@ -480,6 +483,7 @@ impl VmwpDispatcherState {
             attached: false,
             threads_frozen: false,
             vm_paused: false,
+            provider_writes_quiesced: false,
             completion_kick: None,
             unregister: None,
         })
@@ -511,6 +515,7 @@ impl VmwpDispatcherState {
         // Claim this before Suspend-VM: a helper timeout or failed final verification cannot tell
         // whether the VM changed state, so recovery must conservatively issue Resume-VM.
         self.vm_paused = true;
+        self.provider_writes_quiesced = false;
         Ok(())
     }
 
@@ -520,7 +525,22 @@ impl VmwpDispatcherState {
         }
         // Claim this before Suspend-VM for the same conservative recovery reason as initial arm.
         self.vm_paused = true;
+        self.provider_writes_quiesced = false;
         Ok(())
+    }
+
+    fn confirm_vm_pause(&mut self) -> Result<()> {
+        if !self.vm_paused {
+            bail!("cannot confirm a VM pause the dispatcher does not own");
+        }
+        self.provider_writes_quiesced = true;
+        Ok(())
+    }
+
+    fn begin_vm_resume(&mut self) {
+        // Once a resume is possible, provider register access is forbidden until a later
+        // Suspend-VM has completed successfully.
+        self.provider_writes_quiesced = false;
     }
 
     fn refuse_unsafe_recovery(&mut self) -> Result<()> {
@@ -559,6 +579,7 @@ impl VmwpDispatcherState {
             // the VM. If the helper fails, the only safe retained state is that a pause may have
             // succeeded. Recovery and teardown will issue an idempotent resume before release.
             self.vm_paused = true;
+            self.provider_writes_quiesced = false;
             return Err(error.context(
                 "the Hyper-V transition failed, so the VM is conservatively retained as paused",
             ));
@@ -828,6 +849,7 @@ impl EventDispatcher for VmwpDispatcher<'_> {
         match self.state.phase.arm_preparation()? {
             ArmPreparation::OpenAndRegister => self.open_and_register(targets, breakpoints)?,
             ArmPreparation::VerifyAttached => {
+                self.pause_for_provider_writes(targets)?;
                 self.verify_breakpoints(breakpoints)?;
             }
             ArmPreparation::Reattach => self.reattach_registered_handler(targets, breakpoints)?,
@@ -847,6 +869,10 @@ impl EventDispatcher for VmwpDispatcher<'_> {
             bail!("finish_arm requires a debugger-stopped, armed dispatcher");
         }
         Ok(())
+    }
+
+    fn provider_writes_quiesced(&self) -> bool {
+        self.state.provider_writes_quiesced
     }
 
     fn verify_instruction(&mut self, instruction: &InstructionGuard) -> Result<()> {
@@ -880,6 +906,7 @@ impl EventDispatcher for VmwpDispatcher<'_> {
             // A completed step can leave the delayed native-completion kick pending while the VM
             // remains paused. Cancel that delay and begin the resume needed for this exact wait.
             self.state.finish_completion_kick()?;
+            self.state.begin_vm_resume();
             self.state.completion_kick = Some(VmTransition::immediate(
                 primary.vm_id.clone(),
                 VmAction::Resume,
@@ -1008,6 +1035,7 @@ impl EventDispatcher for VmwpDispatcher<'_> {
         }
         self.state.finish_completion_kick()?;
         if self.state.vm_paused {
+            self.state.begin_vm_resume();
             run_vm_action(self.bound_vm_id()?, VmAction::Resume, POWERSHELL_WAIT)?;
             self.state.vm_paused = false;
         }
@@ -1065,6 +1093,7 @@ impl EventDispatcher for VmwpDispatcher<'_> {
 impl VmwpDispatcher<'_> {
     fn finish_teardown(&mut self) -> Result<()> {
         if self.state.vm_paused {
+            self.state.begin_vm_resume();
             run_vm_action(self.bound_vm_id()?, VmAction::Resume, POWERSHELL_WAIT)?;
             self.state.vm_paused = false;
         }
@@ -1083,7 +1112,16 @@ impl VmwpDispatcher<'_> {
     fn pause_held_target(&mut self, event: &HeldEvent) -> Result<()> {
         self.state.claim_held_pause(event)?;
         run_vm_action(self.bound_vm_id()?, VmAction::Pause, POWERSHELL_WAIT)
-            .context("establishing the VM-wide held-event pause barrier")
+            .context("establishing the VM-wide held-event pause barrier")?;
+        self.state.confirm_vm_pause()
+    }
+
+    fn pause_for_provider_writes(&mut self, targets: &[TargetIdentity]) -> Result<()> {
+        let target = targets.first().context("no live-control VP targets")?;
+        self.state.finish_completion_kick()?;
+        self.state.claim_vm_pause(targets)?;
+        run_vm_action(&target.vm_id, VmAction::Pause, POWERSHELL_WAIT)?;
+        self.state.confirm_vm_pause()
     }
 
     fn open_and_register(
@@ -1092,8 +1130,7 @@ impl VmwpDispatcher<'_> {
         breakpoints: &[BreakpointGuard],
     ) -> Result<()> {
         let target = targets.first().context("no live-control VP targets")?;
-        self.state.claim_vm_pause(targets)?;
-        run_vm_action(&target.vm_id, VmAction::Pause, POWERSHELL_WAIT)?;
+        self.pause_for_provider_writes(targets)?;
         verify_vmwp_pid(&target.vm_id, self.state.vmwp_pid)?;
         if self.state.memory.is_none() {
             self.state.memory = Some(LiveGuestMemory::open(&self.state.live_transport, target)?);
@@ -1129,8 +1166,7 @@ impl VmwpDispatcher<'_> {
         if self.state.handler_context.is_none() || !self.state.scratch_allocated {
             bail!("the detached dispatcher no longer owns a registered handler");
         }
-        self.state.claim_vm_pause(targets)?;
-        run_vm_action(&target.vm_id, VmAction::Pause, POWERSHELL_WAIT)?;
+        self.pause_for_provider_writes(targets)?;
         verify_vmwp_pid(&target.vm_id, self.state.vmwp_pid)?;
         let pending = self
             .engine
@@ -1395,6 +1431,7 @@ impl VmwpDispatcher<'_> {
             let site = self.state.profile.native_return.clone();
             let target = self.require_owned_site_breakpoint(&site)?;
             if self.state.completion_kick.is_none() {
+                self.state.begin_vm_resume();
                 self.state.completion_kick = Some(VmTransition::completion_kick(
                     self.bound_vm_id()?.to_string(),
                 ));
@@ -1422,6 +1459,7 @@ impl VmwpDispatcher<'_> {
                 self.detach_handled()?;
                 self.state.finish_completion_kick()?;
                 if self.state.vm_paused {
+                    self.state.begin_vm_resume();
                     run_vm_action(self.bound_vm_id()?, VmAction::Resume, POWERSHELL_WAIT)?;
                     self.state.vm_paused = false;
                 }
@@ -2200,6 +2238,9 @@ mod tests {
         state.claim_held_pause(&event).unwrap();
 
         assert!(state.vm_paused);
+        assert!(!state.provider_writes_quiesced);
+        state.confirm_vm_pause().unwrap();
+        assert!(state.provider_writes_quiesced);
         let mut unrelated = event;
         unrelated.vp = 0;
         assert!(state.claim_held_pause(&unrelated).is_err());
@@ -2224,11 +2265,14 @@ mod tests {
         state.completion_kick = Some(VmTransition::completed_for_test(Err(anyhow!(
             "Resume-VM failed after Suspend-VM"
         ))));
+        state.vm_paused = true;
+        state.provider_writes_quiesced = true;
 
         let error = state.finish_completion_kick().unwrap_err();
 
         assert!(error.to_string().contains("conservatively retained"));
         assert!(state.vm_paused);
+        assert!(!state.provider_writes_quiesced);
         assert!(state.completion_kick.is_none());
     }
 
@@ -2242,6 +2286,9 @@ mod tests {
 
         assert_eq!(state.targets, vec![target.clone()]);
         assert!(state.vm_paused);
+        assert!(!state.provider_writes_quiesced);
+        state.confirm_vm_pause().unwrap();
+        assert!(state.provider_writes_quiesced);
         let mut other = target.clone();
         other.expected_cr3 = HexU64(0x120_2000);
         assert!(state.claim_vm_pause(&[other]).is_err());

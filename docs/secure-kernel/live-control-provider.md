@@ -149,7 +149,10 @@ epoch is a refusal with no mutation. A changed instruction, unexpected stop reas
 callback context, unstable held state, provider failure, or native-completion failure enters the
 terminal `faulted` phase. Recovery first tries to restore the saved register state. It authorizes
 native completion only when both restoration and event ownership are proven; otherwise the adapter
-must leave the disposable target paused. Teardown does not erase the fault record.
+must leave the disposable target paused. Conservative pause ownership means a resume may be owed;
+it does not authorize provider writes. If the whole-VM pause barrier fails or times out, recovery
+does not touch any losing VP baseline and contains the session with the native event incomplete.
+Teardown does not erase the fault record.
 
 The offline state-machine tests cover redirected and natural hardware stops, repeated and
 branching steps, stale epochs, instruction-guard failure, wrong callback context, unstable held
