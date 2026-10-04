@@ -271,10 +271,17 @@ pub fn structured_report(
 
 /// The report as text, for a client that reads the text block rather than `structuredContent`.
 ///
+/// **Every target-derived string goes through [`crate::structured::renderable`]**, whose own doc
+/// comment names this exact case: a driver may legally be named with a `U+2028`, and a target
+/// being analysed is the last place to assume it is not. The module name, the section name and the
+/// mnemonic all come from the image; the addresses beside them are formatted here and cannot carry
+/// one. The surrounding fence is the other half of it, as `hazards::render`'s caller records.
+///
 /// **Says what it did not read, every time.** An empty site list is the answer this tool gives most
 /// often and is the one most easily misread, so the qualification is not conditional on anybody
 /// asking for it.
 pub fn render(report: &crate::structured::Xrefs) -> String {
+    use crate::structured::renderable;
     use std::fmt::Write;
     let mut out = String::new();
     let target = &report.target;
@@ -283,10 +290,10 @@ pub fn render(report: &crate::structured::Xrefs) -> String {
         "References to {}{} in {} (base {})",
         target.address,
         match (&target.module, &target.rva) {
-            (Some(module), Some(rva)) => format!("  [{module}+{rva}]"),
+            (Some(module), Some(rva)) => format!("  [{}+{rva}]", renderable(module)),
             _ => String::new(),
         },
-        report.module,
+        renderable(&report.module),
         report.base,
     );
     let _ = writeln!(
@@ -313,12 +320,12 @@ pub fn render(report: &crate::structured::Xrefs) -> String {
                 out,
                 "{:<18} {:<8} {:<10} {}",
                 match (&site.at.module, &site.at.rva) {
-                    (Some(module), Some(rva)) => format!("{module}+{rva}"),
+                    (Some(module), Some(rva)) => format!("{}+{rva}", renderable(module)),
                     _ => site.at.address.clone(),
                 },
                 site.kind,
-                site.section,
-                site.mnemonic,
+                renderable(&site.section),
+                renderable(&site.mnemonic),
             );
         }
     }
@@ -575,15 +582,14 @@ mod tests {
     /// the question a reader arrived with.
     #[test]
     fn the_sites_are_capped_and_every_count_stays_exact() {
-        // One call first, then enough branches to overrun the cap several times over. Two bytes
-        // each, so they fit inside the section the fixture declares.
+        // One five-byte call, then enough two-byte branches to overrun the cap several times over.
+        let extra = MAX_SITES + 64;
         let mut block = vec![insn(
             BASE + 0x1000,
             "e87b000000",
             "call",
             Flow::Call(Some(TARGET)),
         )];
-        let extra = MAX_SITES + 64;
         for i in 0..extra {
             block.push(insn(
                 BASE + 0x1005 + (i as u64) * 2,
@@ -593,7 +599,19 @@ mod tests {
             ));
         }
 
-        let found = find(&image(), TARGET, only_text(block), never);
+        // **The section is sized to exactly these instructions, which the first version of this
+        // fixture was not.** It declared 0x100 bytes and supplied 0x485, and the test passed
+        // because `walk_code` visits what the decoder hands it without re-checking the address
+        // against the section end — true of a fixture and never of the real decoder, which is
+        // asked for `end - at` bytes at most. So the counts were right for a reason the test did
+        // not mean to rely on, and a later bound on instruction addresses would have broken it
+        // while the cap logic stayed correct (review on
+        // [#446](https://github.com/glslang/windbg-mcp/pull/446)).
+        let mut image = image();
+        let span = 5 + 2 * extra as u32;
+        image.sections[0].virtual_size = span;
+
+        let found = find(&image, TARGET, only_text(block), never);
 
         assert_eq!(found.sites.len(), MAX_SITES, "the list is bounded");
         assert_eq!(
@@ -649,6 +667,56 @@ mod tests {
             found.covered.scanned.is_empty(),
             "a window that would not read is not a window that was scanned"
         );
+    }
+
+    /// **A name the target chose cannot forge a row.**
+    ///
+    /// `U+2028 LINE SEPARATOR` is not in `Cc`, so `char::is_control` misses it and
+    /// `str::lines` does not split on it while a Unicode-aware client does — which is why
+    /// [`crate::structured::renderable`] exists and why its doc comment names a driver named with
+    /// one. A module name, a section name and a mnemonic all come from the image, and this
+    /// renderer passed them through untouched until review on
+    /// [#446](https://github.com/glslang/windbg-mcp/pull/446).
+    #[test]
+    fn a_target_chosen_name_cannot_forge_a_line_in_the_rendering() {
+        const SNEAKY: &str = "ev\u{2028}il";
+
+        let found = Found {
+            target: TARGET,
+            sites: vec![Xref {
+                address: BASE + 0x1000,
+                kind: XrefKind::Call,
+                mnemonic: SNEAKY.to_string(),
+                section: SNEAKY.to_string(),
+            }],
+            site_count: 1,
+            calls: 1,
+            jumps: 0,
+            branches: 0,
+            covered: codewalk::Covered::default(),
+        };
+        let report = structured_report(SNEAKY, BASE, &found, |address| {
+            crate::structured::CodeLocation {
+                address: crate::structured::addr(address),
+                module: Some(SNEAKY.to_string()),
+                rva: Some(crate::structured::addr(address - BASE)),
+                attribution_failed: false,
+            }
+        });
+        let text = render(&report);
+
+        assert!(
+            !text.contains('\u{2028}'),
+            "a separator the target chose reached the rendering: {text:?}"
+        );
+        assert!(
+            text.contains("ev\\u{2028}il"),
+            "the name is escaped rather than dropped, so it stays listable: {text:?}"
+        );
+        // The structured half is deliberately **not** escaped: it is a JSON string, where the
+        // separator is data rather than a line, and a client reading `structuredContent` wants the
+        // name the target actually carries.
+        assert_eq!(report.sites[0].section, SNEAKY);
     }
 
     /// The renderer says what was not looked at **whatever** the answer was, because the empty

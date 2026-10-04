@@ -8446,6 +8446,16 @@ fn run_to_address(e: &DebugEngine, address: &str, wait: u32) -> Result<Output, F
 /// `driver_surface` can have the value without the rendering -- a composite embeds the scan whole
 /// and renders the sections together, and re-parsing a rendering to do that is exactly what
 /// `counts-belong-in-the-type` says not to build.
+fn driver_hazards(e: &DebugEngine, module: &str, deadline: Instant) -> Result<Output, Failed> {
+    let report = hazards_of(e, module, deadline)?;
+    // **Fenced, which is the other half of `structured::renderable`.** That helper escapes a
+    // backtick precisely so a target-chosen string cannot close the block it is printed in -- and
+    // a block is what makes `<br>` inert, where escaping `<` instead would display as `&lt;` in
+    // the nine already-fenced listings this crate has. It is also what these renderers' column
+    // padding has always needed: bare, a Markdown client reflows the rows into a paragraph.
+    Ok(Output::typed(fenced(&hazards::render(&report)), report))
+}
+
 /// Every site in one image whose control flow reaches one address.
 ///
 /// **The gate is the flow and not the operands**, which is the difference from [`hazards_of`]:
@@ -8583,16 +8593,6 @@ fn xrefs_at(
     // is a deadline — and the first stop is the one that happened.
     report.stopped = report.stopped.or_else(|| stopped.get());
     Ok(report)
-}
-
-fn driver_hazards(e: &DebugEngine, module: &str, deadline: Instant) -> Result<Output, Failed> {
-    let report = hazards_of(e, module, deadline)?;
-    // **Fenced, which is the other half of `structured::renderable`.** That helper escapes a
-    // backtick precisely so a target-chosen string cannot close the block it is printed in -- and
-    // a block is what makes `<br>` inert, where escaping `<` instead would display as `&lt;` in
-    // the nine already-fenced listings this crate has. It is also what these renderers' column
-    // padding has always needed: bare, a Markdown client reflows the rows into a paragraph.
-    Ok(Output::typed(fenced(&hazards::render(&report)), report))
 }
 
 /// How a refusal names the instruction set it found.
@@ -11327,6 +11327,29 @@ mod tests {
     ///
     /// Tested here rather than through `resolve_code_target`, which needs an engine: the bound is
     /// two integers, and the defect was on this line rather than in that function.
+    #[test]
+    fn an_rva_is_bounded_by_its_module_unless_the_size_is_unknown() {
+        // A known size bounds it, and the last byte is still inside.
+        assert!(super::rva_within_module(0x1000, 0));
+        assert!(super::rva_within_module(0x1000, 0xfff));
+        assert!(!super::rva_within_module(0x1000, 0x1000));
+        assert!(!super::rva_within_module(0x1000, 0x1_0000));
+
+        // A size of zero is the engine reporting none, so there is nothing to bound against.
+        assert!(
+            super::rva_within_module(0, 0),
+            "an unknown size must not refuse the image's own base"
+        );
+        assert!(
+            super::rva_within_module(0, 0xdead_beef),
+            "an unknown size bounds nothing, which is the convention this crate already keeps"
+        );
+
+        // And the widest real size still rejects what is past it rather than overflowing.
+        assert!(super::rva_within_module(u32::MAX, u64::from(u32::MAX) - 1));
+        assert!(!super::rva_within_module(u32::MAX, u64::from(u32::MAX)));
+    }
+
     /// **Which module holds an address, with the same unknown-size convention.**
     ///
     /// The fourth and last place this change reads a module size. A size of zero made the interval
@@ -11356,29 +11379,6 @@ mod tests {
         // No overflow at the top of the address space, where base + size would wrap.
         assert!(super::module_holds(u64::MAX - 1, 2, u64::MAX));
         assert!(!super::module_holds(u64::MAX - 1, 2, 0));
-    }
-
-    #[test]
-    fn an_rva_is_bounded_by_its_module_unless_the_size_is_unknown() {
-        // A known size bounds it, and the last byte is still inside.
-        assert!(super::rva_within_module(0x1000, 0));
-        assert!(super::rva_within_module(0x1000, 0xfff));
-        assert!(!super::rva_within_module(0x1000, 0x1000));
-        assert!(!super::rva_within_module(0x1000, 0x1_0000));
-
-        // A size of zero is the engine reporting none, so there is nothing to bound against.
-        assert!(
-            super::rva_within_module(0, 0),
-            "an unknown size must not refuse the image's own base"
-        );
-        assert!(
-            super::rva_within_module(0, 0xdead_beef),
-            "an unknown size bounds nothing, which is the convention this crate already keeps"
-        );
-
-        // And the widest real size still rejects what is past it rather than overflowing.
-        assert!(super::rva_within_module(u32::MAX, u64::from(u32::MAX) - 1));
-        assert!(!super::rva_within_module(u32::MAX, u64::from(u32::MAX)));
     }
 
     fn live_control_open() -> EngineOp {
@@ -12203,6 +12203,13 @@ mod tests {
     /// The functions a driver scan's work is spread across, in flow order.
     const SCAN: &[&str] = &["driver_hazards", "scan_of", "hazards_of", "hazards_at"];
 
+    /// Every function a deadline-carrying target resolution now spans.
+    ///
+    /// `reachable` held all of it until `resolve_code_target` was extracted for `xrefs_to` to
+    /// share, and the two reference-scan functions carry the same deadline. Listed rather than
+    /// walked, because a guard that infers its own scope is a guard that quietly loses it.
+    const DEADLINE_BOUND: &[&str] = &["reachable", "resolve_code_target", "xrefs_of", "xrefs_at"];
+
     /// **A driver the chain proved has no devices is a complete section, whatever the directory
     /// did.**
     ///
@@ -12842,19 +12849,18 @@ mod tests {
     /// asserted here is that the op which *does* carry one spends it.
     #[test]
     fn the_reachability_op_resolves_nothing_unbounded() {
-        let code = include_str!("worker.rs")
-            .split_once("\n#[cfg(test)]")
-            .expect("this module has a test half")
-            .0;
-        let body = code
-            .split_once("\nfn reachable(")
-            .expect("this module has a `reachable`")
-            .1;
-        let body = body.split_once("\nfn ").map_or(body, |(body, _)| body);
+        // **Through `bodies_of`, and the reason is this guard's own history.** It read
+        // `reachable`'s body alone and truncated at the next `fn`, so when the target resolution
+        // was extracted into `resolve_code_target` the guard kept passing over code that no
+        // longer contained the thing it was about — `bodies_of`'s floor calls that "the way this
+        // fails without failing", and it is what happened here
+        // ([#446](https://github.com/glslang/windbg-mcp/pull/446)). The floor is what makes the
+        // next extraction fail loudly instead.
+        let body = bodies_of(DEADLINE_BOUND, 25_000);
         // `resolve_within(e,` does not contain this, which is the whole point of the two names.
         assert!(
             !body.contains("resolve(e,"),
-            "`reachable` carries a deadline and must spend it on every command it causes, \
+            "these ops carry a deadline and must spend it on every command they cause, \
              including the ones inside a helper: `resolve` runs an unbounded `? <expr>`, and a \
              symbol fetch there blocks the session's one thread with no poll able to run. Use \
              `resolve_within` with what `remaining` reports."

@@ -111,7 +111,7 @@ native analysis of it works and always has — and says so in the opener's `limi
 
 ## Tools
 
-Seventy-four tools in nine `--tools` groups; the rows below split some of those groups by theme. The
+Seventy-five tools in nine `--tools` groups; the rows below split some of those groups by theme. The
 `--tools` column is the name that selects one — see
 [Serving fewer tools](docs/tool-surface.md#serving-fewer-tools---tools).
 
@@ -133,7 +133,7 @@ Seventy-four tools in nine `--tools` groups; the rows below split some of those 
 | Raw     | `inspect` | `execute` — run any debugger command, returns full text output |
 | Secure Kernel | `securekernel` | Capture: `open_sk_capture`, `sk_modules`, `sk_read_memory`, `sk_symbol`. Live selected-VP control: `open_sk_live_control`, `sk_live_arm`, `sk_live_wait`, `sk_live_registers`, `sk_live_read_memory`, `sk_live_step`, `sk_live_continue`. Capture needs the Windows SDK's saved-state provider; live control needs an operator-supplied privileged provider and an exact-build `vmwp` profile. |
 
-All of them are served unless you say otherwise, and their definitions cost the model **about 28k
+All of them are served unless you say otherwise, and their definitions cost the model **about 29k
 tokens before it has asked anything**. `--tools session,inspect,crash` cuts that to under a third of
 it for twenty-three tools, and a `--listen` client can be given a narrower surface than the run's
 default. The exact byte figures are **not restated here**: they live in the

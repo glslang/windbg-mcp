@@ -5,8 +5,8 @@ how much of that surface a run serves, and four behaviours the table has no room
 
 ## Serving fewer tools (`--tools`)
 
-All seventy-four tools are served unless you say otherwise, and their definitions cost the model
-**113,516 bytes — about 28k tokens — before it has asked anything**, once per conversation. Every
+All seventy-five tools are served unless you say otherwise, and their definitions cost the model
+**116,520 bytes — about 29k tokens — before it has asked anything**, once per conversation. Every
 figure on this page is a measurement of 2026-10-04 rather than an invariant: any edit to a tool's
 description moves it, so re-derive before quoting one. The tables below are checked against a
 running server by `every_documented_surface_figure_matches_the_served_surface`; this sentence is
@@ -59,7 +59,7 @@ is written into the command line the SCM stores, and read back at every start). 
 
 A `--listen` server names its clients, and **a client may be served a surface of its own** — which
 is what lets one listener hold a local model that can fit twenty-three tools beside a hosted client
-that can hold seventy-four, against the same debug sessions:
+that can hold seventy-five, against the same debug sessions:
 
 ```pwsh
 setx WINDBG_MCP_LISTEN_TOKEN_BENCH "<a long random string>"
