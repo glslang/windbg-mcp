@@ -158,6 +158,7 @@ engine — it adds a target and leaves the current one alone. The entry records 
 - [Item 92](#92-windbg-mcp-an-a64-conditional-compare-chain-is-a-compare-chain-the-walk-does-not-read--done-2026-10-02) — [windbg-mcp] An A64 conditional-compare chain is a compare chain the walk does not read — done (2026-10-02)
 - [Item 109](#109-windbg-mcp-the-server-can-walk-a-call-graph-forward-and-find-calls-to-imports-and-cannot-answer-who-calls-this-address--done-2026-10-04) — [windbg-mcp] The server can walk a call graph forward and find calls to imports, and cannot answer "who calls this address" — done (2026-10-04)
 - [Item 111](#111-windbg-mcp--dbgscope-an-image-targets-memory-reads-only-after-something-else-has-read-it-and-a-walk-counts-what-it-did-not-get-as-scanned--done-2026-10-04-the-second-half-withdrawn) — [windbg-mcp] An image target's memory does not read until its module is loaded — done (2026-10-04), with the entry's second claim withdrawn
+- [Item 84](#84-windbg-mcp-an-adrpadd-table-base-is-lost-at-the-add--done-2026-10-04) — [windbg-mcp] An `adrp`+`add` table base is lost at the `add` — done (2026-10-04)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -8825,3 +8826,60 @@ refused, and on x64 zeros decode. They are the image's own bytes. RVA `0x1000` i
 and `kernel32.dll` is `.hexpthk`, an executable hot-patch-thunk section that is zero-filled on
 disk, confirmed by parsing both files' section tables off the bench. So the one observation that
 looked like the withdrawn half was not it either.
+
+## 84. [windbg-mcp] An `adrp`+`add` table base is lost at the `add` — **done** (2026-10-04)
+
+**Repo:** `windbg-mcp`.
+
+A compiler materialises a page-relative address in two instructions -- `adrp x8,<page>` /
+`add x8,x8,#<offset>` -- and `ioctl::update` modelled `Effect::Add` only as `Value::Code +
+immediate`, so the `add` cleared the register and a table base built that way was gone. The jump
+went back `unresolved`, which is the safe direction but is silent about *why*.
+
+**It is not a size threshold, and the first draft of this item said it was.** `adr` reaches ±1 MB,
+so it is tempting to reason that only a driver larger than that needs the pair -- but a compiler
+picks `adrp`+`add` for ordinary globals and relocatable references well inside that range, which is
+a codegen choice rather than a reach one. Raised on review of
+[#347](https://github.com/glslang/windbg-mcp/pull/347), and `mountmgr` proves it at **139 KB**:
+`mountmgr+0x19450` is `adrp x8,mountmgr!QueryPointsFromMemory+0x610` / `add x22,x8,#0x4E8`, four
+instructions after one of the jump tables this branch reads.
+
+**What landed is the one arm the entry asked for**, and it is in the fact walk rather than in
+`follow_table`: `(Some(Value::Address(base)), Some(immediate))` in `ioctl::update`'s `Effect::Add`,
+folding the offset into the page through the same width-wrapped `stepped` the dispatch arithmetic
+steps an offset with. Because it is a fact rather than a reading of one position, it serves all
+three places a switch takes a `Value::Address` from -- the table's own base, the base its signed
+entries are measured from, and the byte map of an MSVC dense switch. The fixture spells the first
+two; the third reads the same register facts and is not fixtured separately.
+
+**And a guard the entry did not name, which is the half worth keeping.** Written as one arm and
+nothing else, the fix is wrong in the other direction: `add w8,w8,#K` writes four bytes of a
+64-bit base and zeroes the rest, so what the register holds afterwards is not the address -- while
+the model, computing at the pointer's width, would hand `follow_table` a base execution never
+formed and resolve the switch from bytes nothing read. So the arm is gated on
+`written.width >= layout.pointer`, which is the question `Value::carried_by` already asks of a copy
+(`mov ecx,edx` is not the IRP), asked here of arithmetic. The entry's own estimate of the blast
+radius -- *every `Value::Address` consumer* -- is what makes the direction matter: there is no
+later check that would catch it, because a base is believed or absent.
+
+**The fixture is hand-written, and the entry predicted why.** It asked for one of the small drivers
+rather than a hypothetical large one; what no driver on this bench does is use the pair for a table
+**base**, which is the only position `follow_table` asks about -- `mountmgr`'s instance is four
+instructions *past* a table, not under one. So `an_a64_table_base_survives_the_add_that_completes_an_adrp`
+is a block built from the real offset that driver adds (`#0x4E8`), with both of the switch's
+`Value::Address` positions spelled as the pair, and
+`a_page_offset_added_in_a_narrow_register_is_not_a_table_base` is the width half, answering the
+read at *either* address the two readings could compute so the test turns on the width rather than
+on which read the fixture happened to serve.
+
+**Both were mutation-verified against the state before the change**, which is what says they are
+load-bearing: back the arm out and the first reports **no cases at all** -- the defect this item is
+about, and the whole of why it was invisible; back the guard out and the second reports **two**
+cases from a base execution never formed. Measured on the ARM64 guest in a fresh clone of
+`e2fb6aa` with this change scp'd in (2026-10-04): `cargo test --bin windbg-mcp`, **1,247** unit
+tests, 0 failed. That is a unit-test measurement and not a target one -- no driver here reaches the
+position, which is the reason the fixture exists.
+
+**Where it landed:** `ioctl::update`'s `Effect::Add` arm (`src/ioctl.rs`), ahead of the
+`_ => set(facts, &destination, None)` fall-through, which still answers for everything else an
+`add` can be.

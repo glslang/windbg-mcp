@@ -82,7 +82,6 @@ line is simply open.
 - [Item 72](#72-windbg-mcp-the-driver-tools-name-a-module-refresh-they-could-run-themselves) — [windbg-mcp] The driver tools name a module refresh they could run themselves
 - [Item 73](#73-windbg-mcp-a-drivers-import-directory-can-be-in-a-section-the-loader-freed) — [windbg-mcp] A driver's import directory can be in a section the loader freed
 - [Item 74](#74-windbg-mcp-the-driver-tools-report-no-pool-tags) — [windbg-mcp] The driver tools report no pool tags
-- [Item 84](#84-windbg-mcp-an-adrpadd-table-base-is-lost-at-the-add) — [windbg-mcp] An `adrp`+`add` table base is lost at the `add`
 - [Item 87](#87-windbg-mcp-a-code-materialised-in-the-previous-block-is-lost-at-the-join) — [windbg-mcp] A code materialised in the previous block is lost at the join
 - [Item 91](#91-windbg-mcp-a-refusal-that-returns-through-a-shared-epilogue-is-not-recognised) — [windbg-mcp] A refusal that returns through a shared epilogue is not recognised
 - [Item 88](#88-windbg-mcp-a-call-that-outlives-its-budget-finishes-its-work-and-has-the-answer-discarded) — [windbg-mcp] A call that outlives its budget finishes its work and has the answer discarded
@@ -1395,33 +1394,6 @@ its own code, which is what makes the walk worth starting.
 **Where it picks up.** `src/hazards.rs`'s sink call-site recovery, which already has the call sites
 these arguments belong to, and `pool_find_tag` in `src/worker.rs` for the join.
 
-## 84. [windbg-mcp] An `adrp`+`add` table base is lost at the `add`
-
-**Repo:** `windbg-mcp`.
-
-A compiler materialises a page-relative address in two instructions -- `adrp x8,<page>` /
-`add x8,x8,#<offset>` -- and `ioctl::update` models `Effect::Add` only as `Value::Code +
-immediate`, so the `add` clears the register and a table base built that way is gone. The jump goes
-back `unresolved`, which is the safe direction but is silent about *why*.
-
-**It is not a size threshold, and the first draft of this item said it was.** `adr` reaches ±1 MB,
-so it is tempting to reason that only a driver larger than that needs the pair -- but a compiler
-picks `adrp`+`add` for ordinary globals and relocatable references well inside that range, which is
-a codegen choice rather than a reach one. Raised on review of
-[#347](https://github.com/glslang/windbg-mcp/pull/347), and `mountmgr` proves it at **139 KB**:
-`mountmgr+0x19450` is `adrp x8,mountmgr!QueryPointsFromMemory+0x610` / `add x22,x8,#0x4E8`, four
-instructions after one of the jump tables this branch reads. So the shape is already on this bench
-and in the smallest fixtures; what none of them does is use it for a **table base**, which is the
-only position `follow_table` asks about.
-
-**Why deferred:** no measurement here reaches the position that matters, and the fix is one arm
-whose blast radius is every `Value::Address` consumer -- worth doing beside item 82, which opens
-the same function. A fixture for it should be one of the small drivers rather than a hypothetical
-large one.
-
-**Where it picks up:** `ioctl::update`'s `Effect::Add` arm (`src/ioctl.rs`), where the
-`_ => set(facts, &destination, None)` fall-through is.
-
 ## 87. [windbg-mcp] A code materialised in the previous block is lost at the join
 
 **Repo:** `windbg-mcp`.
@@ -2558,8 +2530,10 @@ when it runs (filed 2026-09-18, closed 2026-09-25 by reading the target rather t
 And item **84** from running
 `ioctl_map` against a live **ARM64** target for the first time
 ([#345](https://github.com/glslang/windbg-mcp/pull/345), 2026-09-19): an `adrp`+`add` table base
-lost at the `add`. That run filed five more, all now in
-[`DONE.md`](./DONE.md) -- the literal pool the fact walk could not read (item 82, which was the
+lost at the `add`, **now in [`DONE.md`](./DONE.md)**, closed 2026-10-04 by modelling
+`Value::Address + immediate` in that `add` -- plus the width guard the entry had not asked for,
+without which the same arm hands the resolver a base execution never formed. That run filed five
+more, which are in [`DONE.md`](./DONE.md) as well -- the literal pool the fact walk could not read (item 82, which was the
 whole of why 235 codes carried no proven size or refusal), the switch tables the reachability
 walk did not follow while the map resolved them (item 83), the two things item 83's own
 fourteen review rounds left behind -- a resolver cap discarding the targets it had proved (item 90)

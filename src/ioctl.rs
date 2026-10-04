@@ -2481,6 +2481,33 @@ fn update(
                     at: instruction.address,
                 });
             }
+            // **A page and an offset are one address, and the `add` is where it is completed.**
+            // A compiler materialises a page-relative address as `adrp x8,<page>` /
+            // `add x8,x8,#<offset>`, and without this arm the second instruction cleared the
+            // register: a table base built that way was gone and the dispatch jump went back
+            // `unresolved` -- the safe direction, and silent about why.
+            //
+            // **It is a codegen choice rather than a reach one**, which is what makes it ordinary
+            // rather than a large-driver edge. `adr` covers +/-1 MB, so it is tempting to reason
+            // that only a driver past that needs the pair; `mountmgr` emits it at **139 KB**
+            // (`mountmgr+0x19450` is `adrp x8,mountmgr!QueryPointsFromMemory+0x610` /
+            // `add x22,x8,#0x4E8`, four instructions after one of its jump tables). Raised on
+            // review of windbg-mcp#347.
+            //
+            // **At the pointer's width, because a truncated base is not the base.** `add w8,w8,#K`
+            // writes four bytes of a 64-bit address and zeroes the rest, so a table read there is
+            // read at an address execution never formed -- the question [`Value::carried_by`]
+            // asks of a copy, asked here of arithmetic. The *destination's* width answers it for
+            // both shapes: A64 takes both registers of an `add` from one `wide` bit, and x86's
+            // two-operand form has the source and the destination as the same register.
+            (Some(Value::Address(base)), Some(immediate)) if written.width >= layout.pointer => {
+                // Wrapped in the width the address has, by the same rule the dispatch arithmetic
+                // steps an offset with: a 32-bit target computes a base modulo 2^32, and carrying
+                // out of it would resolve a table above 4 GB on a machine that has no such
+                // address.
+                let address = stepped(base as i64, immediate, true, layout.pointer) as u64;
+                set(facts, &destination, Some(Value::Address(address)));
+            }
             // An `add` of anything else -- a table entry to its base, most often -- leaves a value
             // this does not model.
             _ => set(facts, &destination, None),
@@ -12259,6 +12286,259 @@ mod tests {
             found.unresolved.is_empty(),
             "the jump was followed, so it is not also a loss: {:?}",
             found.unresolved
+        );
+    }
+
+    /// And a base the compiler materialised in **two** instructions is still a base.
+    ///
+    /// `adrp x9,<page>` / `add x9,x9,#<offset>` is how a page-relative address is formed on A64,
+    /// and `Effect::Add` modelled only `Value::Code + immediate` -- so the `add` cleared the
+    /// register, `follow_table` found no base and the `br` went back `unresolved`. Safe, and
+    /// silent about why: a driver whose switch this shape builds reports no cases from it and
+    /// nothing saying the base was the part that was lost.
+    ///
+    /// **Not a size threshold, which is what the first reading of this was.** `adr` reaches
+    /// +/-1 MB, so the pair looks like something only a large driver needs; a compiler picks it
+    /// for ordinary globals well inside that range. `mountmgr` is **139 KB** and has it four
+    /// instructions after one of the two jump tables these fixtures are drawn from:
+    /// `mountmgr+0x19450` is `adrp x8,mountmgr!QueryPointsFromMemory+0x610` /
+    /// `add x22,x8,#0x4E8`. What no driver on this bench does is use the pair for a table
+    /// **base**, which is the only position `follow_table` asks about -- hence a fixture, built
+    /// from the real offset that driver adds.
+    ///
+    /// Both `Value::Address` positions a switch has are built this way, because a compiler that
+    /// spells one address so spells the other: the table's own base, and the base the signed
+    /// entries are measured from.
+    #[test]
+    fn an_a64_table_base_survives_the_add_that_completes_an_adrp() {
+        const TABLE_PAGE: u64 = IMAGE_BASE + 0x9000;
+        const TABLE: u64 = TABLE_PAGE + 0x4e8;
+        const ENTRIES_PAGE: u64 = IMAGE_BASE + 0x4000;
+        const ENTRIES: u64 = ENTRIES_PAGE + 0x100;
+        const DEFAULT: u64 = ENTRIES + 0x400;
+        let block = vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "ldr",
+                vec![reg("w9"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 8,
+                "sub",
+                vec![reg("w10"), reg("w9"), imm(0x6dc040)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "cmp",
+                vec![reg("w10"), imm(3)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x10,
+                "b.hi",
+                Vec::new(),
+                Flow::Branch(Some(DEFAULT)),
+            ),
+            // The page, then the offset into it -- and the page alone is 0x4e8 short of the
+            // table, which is what a reading that kept it would resolve the switch from.
+            insn(
+                DISPATCH + 0x14,
+                "adrp",
+                vec![reg("x9"), adr_to(TABLE_PAGE)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x18,
+                "add",
+                vec![reg("x9"), reg("x9"), imm(0x4e8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x1c,
+                "ldrsw",
+                vec![reg("x8"), table_load("x9", "w10", 4)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x20,
+                "adrp",
+                vec![reg("x11"), adr_to(ENTRIES_PAGE)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x24,
+                "add",
+                vec![reg("x11"), reg("x11"), imm(0x100)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x28,
+                "add",
+                vec![reg("x8"), reg("x11"), reg("x8"), lsl(2)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x2c, "br", vec![reg("x8")], Flow::Jmp(None)),
+        ];
+        // The same table the shift fixture above reads, at the address the pair computes: slots 1
+        // and 2 hold the default once scaled, and slot 3 points backwards.
+        let read = |at: u64, len: usize| {
+            (at == TABLE && len == 16).then(|| {
+                [0x40i32, 0x100, 0x100, -0x10]
+                    .iter()
+                    .flat_map(|entry| entry.to_le_bytes())
+                    .collect()
+            })
+        };
+
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            read,
+            in_image,
+            constant_data,
+            never,
+        );
+
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands))
+                .collect::<Vec<_>>(),
+            vec![
+                (0x6dc040, ENTRIES + 0x100),
+                (0x6dc043, ENTRIES.wrapping_sub(0x40)),
+            ],
+            "the table is at the page plus the offset, and the entries are measured from a base \
+             built the same way: {:?}",
+            found.cases
+        );
+        assert!(
+            found.unresolved.is_empty(),
+            "the jump was followed, so it is not also a loss: {:?}",
+            found.unresolved
+        );
+    }
+
+    /// And the offset has to land in a register wide enough to hold the address it completes.
+    ///
+    /// `add w9,w9,#0x4e8` writes four bytes of a 64-bit base and zeroes the rest, so what is in
+    /// `x9` afterwards is not the table -- it is the low half of it, which on this fixture's
+    /// image is outside the driver altogether. Folded anyway, the switch resolves from bytes read
+    /// at an address execution never formed and every case it reports is invented; the jump going
+    /// back `unresolved` is the answer. Same question [`Value::carried_by`] asks of
+    /// `mov ecx,edx`, asked of the arithmetic that completes a page.
+    #[test]
+    fn a_page_offset_added_in_a_narrow_register_is_not_a_table_base() {
+        const TABLE_PAGE: u64 = IMAGE_BASE + 0x9000;
+        const ENTRIES: u64 = IMAGE_BASE + 0x4000;
+        const DEFAULT: u64 = ENTRIES + 0x400;
+        let block = vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "ldr",
+                vec![reg("w9"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 8,
+                "sub",
+                vec![reg("w10"), reg("w9"), imm(0x6dc040)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "cmp",
+                vec![reg("w10"), imm(3)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x10,
+                "b.hi",
+                Vec::new(),
+                Flow::Branch(Some(DEFAULT)),
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "adrp",
+                vec![reg("x9"), adr_to(TABLE_PAGE)],
+                Flow::Fallthrough,
+            ),
+            // The narrow spelling of the same register, which is the whole difference from the
+            // fixture above.
+            insn(
+                DISPATCH + 0x18,
+                "add",
+                vec![reg("w9"), reg("w9"), imm(0x4e8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x1c,
+                "ldrsw",
+                vec![reg("x8"), table_load("x9", "w10", 4)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x20,
+                "adr",
+                vec![reg("x11"), adr_to(ENTRIES)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x24,
+                "add",
+                vec![reg("x8"), reg("x11"), reg("x8"), lsl(2)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x28, "br", vec![reg("x8")], Flow::Jmp(None)),
+        ];
+        // Answers at **either** address the two readings could compute, so the test turns on the
+        // width rather than on which read the fixture happened to serve.
+        let read = |at: u64, len: usize| {
+            ((at == TABLE_PAGE + 0x4e8 || at == u64::from((TABLE_PAGE as u32).wrapping_add(0x4e8)))
+                && len == 16)
+                .then(|| {
+                    [0x40i32, 0x100, 0x100, -0x10]
+                        .iter()
+                        .flat_map(|entry| entry.to_le_bytes())
+                        .collect()
+                })
+        };
+
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            read,
+            in_image,
+            constant_data,
+            never,
+        );
+
+        assert!(
+            found.cases.is_empty(),
+            "a base truncated to four bytes is not a base, so no case may come from it: {:?}",
+            found.cases
+        );
+        assert_eq!(
+            found.unresolved,
+            vec![DISPATCH + 0x28],
+            "and the jump it feeds is recorded as one this could not follow"
         );
     }
 
