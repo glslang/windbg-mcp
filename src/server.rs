@@ -1161,7 +1161,8 @@ pub struct SkLiveOpenArgs {
     /// Virtual processor to control. Defaults to VP 0. The native event must report this VP.
     #[serde(default)]
     pub vp: Option<u32>,
-    /// Further VP numbers which may win a natural stop. `control_transport` must contain `{vp}`.
+    /// Further VP numbers which may win a natural stop, at most 15. `control_transport` must
+    /// contain `{vp}`.
     #[serde(default)]
     pub additional_vps: Vec<u32>,
 }
@@ -4037,6 +4038,17 @@ impl WindbgServer {
         }
         let mut vp_numbers = vec![target.vp];
         let mut additional_vps = Vec::with_capacity(args.additional_vps.len());
+        if args.additional_vps.len() >= crate::sklive::MAX_LIVE_CONTROL_VPS {
+            return open_failure(
+                ErrorCategory::InvalidArgument,
+                format!(
+                    "live control accepts at most {} VP providers",
+                    crate::sklive::MAX_LIVE_CONTROL_VPS
+                ),
+                None,
+                TargetCreated::No,
+            );
+        }
         if !args.additional_vps.is_empty() && !args.control_transport.contains("{vp}") {
             return open_failure(
                 ErrorCategory::InvalidArgument,

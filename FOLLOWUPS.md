@@ -2332,8 +2332,11 @@ profile argument can now name a bounded directory and selects exactly one entry 
 `vmwp.exe` hash matches the current local image. Natural mode accepts up to four explicitly slotted
 execution breakpoints and several VP-bound providers in one worker; the native event chooses the
 winning VP and DR6 chooses the winning slot, after which every losing VP is restored before the
-stop is returned. Redirect mode remains deliberately one VP and one address. Offline tests cover a
-VP1 win with VP0 restoration, multi-slot classification, duplicate refusal and baseline recovery.
+stop is returned and the following TF wait is restricted to the winner. Fan-out is capped at 16
+providers before any child starts. The raw debug event deliberately advances the provider wire
+contract to v2, so a v1 provider is refused at its banner. Redirect mode remains deliberately one
+VP and one address. Offline tests cover a VP1 win with VP0 restoration, multi-slot classification,
+duplicate refusal and baseline recovery.
 The fan-out path still needs a live multi-provider acceptance run; its predecessor's live proof is
 one selected VP at a time.
 
