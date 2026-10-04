@@ -133,11 +133,15 @@ Seventy-four tools in nine `--tools` groups; the rows below split some of those 
 | Raw     | `inspect` | `execute` — run any debugger command, returns full text output |
 | Secure Kernel | `securekernel` | Capture: `open_sk_capture`, `sk_modules`, `sk_read_memory`, `sk_symbol`. Live selected-VP control: `open_sk_live_control`, `sk_live_arm`, `sk_live_wait`, `sk_live_registers`, `sk_live_read_memory`, `sk_live_step`, `sk_live_continue`. Capture needs the Windows SDK's saved-state provider; live control needs an operator-supplied privileged provider and an exact-build `vmwp` profile. |
 
-All of them are served unless you say otherwise, and the definitions cost the model **112,429 bytes —
-about 28k tokens — before it has asked anything** (measured 2026-10-03). `--tools
-session,inspect,crash` cuts that to 33,895 B for twenty-three tools, and a `--listen` client can be
-given a narrower surface than the run's default. [`docs/tool-surface.md`](docs/tool-surface.md) has the arithmetic, the rule that `session`
-is always included, and what a typed operand may not contain.
+All of them are served unless you say otherwise, and their definitions cost the model **about 28k
+tokens before it has asked anything**. `--tools session,inspect,crash` cuts that to under a third of
+it for twenty-three tools, and a `--listen` client can be given a narrower surface than the run's
+default. The exact byte figures are **not restated here**: they live in the
+[`docs/tool-surface.md`](docs/tool-surface.md) tables, which
+`every_documented_surface_figure_matches_the_served_surface` checks against a running server, while
+the copy that used to sit in this sentence went stale on the first day the figure moved twice. That
+page also has the arithmetic, the rule that `session` is always included, and what a typed operand
+may not contain.
 
 Most of the tools also answer with MCP `structuredContent`, so a program can read a field
 instead of parsing prose, and a failure carries a stable category (`invalid_argument`, `debugger`,
