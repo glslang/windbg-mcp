@@ -8494,26 +8494,33 @@ fn xrefs_of(
     // reason: `lm m` takes a WinDbg pattern, so a name matching several images would have the
     // first row's address silently win.
     let loaded = e.modules().map_err(failed)?;
-    let (name, base, loaded_size) = match module {
-        Some(module) => module_named(e, module)?,
-        // **The image holding the target, when the caller named none.** That is the answer they
-        // almost always want — a routine's callers are overwhelmingly in its own image — and it is
-        // a fact this side can read rather than a default this side invents.
-        None => {
+    let (name, base, loaded_size) = match (module, target_module) {
+        // The caller named the image to search.
+        (Some(module), _) => module_named(e, module)?,
+        // **They named the image the target is in, so that is the image to search.** No search:
+        // the RVA was already proved inside this module above, so asking which module holds the
+        // sum could only either agree or disagree with the caller about their own coordinate —
+        // and on a target whose module sizes are unknown it would disagree, which is how this
+        // arm came to exist (review on
+        // [#446](https://github.com/glslang/windbg-mcp/pull/446)).
+        (None, Some(target_module)) => module_named(e, target_module)?,
+        // **Only an absolute address, so the image is whichever holds it.** That is the answer a
+        // caller almost always wants — a routine's callers are overwhelmingly in its own image —
+        // and it is a fact this side can read rather than a default this side invents.
+        (None, None) => {
             let holding = loaded
                 .iter()
-                .find(|candidate| {
-                    let end = candidate.base.saturating_add(u64::from(candidate.size));
-                    target >= candidate.base && target < end
-                })
+                .find(|candidate| module_holds(candidate.base, candidate.size, target))
                 .ok_or_else(|| {
                     Failed::categorised(
                         structured::ErrorCategory::Debugger,
                         format!(
-                            "no loaded module holds {target:#x}, so there is no image to scan. \
+                            "no loaded module holds {target:#x}, so there is no image to search. \
                              Code in a pool allocation, or in a driver that has unloaded, is in \
-                             none; name the image with `module` if the caller of this address is \
-                             in one."
+                             none, and a module whose size this target does not report is only \
+                             known to hold its own base. Name the image with `module`, or give \
+                             the target as `target_module`+`rva`, if the caller of this address \
+                             is in one."
                         ),
                     )
                 })?;
@@ -10789,6 +10796,26 @@ fn module_named(e: &DebugEngine, module: &str) -> Result<(String, u64, u32), Fai
     }
 }
 
+/// Whether a module of this base and size holds `target`.
+///
+/// **A size of zero means the engine reported none**, the same convention as
+/// [`rva_within_module`], [`within_module`] and [`smaller_extent`] — so the interval is not empty,
+/// it is *unknown*. What is still known is where the image starts, so that one address is held and
+/// nothing beyond it is claimed. Guessing an extent — the next module's base, say — would attribute
+/// a gap to whichever image happened to be loaded below it, and a scan labelled with the wrong
+/// module is the failure this whole seam has been about.
+///
+/// A caller who needs more on such a target names the image with `module`, which is what the
+/// refusal says. That is a limit rather than a complete answer, and it is stated rather than
+/// papered over: reading the PE header of every candidate to recover an extent is a read per
+/// module, which is not what a search for one address should cost.
+fn module_holds(base: u64, size: u32, target: u64) -> bool {
+    match size {
+        0 => target == base,
+        _ => target >= base && target - base < u64::from(size),
+    }
+}
+
 /// Whether an RVA names a place inside a module of this size.
 ///
 /// **A size of zero means the engine reported none**, which this crate reads as *unknown* rather
@@ -11300,6 +11327,37 @@ mod tests {
     ///
     /// Tested here rather than through `resolve_code_target`, which needs an engine: the bound is
     /// two integers, and the defect was on this line rather than in that function.
+    /// **Which module holds an address, with the same unknown-size convention.**
+    ///
+    /// The fourth and last place this change reads a module size. A size of zero made the interval
+    /// *empty* here — `target < base + 0` is never true — so an address in such a module was held
+    /// by nothing and `xrefs_to` refused its own documented default. Zero means unknown, so the
+    /// base is held and nothing past it is claimed
+    /// ([#446](https://github.com/glslang/windbg-mcp/pull/446), round 5).
+    #[test]
+    fn a_module_of_unknown_size_holds_its_base_and_claims_nothing_further() {
+        // A known size is a half-open interval.
+        assert!(super::module_holds(0x1000, 0x200, 0x1000));
+        assert!(super::module_holds(0x1000, 0x200, 0x11ff));
+        assert!(!super::module_holds(0x1000, 0x200, 0x1200));
+        assert!(!super::module_holds(0x1000, 0x200, 0xfff));
+
+        // An unknown size holds the base and nothing else, rather than nothing at all.
+        assert!(
+            super::module_holds(0x1000, 0, 0x1000),
+            "the image is known to start here"
+        );
+        assert!(
+            !super::module_holds(0x1000, 0, 0x1001),
+            "and nothing beyond it is claimed rather than guessed"
+        );
+        assert!(!super::module_holds(0x1000, 0, 0xfff));
+
+        // No overflow at the top of the address space, where base + size would wrap.
+        assert!(super::module_holds(u64::MAX - 1, 2, u64::MAX));
+        assert!(!super::module_holds(u64::MAX - 1, 2, 0));
+    }
+
     #[test]
     fn an_rva_is_bounded_by_its_module_unless_the_size_is_unknown() {
         // A known size bounds it, and the last byte is still inside.
