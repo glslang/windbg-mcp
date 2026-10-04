@@ -10,11 +10,6 @@
 //! [`LivePhase::Releasing`] state covers that gap. Any failure in it is terminal and runs the same
 //! bounded recovery path as an unexpected debugger stop.
 
-#![allow(
-    dead_code,
-    reason = "the K4.2 state machine is consumed by the build-specific worker adapter in K4.3"
-)]
-
 use anyhow::{Context, Result, anyhow, bail};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -68,7 +63,6 @@ const WRITTEN_REGISTERS: [RegisterName; 9] = [
 /// JSON-line [`ControlSession`]; tests use an in-memory provider with the same transition rules.
 pub(crate) trait ControlProvider {
     fn target(&self) -> &TargetIdentity;
-    fn epoch(&self) -> &StopEpoch;
     fn capabilities(&mut self) -> Result<Capabilities>;
     fn begin_arm(&mut self) -> Result<()>;
     fn finish_arm(&mut self) -> Result<()>;
@@ -82,10 +76,6 @@ pub(crate) trait ControlProvider {
 impl<R: std::io::BufRead, W: std::io::Write> ControlProvider for ControlSession<R, W> {
     fn target(&self) -> &TargetIdentity {
         ControlSession::target(self)
-    }
-
-    fn epoch(&self) -> &StopEpoch {
-        ControlSession::epoch(self)
     }
 
     fn capabilities(&mut self) -> Result<Capabilities> {
@@ -124,10 +114,6 @@ impl<R: std::io::BufRead, W: std::io::Write> ControlProvider for ControlSession<
 impl ControlProvider for ControlProcess {
     fn target(&self) -> &TargetIdentity {
         ControlProcess::target(self)
-    }
-
-    fn epoch(&self) -> &StopEpoch {
-        ControlProcess::epoch(self)
     }
 
     fn capabilities(&mut self) -> Result<Capabilities> {
@@ -850,10 +836,7 @@ impl<P: ControlProvider> LiveControl<P> {
         }
     }
 
-    pub(crate) fn epoch(&self) -> &StopEpoch {
-        &self.public_epoch
-    }
-
+    #[cfg(test)]
     pub(crate) fn fault(&self) -> Option<&FaultRecord> {
         self.fault.as_ref()
     }
@@ -1873,10 +1856,6 @@ mod tests {
     impl ControlProvider for FakeProvider {
         fn target(&self) -> &TargetIdentity {
             &self.target
-        }
-
-        fn epoch(&self) -> &StopEpoch {
-            &self.epoch
         }
 
         fn capabilities(&mut self) -> Result<Capabilities> {
