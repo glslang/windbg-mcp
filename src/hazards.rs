@@ -36,6 +36,10 @@ use std::collections::{BTreeMap, HashMap};
 
 use dbgscope::dbgeng::{Effect, Flow, Instruction, InstructionSet, Operand};
 
+use crate::codewalk;
+// Re-exported rather than aliased at every use: this module's public result still carries
+// these ranges, and a caller of `scan` should not have to know which module owns the type.
+pub use crate::codewalk::Scanned;
 use crate::walk::Halt;
 use dbgscope::pe;
 
@@ -371,16 +375,6 @@ pub struct Privileged {
     pub mnemonic: String,
 }
 
-/// One executable range this scan covered, so a caller can see what it did *not*.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Scanned {
-    pub section: String,
-    pub start: u64,
-    /// Bytes decoded. Less than the section's size means the scan stopped inside it — the byte cap
-    /// or a halt — and the report says which.
-    pub bytes: u64,
-}
-
 /// What a scan found, and how much of the image it looked at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scan {
@@ -450,41 +444,20 @@ pub const MAX_CALL_SITES_TOTAL: usize = 4096;
 pub const MAX_PRIVILEGED: usize = 1024;
 /// See [`MAX_CALL_SITES_PER_SINK`]. One in every real image; more means a repeated name.
 pub const MAX_SLOTS_PER_SINK: usize = 16;
-/// See [`MAX_CALL_SITES_PER_SINK`]. Both lists are bounded by the byte cap and the section count
-/// already; this keeps a pathological section table from turning that into thousands of rows.
-pub const MAX_RANGES: usize = 256;
-
-/// The most code one scan will decode, in bytes.
-///
-/// A driver's executable sections are tens to hundreds of kilobytes; this is well past that and is
-/// there to bound the absurd — a caller pointing this at `nt`, whose `.text` is megabytes. It is a
-/// **cap that reports itself** rather than a refusal, because a partial scan of a huge image still
-/// names the sinks it found, and `cap_hit` says the rest was not looked at.
-pub const MAX_SCAN_BYTES: u64 = 4 * 1024 * 1024;
-
-/// How much is decoded between two halt polls.
-///
-/// The decode is one call per window, so this is also the largest read a scan makes at once. Small
-/// enough that a cancelled scan stops promptly, large enough that a 100 KB section is a handful of
-/// calls rather than hundreds.
-const WINDOW: u64 = 64 * 1024;
 
 /// Scans an image's executable sections for sensitive calls and privileged instructions.
 ///
 /// `decode` takes an address and a length and answers the instructions in it, or `None` where the
 /// bytes could not be read — which is a fact about the image rather than an error, and leaves that
-/// window out of [`Scan::scanned`]. `halt` is polled between windows.
-///
-/// **Windows overlap by nothing and that is deliberate.** A window boundary can fall inside an
-/// instruction, so the last instruction of a window may be decoded from a truncated tail and the
-/// next window starts mid-instruction. Both are handled by decoding from the *instruction after*
-/// the last complete one rather than from a fixed offset, which is what `next` below carries.
+/// window out of [`Scan::scanned`]. `halt` is polled between windows. Both are handed to
+/// [`codewalk::walk_code`], which owns the section walk, the window boundaries and the two
+/// budgets; what stays here is the per-instruction reading.
 pub fn scan(
     image: &pe::Image,
     imports: &[pe::Import],
     set: InstructionSet,
-    mut decode: impl FnMut(u64, usize) -> Option<Vec<Instruction>>,
-    mut halt: impl FnMut() -> Option<Halt>,
+    decode: impl FnMut(u64, usize) -> Option<Vec<Instruction>>,
+    halt: impl FnMut() -> Option<Halt>,
 ) -> Scan {
     let by_slot = pe::imports_by_slot(imports);
     // **Keyed by library and name, not by slot**, which is what bounds this list by construction:
@@ -520,215 +493,69 @@ pub fn scan(
     let mut privileged = Vec::new();
     let mut privileged_count = 0usize;
     let mut listed_call_sites = 0usize;
-    let mut scanned = Vec::new();
-    let mut unreadable: Vec<Scanned> = Vec::new();
-    let mut budget = MAX_SCAN_BYTES;
-    let mut halted = None;
-    let mut cap_hit = false;
+    // The addresses this code has been watched computing, for the calls that reach an import
+    // through a register rather than through a memory operand. Cleared at every discontinuity the
+    // walk reports, so a register's meaning never crosses a section boundary or an unreadable page.
+    let mut formed = Formed::default();
 
-    // **Sorted, and each range clamped past the last**, so every byte is decoded at most once. A
-    // malformed header can declare two executable sections covering the same addresses, and
-    // scanning both counts every call site and every privileged instruction in the overlap twice
-    // — which would make `call_site_count` and `privileged_count`, documented as exact, quietly
-    // inflated. Clamping rather than refusing, because the bytes are real and scanning them once
-    // is the right answer; what is dropped is the second visit, not the code.
-    let mut code: Vec<&pe::Section> = image.code_sections().collect();
-    code.sort_by_key(|section| section.rva);
-    let mut past = 0u64;
-
-    'sections: for section in code {
-        // **The whole span, not just its start.** `checked_va(rva, 0)` asks only whether the
-        // section begins inside the image, and a header claiming a `virtual_size` that runs past
-        // `SizeOfImage` would then have this decode straight out of the module and into whatever
-        // is mapped next — on a live target, the next driver — reporting its calls and its
-        // privileged instructions as this one's. A span that does not fit is **clamped to the
-        // image and recorded as a gap**, rather than skipped: what is genuinely inside is still
-        // worth scanning, and what was cut has to be visible for the same reason every other
-        // shortfall here does.
-        let Ok(start) = image.checked_va(section.rva, 0) else {
-            // A section that begins **outside** the image is recorded, not skipped. Skipped, its
-            // whole declared range vanished from both lists and the report read as a complete
-            // clean scan of an image whose headers do not hold together. There is no address to
-            // record it at -- that is the point of it -- so it is reported at the image's end,
-            // which is the last address this scan can speak for.
-            unreadable.push(Scanned {
-                section: section.name.clone(),
-                start: image.base.saturating_add(u64::from(image.size_of_image)),
-                bytes: u64::from(section.virtual_size),
-            });
-            continue;
+    let covered = codewalk::walk_code(image, decode, halt, |step| {
+        let instruction = match step {
+            // Nothing a register held survives a break: what is on the far side of an unreadable
+            // page, or at the start of the next section, is not the next instruction of anything.
+            codewalk::Step::Break => return formed.clear(),
+            codewalk::Step::At(instruction, _) => instruction,
         };
-        let declared = u64::from(section.virtual_size);
-        let end = match image.checked_va(section.rva, section.virtual_size as usize) {
-            Ok(_) => start.saturating_add(declared),
-            Err(_) => {
-                let inside = u64::from(image.size_of_image.saturating_sub(section.rva));
-                unreadable.push(Scanned {
-                    section: section.name.clone(),
-                    start: start.saturating_add(inside),
-                    bytes: declared.saturating_sub(inside),
-                });
-                start.saturating_add(inside)
-            }
-        };
-
-        // The overlap with everything already scanned is skipped rather than decoded again.
-        let mut at = start.max(past);
-        past = past.max(end);
-        // One entry per **contiguous** decoded run rather than one per section. A section with a
-        // hole in it used to come back as a single range starting where the section starts and
-        // counting only the bytes that read — a shape that cannot say where the hole was, and
-        // whose `start` is wrong for everything after it.
-        let mut run: Option<(u64, u64)> = None;
-        // The addresses this section's code has been watched computing, for the calls that reach
-        // an import through a register rather than through a memory operand. Per section, so a
-        // register's meaning never crosses from one section's code into another's.
-        let mut formed = Formed::default();
-        let close = |run: &mut Option<(u64, u64)>, scanned: &mut Vec<Scanned>| {
-            if let Some((from, bytes)) = run.take()
-                && bytes > 0
+        // The slot the call names, or -- where the architecture cannot name one -- the slot this
+        // watched being computed into the register it calls through.
+        let slot = called_slot(instruction).or_else(|| formed.slot_of(instruction));
+        if let Some(import) = by_slot.get(&slot.unwrap_or(0))
+            && let Some(sink) = sinks.get_mut(&(import.library.clone(), import.name.to_string()))
+        {
+            // Counted always, listed up to the cap: the count is the fact and the list is a
+            // sample of it.
+            sink.call_site_count += 1;
+            if sink.call_sites.len() < MAX_CALL_SITES_PER_SINK
+                && listed_call_sites < MAX_CALL_SITES_TOTAL
             {
-                scanned.push(Scanned {
-                    section: section.name.clone(),
-                    start: from,
-                    bytes,
-                });
+                sink.call_sites.push(instruction.address);
+                listed_call_sites += 1;
             }
-        };
-        while at < end {
-            if let Some(why) = halt() {
-                halted = Some(why);
-                close(&mut run, &mut scanned);
-                break 'sections;
-            }
-            if budget == 0 {
-                cap_hit = true;
-                close(&mut run, &mut scanned);
-                break 'sections;
-            }
-            // The two range lists are bounded like everything else the answer carries. A section
-            // table that is plausible produces a handful of entries; one that is not can produce a
-            // row per window per section, and a bounded answer is still an answer where thousands
-            // of rows is a reply nobody reads.
-            if scanned.len() + unreadable.len() >= MAX_RANGES {
-                cap_hit = true;
-                close(&mut run, &mut scanned);
-                break 'sections;
-            }
-            let want = WINDOW.min(end - at).min(budget);
-            let Some(block) = decode(at, want as usize) else {
-                // A window that would not read is skipped rather than ending the scan — a driver
-                // whose `.text` is partly absent still answers for the rest of it — but it is
-                // **recorded**. Left silent, a dump missing one page reports a driver with no
-                // privileged instructions, and nothing anywhere says a page was missing.
-                //
-                // Nothing a register held survives the gap: what is on the far side of an
-                // unreadable page is not the next instruction of anything.
-                formed.clear();
-                close(&mut run, &mut scanned);
-                unreadable.push(Scanned {
-                    section: section.name.clone(),
-                    start: at,
-                    bytes: want,
-                });
-                at = at.saturating_add(want);
-                budget = budget.saturating_sub(want);
-                continue;
-            };
-            // **An empty answer is not an answer**, and neither is one that advances nothing.
-            // The decoder can succeed and return nothing — bytes that are there and decode to no
-            // instruction — and a zero-length instruction would loop for ever, so both end the
-            // section. What each has to do first is say what it is leaving: without that, a window
-            // that decoded to nothing ends a section silently and the rest of it is missing from
-            // both lists, which is the same silence an unreadable window used to keep.
-            if block.is_empty() {
-                formed.clear();
-                close(&mut run, &mut scanned);
-                unreadable.push(Scanned {
-                    section: section.name.clone(),
-                    start: at,
-                    bytes: end.saturating_sub(at),
-                });
-                break;
-            }
-            for instruction in &block {
-                // The slot the call names, or -- where the architecture cannot name one -- the
-                // slot this watched being computed into the register it calls through.
-                let slot = called_slot(instruction).or_else(|| formed.slot_of(instruction));
-                if let Some(import) = by_slot.get(&slot.unwrap_or(0))
-                    && let Some(sink) =
-                        sinks.get_mut(&(import.library.clone(), import.name.to_string()))
-                {
-                    // Counted always, listed up to the cap: the count is the fact and the list is
-                    // a sample of it.
-                    sink.call_site_count += 1;
-                    if sink.call_sites.len() < MAX_CALL_SITES_PER_SINK
-                        && listed_call_sites < MAX_CALL_SITES_TOTAL
-                    {
-                        sink.call_sites.push(instruction.address);
-                        listed_call_sites += 1;
-                    }
-                }
-                if let Some(kind) = privilege_kind(instruction, set) {
-                    privileged_count += 1;
-                    if privileged.len() < MAX_PRIVILEGED {
-                        privileged.push(Privileged {
-                            address: instruction.address,
-                            kind,
-                            mnemonic: instruction.mnemonic.clone(),
-                        });
-                    }
-                }
-                // **After the reads above, not before**: the call is the last step of the sequence
-                // this watches, and applying it first would clear the register the call reaches
-                // the slot through.
-                formed.apply(instruction);
-                // And nothing survives a terminator. The sequence is three adjacent instructions,
-                // so this costs almost nothing and is what keeps a slot from being attributed to a
-                // `blr` on an unrelated path.
-                if !matches!(instruction.flow, Flow::Fallthrough) {
-                    formed.clear();
-                }
-            }
-            // Resume after the last instruction that decoded whole, not at a fixed stride: a
-            // window's tail is usually a partial instruction, and restarting at `at + want` would
-            // decode the next window from the middle of one.
-            let last = block.last().expect("the block is not empty");
-            let next = last.address.saturating_add(instruction_len(last));
-            let consumed = next.saturating_sub(at);
-            if consumed == 0 {
-                close(&mut run, &mut scanned);
-                unreadable.push(Scanned {
-                    section: section.name.clone(),
-                    start: at,
-                    bytes: end.saturating_sub(at),
-                });
-                break;
-            }
-            let taken = consumed.min(want);
-            match &mut run {
-                Some((_, bytes)) => *bytes += taken,
-                None => run = Some((at, taken)),
-            }
-            budget = budget.saturating_sub(taken);
-            at = next;
         }
-        close(&mut run, &mut scanned);
-    }
+        if let Some(kind) = privilege_kind(instruction, set) {
+            privileged_count += 1;
+            if privileged.len() < MAX_PRIVILEGED {
+                privileged.push(Privileged {
+                    address: instruction.address,
+                    kind,
+                    mnemonic: instruction.mnemonic.clone(),
+                });
+            }
+        }
+        // **After the reads above, not before**: the call is the last step of the sequence this
+        // watches, and applying it first would clear the register the call reaches the slot
+        // through.
+        formed.apply(instruction);
+        // And nothing survives a terminator. The sequence is three adjacent instructions, so this
+        // costs almost nothing and is what keeps a slot from being attributed to a `blr` on an
+        // unrelated path.
+        if !matches!(instruction.flow, Flow::Fallthrough) {
+            formed.clear();
+        }
+    });
 
     Scan {
         sinks: sinks.into_values().collect(),
         privileged,
         privileged_count,
-        scanned,
-        unreadable,
+        scanned: covered.scanned,
+        unreadable: covered.unreadable,
         other_imports,
         // Over the whole table, not over the sinks: the bind routine is not a sink and never will
         // be -- it is how a driver *loads*, not something it does to a caller's buffer.
         framework: crate::framework::client_of(imports),
         unnamed_libraries: Vec::new(),
-        halted,
-        cap_hit,
+        halted: covered.halted,
+        cap_hit: covered.cap_hit,
     }
 }
 
@@ -888,14 +715,6 @@ enum Held {
     Slot(u64),
 }
 
-/// The encoded length of an instruction, from the bytes the decoder reported.
-///
-/// The engine prints the encoding as hex pairs, so the length is half the digits. Zero for an
-/// instruction that carried none, which is what stops a scan rather than looping on it.
-fn instruction_len(instruction: &Instruction) -> u64 {
-    (instruction.bytes.len() / 2) as u64
-}
-
 /// The scan as values, with every address turned into a coordinate by `locate`.
 ///
 /// A closure for the same reason every other pass here takes one: attributing an address is an
@@ -935,8 +754,8 @@ pub fn structured_report(
             })
             .collect(),
         privileged_count: scan.privileged_count,
-        scanned: scan.scanned.iter().map(scanned_range).collect(),
-        unreadable: scan.unreadable.iter().map(scanned_range).collect(),
+        scanned: scan.scanned.iter().map(codewalk::range_report).collect(),
+        unreadable: scan.unreadable.iter().map(codewalk::range_report).collect(),
         other_imports: scan.other_imports,
         // The import tell, and only it: this end has read no driver object and no dispatch table, so
         // it must not claim the second tell, and `Table::Unread` is what says so in the note.
@@ -951,15 +770,6 @@ pub fn structured_report(
             Halt::Interrupted => structured::WalkHalt::Interrupted,
         }),
         cap_hit: scan.cap_hit,
-    }
-}
-
-/// One covered or missing range, as the typed result carries it.
-fn scanned_range(range: &Scanned) -> crate::structured::ScannedRange {
-    crate::structured::ScannedRange {
-        section: range.section.clone(),
-        start: crate::structured::addr(range.start),
-        bytes: range.bytes,
     }
 }
 

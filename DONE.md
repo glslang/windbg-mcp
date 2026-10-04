@@ -156,6 +156,7 @@ engine — it adds a target and leaves the current one alone. The entry records 
 - [Item 103](#103-windbg-mcp-h5b--expose-the-secure-kernel-reads-without-forcing-them-through-dbgeng--done-2026-10-02) — [windbg-mcp] H5b — expose the Secure Kernel reads, without forcing them through DbgEng — done (2026-10-02)
 - [Item 107](#107-windbg-mcp-a-misspelt-tool-argument-is-silently-ignored-and-the-call-answers-status-ok--done-2026-10-02) — [windbg-mcp] A misspelt tool argument is silently ignored, and the call answers `status: ok` — done (2026-10-02)
 - [Item 92](#92-windbg-mcp-an-a64-conditional-compare-chain-is-a-compare-chain-the-walk-does-not-read--done-2026-10-02) — [windbg-mcp] An A64 conditional-compare chain is a compare chain the walk does not read — done (2026-10-02)
+- [Item 109](#109-windbg-mcp-the-server-can-walk-a-call-graph-forward-and-find-calls-to-imports-and-cannot-answer-who-calls-this-address--done-2026-10-04) — [windbg-mcp] The server can walk a call graph forward and find calls to imports, and cannot answer "who calls this address" — done (2026-10-04)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -8642,3 +8643,59 @@ asks of any schema change. Both goldens re-recorded; the shape golden's whole di
 
 Verified on the ARM64 bench: `cargo test` is **1,124 unit tests and 132 `mcp_smoke`**, 0 failed, and
 the dump tier green beside it.
+
+## 109. [windbg-mcp] The server can walk a call graph forward and find calls to imports, and cannot answer "who calls this address" — done (2026-10-04)
+
+**`xrefs_to` landed**: every site in one image whose decoded control flow reaches one address, with
+module+RVA, the transfer kind, the mnemonic and the section on each. Calls, unconditional jumps and
+conditional branches are counted apart, because an address that is only branched to is a label
+inside another routine while one that is called is a routine of its own — and the three counts are
+exact where the list is capped, so *is it called at all* survives a target reached by four thousand
+branches.
+
+**Built on the hazard scan's walk rather than beside it**, which the item asked for and which took
+an extraction first: `src/codewalk.rs` now owns the bounded section walk, the window boundaries
+that resume after the last *whole* instruction, the clamped overrunning section, the unreadable-window
+accounting and the two budgets. `hazards::scan` was moved onto it unchanged — its own 16 tests
+cover exactly those behaviours and stayed green, and breaking `codewalk`'s hex-pair instruction
+length fails two of them, which is what says the behaviour really moved rather than being copied.
+A second copy of that loop would have been a copy of the defects fourteen rounds of review on
+[#305](https://github.com/glslang/windbg-mcp/pull/305) and
+[#307](https://github.com/glslang/windbg-mcp/pull/307) took out of it.
+
+**Decoded, never pattern-matched**, which was the item's first requirement and is now a test rather
+than an intention: the destination is a field on `Flow`, the `Flow` match is exhaustive so an
+upstream variant cannot be silently dropped, and the control — an address one byte inside an
+instruction — comes back with no sites. The ad-hoc Python this replaces matched `E8`/`E9`
+displacements over raw bytes, which is sound enough to generate a lead and not sound enough to be a
+tool.
+
+**And the field census the item warned against was not shipped.** "Answering for an address is not
+answering for an object" is still true and still unbuilt, deliberately.
+
+**Verified as a round trip, because nothing else tests a search.** A tool answering an empty list
+for everything passes every "did it error" check ever written. So
+`a_reference_scan_answers_where_the_import_table_cannot_be_read` (dump tier) reads the fact from the
+**disassembler** first — a direct call in `nt` and the routine it names — and requires that site
+back with its kind, module and RVA. Which call is deliberately not written down: the x64 sample's
+`nt!KeBugCheckEx` opens with `RtlCaptureContext`, the ARM64 one reaches `KeBugCheck2` four
+instructions in, and a fixture naming either stood down on the other host as a `SKIPPED` line that
+read like a missing symbol and was a hard-coded callee. Measured by hand on both samples first: 391
+sites for `nt!KeBugCheck2` on the ARM64 dump (383 call, 8 jump), including the site the disassembly
+had already shown.
+
+**One claim of this item's own did not survive its verification, and is now item 111.** The entry
+said the tool "works with **no debuggee** against an image target, so `securekernel.exe`,
+`winhvr.sys`, `Vid.sys` and any driver answer offline". It does not. On `securekernel.exe` opened as
+an image the scan reports all four code sections covered with no unreadable range and finds nothing,
+while `reachable_from_dispatch` proves a call exists in the same session. The cause is below this
+tool — an image target's memory does not read until something else has read it, and the walk counts
+what it did not get as scanned — so it is filed as its own item with the measurement, `driver_hazards`
+is implicated in it on the same image, and both tools' prose now sends a reader to a dump or a live
+target. **That gap was the item's rationale rather than its deliverable**, which is why this closed
+and 111 opened rather than this staying half-landed: the thing asked for exists and is tested, and
+what is left is a defect in a layer underneath it.
+
+**The surface cost is 2,930 B** — 1,718 of description, 1,163 of input schema — taking the model-visible
+surface from 113,516 to 116,446 and its ceiling from 114,000 to 118,000, with the arithmetic and the
+reason the description is the larger half recorded above `MODEL_VISIBLE_CEILING`.

@@ -1790,6 +1790,32 @@ pub struct IoctlMapArgs {
     pub session_id: Option<String>,
 }
 
+/// Arguments for `xrefs_to`.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct XrefsArgs {
+    /// Address to find references to, in any WinDbg form — a bare value is hex
+    /// (e.g. "fffff803`3e254750"), and "0x"-hex or a symbol also work. Provide this
+    /// OR `target_module`+`rva`, not both.
+    #[serde(default)]
+    pub address: Option<String>,
+    /// Module for a module+RVA target, e.g. "mydriver"; its live base is added to
+    /// `rva`. Required (with `rva`) when `address` is omitted.
+    #[serde(default)]
+    pub target_module: Option<String>,
+    /// Offset added to `target_module`'s live base, in WinDbg form (bare is hex).
+    #[serde(default)]
+    pub rva: Option<String>,
+    /// Image to search. Omit for the one holding the target, which is where a
+    /// routine's callers almost always are; name another for cross-module refs.
+    #[serde(default)]
+    pub module: Option<String>,
+    /// Which session to act on. Omit for the current one; pass an opener's handle to route to that
+    /// session and be refused if its target was replaced or closed.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DriverHazardsArgs {
@@ -5967,6 +5993,95 @@ impl WindbgServer {
         engine_result_for(args.session_id.as_deref(), out)
     }
 
+    /// Which sites in one image reach a given address — the reverse of a forward
+    /// call-graph walk, and about an **internal** address rather than an import.
+    /// The question you have when a symbol is absent, a PDB is public and typeless,
+    /// or the interesting thing is a callback body rather than a named routine.
+    /// Needs only control flow, so it answers where operand decoding does not.
+    /// **Ask it on a dump or a live target**: on an image opened with no debuggee
+    /// the scan reports ranges it did not really read, and answers nothing.
+    ///
+    /// Each site carries module+RVA, the transfer kind, the mnemonic and its
+    /// section; a reference from a discardable section such as `INIT` is dead once
+    /// the driver has loaded. Calls, unconditional jumps and conditional branches
+    /// are counted apart — an address only branched to is a label inside another
+    /// routine, one that is called is a routine of its own. Destinations come from
+    /// the **decoded** instruction, so a stray call-opcode byte is not a hit.
+    ///
+    /// **An empty list is evidence about the scan, not the target.** An indirect
+    /// transfer (`call rax`) carries no destination to compare; an address merely
+    /// *stored* in a dispatch table or callback slot is never branched to; only this
+    /// image is read; and code that did not decode is reported and says nothing.
+    #[rmcp::tool(
+        annotations(
+            title = "Find the sites that call or branch to one address",
+            read_only_hint = true,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<Outcome<structured::Xrefs>>()
+    )]
+    async fn xrefs_to(
+        &self,
+        Parameters(args): Parameters<XrefsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // Screened for the separators that would run a second command, because the target forms
+        // reach the debugger's expression evaluator and `module`'s base is read through `lm m`.
+        // `module` itself is matched against the module inventory rather than interpolated, and is
+        // screened anyway: the pair of them arriving from one caller is easier to reason about
+        // screened together than with an exception nobody can see the edge of.
+        for (field, value) in [
+            ("address", args.address.as_ref()),
+            ("target_module", args.target_module.as_ref()),
+            ("rva", args.rva.as_ref()),
+            ("module", args.module.as_ref()),
+        ] {
+            if let Some(value) = value
+                && let Err(e) = reject_command_breakers(field, value, Quotes::Rejected)
+            {
+                // `typed_error`, not `tool_error`: this tool declares an `outputSchema`, so every
+                // result it returns has to carry `structuredContent` — a refusal included, or a
+                // caller branching on `category` gets prose instead.
+                return typed_error(ErrorCategory::InvalidArgument, e, args.session_id.clone());
+            }
+        }
+        // **The two target forms are settled here rather than in the worker**, so a malformed
+        // pair is an argument error naming the pair instead of whatever the engine made of it —
+        // and, as with the reachability walk, it settles an ordering the worker could not: the
+        // worker refuses an instruction set whose flow it cannot decode, and that check runs
+        // first, so a malformed pair would otherwise come back as `debugger` and send a caller to
+        // change their target rather than their call. The worker matches these forms again,
+        // deliberately: it is the one place the VA is computed.
+        let target_forms = match (&args.address, &args.target_module, &args.rva) {
+            (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+                Some("provide `address` OR `target_module`+`rva`, not both")
+            }
+            (Some(_), None, None) | (None, Some(_), Some(_)) => None,
+            _ => Some("provide `address`, or both `target_module` and `rva`"),
+        };
+        if let Some(why) = target_forms {
+            return typed_error(
+                ErrorCategory::InvalidArgument,
+                why.to_string(),
+                args.session_id.clone(),
+            );
+        }
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::Xrefs {
+                    module: args.module,
+                    address: args.address,
+                    target_module: args.target_module,
+                    rva: args.rva,
+                    // Filled in by the supervisor's pump when this job reaches the front of its
+                    // session's queue, exactly as the hazard scan's is.
+                    patience_ms: 0,
+                },
+            )
+            .await;
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
     /// What a driver's image says it can do: the sensitive APIs it imports with the
     /// call sites that reach them, and the privileged instructions in its code
     /// (`rdmsr`, `out`, `mov cr3`, and every other one the decoder calls
@@ -6423,6 +6538,20 @@ const SUMMARY_NOTES: &[SummaryNote] = &[
 /// served, so if the base description is clean on the tightest surface it is clean on every wider
 /// one.
 const TOOL_NOTES: &[ToolNote] = &[
+    ToolNote {
+        tool: "xrefs_to",
+        names: &["reachable_from_dispatch"],
+        note: "This asks who reaches an address; `reachable_from_dispatch` asks the forward \
+               question — whether one block is reachable from a dispatch routine — and is the one \
+               to use when the root is known and the target is the question.",
+    },
+    ToolNote {
+        tool: "xrefs_to",
+        names: &["driver_hazards"],
+        note: "For the call sites of an *imported* routine, `driver_hazards` already has them: it \
+               matches a call by its import-table slot, which needs no address and finds the \
+               indirect calls through the IAT that this does not.",
+    },
     ToolNote {
         tool: "driver_surface",
         names: &["device_security"],

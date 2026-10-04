@@ -665,18 +665,27 @@
       "name": "walk_memory",
       "outputSchema": 3060,
       "wire": 7354
+    },
+    {
+      "annotations": 102,
+      "description": 1718,
+      "inputSchema": 1163,
+      "modelVisible": 2930,
+      "name": "xrefs_to",
+      "outputSchema": 2508,
+      "wire": 5571
     }
   ],
   "totals": {
-    "annotations": 8082,
-    "description": 42424,
-    "inputSchema": 67168,
+    "annotations": 8184,
+    "description": 44142,
+    "inputSchema": 68331,
     "instructions": 2022,
-    "modelVisible": 113516,
-    "outputSchema": 198306,
-    "payload": 322043,
-    "tools": 74,
-    "wire": 321958,
+    "modelVisible": 116446,
+    "outputSchema": 200814,
+    "payload": 327615,
+    "tools": 75,
+    "wire": 327529,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10842
   }
