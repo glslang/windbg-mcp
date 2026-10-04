@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A jump-table base the compiler built in two instructions survives the second one**
+  (`FOLLOWUPS.md` item 84, in `DONE.md`). A64 materialises a page-relative address as
+  `adrp x8,<page>` / `add x8,x8,#<offset>`, and `ioctl::update` modelled `Effect::Add` only as
+  `Value::Code + immediate` -- so the `add` cleared the register, `follow_table` found no base, and
+  the dispatch `br` went back `unresolved`: the safe direction, and silent about which part was
+  lost. **It is a codegen choice rather than a reach one**, which is why it is not a large-driver
+  edge: `adr` covers ±1 MB, and `mountmgr` emits the pair at **139 KB**
+  (`mountmgr+0x19450` is `adrp x8,mountmgr!QueryPointsFromMemory+0x610` / `add x22,x8,#0x4E8`, four
+  instructions past one of its two jump tables). The arm is in the fact walk, so it serves all three
+  places a switch takes an address from -- the table's base, the base its signed entries are
+  measured from, and an MSVC byte map's. **Gated on the destination's width**, which the item did
+  not ask for and is the half that decides the direction: `add w8,w8,#K` writes four bytes of a
+  64-bit base and zeroes the rest, and a model computing at the pointer's width would resolve the
+  switch from bytes at an address execution never formed -- the question `Value::carried_by` already
+  asks of `mov ecx,edx`, asked of arithmetic. No driver on this bench uses the pair for a table
+  *base* -- `mountmgr`'s instance is past a table rather than under one -- so both halves are pinned
+  by fixtures built from that driver's real offset, each mutation-verified against the state before
+  the change: without the arm the switch recovers **no cases at all**, and without the guard it
+  publishes **two** from a truncated base.
+
 - **An image target's memory reads on the first call** (`FOLLOWUPS.md` item 111, in `DONE.md`). A
   PE opened with `open_dump` and no debuggee answered a virtual read with `0x8007001E` — *the
   system cannot read from the specified device* — until something made the engine load the module
