@@ -8503,7 +8503,6 @@ fn xrefs_of(
     // **Resolved through the module inventory, exactly as the hazard scan is**, and for the same
     // reason: `lm m` takes a WinDbg pattern, so a name matching several images would have the
     // first row's address silently win.
-    let loaded = e.modules().map_err(failed)?;
     let (name, base, loaded_size) = match (module, target_module) {
         // The caller named the image to search.
         (Some(module), _) => module_named(e, module)?,
@@ -8513,19 +8512,36 @@ fn xrefs_of(
         // and on a target whose module sizes are unknown it would disagree, which is how this
         // arm came to exist (review on
         // [#446](https://github.com/glslang/windbg-mcp/pull/446)).
-        (None, Some(target_module)) => module_named(e, target_module)?,
+        //
+        // Taken from the resolution rather than looked up again: it is the same name through the
+        // same helper, and enumerating a second time is a round trip this arm already paid for.
+        (None, Some(target_module)) => match &target.module {
+            Some(resolved) => resolved.clone(),
+            // **Unreachable, and a second lookup rather than a panic.** `target_module` arrives
+            // only with an `rva` — the tool refuses the pair otherwise and `resolve_code_target`
+            // refuses it again — so the resolution above always kept its module. If that ever
+            // stops being true this pays the enumeration it was avoiding instead of taking the
+            // session down with it, which is the right way round for a worker thread.
+            None => module_named(e, target_module)?,
+        },
         // **Only an absolute address, so the image is whichever holds it.** That is the answer a
         // caller almost always wants — a routine's callers are overwhelmingly in its own image —
         // and it is a fact this side can read rather than a default this side invents.
         (None, None) => {
+            // Enumerated **here**, where it is the answer, rather than above where only this arm
+            // reads it. Both arms before this one resolve a name through `module_named`, which
+            // enumerates for itself.
+            let loaded = e.modules().map_err(failed)?;
+            // Bound for the message below: `address` in this scope is the caller's own argument.
+            let va = target.address;
             let holding = loaded
                 .iter()
-                .find(|candidate| module_holds(candidate.base, candidate.size, target))
+                .find(|candidate| module_holds(candidate.base, candidate.size, target.address))
                 .ok_or_else(|| {
                     Failed::categorised(
                         structured::ErrorCategory::Debugger,
                         format!(
-                            "no loaded module holds {target:#x}, so there is no image to search. \
+                            "no loaded module holds {va:#x}, so there is no image to search. \
                              Code in a pool allocation, or in a driver that has unloaded, is in \
                              none, and a module whose size this target does not report is only \
                              known to hold its own base. Name the image with `module`, or give \
@@ -8538,7 +8554,7 @@ fn xrefs_of(
         }
     };
 
-    let report = xrefs_at(e, &name, base, loaded_size, target, deadline)?;
+    let report = xrefs_at(e, &name, base, loaded_size, target.address, deadline)?;
     Ok(Output::typed(fenced(&xrefs::render(&report)), report))
 }
 
@@ -10833,6 +10849,24 @@ fn rva_within_module(size: u32, rva: u64) -> bool {
     size == 0 || rva < u64::from(size)
 }
 
+/// A resolved target: the absolute VA, and the module it was an offset into if it was one.
+///
+/// **The module is carried because the caller would otherwise look it up again.** `xrefs_of`
+/// scans the image a `target_module`+`rva` pair named, and resolving that pair here already
+/// enumerated the inventory to find it — so returning it takes a `module+rva` request from three
+/// enumerations before the first image read to one. On a slow remote-kernel transport those are
+/// synchronous and unpolled, and can spend the scan's remaining deadline before any of the work
+/// the caller asked for (review on
+/// [#446](https://github.com/glslang/windbg-mcp/pull/446)).
+///
+/// `None` for an absolute `address`, which is an offset into nothing — the same asymmetry the
+/// contract table below records for what bounds each form.
+struct CodeTarget {
+    address: u64,
+    /// Name, base and size, as [`module_named`] resolved them.
+    module: Option<(String, u64, u32)>,
+}
+
 /// The absolute VA a caller named, from an `address` **or** a `module`+`rva` pair.
 ///
 /// **Shared rather than copied**, which is the only reason it is a function: `reachable` grew it
@@ -10870,7 +10904,7 @@ fn resolve_code_target(
     module: Option<&str>,
     rva: Option<&str>,
     deadline: Instant,
-) -> Result<u64, Failed> {
+) -> Result<CodeTarget, Failed> {
     // Resolve the target VA: an absolute address, or module+RVA rebased against the module's
     // live base from `lm m <module>`. Both sides go through `resolve`, so a value pasted from
     // WinDbg — a `hi`lo` backtick address or a digit-only 32-bit address — reads consistently.
@@ -10878,6 +10912,8 @@ fn resolve_code_target(
     // keeps a malformed pair from arriving here as an architecture refusal. They are matched again
     // rather than assumed: this is the one place the target VA is computed, and a match that
     // cannot fail is a match whose arms nobody has to reason about.
+    // The module the pair named, kept rather than recomputed by the caller — see [`CodeTarget`].
+    let mut named = None;
     let target = match (address, module, rva) {
         // Reject conflicting target forms rather than silently ignoring one — analysing the
         // wrong target would give a misleading verdict.
@@ -10917,6 +10953,7 @@ fn resolve_code_target(
             // path's last command away: there is no text left to parse and no pattern left to
             // resolve to an arbitrary row.
             let (name, base, size) = module_named(e, m)?;
+            named = Some((name.clone(), base, size));
             // **And the offset has to be inside the image it is an offset into.** `nt`+`0x1800000`
             // on the checked-in x64 dump is `hal`'s base: the caller said the target was in `nt`,
             // every bound above was satisfied, and `xrefs_to` scanned `hal` and said so only in a
@@ -10952,7 +10989,10 @@ fn resolve_code_target(
         }
     };
 
-    Ok(target)
+    Ok(CodeTarget {
+        address: target,
+        module: named,
+    })
 }
 
 fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result<Output, Failed> {
@@ -10992,13 +11032,15 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
         ));
     }
 
+    // This walk takes a target and never an image, so the resolved module is nothing to it.
     let target = resolve_code_target(
         e,
         args.address.as_deref(),
         args.module.as_deref(),
         args.rva.as_deref(),
         deadline,
-    )?;
+    )?
+    .address;
 
     // Resolve `from` to a numeric VA so a mid-function start (a handler scoped past a switch)
     // is honored; `None` (unresolvable) starts at the entry.
@@ -11314,6 +11356,39 @@ mod tests {
     };
 
     use super::TargetFingerprint;
+
+    /// **One module enumeration per reference scan, in the arm that has no name to resolve.**
+    ///
+    /// `xrefs_of` read the inventory unconditionally while both of its named arms resolved through
+    /// `module_named`, which enumerates for itself — so a `target_module`+`rva` request walked the
+    /// table three times before the first image read, and nothing failed because the binding *was*
+    /// used, by the third arm (review on
+    /// [#446](https://github.com/glslang/windbg-mcp/pull/446)). On a slow remote-kernel transport
+    /// those calls are synchronous and unpolled and can spend the scan's deadline before its work
+    /// begins.
+    ///
+    /// A source guard because that is what the property is: the cost is in which *arms* call out,
+    /// and a behavioural test would need an engine and a way to count its round trips.
+    #[test]
+    fn a_reference_scan_enumerates_the_module_inventory_once() {
+        let body = bodies_of(&["xrefs_of"], 3_000);
+        assert_eq!(
+            body.matches("e.modules()").count(),
+            1,
+            "`xrefs_of` should enumerate once; its two named arms resolve through `module_named`, \
+             which enumerates for itself, and the module a `target_module`+`rva` pair named is \
+             carried back by `CodeTarget` rather than looked up twice"
+        );
+        let unnamed = body
+            .split_once("(None, None) => {")
+            .expect("`xrefs_of` has an arm for a bare address")
+            .1;
+        assert!(
+            unnamed.contains("e.modules()"),
+            "the one enumeration belongs to the arm that has no name to resolve, not above the \
+             match where every arm pays for it"
+        );
+    }
 
     /// **A module+RVA coordinate is bounded by the image, and an unknown size is not an empty
     /// one.**
