@@ -10789,6 +10789,23 @@ fn module_named(e: &DebugEngine, module: &str) -> Result<(String, u64, u32), Fai
     }
 }
 
+/// Whether an RVA names a place inside a module of this size.
+///
+/// **A size of zero means the engine reported none**, which this crate reads as *unknown* rather
+/// than as an empty image — the same convention as [`within_module`] and [`smaller_extent`], whose
+/// own comments say why: a target that cannot say how big its modules are would otherwise have
+/// every read, every clamp and every coordinate refused. Written as a predicate rather than inline
+/// because the inline version could not express it: `size <= rva` is true for *every* `rva` when
+/// the size is zero, so the first version of this bound refused `rva: 0` on such a target and
+/// regressed both callers (review on
+/// [#446](https://github.com/glslang/windbg-mcp/pull/446), against that round's own fix).
+///
+/// A name also makes the bound testable at the site the defect was on, which a test driving
+/// `resolve_code_target` cannot be: that needs an engine, and this needs two integers.
+fn rva_within_module(size: u32, rva: u64) -> bool {
+    size == 0 || rva < u64::from(size)
+}
+
 /// The absolute VA a caller named, from an `address` **or** a `module`+`rva` pair.
 ///
 /// **Shared rather than copied**, which is the only reason it is a function: `reachable` grew it
@@ -10814,7 +10831,7 @@ fn module_named(e: &DebugEngine, module: &str) -> Result<(String, u64, u32), Fai
 /// |---|---|
 /// | `address` | **nothing, deliberately.** The caller named an absolute address and the debugger resolved it; there is no image it is an offset into, so any VA in the target is a legitimate answer. |
 /// | `module` | exactly one entry of the typed inventory, matched on the name rather than as a pattern ([`module_named`]). |
-/// | `rva` | strictly less than that module's size, so the pair names a place **inside** the image it claims. |
+/// | `rva` | strictly less than that module's size ([`rva_within_module`]), so the pair names a place **inside** the image it claims — unless the engine reported no size at all, which this crate reads as unknown rather than empty. |
 /// | `base + rva` | checked for overflow, which the two bounds above already make unreachable and which stays because it costs nothing to keep true. |
 /// | the two forms | one or the other, never both and never neither — settled in the tool as well, so a malformed pair is an argument error before a session is chosen. |
 ///
@@ -10882,7 +10899,7 @@ fn resolve_code_target(
             //
             // This is `guarded_address`' rule, which this crate already applies to an
             // `ImageCoordinate`; it was simply not applied here.
-            if u64::from(size) <= rva {
+            if !rva_within_module(size, rva) {
                 return Err(Failed::categorised(
                     structured::ErrorCategory::InvalidArgument,
                     format!(
@@ -11270,6 +11287,41 @@ mod tests {
     };
 
     use super::TargetFingerprint;
+
+    /// **A module+RVA coordinate is bounded by the image, and an unknown size is not an empty
+    /// one.**
+    ///
+    /// Both halves in one test because the first version of this bound had the first and not the
+    /// second: `size <= rva` refuses every `rva` when the size is zero, including `0`, so a target
+    /// whose engine reports no module sizes lost `xrefs_to` and `reachable_from_dispatch`
+    /// outright. Zero means *unknown* here, as [`within_module`] and [`smaller_extent`] already
+    /// read it (review on [#446](https://github.com/glslang/windbg-mcp/pull/446), against the
+    /// previous round's own fix).
+    ///
+    /// Tested here rather than through `resolve_code_target`, which needs an engine: the bound is
+    /// two integers, and the defect was on this line rather than in that function.
+    #[test]
+    fn an_rva_is_bounded_by_its_module_unless_the_size_is_unknown() {
+        // A known size bounds it, and the last byte is still inside.
+        assert!(super::rva_within_module(0x1000, 0));
+        assert!(super::rva_within_module(0x1000, 0xfff));
+        assert!(!super::rva_within_module(0x1000, 0x1000));
+        assert!(!super::rva_within_module(0x1000, 0x1_0000));
+
+        // A size of zero is the engine reporting none, so there is nothing to bound against.
+        assert!(
+            super::rva_within_module(0, 0),
+            "an unknown size must not refuse the image's own base"
+        );
+        assert!(
+            super::rva_within_module(0, 0xdead_beef),
+            "an unknown size bounds nothing, which is the convention this crate already keeps"
+        );
+
+        // And the widest real size still rejects what is past it rather than overflowing.
+        assert!(super::rva_within_module(u32::MAX, u64::from(u32::MAX) - 1));
+        assert!(!super::rva_within_module(u32::MAX, u64::from(u32::MAX)));
+    }
 
     fn live_control_open() -> EngineOp {
         EngineOp::OpenSecureKernelLive(Box::new(crate::skdispatch::OpenRequest {
