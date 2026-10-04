@@ -33,6 +33,7 @@ use crate::sklive::{
 pub(crate) const LIVE_CONTROL_FLAG: &str = "--sk-live-control";
 
 const DEBUG_WAIT: u32 = 60_000;
+const NATIVE_SETTLE_WAIT: u32 = 1_000;
 const COMPLETION_KICK_AFTER: Duration = Duration::from_secs(12);
 const POWERSHELL_WAIT: Duration = Duration::from_secs(60);
 const LIVE_MEMORY_WAIT: Duration = Duration::from_secs(60);
@@ -49,10 +50,11 @@ pub(crate) struct Session {
 
 impl Session {
     pub(crate) fn open(request: &OpenRequest) -> Result<(Self, Vec<String>)> {
-        if request.additional_vps.len() >= crate::sklive::MAX_LIVE_CONTROL_VPS {
+        if !request.additional_vps.is_empty() {
             bail!(
-                "live control accepts at most {} VP providers",
-                crate::sklive::MAX_LIVE_CONTROL_VPS
+                "the build-guarded live adapter currently accepts exactly one selected VP; the \
+                 native vmwp dispatcher serializes held callbacks, so multi-provider control \
+                 requires a separate release-and-quiesce protocol"
             );
         }
         request.target.validate()?;
@@ -67,25 +69,11 @@ impl Session {
             &request.control_transport,
             request.target.clone(),
         )?;
-        let mut providers = vec![provider];
-        let mut skipped = skipped
+        let skipped = skipped
             .into_iter()
             .map(|line| format!("VP {}: {line}", request.target.vp))
             .collect::<Vec<_>>();
-        for additional in &request.additional_vps {
-            additional.target.validate()?;
-            let (provider, provider_skipped) = crate::skcontrol::ControlProcess::spawn(
-                &additional.control_transport,
-                additional.target.clone(),
-            )?;
-            skipped.extend(
-                provider_skipped
-                    .into_iter()
-                    .map(|line| format!("VP {}: {line}", additional.target.vp)),
-            );
-            providers.push(provider);
-        }
-        let control = LiveControl::open_many(providers)?;
+        let control = LiveControl::open(provider)?;
         Ok((
             Self {
                 control,
@@ -429,6 +417,13 @@ pub(crate) fn parse_hex_bytes(text: &str) -> Result<Vec<u8>> {
 
 /// Persistent half of the adapter. It is kept beside the live-control state machine in the
 /// worker; [`VmwpDispatcher`] borrows it together with the worker's engine for one operation.
+#[derive(Clone, Debug)]
+struct RetainedEvent {
+    system_id: u32,
+    return_ip: u64,
+    event: HeldEvent,
+}
+
 pub(crate) struct VmwpDispatcherState {
     profile: DispatcherProfile,
     vmwp_pid: u32,
@@ -445,8 +440,11 @@ pub(crate) struct VmwpDispatcherState {
     threads_frozen: bool,
     /// A pause may have taken effect, so an idempotent resume is owed during safe cleanup.
     vm_paused: bool,
-    /// Suspend-VM completed successfully and provider register access cannot race guest execution.
+    /// The selected provider is held by an outstanding native event, or Suspend-VM completed before
+    /// the dispatcher registered an event.
     provider_writes_quiesced: bool,
+    /// Exact callback thread retained until this provider's debug state is restored.
+    retained_event: Option<RetainedEvent>,
     completion_kick: Option<VmTransition>,
     unregister: Option<UnregisterProgress>,
 }
@@ -484,6 +482,7 @@ impl VmwpDispatcherState {
             threads_frozen: false,
             vm_paused: false,
             provider_writes_quiesced: false,
+            retained_event: None,
             completion_kick: None,
             unregister: None,
         })
@@ -519,16 +518,6 @@ impl VmwpDispatcherState {
         Ok(())
     }
 
-    fn claim_held_pause(&mut self, event: &HeldEvent) -> Result<()> {
-        if self.phase.held_event() != Some(event) {
-            bail!("the VM-wide pause barrier does not name the held dispatcher event");
-        }
-        // Claim this before Suspend-VM for the same conservative recovery reason as initial arm.
-        self.vm_paused = true;
-        self.provider_writes_quiesced = false;
-        Ok(())
-    }
-
     fn confirm_vm_pause(&mut self) -> Result<()> {
         if !self.vm_paused {
             bail!("cannot confirm a VM pause the dispatcher does not own");
@@ -537,9 +526,25 @@ impl VmwpDispatcherState {
         Ok(())
     }
 
+    fn confirm_retained_provider_stop(&mut self, targets: &[TargetIdentity]) -> Result<()> {
+        let target = targets
+            .first()
+            .filter(|_| targets.len() == 1)
+            .context("provider quiescence requires exactly one selected VP")?;
+        let retained = self
+            .retained_event
+            .as_ref()
+            .context("the selected provider has no retained dispatcher event")?;
+        if retained.event.vp != target.vp || retained.event.vtl != target.vtl {
+            bail!("the retained dispatcher event does not name the selected provider");
+        }
+        self.provider_writes_quiesced = true;
+        Ok(())
+    }
+
     fn begin_vm_resume(&mut self) {
-        // Once a resume is possible, provider register access is forbidden until a later
-        // Suspend-VM has completed successfully.
+        // Once a resume is possible, provider register access is forbidden until a later pause or
+        // retained provider stop has completed successfully.
         self.provider_writes_quiesced = false;
     }
 
@@ -876,22 +881,38 @@ impl EventDispatcher for VmwpDispatcher<'_> {
     }
 
     fn establish_recovery_pause(&mut self, targets: &[TargetIdentity]) -> Result<()> {
-        // A wait may fail while its asynchronous Resume-VM is still outstanding. Join that helper
-        // before issuing the recovery pause, but attempt the pause even when the helper reports an
-        // ambiguous failure: only the new successful Suspend-VM can authorize provider writes.
+        if self.state.retained_event.is_some() {
+            // A delayed completion kick cannot be joined while its pause request is blocked behind
+            // this native event. The event itself is the selected provider's write barrier; safe
+            // recovery completes the callback, detaches, and joins the helper in that order.
+            return self.state.confirm_retained_provider_stop(targets);
+        }
+        // A wait may fail while its asynchronous Resume-VM is still outstanding. With no retained
+        // event, join that helper before a fresh Suspend-VM proves recovery quiescence. An incomplete
+        // callback whose exact thread was not retained remains fail-closed.
         let transition_error = self.state.finish_completion_kick().err();
-        let pause = if let Some(event) = self.state.phase.held_event().cloned() {
-            self.pause_held_target(&event)
+        let pause = if matches!(
+            self.state.phase,
+            DispatcherPhase::Holding(_)
+                | DispatcherPhase::ReturningCallback(_)
+                | DispatcherPhase::CallbackEntry(_)
+                | DispatcherPhase::ReturningHandle(_)
+                | DispatcherPhase::HandleReturn(_)
+                | DispatcherPhase::ReturningNative(_)
+        ) {
+            Err(anyhow!(
+                "an incomplete native callback has no retained thread identity"
+            ))
         } else {
             self.pause_for_provider_writes(targets)
         };
         match (transition_error, pause) {
             (None, result) => result,
             (Some(error), Ok(())) => Err(error
-                .context("the pending VM transition failed before a successful recovery pause")),
+                .context("the pending VM transition failed before recovery quiescence was proved")),
             (Some(transition), Err(pause)) => bail!(
-                "the pending VM transition failed: {transition:#}; the recovery pause also failed: \
-                 {pause:#}"
+                "the pending VM transition failed: {transition:#}; recovery quiescence also \
+                 failed: {pause:#}"
             ),
         }
     }
@@ -917,6 +938,9 @@ impl EventDispatcher for VmwpDispatcher<'_> {
             DispatcherPhase::ReadyForStop => {}
             other => bail!("wait_for_stop requires an armed dispatcher, got {other:?}"),
         }
+        if self.state.retained_event.is_some() {
+            bail!("wait_for_stop found dispatcher events retained from an earlier stop");
+        }
         let event_site = self.site_address(&self.state.profile.event_held)?;
         if self.state.breakpoint.is_none() {
             let site = self.state.profile.event_held.clone();
@@ -935,63 +959,10 @@ impl EventDispatcher for VmwpDispatcher<'_> {
         }
 
         let deadline = Instant::now() + Duration::from_millis(u64::from(DEBUG_WAIT));
-        let (event_pointer, target) = loop {
-            self.run_to_current_breakpoint(deadline)?;
-            if self.engine.instruction_pointer().map_err(debugger)? != event_site {
-                bail!("debugger stopped away from the owned dispatcher breakpoint");
-            }
-            let message_type = self.register("rcx")?;
-            let event_pointer = self.register("r14")?;
-            let context = self.read_u64(
-                event_pointer
-                    .checked_add(u64::from(self.state.profile.layout.event_context))
-                    .context("event context address overflowed")?,
-            )?;
-            let vp = self.read_u32(
-                event_pointer
-                    .checked_add(u64::from(self.state.profile.layout.event_vp))
-                    .context("event VP address overflowed")?,
-            )?;
-            let target = targets.iter().find(|target| target.vp == vp);
-            if message_type == EVENT_TYPE_VECTOR_1
-                && context == self.state.handler_context.context("no handler context")?
-                && let Some(target) = target
-            {
-                break (event_pointer, target);
-            }
-            if Instant::now() >= deadline {
-                bail!("too many unrelated dispatcher events before the owned vector-1 event");
-            }
-        };
-
-        let event = HeldEvent {
-            message_type: HexU64(EVENT_TYPE_VECTOR_1),
-            vector: 1,
-            vp: target.vp,
-            vtl: target.vtl,
-            cpl: 0,
-            dispatcher_context: HexU64(self.state.handler_context.context("no handler context")?),
-            advance_instruction_pointer: false,
-            reason: StopReason::DebugException,
-        };
-        // Matching the vector, VP and registered context proves ownership of the native event.
-        // Record it before any cleanup or live-memory operation can fail so recovery completes this
-        // callback instead of detaching from a still-pending one.
-        self.state.phase = DispatcherPhase::Holding(event.clone());
+        let (event_pointer, event) = self.wait_for_owned_event(targets, event_site, deadline)?;
+        self.retain_current_event(event_pointer, event_site, &event)?;
         self.state.vm_paused = false;
-        self.prepare_held_event()?;
-        // The native intercept holds only the winning VP. Re-establish a VM-wide barrier before
-        // the controller restores debug registers on any losing VP or publishes stop evidence.
-        self.pause_held_target(&event)?;
-
-        let advance = self.read_u8(
-            event_pointer
-                .checked_add(u64::from(self.state.profile.layout.exchange_advance))
-                .context("event advance address overflowed")?,
-        )?;
-        if advance != 0 {
-            bail!("the native dispatcher event already requests instruction-pointer advance");
-        }
+        self.state.confirm_retained_provider_stop(targets)?;
         let memory = self
             .state
             .memory
@@ -1009,12 +980,13 @@ impl EventDispatcher for VmwpDispatcher<'_> {
     }
 
     fn release_event(&mut self, event: &HeldEvent, mode: ReleaseMode) -> Result<()> {
-        let held = self
+        let retained = self
             .state
-            .phase
-            .held_event()
+            .retained_event
+            .as_ref()
+            .map(|retained| &retained.event)
             .context("the dispatcher owns no event to release")?;
-        if held != event {
+        if retained != event {
             bail!("release does not name the event held by the dispatcher");
         }
         self.complete_event(mode)
@@ -1032,14 +1004,16 @@ impl EventDispatcher for VmwpDispatcher<'_> {
             return Ok(());
         }
 
-        if let Some(held) = self.state.phase.held_event().cloned() {
+        if let Some(held) = self
+            .state
+            .retained_event
+            .as_ref()
+            .map(|retained| retained.event.clone())
+        {
             if let Some(expected) = event
                 && expected != &held
             {
                 bail!("recovery event does not match the event held by the dispatcher");
-            }
-            if matches!(self.state.phase, DispatcherPhase::Holding(_)) {
-                self.prepare_held_event()?;
             }
             return self.release_event(&held, ReleaseMode::Resume);
         }
@@ -1130,11 +1104,81 @@ impl VmwpDispatcher<'_> {
         Ok(())
     }
 
-    fn pause_held_target(&mut self, event: &HeldEvent) -> Result<()> {
-        self.state.claim_held_pause(event)?;
-        run_vm_action(self.bound_vm_id()?, VmAction::Pause, POWERSHELL_WAIT)
-            .context("establishing the VM-wide held-event pause barrier")?;
-        self.state.confirm_vm_pause()
+    fn wait_for_owned_event(
+        &self,
+        targets: &[TargetIdentity],
+        event_site: u64,
+        deadline: Instant,
+    ) -> Result<(u64, HeldEvent)> {
+        loop {
+            self.run_to_current_breakpoint(deadline)?;
+            if self.engine.instruction_pointer().map_err(debugger)? != event_site {
+                bail!("debugger stopped away from the owned dispatcher breakpoint");
+            }
+            let message_type = self.register("rcx")?;
+            let event_pointer = self.register("r14")?;
+            let context = self.read_u64(
+                event_pointer
+                    .checked_add(u64::from(self.state.profile.layout.event_context))
+                    .context("event context address overflowed")?,
+            )?;
+            let vp = self.read_u32(
+                event_pointer
+                    .checked_add(u64::from(self.state.profile.layout.event_vp))
+                    .context("event VP address overflowed")?,
+            )?;
+            if message_type == EVENT_TYPE_VECTOR_1
+                && context == self.state.handler_context.context("no handler context")?
+                && let Some(target) = targets.iter().find(|target| target.vp == vp)
+            {
+                return Ok((
+                    event_pointer,
+                    HeldEvent {
+                        message_type: HexU64(EVENT_TYPE_VECTOR_1),
+                        vector: 1,
+                        vp: target.vp,
+                        vtl: target.vtl,
+                        cpl: 0,
+                        dispatcher_context: HexU64(context),
+                        advance_instruction_pointer: false,
+                        reason: StopReason::DebugException,
+                    },
+                ));
+            }
+            if Instant::now() >= deadline {
+                bail!("too many unrelated dispatcher events before the owned vector-1 event");
+            }
+        }
+    }
+
+    fn retain_current_event(
+        &mut self,
+        event_pointer: u64,
+        event_site: u64,
+        event: &HeldEvent,
+    ) -> Result<()> {
+        // Name the native event before any fallible inspection. Once the exact callback thread is
+        // known, retain that identity before cleanup so recovery can either complete it or contain
+        // vmwp without detaching from an outstanding event.
+        self.state.phase = DispatcherPhase::Holding(event.clone());
+        let system_id = self.engine.current_thread_system_id().map_err(debugger)?;
+        if self.state.retained_event.is_some() {
+            bail!("the dispatcher already retains a native event thread");
+        }
+        self.state.retained_event = Some(RetainedEvent {
+            system_id,
+            return_ip: event_site,
+            event: event.clone(),
+        });
+        let advance = self.read_u8(
+            event_pointer
+                .checked_add(u64::from(self.state.profile.layout.exchange_advance))
+                .context("event advance address overflowed")?,
+        )?;
+        if advance != 0 {
+            bail!("the native dispatcher event already requests instruction-pointer advance");
+        }
+        self.prepare_held_event()
     }
 
     fn pause_for_provider_writes(&mut self, targets: &[TargetIdentity]) -> Result<()> {
@@ -1368,6 +1412,78 @@ impl VmwpDispatcher<'_> {
     }
 
     fn complete_event(&mut self, mode: ReleaseMode) -> Result<()> {
+        let event = self
+            .state
+            .retained_event
+            .as_ref()
+            .map(|retained| retained.event.clone())
+            .context("the dispatcher owns no retained event to complete")?;
+        self.complete_retained_event(&event)?;
+
+        match mode {
+            ReleaseMode::ArmNextStop => {
+                let site = self.state.profile.event_held.clone();
+                self.set_site_breakpoint(&site)?;
+                self.state.phase = DispatcherPhase::ReadyForStop;
+            }
+            ReleaseMode::Resume => {
+                self.settle_native_completion()?;
+                self.detach_handled()?;
+                self.state.finish_completion_kick()?;
+                if self.state.vm_paused {
+                    self.state.begin_vm_resume();
+                    run_vm_action(self.bound_vm_id()?, VmAction::Resume, POWERSHELL_WAIT)?;
+                    self.state.vm_paused = false;
+                }
+                self.state.phase = DispatcherPhase::Detached;
+            }
+        }
+        Ok(())
+    }
+
+    fn settle_native_completion(&self) -> Result<()> {
+        // The native return proves success before vmwp has executed past the call. Let the existing
+        // DbgEng watchdog interrupt that ordinary execution, then detach before joining the Hyper-V
+        // helper whose pause request is blocked while the callback remains debugger-stopped.
+        let run = self
+            .engine
+            .execute_and_wait("g", NATIVE_SETTLE_WAIT)
+            .map_err(debugger)?;
+        if run.target_gone {
+            bail!("vmwp left the debugger while settling native event completion");
+        }
+        match run.cut_short {
+            Some(Interruption::Deadline { .. }) => Ok(()),
+            Some(Interruption::OnRequest) => {
+                bail!("native event completion was interrupted on request")
+            }
+            None => bail!("vmwp stopped unexpectedly while settling native event completion"),
+        }
+    }
+
+    fn complete_retained_event(&mut self, event: &HeldEvent) -> Result<()> {
+        let phase_event = self.state.phase.held_event();
+        if phase_event != Some(event) || matches!(self.state.phase, DispatcherPhase::Holding(_)) {
+            self.restore_retained_event(event)?;
+        }
+        self.complete_event_to_native_return()?;
+        if !matches!(&self.state.phase, DispatcherPhase::NativeReturn(held) if held == event) {
+            bail!("dispatcher completion did not reach the named native return");
+        }
+        let retained = self
+            .state
+            .retained_event
+            .take()
+            .context("the completed dispatcher event lost its retained-thread record")?;
+        if &retained.event != event {
+            self.state.retained_event = Some(retained);
+            bail!("the completed dispatcher event changed its retained-thread record");
+        }
+        self.state.provider_writes_quiesced = false;
+        Ok(())
+    }
+
+    fn complete_event_to_native_return(&mut self) -> Result<()> {
         let held = match &self.state.phase {
             DispatcherPhase::Holding(event) => event.clone(),
             DispatcherPhase::ReturningCallback(event)
@@ -1468,24 +1584,6 @@ impl VmwpDispatcher<'_> {
             }
             self.remove_owned_breakpoint()?;
             self.state.phase = DispatcherPhase::NativeReturn(held.clone());
-        }
-
-        match mode {
-            ReleaseMode::ArmNextStop => {
-                let site = self.state.profile.event_held.clone();
-                self.set_site_breakpoint(&site)?;
-                self.state.phase = DispatcherPhase::ReadyForStop;
-            }
-            ReleaseMode::Resume => {
-                self.detach_handled()?;
-                self.state.finish_completion_kick()?;
-                if self.state.vm_paused {
-                    self.state.begin_vm_resume();
-                    run_vm_action(self.bound_vm_id()?, VmAction::Resume, POWERSHELL_WAIT)?;
-                    self.state.vm_paused = false;
-                }
-                self.state.phase = DispatcherPhase::Detached;
-            }
         }
         Ok(())
     }
@@ -1884,6 +1982,35 @@ impl VmwpDispatcher<'_> {
             .context("callback scratch address overflowed")
     }
 
+    fn restore_retained_event(&mut self, event: &HeldEvent) -> Result<()> {
+        let retained = self
+            .state
+            .retained_event
+            .as_ref()
+            .filter(|retained| &retained.event == event)
+            .cloned()
+            .context("the dispatcher has no retained thread for the named event")?;
+        self.engine
+            .execute_command(&format!("~~[{:x}]s", retained.system_id))
+            .map_err(debugger)?;
+        let selected = self.engine.current_thread_system_id().map_err(debugger)?;
+        if selected != retained.system_id {
+            bail!(
+                "reselected vmwp thread {selected:#x}, expected {:#x}",
+                retained.system_id
+            );
+        }
+        let actual = self.engine.instruction_pointer().map_err(debugger)?;
+        self.state.phase = DispatcherPhase::Holding(event.clone());
+        if actual != retained.return_ip {
+            bail!(
+                "held vmwp thread moved to {actual:#x}, expected event site {:#x}",
+                retained.return_ip
+            );
+        }
+        Ok(())
+    }
+
     fn register(&self, name: &str) -> Result<u64> {
         let register = self
             .engine
@@ -2189,6 +2316,31 @@ mod tests {
     }
 
     #[test]
+    fn concrete_live_adapter_refuses_fan_out_before_loading_a_profile() {
+        let mut additional = target();
+        additional.vp = 1;
+        let request = OpenRequest {
+            profile: r"Z:\definitely-missing\profile.json".into(),
+            control_transport: "provider --vp 0".into(),
+            live_transport: "memory-provider".into(),
+            vmwp_pid: 4242,
+            dispatcher_vnd: 0x2000_0000_1000,
+            target: target(),
+            additional_vps: vec![AdditionalVp {
+                control_transport: "provider --vp 1".into(),
+                target: additional,
+            }],
+        };
+
+        let error = match Session::open(&request) {
+            Ok(_) => panic!("multi-provider concrete session unexpectedly opened"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("exactly one selected VP"));
+    }
+
+    #[test]
     fn profile_addresses_are_checked_before_the_engine_is_borrowed() {
         let mut profile = profile();
         profile.scratch_base = HexU64(u64::MAX - 0x7ff);
@@ -2241,7 +2393,7 @@ mod tests {
     }
 
     #[test]
-    fn the_held_event_pause_barrier_claims_ownership_before_suspend() {
+    fn provider_stop_requires_the_selected_vp_event() {
         let event = HeldEvent {
             message_type: HexU64(EVENT_TYPE_VECTOR_1),
             vector: 1,
@@ -2255,17 +2407,22 @@ mod tests {
         let mut state =
             VmwpDispatcherState::new(profile(), 4242, 0x2000_0000_1000, "provider".into()).unwrap();
         state.phase = DispatcherPhase::Holding(event.clone());
+        state.retained_event = Some(RetainedEvent {
+            system_id: 0x1234,
+            return_ip: 0x2000_0000_3000,
+            event,
+        });
+        let mut selected = target();
+        selected.vp = 1;
 
-        state.claim_held_pause(&event).unwrap();
+        state
+            .confirm_retained_provider_stop(std::slice::from_ref(&selected))
+            .unwrap();
 
-        assert!(state.vm_paused);
-        assert!(!state.provider_writes_quiesced);
-        state.confirm_vm_pause().unwrap();
+        assert!(!state.vm_paused);
         assert!(state.provider_writes_quiesced);
-        let mut unrelated = event;
-        unrelated.vp = 0;
-        assert!(state.claim_held_pause(&unrelated).is_err());
-        assert!(state.vm_paused);
+        selected.vp = 0;
+        assert!(state.confirm_retained_provider_stop(&[selected]).is_err());
     }
 
     #[test]

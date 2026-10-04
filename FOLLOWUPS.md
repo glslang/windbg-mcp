@@ -2328,29 +2328,35 @@ broader exact-build profile coverage, remain open. The detailed bench sequence, 
 and evidence remain in the ignored private plan.
 
 The tracked controller was widened on 2026-10-04 without weakening those exact-build checks. A
-profile argument can now name a bounded directory and selects exactly one entry whose declared
-`vmwp.exe` hash matches the current local image. Natural mode accepts up to four explicitly slotted
-execution breakpoints and several VP-bound providers in one worker; the native event chooses the
-winning VP and DR6 chooses the winning slot, after which every losing VP is restored before the
-stop is returned and the following TF wait is restricted to the winner. Fan-out is capped at 16
-providers before any child starts. The raw debug event deliberately advances the provider wire
-contract to v2, so a v1 provider is refused at its banner. Redirect mode remains deliberately one
-VP and one address. Offline tests cover a VP1 win with VP0 restoration, multi-slot classification,
-duplicate refusal and baseline recovery. Review then found two cross-provider ownership gaps: a
-provider-local epoch could collide with another provider's token, and a native intercept held only
-the winning VP while losing baselines were restored. Public transitions now use a controller-local
-monotonic epoch prefixed by a per-session 256-bit system-RNG nonce, preventing both cross-provider
-and cross-session replay. The dispatcher re-establishes a whole-VM pause barrier before the
-controller touches losing VPs. Step completion retains that pause until the next bounded wait
-resumes the VM; final continue resumes it explicitly after handled detach.
-Pause ownership and proved quiescence are tracked separately. A failed or timed-out pause may still
-owe an idempotent resume. Fault recovery finishes that pending transition and attempts a fresh
-`Suspend-VM`; it restores provider state only after the new pause completes successfully, and
-otherwise skips every provider register transition and contains the native event.
-The catalog bound is also enforced during directory iteration across every entry, including
-non-JSON files, so selection never first materializes an unbounded directory.
-The fan-out path still needs a live multi-provider acceptance run; its predecessor's live proof is
-one selected VP at a time.
+profile argument can name a bounded directory and selects exactly one entry whose declared
+`vmwp.exe` hash matches the current local image. The catalog bound is enforced during directory
+iteration across every entry, including non-JSON files, so selection never first materializes an
+unbounded directory. Natural mode accepts up to four explicitly slotted execution breakpoints and
+DR6 chooses the winning slot. The raw debug event deliberately advances the provider wire contract
+to v2, so a v1 provider is refused at its banner. Redirect mode remains deliberately one address.
+Public transitions use a controller-local monotonic epoch prefixed by a per-session 256-bit
+system-RNG nonce, preventing cross-provider and cross-session replay. The generic controller retains
+offline fan-out tests, including a VP1 win with VP0 restoration, but the concrete build-guarded
+adapter now refuses `additional_vps` before profile loading or provider startup.
+
+That refusal follows a live result rather than an untested restriction. `Suspend-VM` did not return
+while the winning VID event was outstanding, even after the event thread was redirected to owned
+scratch and DbgEng performed a handled detach. Holding that first callback and pumping the remaining
+`vmwp` threads also produced no second selected-VP callback before the bounded deadline: the native
+dispatcher path is serialized at this point. The safe narrow path instead treats the one selected
+VP's retained event as its provider-write barrier. It records and later reselects the exact system
+thread, reaches the guarded callback and native return boundaries, gives native completion one
+watchdog-bounded run slice, detaches handled, and only then joins the delayed Hyper-V helper. A fresh
+run selected the exact entry from an exact-plus-wrong-build catalog, armed all four DR slots, stopped
+naturally on slot 3, completed 16 guarded steps, restored both vCPU debug baselines and TF/RF state,
+preserved guest text, passed the independent 60-second same-`vmwp` audit, and left the VM Off.
+
+Multi-provider work is split into later gates: first add a two-phase dispatcher release that can
+finish the winning native event and prove a post-event VM pause before any unheld provider write;
+then restore providers that never generated an event under that pause; then handle and restore a
+losing provider that generates a breakpoint event while the winner is stepping; finally rerun the
+two-provider, four-slot, 16-step scheduler-selected lifecycle and the independent health audit. No
+fan-out claim should be restored until each gate has live evidence and fail-closed recovery.
 
 The record below explains how the route was chosen. Cost and “still open” statements in it describe
 the decision point and are superseded by the result above.

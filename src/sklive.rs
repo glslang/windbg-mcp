@@ -185,14 +185,13 @@ pub(crate) trait EventDispatcher {
         breakpoints: &[BreakpointGuard],
     ) -> Result<HexU64>;
     fn finish_arm(&mut self) -> Result<()>;
-    /// Whether a completed whole-target pause currently makes provider register access safe.
+    /// Whether every provider whose registers may be accessed is currently quiesced.
     fn provider_writes_quiesced(&self) -> bool;
-    /// Finish any pending resume and establish a new whole-target pause for fault recovery.
+    /// Finish any pending transition and prove provider-write quiescence for fault recovery.
     fn establish_recovery_pause(&mut self, targets: &[TargetIdentity]) -> Result<()>;
     /// Re-read a proposed current instruction while the owned event remains held.
     fn verify_instruction(&mut self, instruction: &InstructionGuard) -> Result<()>;
-    /// Return an owned event only after re-establishing a whole-target pause. The controller can
-    /// then restore losing VP state without racing guest execution.
+    /// Return an owned event only after every provider whose registers may be accessed is quiesced.
     fn wait_for_stop(
         &mut self,
         targets: &[TargetIdentity],
@@ -1375,7 +1374,7 @@ impl<P: ControlProvider> LiveControl<P> {
     ) -> Result<()> {
         let context = dispatcher.begin_arm(&self.targets(), breakpoints)?;
         if !dispatcher.provider_writes_quiesced() {
-            bail!("the dispatcher did not prove whole-VM quiescence for provider writes");
+            bail!("the dispatcher did not prove quiescence for provider writes");
         }
         if context.0 == 0 {
             bail!("the debugger adapter returned a zero handler context");
@@ -1606,16 +1605,22 @@ impl<P: ControlProvider> LiveControl<P> {
             .any(|provider| provider.baseline.is_some());
         let mut safe_to_resume = !owns_provider_state || dispatcher.provider_writes_quiesced();
         if owns_provider_state && !safe_to_resume {
-            if let Err(error) = dispatcher.establish_recovery_pause(&self.targets()) {
+            let recovery_targets = self
+                .providers
+                .iter()
+                .filter(|provider| provider.baseline.is_some())
+                .map(|provider| provider.target.clone())
+                .collect::<Vec<_>>();
+            if let Err(error) = dispatcher.establish_recovery_pause(&recovery_targets) {
                 recovery_errors.push(format!(
-                    "establish whole-VM pause for VTL1 recovery: {error:#}"
+                    "establish provider-write quiescence for VTL1 recovery: {error:#}"
                 ));
             }
             safe_to_resume = dispatcher.provider_writes_quiesced();
         }
         if owns_provider_state && !safe_to_resume {
             recovery_errors.push(
-                "skipped VTL1 baseline restoration because whole-VM quiescence was not proved"
+                "skipped VTL1 baseline restoration because provider-write quiescence was not proved"
                     .to_string(),
             );
         }
