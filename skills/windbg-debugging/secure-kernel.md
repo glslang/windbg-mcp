@@ -1,15 +1,17 @@
 # Playbook: the Secure Kernel (VTL1)
 
-**Goal:** read a Windows guest's **Secure Kernel** — the VBS VTL1 side, memory a running Windows
-cannot read about itself — out of a **Hyper-V saved state**. Four tools do it: `open_sk_capture`,
-`sk_modules`, `sk_read_memory`, `sk_symbol`.
+**Goal:** inspect or control a Windows guest's **Secure Kernel** — the VBS VTL1 side, memory a
+running Windows cannot read about itself. Four capture tools read a Hyper-V saved state; seven
+live-control tools stop, inspect, step and resume one selected VP in an exact disposable VBS VM.
 
-**There are two routes and only one of them is a tool.** A **capture** is a file, and the tools read
-it with no driver, no debuggee, and nothing running. A **live** guest needs a transport the
-**operator** supplies, is driven by a command-line role rather than by MCP, and this repository
-ships no transport — so nothing in the tool list reaches a running Secure Kernel. If that is what
-was asked for, read [the live route](#the-live-route-the-operator-supplies-the-transport) first;
-it is the second half of this page.
+**There are three routes.** A **capture** is a file, and its MCP tools read it with no driver, no
+debuggee, and nothing running. A **live decode** uses the `--sk-live` command-line role and an
+operator-supplied memory transport. **Live execution control** is a separate MCP session using
+operator-supplied register and memory providers plus a build-matched `vmwp` adapter. This repository
+ships no privileged provider. For a running guest, choose between
+[live decode](#the-live-route-the-operator-supplies-the-transport) and
+[live control](#live-execution-control-a-separate-mcp-session) according to whether the request
+needs a snapshot or stop/step/resume.
 
 ## What the capture route needs on the host
 
@@ -29,9 +31,10 @@ it is the second half of this page.
   the wrong file; point `image` at the guest's own copy or the decode finds nothing and reports
   that it did.
 - **The `securekernel` tool group.** It is in the default surface, so a server started plainly has
-  all four. One started with a narrowed `--tools` has them if that spec names the `securekernel`
-  group **or** names the tools it wants individually — `--tools` takes either, so a surface can
-  carry `open_sk_capture` and `sk_read_memory` and not the other two.
+  all eleven capture and live-control tools. One started with a narrowed `--tools` has the capture
+  tools if that spec names the `securekernel` group **or** names the tools it wants individually —
+  `--tools` takes either, so a surface can carry `open_sk_capture` and `sk_read_memory` and not the
+  other two capture readers.
 
 No driver, no test-signing, and no debugger attached to anything. A checkpoint is the guest's whole
 RAM in a file, so handle one like a full memory dump of that machine.
@@ -287,18 +290,56 @@ Things to know besides the numbers and the grammar:
   newline blocks it until the operator interrupts — acceptable in a foreground command run by the
   person who wrote the transport, and one of the reasons it is not reachable from the server.
 
+## Live execution control: a separate MCP session
+
+The `--sk-live` role above decodes a running guest once. It does not stop or resume anything. For a
+controlled VTL1 kernel-mode stop, use the seven live-control tools. They create a dedicated worker
+session whose DbgEng target is the host's `vmwp` and whose operator-supplied providers access the
+selected VP's VTL1 registers and memory. The repository ships neither provider and ordinary debugger
+tools are refused on this session so they cannot report `vmwp` state as guest state.
+
+Use this route only for an exact, disposable VBS VM under an independent heartbeat, crash-record and
+unchanged-text audit. Before opening, collect the current VM GUID, partition ID, selected VP, VTL1
+CR3, `vmwp` PID and dispatcher VND; the exact-build `vmwp` profile or bounded profile directory; and
+the register-control and live-memory provider commands. `open_sk_live_control` validates all of
+those without pausing the VM or arming a breakpoint.
+
+The sequence is:
+
+1. `open_sk_live_control` with `profile`, `control_transport`, `live_transport`, `vmwp_pid`,
+   `dispatcher_vnd`, `vm_id`, `partition_id`, `expected_cr3` and optional `vp`.
+2. `sk_live_arm` with the exact instruction address and 1–15 guarded bytes. Natural mode leaves RIP
+   untouched and may arm up to four distinct debug-register slots; redirect mode accepts one and
+   deliberately moves RIP.
+3. `sk_live_wait` to resume and collect the exact owned vector-1 event. Its answer includes the
+   complete two-read register evidence, guarded instruction, expected next RIPs and a new opaque
+   stopped epoch.
+4. While that event is held, use `sk_live_registers` or `sk_live_read_memory`. Reads are bound to the
+   stop and refused while running.
+5. Pass the exact current epoch to `sk_live_step`, then call `sk_live_wait` for the next stop. For
+   repeated steps, give the new current instruction and its bounded destinations.
+6. Pass the final stopped epoch to `sk_live_continue`, then call `end_session`. Require the teardown
+   to confirm release and that the target is running before the external health audit decides the
+   run passed.
+
+Every mutating stopped operation consumes one session-scoped epoch. Never reuse an epoch, guess an
+instruction, or widen a branch beyond its decoded destinations. If teardown is unconfirmed,
+`session_status` reports `live_control_unresolved` and retains the worker plus the exact VM/`vmwp`
+reservation. Do not open a second controller; inspect or discard the disposable VM out of band.
+
 ### If the user wants live Secure Kernel
 
 Offer the capture first: it answers the same landmarks, needs no driver and no weakened bench, and
-a checkpoint can be read on a different machine from the one that made it. If they need a *running*
-guest, say plainly that the transport is theirs to supply — this server ships none and `--sk-live`
-refuses to start without `--transport` — and that the role runs on the debugger host, not through
-these tools. Then ask them to paste what it printed.
+a checkpoint can be read on a different machine from the one that made it. For a current decode of
+a *running* guest, use `--sk-live`: the transport is theirs to supply, the server ships none, and the
+role runs on the debugger host outside MCP. For a controlled stop, stopped-state inspection, step or
+resume at a chosen address, use `open_sk_live_control` and the epoch-bound MCP sequence above, after
+the operator supplies the exact disposable target and both providers.
 
 ## Where the rest of it is
 
-- [`docs/sessions.md`](../../docs/sessions.md) — the caller's half: what a capture session is, and
-  what ending one does.
+- [`docs/sessions.md`](../../docs/sessions.md) — the caller's half: what capture and live-control
+  sessions are, and what ending one does.
 - [`docs/secure-kernel/README.md`](../../docs/secure-kernel/README.md) — the research record behind
   all of it: what is reachable from where, which landmarks survive a reboot and which do not, and
   what the lab needs. Several sections record what did **not** work, which is most of the value.

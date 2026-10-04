@@ -2045,12 +2045,12 @@ a second one"*.
 created the cost rather than by a reviewer, because the arithmetic is unarguable and the remedy is
 not.
 
-**The four `securekernel` tools are 7,501 B of model-visible surface** (`open_sk_capture` 3,918,
-`sk_symbol` 1,466, `sk_read_memory` 1,277, `sk_modules` 840, measured 2026-09-27 against a
-103,293 B surface), and they are paid **once per conversation by every caller**, because the default
-surface is every tool. What they need to be usable is a Hyper-V standard checkpoint of a VBS guest,
-the Windows SDK's saved-state provider, and the `securekernel.exe` that guest was running. Almost
-nobody driving a crash dump has any of the three.
+**The eleven `securekernel` tools are 15,468 B of model-visible surface**, measured 2026-10-04
+against a 113,411 B surface: **13.6%** of the default tool cost, paid once per conversation by every
+caller. Four tools need a Hyper-V standard checkpoint of a VBS guest, the Windows SDK's saved-state
+provider and the `securekernel.exe` that guest was running; seven more need an exact disposable VBS
+VM, two operator-supplied live providers and a build-matched `vmwp` profile. Almost nobody driving a
+crash dump has either setup.
 
 `--tools` is the lever that exists for exactly this, and its shape is the problem: it is opt-**out**,
 so a caller who wants no capture tools has to name every group it *does* want, and the default a
@@ -2558,8 +2558,11 @@ to collect what does not depend on that step, and then to falsify it before anyt
 **Current summary.** A resumable initialized Secure Kernel stop and a one-instruction hardware
 stop/step both pass on the allowlisted disposable managed VM. The repository now has the provider
 owner, dedicated worker state machine, exact-build adapter and separate epoch-bound MCP session
-surface. Capture inspection remains independent. The next boundary is live debugger loss after
-restoration, VM-reset identity and wider exact-build profile coverage. The direct owner-built
+surface. Capture inspection remains independent. Multi-provider work is split into four live gates:
+a two-phase winning-event release followed by a proved VM pause before any unheld provider write;
+restoration of providers that never generated an event under that pause; handling and restoration
+of a losing provider whose breakpoint arrives while the winner is stepping; and the full
+two-provider, four-slot, 16-step lifecycle plus independent health audit. The direct owner-built
 Windows boot is no longer on that path.
 
 **Safety rules that are not negotiable per arm.** The owner-partition probes never enumerate or open

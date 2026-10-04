@@ -641,6 +641,7 @@ itself still works.
 | Live kernel (`attach_kernel_local` / `attach_kernel`) | **Yes** |
 | TTD recording (`record_trace`) | **Yes** + a `TTD.exe` — the bundled `ttd\TTD.exe` will do; `PATH` only overrides it |
 | Secure Kernel capture (`open_sk_capture`) | No — but it needs the Windows SDK's `vmsavedstatedumpprovider.dll` and read access to the checkpoint. Naming the capture as a `vm` rather than as a path asks Hyper-V where it lives, so that needs the role installed on this host and an account that may ask about that VM ([secure-kernel.md](secure-kernel.md)) |
+| Secure Kernel live control (`open_sk_live_control`) | **Yes** — plus an exact disposable VBS VM, operator-supplied register and memory providers, and a build-matched `vmwp` profile ([secure-kernel.md](secure-kernel.md#live-execution-control-a-separate-mcp-session)) |
 
 `record_trace` captures the recorder's startup output to `<out_dir>\ttd_record.log` and
 watches it briefly, so a fast failure (e.g. un-elevated → `0x80070005 Access is denied`)

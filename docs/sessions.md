@@ -1,9 +1,10 @@
 # Sessions and session handles
 
-The six Session tools that open a target (`open_dump`, `open_trace`, `attach_kernel_local`,
-`attach_kernel`, `attach_process`, `launch`) each create a **session** — one engine worker process
-holding one target — and return a **`session_id`**. Every tool that touches a target accepts that id
-as an optional argument, and it is what **routes** the call to the right worker.
+Eight Session tools open a target. The six debugger openers (`open_dump`, `open_trace`,
+`attach_kernel_local`, `attach_kernel`, `attach_process`, `launch`) each create a **session** — one
+engine worker process holding one target — and return a **`session_id`**. Every tool that touches a
+target accepts that id as an optional argument, and it is what **routes** the call to the right
+worker.
 
 `open_sk_capture` is a seventh, and the one whose session holds **no debuggee**: it reads a Hyper-V
 checkpoint for the Secure Kernel in the guest's VTL1, which is a file rather than a target, and the
@@ -11,13 +12,19 @@ debugger tools are **refused** on it rather than answering about the `securekern
 beside it has open for symbols. It counts against the same limit, ends the same way, and appears in
 `session_status` as `secure_kernel`. See [Secure Kernel captures](#secure-kernel-captures) below.
 
+`open_sk_live_control` is the eighth. Its worker binds operator-supplied providers and an
+exact-build `vmwp` debugger adapter to one selected VP in an explicitly disposable VBS VM. Opening
+validates the complete identity and capabilities but does not pause the VM or arm a breakpoint.
+See [Live Secure Kernel control](#live-secure-kernel-control) below.
+
 Sessions are independent. Opening a second target does not disturb the first, a call against one
 does not queue behind work in another, and ending one leaves the rest alone. Up to `4` at once; at
 the limit a new open reclaims the oldest **idle** session, and if every session has a call in flight
 the open is refused with the list rather than picking a victim. A disconnect attempts the same
-release as `end_session`, with a shorter grace. **Unresolved remote kernel controllers are an
-exception: their workers and session slots are retained**, including after lease expiry or
-supervisor loss. End a healthy live kernel session explicitly and check its release result.
+release as `end_session`, with a shorter grace. **Unresolved remote kernel and live Secure Kernel
+controllers are exceptions: their workers, reservations and session slots are retained**, including
+after lease expiry or supervisor loss. End a healthy live controller explicitly and check its
+release result.
 
 **What ending a session does to its target depends on which tool opened it.** A dump or a trace is
 simply closed. A live kernel is resumed and detached, so the machine is left running rather than
@@ -109,6 +116,42 @@ What it needs on the host: the Windows SDK's `vmsavedstatedumpprovider.dll`, and
 machine reading the file** — a checkpoint copied off the host reads the same anywhere.
 [`secure-kernel/README.md`](secure-kernel/README.md) is the background, and the capabilities and
 limits are recorded there rather than here.
+
+## Live Secure Kernel control
+
+`open_sk_live_control` opens a dedicated control session for one selected VTL1 VP in a running,
+disposable VBS VM. The caller supplies the exact VM GUID, partition ID, VP, VTL1 CR3, `vmwp` PID,
+dispatcher address, an exact-build adapter profile, a register-control provider command and a live
+memory transport command. The repository supplies neither privileged provider. The worker validates
+their identity and capabilities, the VM-to-`vmwp` binding and the local `vmwp.exe` image before it
+accepts the session; opening itself does not change guest execution.
+
+Six tools drive that session after the open:
+
+- `sk_live_arm` saves the selected VP's baseline and installs one to four guarded execution
+  breakpoints. Each address carries the exact live instruction bytes expected there.
+- `sk_live_wait` moves the VM and returns only after `vmwp` holds the exact owned vector-1 event. Its
+  stop record carries the target and event identity, two-read register evidence, guarded instruction,
+  accepted next addresses, arm mode and a new opaque epoch.
+- `sk_live_registers` returns that retained stop record without changing it, and
+  `sk_live_read_memory` reads VTL1 virtual memory only while the stop remains held. The memory answer
+  is tied to the same epoch and includes its starting GPA.
+- `sk_live_step` consumes the current stop epoch, proves the current instruction and its bounded
+  destinations, and arms the next trap. Collect that stop with `sk_live_wait`.
+- `sk_live_continue` consumes the current epoch, restores the complete saved baseline, clears the
+  execution breakpoints and resumes. The session stays open for another arm.
+
+Ordinary debugger tools are refused on this session because its DbgEng target is the host's
+`vmwp`, not the guest Secure Kernel. Public epochs are scoped to one controller and every mutating
+stopped operation rejects a stale epoch. Reads and register writes are refused while running.
+
+Teardown is fail-closed. A confirmed `end_session` restores the selected VP, completes any owned
+event through the native dispatcher, removes the temporary handler, detaches from `vmwp` and leaves
+the VM running. If any of that is unconfirmed, `session_status` reports
+`live_control_unresolved`; the worker, exact VM/`vmwp` reservation and session slot survive idle and
+capacity reclamation, lease expiry, shutdown and supervisor loss. The unresolved session refuses
+further control work and cannot be treated as released. Inspect or discard the disposable VM out of
+band before allowing another controller to own it.
 
 ## Running a target asynchronously
 

@@ -11,7 +11,8 @@ An [MCP](https://modelcontextprotocol.io) server that exposes **WinDbg/DbgEng** 
 serves the same tools to clients that are not on the machine DbgEng runs on. It drives a live
 debugger engine for **user-mode**, **kernel-mode**, **crash-dump**, and
 **Time Travel Debugging (TTD)** workflows — and reads a VBS guest's **Secure Kernel (VTL1)** out
-of a Hyper-V checkpoint, which is a target with no debuggee in it.
+of a Hyper-V checkpoint or controls one selected VP in an exact disposable VBS VM through
+operator-supplied providers.
 
 The low-level engine bindings live in [`dbgscope`](https://github.com/glslang/dbgscope)
 (`src/dbgeng.rs`); this crate adds process-per-session engine supervision and the `rmcp` tool
@@ -46,12 +47,12 @@ Operator and reference material: [remote listener](docs/remote-listener.md),
 [smoke test](docs/smoke-test.md), [token budget](docs/token-budget.md),
 [releasing](docs/releasing.md).
 
-**Secure Kernel (VTL1)**, where the shipped half and the research are easy to confuse: the
-**capture** tools are shipped — the `securekernel` group in the table below, with
-[`docs/sessions.md`](docs/sessions.md#secure-kernel-captures) as the caller's half. What is research
-is everything around them, [recorded gate by gate](docs/secure-kernel/README.md) with the controls
-and the dead ends — including the **live** route, which is a command-line role and needs a
-transport this repository does not ship.
+**Secure Kernel (VTL1)** has three routes. The shipped `securekernel` group contains four tools for
+a fixed **capture** and seven tools for selected-VP **live control**; both session contracts are in
+[`docs/sessions.md`](docs/sessions.md). The separate `--sk-live` command-line role decodes a running
+guest without controlling it. Live decode and control require operator-supplied transports this
+repository does not ship. The evidence, controls and dead ends are
+[recorded gate by gate](docs/secure-kernel/README.md).
 
 ## Quick start
 

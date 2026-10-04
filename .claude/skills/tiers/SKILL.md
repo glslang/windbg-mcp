@@ -1,6 +1,6 @@
 ---
 name: tiers
-description: Run and interpret this repo's test tiers - what `cargo test` covers, which gates are off by default, and how to turn on the dump, bounded, live-kernel, TTD, 32-bit, image-symbol and Secure Kernel capture gates. Use before claiming a change is covered by a green run, when a tier needs enabling, or when a pass count or SKIPPED line has to be read correctly.
+description: Run and interpret this repo's test tiers - what `cargo test` covers, which gates are off by default, and how to turn on the dump, bounded, live-kernel, TTD, 32-bit, image-symbol, Secure Kernel capture and live-control gates. Use before claiming a change is covered by a green run, when a tier needs enabling, or when a pass count or SKIPPED line has to be read correctly.
 ---
 
 # Running the test tiers
@@ -231,4 +231,26 @@ same capture.
 capture tools are refused on it. The rule itself is a unit test
 (`engine::tests::a_capture_session_accepts_its_own_ops_and_refuses_the_debugger_ones`); those two are
 what say it is wired into the funnel every call passes.
+
+## The live Secure Kernel tier
+
+This tier drives the seven typed live-control tools through one worker against an explicitly
+disposable VBS VM. It is both `#[ignore]`d and gated by a private JSON file, so ordinary `cargo test`
+cannot stop a guest even when an old environment variable remains set:
+
+```pwsh
+$env:WINDBG_MCP_SMOKE_SK_LIVE = "C:\private\live-sk-config.json"
+cargo test --test mcp_smoke -- --ignored --exact a_live_secure_kernel_session_stops_steps_inspects_resumes_and_closes --nocapture
+```
+
+The JSON supplies `profile`, `control_transport`, `live_transport`, `vmwp_pid`, `dispatcher_vnd`,
+`vm_id`, `partition_id`, `expected_cr3`, `instruction_address` and `instruction_bytes`; `vp` and
+`read_size` are optional. It must contain the literal guard `"disposable": true`. Neither that file,
+the provider commands nor the resulting evidence belongs in the repository.
+
+Run the test alone under the bench's independent heartbeat, crash-record and unchanged-text audit.
+It opens the live-control session, arms an exact DR0 stop, waits, compares the retained registers,
+reads stopped VTL1 memory, consumes the epoch to step, consumes the next epoch to restore and
+continue, and requires teardown to report both release and a running target. A green ordinary test
+run makes no live-control claim; this ignored test's `RAN:` output and the independent audit do.
 
