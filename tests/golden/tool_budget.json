@@ -668,24 +668,24 @@
     },
     {
       "annotations": 102,
-      "description": 1718,
+      "description": 1572,
       "inputSchema": 1163,
-      "modelVisible": 2930,
+      "modelVisible": 2784,
       "name": "xrefs_to",
       "outputSchema": 2508,
-      "wire": 5571
+      "wire": 5425
     }
   ],
   "totals": {
     "annotations": 8184,
-    "description": 44142,
+    "description": 43996,
     "inputSchema": 68405,
     "instructions": 2022,
-    "modelVisible": 116520,
+    "modelVisible": 116374,
     "outputSchema": 200814,
-    "payload": 327689,
+    "payload": 327543,
     "tools": 75,
-    "wire": 327603,
+    "wire": 327457,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10842
   }

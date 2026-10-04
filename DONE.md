@@ -157,6 +157,7 @@ engine — it adds a target and leaves the current one alone. The entry records 
 - [Item 107](#107-windbg-mcp-a-misspelt-tool-argument-is-silently-ignored-and-the-call-answers-status-ok--done-2026-10-02) — [windbg-mcp] A misspelt tool argument is silently ignored, and the call answers `status: ok` — done (2026-10-02)
 - [Item 92](#92-windbg-mcp-an-a64-conditional-compare-chain-is-a-compare-chain-the-walk-does-not-read--done-2026-10-02) — [windbg-mcp] An A64 conditional-compare chain is a compare chain the walk does not read — done (2026-10-02)
 - [Item 109](#109-windbg-mcp-the-server-can-walk-a-call-graph-forward-and-find-calls-to-imports-and-cannot-answer-who-calls-this-address--done-2026-10-04) — [windbg-mcp] The server can walk a call graph forward and find calls to imports, and cannot answer "who calls this address" — done (2026-10-04)
+- [Item 111](#111-windbg-mcp--dbgscope-an-image-targets-memory-reads-only-after-something-else-has-read-it-and-a-walk-counts-what-it-did-not-get-as-scanned--done-2026-10-04-the-second-half-withdrawn) — [windbg-mcp] An image target's memory does not read until its module is loaded — done (2026-10-04), with the entry's second claim withdrawn
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -8700,3 +8701,127 @@ what is left is a defect in a layer underneath it.
 surface from 113,516 to 116,520 — 74 B of that `reachable_from_dispatch`'s rewritten `module`
 argument, from the review fix below — and its ceiling from 114,000 to 118,000, with the arithmetic and the
 reason the description is the larger half recorded above `MODEL_VISIBLE_CEILING`.
+
+## 111. [windbg-mcp + dbgscope] An image target's memory reads only after something else has read it, and a walk counts what it did not get as scanned — **done** (2026-10-04), the second half **withdrawn**
+
+**Filed out of item 109's verification and closed the same day, by running the controls its own
+*what closes it* asked for.** Half of what it alleged reproduced on five of the six images
+surveyed and half of it reproduced on none — and the half that did not is the one the title ends with, so read this
+before citing the title. It is also tagged `[windbg-mcp + dbgscope]` and nothing in `dbgscope`
+needed changing: the entry reached for that repo because it had `decode_range` in view, and
+`decode_range` turned out not to be in the story.
+
+### What was measured
+
+Bench: the Parallels ARM64 Windows 11 guest, dbgeng 10.0.26100.x, server **`0.21.0+g3f69dde2`** —
+read from `initialize`'s `serverInfo` on every arm rather than assumed from the checkout beside it
+(`.claude/rules/measurement-provenance.md`). Each arm is a **fresh server process** over ssh
+stdio, so a fresh supervisor, a fresh worker and a fresh session, which is what *one read at a
+time, in a fresh session* asks for. Two targets, so the reading is not one architecture's:
+`C:\Windows\System32\securekernel.exe` (ARM64) and `C:\symbols\ACPI.sys\180E829Ad6000\ACPI.sys`
+(x64).
+
+| what the session did first | then `read_memory`, 16 B at `.text` |
+|---|---|
+| that read itself | `0x8007001E` |
+| the same read a second time | `0x8007001E` |
+| a 4 KiB read, then a 64 KiB read | `0x8007001E` — the 64 KiB one fails on its **first** 4 KiB chunk |
+| 16 B at the image base instead | `0x8007001E`, and the `.text` read after it too |
+| nothing at all, for 25 s | `0x8007001E` |
+| `modules` | `0x8007001E` |
+| `modules { refresh: true }` | **reads** |
+| `disassemble` | **reads** |
+| `xrefs_to { address }` | **reads** |
+| `xrefs_to { target_module, rva }` | **reads** |
+| `reachable_from_dispatch` | **reads** |
+| `driver_hazards` | **refuses**, and the read after it still fails |
+
+**None of the three candidates the entry named is the mechanism.** Not a chunked read filling
+short: the bounded read fails outright on its first page, and says so — the 64 KiB request reports
+*reading 4096 bytes … failed*. Not a cached page: a second identical read fails identically. Not
+`decode_range`'s own read succeeding where a 16-byte one fails: it is the *same*
+`dbgscope::read_memory`, strict in both. And not time. What every tool that worked has in common
+is that it resolves an address or a symbol through the debugger's expression evaluator or its
+disassembler *before* reading anything, and that resolution is a **module load** — the `.reload`
+that `modules { refresh: true }` runs. So the tools that happened to answer on an image target
+were the ones that look something up first, and the ones that read memory were the ones that did
+not.
+
+### The half that did not reproduce, and it is the damaging half
+
+The entry's own summary was *the walk was fed something that decoded, counted it as read, and
+reported a complete scan of code it had not got*. **No walk did that, on either image.**
+
+- A cold `xrefs_to` is byte-for-byte a warm one: two sites on `securekernel` (`0x1400012a8` and
+  `0x1400018ac`, both `bl`, against a callee picked by decoding the first 4 KiB by hand) and 242
+  on `ACPI`, with identical `scanned` ranges and an empty `unreadable` in all four runs. It reads
+  correctly because its own target resolution is the module load.
+- A cold `driver_hazards` **fails closed**: *`securekernel`'s PE structures could not be read: 64
+  bytes at 0x140000000 could not be read*. It never reaches a walk, so the 1,182 privileged
+  instructions the entry put beside the empty reference list are not a figure this bench can
+  produce cold at all — warm, the same image answers 559, on ARM64.
+- And the accounting underneath is sound by construction, which is why: `decode_range` reads
+  through `dbgscope::read_memory`, which is **strict** — a short read is `DbgEngError::ShortRead`,
+  the closure's `.ok()` makes it `None`, and `codewalk::walk_code` turns a `None` into an
+  `unreadable` range. There is no path from a failed read to a scanned byte.
+
+What the entry's figures were taken on cannot be re-derived: `.text` of 1,002,088 bytes and a
+`KVASCODE` section are an **x64** `securekernel.exe`, and the first instruction it quotes
+(`cc cc … 48 ba`) is x64 code, while this guest's `System32` is ARM64. So the reading came from
+another host and the claim is neither confirmed nor contradicted *there*; it is contradicted on
+every target this bench can open, including an x64 one. Re-running the arms above on that host is
+what would settle it, and nothing is waiting on the answer — the fix below removes the condition
+the claim depended on.
+
+### What landed
+
+`worker::load_an_image_targets_module`, called from `open_dump`'s after-step beside `.load ext`
+and before `vertarget`: if the target is an image, `.reload` it, so a session's **first** memory
+call reads. Verified against ground truth off the engine — on a fresh session whose first memory
+call is at `kernel32!.text`, the server answers `fd7bbea9fd030091300a00d0310a00d0`, which is
+`kernel32.dll`'s own bytes at that section's raw offset read from the file on another machine;
+without the fix the same call fails.
+
+Three decisions in it, each paid for by a measurement:
+
+- **At the open, not at each reader.** A caller cannot be expected to know that
+  `modules { refresh: true }` is the precondition for `read_memory`, and every reader needing the
+  same retry is a list of places to forget it.
+- **Gated on the target kind**, because `modules { refresh: true }` — this `.reload` plus an
+  enumeration, which is as close as a tool call gets to timing it — took **2,159 ms** on the
+  checked-in x64 kernel dump against **11 ms** on the image, so doing it unconditionally would put
+  something like two seconds on the open of the one kind that does not need it.
+- **Gated on `GetDebuggeeType`'s class**, which is a reading rather than a guess: an image target
+  answers `DEBUG_CLASS_IMAGE_FILE` / `DEBUG_DUMP_IMAGE_FILE` — **3 / 1027** — with one module, the
+  image's own path as its dump file, and a process set holding the engine's `0xf0f0f0f0`
+  placeholder. That pair was missing from `TargetFingerprint`'s table, which had two rows for
+  `open_dump` and needed three, and it is now there.
+
+The predicate is a pure function (`worker::is_an_image_file`) for `fingerprints_the_process`'s
+reason, with a unit test over every target kind this server opens; the behaviour is
+`mcp_smoke::an_image_targets_memory_reads_on_the_first_call` in the debugger tier.
+
+**And `xrefs_to`'s description lost the caveat item 109 had just added to it** — *ask it on a dump
+or a live target: on an image opened with no debuggee the scan reports ranges it did not really
+read, and answers nothing* — because the measurement above says it is false twice over. 146 B
+back: the description is 1,572 B where item 109 recorded 1,718, the model-visible surface 116,374
+where that entry recorded 116,520, and the wire payload 327,543. The clause was added for the
+right reason on a reading that did not survive being re-run, which is the whole of why this entry
+is worth reading beside that one.
+
+### The trap this left in its own test, which is the part worth carrying
+
+The smoke test's first fixture was `C:\Windows\System32\ntdll.dll`, chosen on this entry's own
+sentence that *the reproduction needs no fixture — any `System32` binary*. It passed. It also
+passed with the fix **backed out**, because `ntdll` is the one image surveyed that answers a cold
+read anyway: against a build with the fix removed, `kernel32.dll`, `securekernel.exe`,
+`notepad.exe`, `ntoskrnl.exe` and `drivers\acpi.sys` all failed `0x8007001E` at their own image
+base and `ntdll.dll` returned its `MZ`. Why it is different is not established. The fixture is
+`kernel32.dll` now, and the test fails with the fix removed.
+
+One thing that survey turned up and then disposed of: a cold `ntdll` read at base+`0x1000` comes
+back **all zeros**, which is exactly the shape this entry feared — bytes returned rather than
+refused, and on x64 zeros decode. They are the image's own bytes. RVA `0x1000` in both `ntdll.dll`
+and `kernel32.dll` is `.hexpthk`, an executable hot-patch-thunk section that is zero-filled on
+disk, confirmed by parsing both files' section tables off the bench. So the one observation that
+looked like the withdrawn half was not it either.
