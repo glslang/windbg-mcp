@@ -2045,8 +2045,8 @@ a second one"*.
 created the cost rather than by a reviewer, because the arithmetic is unarguable and the remedy is
 not.
 
-**The eleven `securekernel` tools are 15,468 B of model-visible surface**, measured 2026-10-04
-against a 113,411 B surface: **13.6%** of the default tool cost, paid once per conversation by every
+**The eleven `securekernel` tools are 15,573 B of model-visible surface**, measured 2026-10-04
+against a 113,516 B surface: **13.7%** of the default tool cost, paid once per conversation by every
 caller. Four tools need a Hyper-V standard checkpoint of a VBS guest, the Windows SDK's saved-state
 provider and the `securekernel.exe` that guest was running; seven more need an exact disposable VBS
 VM, two operator-supplied live providers and a build-matched `vmwp` profile. Almost nobody driving a

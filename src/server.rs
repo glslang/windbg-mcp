@@ -3966,9 +3966,10 @@ impl WindbgServer {
             .await;
         engine_result_for(args.session_id.as_deref(), out)
     }
-    /// Bind a live Secure Kernel controller to one VP of an exact disposable VM, partition, CR3
-    /// and host `vmwp` process. Opening validates identity and capabilities but does not pause the
-    /// VM or arm a breakpoint.
+    /// Open a live Secure Kernel controller for one selected VP. Opening validates argument shape
+    /// and the register provider's declared identity and capabilities, but does not pause or inspect
+    /// the VM. The first arm pauses it, verifies the VM, `vmwp`, CR3, build and instruction identity,
+    /// and only then mutates state.
     #[rmcp::tool(
         annotations(
             title = "Open live Secure Kernel control",

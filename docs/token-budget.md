@@ -345,17 +345,17 @@ None of these is a bug. They are recorded because they were invisible, and
    |---|---:|---:|---:|
    | `allocator` | 10 | 16,868 | 14.9% |
    | `exec` | 10 | 15,137 | 13.3% |
-   | `session` | 10 | 14,013 | 12.4% |
-   | `inspect` | 10 | 13,442 | 11.9% |
-   | `securekernel` | 11 | 15,468 | 13.6% |
+   | `session` | 10 | 14,013 | 12.3% |
+   | `inspect` | 10 | 13,442 | 11.8% |
+   | `securekernel` | 11 | 15,573 | 13.7% |
    | `ioctl` | 10 | 13,037 | 11.5% |
    | `batch` | 1 | 10,842 | 9.6% |
    | `crash` | 3 | 7,514 | 6.6% |
-   | `ttd` | 9 | 7,090 | 6.3% |
+   | `ttd` | 9 | 7,090 | 6.2% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 74 | 113,411 |
+   | *(absent)* | 74 | 113,516 |
    | `session,inspect,exec,crash` | 33 | 49,185 |
    | `session,inspect,crash` | 23 | 33,895 |
    | `crash` | 13 | 20,361 |

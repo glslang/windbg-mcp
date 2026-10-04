@@ -169,12 +169,16 @@ The `securekernel` tool group exposes one selected VP through a worker-owned liv
 adapter uses an initial VM pause and the held native event to keep provider state stable while it
 changes that VP:
 
-1. `open_sk_live_control` binds the exact VM, partition, selected VP, CR3, `vmwp` PID, dispatcher
-   pointer, profile and provider commands. Its MCP schema exposes one VP; multi-provider
-   coordination remains a separate gate. Opening does not pause the VM or install a breakpoint.
-2. `sk_live_arm` re-reads each exact instruction, saves the selected VP's writable baseline and
-   installs one to four explicitly slotted execution breakpoints. Redirect mode requires one VP
-   and one breakpoint. Natural mode arms the full VP and breakpoint set.
+1. `open_sk_live_control` records the requested VM, partition, selected VP, CR3, `vmwp` PID,
+   dispatcher pointer, profile and provider commands. It validates their shape, loads the profile,
+   and validates the register provider's declared identity and capabilities. Its MCP schema exposes
+   one VP; multi-provider coordination remains a separate gate. Opening does not pause, attach to or
+   inspect the VM.
+2. The first `sk_live_arm` pauses the VM, verifies its `vmwp` binding, opens and checks live memory
+   against the requested CR3, verifies each guarded instruction, attaches to `vmwp`, and checks its
+   exact build and dispatcher sites. Only then does it save the selected VP's writable baseline and
+   install one to four explicitly slotted execution breakpoints. Redirect mode requires one VP and
+   one breakpoint. Natural mode arms the full VP and breakpoint set.
 3. `sk_live_wait` pumps `vmwp` until the selected VP reaches any armed address. It retains that exact
    callback thread and returns the winning DR slot with complete stop evidence and a fresh
    controller epoch.
