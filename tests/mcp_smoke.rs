@@ -3835,9 +3835,12 @@ fn a_reference_scan_with_a_malformed_target_is_refused_before_a_session_is_neede
         );
     }
 
-    // A command breaker in any field is screened the same way, and on the same side of the
-    // session: `module` is matched against the module inventory rather than interpolated, and is
-    // screened anyway so the four fields need no exception a reader cannot see the edge of.
+    // A command breaker is screened on the same side of the session as the target forms above.
+    // **Only `address` and `rva` are screened**, because only those two reach the debugger's
+    // expression evaluator; the two module names are compared against the typed inventory and
+    // never interpolated, so screening them would refuse a module whose name legally contains a
+    // separator. `xrefs_to`'s own comment in `src/server.rs` carries that reasoning, and an
+    // earlier draft of this one described the screen as it was before the module lookup changed.
     let injected = server.call_tool(
         "xrefs_to",
         json!({ "address": "nt!KeBugCheckEx; .kill" }),
@@ -6164,7 +6167,7 @@ fn a_module_rva_target_refuses_a_pattern_matching_several_images() {
 /// **And the import-table difference is measured here rather than claimed in a comment.** Where
 /// `driver_hazards` is refused on this same session — part of `nt`'s import directory is outside
 /// the capture — this still answers, because it reads the headers and the code and never the
-/// imports. That is `xrefs_at`'s reason for existing beside the hazard scan.
+/// imports. That is `xrefs_at`'s reason for existing beside `hazards_at`.
 #[test]
 fn a_reference_scan_answers_where_the_import_table_cannot_be_read() {
     let Some(dump) = target_tier() else {
