@@ -1,124 +1,14 @@
 # Follow-ups
 
-Deferred work, grouped by origin: items 2–6 come from the reachability-confirmation effort (path
-recipe + `run_to_address`, merged 2026-07-04), items 8–9, 11 and 88 from surveying this server
-against the MCP `2026-07-28` extensions (tasks, apps) and then re-measuring the tasks half of it
-(2026-09-19) — where rmcp and the reference TypeScript SDK turn out to implement two
-wire-incompatible generations of SEP-2663 while the client this server is actually driven by
-declares neither, and where the one thing a task would genuinely have bought surfaced as item 88
-instead: a call that outlives its budget finishes its work in the worker and has the answer
-thrown away — item 15 from the private worker channel (#65 / #72,
-2026-08-04), item 19 from
-`walk_memory` (#103, 2026-08-13), item 27 from completing the coordinate work (#156–#158,
-2026-08-18), item 32 from running the debugger tier on the ARM64 runner image that replaced
-`windows-11-arm` in September 2026 — now in [`DONE.md`](./DONE.md), the migration having landed on
-2026-09-23 — items 33 and 39 from driving the server with a **local model** —
-the lease grace measured against the wrong slow party (2026-08-22), and then running the surface,
-the window and the model as a **grid** rather than as a sighting (2026-08-23) — item 35 from
-measuring what a `registers` answer is actually made of (2026-08-22), item 47 from fixing
-[#226](https://github.com/glslang/windbg-mcp/issues/226), where making every target take the bounded
-wait left one target type nobody on this bench can measure (2026-08-25), item 50 from Windows
-Defender quarantining this project's own binary while the 32-bit worker was being tested
-(2026-08-26), items 52–53 from [#83](https://github.com/glslang/windbg-mcp/issues/83)'s asynchronous
-execution handles, where the invariant that stops a description naming a tool its client cannot call
-turned out to cover only half the prose a client is served (2026-08-29), and where a break arriving
-in the microseconds after a run built its stop is recorded in that result's prose and not in its flag
-(2026-08-30), item 54 from
-[#85](https://github.com/glslang/windbg-mcp/issues/85)'s module-inventory refresh, whose engine call
-no watchdog in either crate can currently cut short (2026-08-30), item 56 from closing item 14 —
-collapsing the coverage rule to "bound every command except `index_trace`" meant enumerating the
-`Execute` calls rather than the ops, which found one left on a shared helper that three callers
-reach on three different clocks (2026-08-31) — items 58–59 from
-[#286](https://github.com/glslang/windbg-mcp/pull/286)'s user-mode fault triage, where the engine
-call that names a target's machine turns out to name the *processor's*, and where nothing can ask
-which thread the engine has selected (2026-09-05), items
-61–62 and 64–65 from completing Personal similarity delivery while separating CVE-specific investigation,
-upstream Binary Ninja limitations, and unaffordable Ultimate validation (2026-09-12), and items
-66–67 from the IOCTL recovery in [#305](https://github.com/glslang/windbg-mcp/pull/305) and
-[#307](https://github.com/glslang/windbg-mcp/pull/307): thirty-nine review findings over fourteen
-rounds that were one default — a backwards walk refusing what it trips over rather than recognising
-what a compiler emits — and then, from the differential oracle those rounds produced, the walk
-reporting a code down the dead edge of a branch whose condition is a constant (2026-09-12), and items
-68–69 from `device_security` ([#311](https://github.com/glslang/windbg-mcp/pull/311)), where
-eleven rounds of review on one tool ended with its own live-kernel measurement contradicting the
-item an earlier round of it had produced (2026-09-13), and item 71 from `driver_surface`, the
-fourth driver tool, whose specification included a dispatch-to-sink traversal that did not land
-with it, and item 72 from running that tool's live-kernel tier, where a fresh attach turns out to
-leave the debugger's module inventory nearly empty and the driver tools with nothing to resolve
-against (2026-09-13), and items 73–74 from checking the four driver tools against Ghidra and
-Driver Buddy Revolutions over `mountmgr` and HEVD — an import directory the loader may have
-freed, and the one section of the ported program with no counterpart here (2026-09-14) — and item
-79 from item 78's own fix, which got the user-mode heap walker past the layout refusal and one step
-into the next wall: the PEB lists one heap where the debugger sees four (2026-09-16), and item 80
-from adding Apple's on-device model as the eval's third backend (#335 / #336, 2026-09-17), where
-two review rounds found `identity()` reporting something false about a run because it worked out
-what a record contributes by testing the backend again in each field that needs it — both now in
-[`DONE.md`](./DONE.md) — as is item 81 from
-[#341](https://github.com/glslang/windbg-mcp/pull/341)'s breakpoint-command guard, where both
-review bots independently reached the same finding: a command scanner that reads the first token
-of a segment cannot see `.opendump` inside an `.if`, a `.foreach` or an alias that resolves only
-when it runs (filed 2026-09-18, closed 2026-09-25 by reading the target rather than the command).
-And item **84** from running
-`ioctl_map` against a live **ARM64** target for the first time
-([#345](https://github.com/glslang/windbg-mcp/pull/345), 2026-09-19): an `adrp`+`add` table base
-lost at the `add`. That run filed five more, all now in
-[`DONE.md`](./DONE.md) -- the literal pool the fact walk could not read (item 82, which was the
-whole of why 235 codes carried no proven size or refusal), the switch tables the reachability
-walk did not follow while the map resolved them (item 83), the two things item 83's own
-fourteen review rounds left behind -- a resolver cap discarding the targets it had proved (item 90)
-and the last uncounted way a `NOT REACHABLE` can be short of the graph (item 89) -- and the ARM64
-second opinion that had never been diffed (item 85), whose lane, once written, found the published
-`mountmgr` agreement to have been between two different builds. And item 87 from verifying one of the review findings on
-[#347](https://github.com/glslang/windbg-mcp/pull/347), where checking which `untracked` entries
-`volmgr` actually had turned up a code the map loses beside three identical ones it keeps
-(2026-09-19), and item 91 from the one-sided half of that diff (2026-09-20): after item 82's
-literal-pool read landed, `rdyboost`'s thirteen length checks are all still `exact: false`, because
-the refusal they branch to returns through a shared epilogue the walk stops at the head of. And
-item 92 from item 85's lane finding a driver the two implementations disagree about
-(2026-09-20) -- A64 writes `a || b || c` as three compares feeding one branch, and this walk read
-the last of them and filed the rest in `untracked` -- is **now in [`DONE.md`](./DONE.md)**, closed
-2026-10-02 by reading the `nzcv` immediate the chain carries rather than by folding conditions; the
-companion's half of that disagreement is open in its own repository, so the lane's answer for that
-driver now differs in the other direction. And item 94 from giving the multiprocessor hypervisor
-investigation's harness the tools it was written against (2026-09-20) -- that investigation is
-item 93 and is now in [`DONE.md`](./DONE.md): a typed breakpoint listing and removal landed, and
-`bd`/`be` deliberately did not. And item 97 from running the heap tools on ARM64 for the
-first time ([dbgscope#177](https://github.com/glslang/dbgscope/pull/177), 2026-09-23), with the
-target's own `HeapWalk` as the oracle: an LFH block awaiting a delayed free, which `HeapWalk`
-calls free and the heap tools call allocated. That run filed two more, both now in
-[`DONE.md`](./DONE.md) — item 96, the pool walker's LFH reading, which it showed is not `nt`'s,
-and the ARM64 pool gate behind it; and item 98, the uncommitted memory that kept every live walk
-measured at `Partial` once the diagnostics were gone, which turned out to want the memory
-manager's answer rather than the allocator's. And item 105 from review on that item's PR after it had merged (2026-09-27): the
-measurement item 102 took to correct its own example contradicts a claim this server's design is
-introduced with, in about a dozen places that were never swept. And item 104 from closing item 102 (2026-09-26): the target fingerprint spells
-*"this field does not apply"* and *"this field could not be read"* the same way, so two failures
-compare equal and a recovery reads as a replacement — which a handle survives and a batch's
-rollback does not.
-And items 100–101 from checking its fixes end to
-end through the tool surface once they had merged (2026-09-23) — the VS chunk chain coming apart
-on **29671**, found while confirming those fixes were not fitted to 26100, which they are not; and
-the same chain drifting 0x10 on 26100, which is all that is left of item 99 now that it too is in
-[`DONE.md`](./DONE.md). They were filed as possibly one question and are **not** (2026-09-24):
-item 100 is the target's paged pool being trimmed out from under a KD link, with nothing in the
-walker to fix, and is measured and declined; item 101 is a real placement defect in readable
-memory.
-And item 110 from the 2026-10-01 VTL1 controlled-stop probe (item 103's control axis): stopping and
-resuming real `securekernel.exe` image code on a partition we own does not reach an *initialized*
-Secure Kernel, and the route that would needs the experiment to own a Windows/VBS boot — filed as a
-decision with its falsification first, because its one unvalidated step is likely to close it.
-**Item 103 closed on 2026-10-02 and is in [`DONE.md`](./DONE.md)** — the Secure Kernel capture route
-with its four tools, plus a live source since gate S5w, plus the four attempts that had kept it open.
-What decided the close was the **route** rather than the deliverable: inspection of VTL1 kernel mode
-is complete in both directions, and a controlled stop inside a *real* guest's Secure Kernel has no
-mechanism on a VM Hyper-V manages — so the realistic route is to own the boot, which is **item 110**.
-Its last two arms are declined on that ground rather than left open, each with the condition that
-reverses it, and exactly one moved to 110. Two drafts of that entry's status got the close wrong in
-opposite directions and both are recorded in it.
-Each item notes its repo, why it was deferred, and where it picks up. See
-[`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and its
-2026-08-02 entries for the bounded-command coverage review that produced item 13, now in
-[`DONE.md`](./DONE.md).
+Deferred work on this server and on [`dbgscope`](https://github.com/glslang/dbgscope), one entry per
+item. **The [index](#index) below is the way in**, and each entry then says which repo it belongs to,
+why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design
+rationale (D1–D5) that items 2–6 extend.
+
+**What each item came out of is [at the end](#where-these-items-came-from) rather than here.** That
+record is worth keeping — it is where the shape of a cluster lives, and which measurement produced
+which item — but most of what it narrates has since closed, so a reader who opens this file to find
+open work would meet several pages about items that are no longer in it.
 
 **Items that have landed are in [`DONE.md`](./DONE.md), under the numbers they were filed with**,
 which is why the numbering here is sparse — its index is the list of them, and is the one list, so
@@ -131,20 +21,81 @@ citation whose *file* half followed the entry would make closing an item a sweep
 comments, with nothing to catch the ones missed. "Item N" is the stable name; this paragraph is
 what answers *which file*, for whoever followed a citation here.
 `engine::every_followups_citation_names_an_item_that_exists` is what keeps that true: an entry
-deleted, renumbered, or moved without reaching `DONE.md`'s index fails the build rather than a
-reader.
+deleted, renumbered, or moved without reaching the other file's index fails the build rather than a
+reader. It holds **both** indexes to the same rule — every entry in this file is named by the index
+below, at an anchor that resolves, and so is every entry in `DONE.md`.
 
-Two kinds of item stay here rather than moving. One that is **measured and declined** (27, 35, 100):
-each records the measurement that settled it and the condition that would reopen it, item 35 leaves
-a judgement call open, and item 100 answers its own question against itself — the walk it was filed
-about turns out to be right, and what the run found instead went into item 98, now in
-[`DONE.md`](./DONE.md). And one that has
-**half** landed (2, 50, 108) — the entry is narrowed to the half that is left rather than split
-across two files. Item 108's first step landed on 2026-10-02 and its entry now carries what that
-step measured, what step 2 should start from, and the three claims of its own that measurement
-did not support.
+Two kinds of item stay here rather than moving. One that is **measured and declined**: nothing
+was built, and the entry records both the measurement that settled it and the condition that
+would reopen it. And one that has **half** landed, whose entry is narrowed to the half that is
+left rather than split across two files. **Which items those are is on their index lines
+below**, and is not enumerated here as well: `DONE.md` kept a second copy of both lists and had
+drifted three items behind this one by the time the index was written.
+
+Three of them carry something a marker cannot. Item 35 leaves a judgement call open. Item 100
+answers its own question against itself — the walk it was filed about turns out to be right, and
+what the run found instead went into item 98, now in [`DONE.md`](./DONE.md). And item 108's
+first step landed on 2026-10-02, so its entry now carries what that step measured, what step 2
+should start from, and the three claims of its own that measurement did not support.
 
 Items are roughly ordered by how soon they're worth doing, within each cluster.
+
+## Index
+
+Every entry in this file, in the order it appears. A line carries a status only where the
+entry's own title does not: **half landed** (the rest of it is still open), **measured and
+declined** (nothing was built, and the entry holds the condition that would reopen it), and
+**blocked** (the measurement that would decide it cannot be taken on this bench). An unmarked
+line is simply open.
+
+- [Item 2](#2-dbgscope-typed-write-primitives) — [dbgscope] Typed write primitives — **half landed**
+- [Item 3](#3-windbg-mcp--dbgscope-state-injection-confirmation-path-decisionsmd-d4) — [windbg-mcp + dbgscope] State-injection confirmation path (DECISIONS.md D4)
+- [Item 4](#4-dbgscope-typed-read_register) — [dbgscope] Typed `read_register`
+- [Item 5](#5-windbg-mcp-path-recipe-decode-limits-heuristic-boundary) — [windbg-mcp] Path-recipe decode limits (heuristic boundary)
+- [Item 6](#6-windbg-mcp-concolicsymbolic-buffer-synthesis-decisionsmd-d2--scoped-out) — [windbg-mcp] Concolic/symbolic buffer synthesis (DECISIONS.md D2 — scoped out)
+- [Item 8](#8-windbg-mcp-tasks-extension-iomodelcontextprotocoltasks-sep-2663--measured-and-deferred-2026-09-19) — [windbg-mcp] Tasks extension (`io.modelcontextprotocol/tasks`, SEP-2663) — **measured and deferred** (2026-09-19)
+- [Item 9](#9-dbgscope--windbg-mcp-incremental-output-from-a-running-command) — [dbgscope + windbg-mcp] Incremental output from a running command
+- [Item 11](#11-windbg-mcp-mcp-apps-ui-resources--scoped-out) — [windbg-mcp] MCP Apps (`ui://` resources) — scoped out
+- [Item 15](#15-windbg-mcp-make-handle-inheritance-a-property-of-the-spawn-not-of-the-process) — [windbg-mcp] Make handle inheritance a property of the spawn, not of the process
+- [Item 19](#19-windbg-mcp-let-a-debug_batch-step-walk-a-structure) — [windbg-mcp] Let a `debug_batch` step walk a structure
+- [Item 27](#27-windbg-mcp--dbgscope-a-deferred-module-reports-no-pdb-identity--measured-and-declined-2026-08-20) — [windbg-mcp + dbgscope] A deferred module reports no PDB identity — **measured and declined** (2026-08-20)
+- [Item 33](#33-windbg-mcp-the-lease-grace-assumes-the-server-is-the-slow-party) — [windbg-mcp] The lease grace assumes the server is the slow party
+- [Item 35](#35-windbg-mcp--dbgscope-the-engines-subregister-flag-misses-the-views-that-matter--measured-and-declined-2026-08-22) — [windbg-mcp + dbgscope] The engine's subregister flag misses the views that matter — **measured and declined** (2026-08-22)
+- [Item 39](#39-windbg-mcp-the-eval-measures-single-questions-not-an-investigation) — [windbg-mcp] The eval measures single questions, not an investigation
+- [Item 47](#47-windbg-mcp--dbgscope-the-bounded-wait-is-unmeasured-on-a-ttd-replay-target) — [windbg-mcp + dbgscope] The bounded wait is unmeasured on a TTD replay target
+- [Item 50](#50-windbg-mcp-the-released-binary-is-unsigned--only-the-certificate-is-left) — [windbg-mcp] The released binary is unsigned — only the certificate is left — **half landed**
+- [Item 52](#52-windbg-mcp-the-no-description-names-a-tool-the-client-cannot-call-invariant-does-not-cover-input-schemas) — [windbg-mcp] The "no description names a tool the client cannot call" invariant does not cover **input schemas**
+- [Item 53](#53-windbg-mcp-a-break-raised-after-a-runs-stop-is-built-labels-the-result-cut-short) — [windbg-mcp] A break raised *after* a run's stop is built labels the result cut short
+- [Item 54](#54-dbgscope--windbg-mcp-modules--refresh-true--has-no-wall-clock-bound) — [dbgscope + windbg-mcp] `modules { "refresh": true }` has no wall-clock bound
+- [Item 56](#56-windbg-mcp-resolves--expr-is-a-callers-command-on-nobodys-clock) — [windbg-mcp] `resolve`'s `? <expr>` is a caller's command on nobody's clock
+- [Item 58](#58-dbgscope--windbg-mcp-geteffectiveprocessortype-is-the-question-and-is-not-bound) — [dbgscope + windbg-mcp] `GetEffectiveProcessorType` is the question, and is not bound
+- [Item 59](#59-dbgscope--windbg-mcp-nothing-can-ask-which-thread-the-engine-has-selected) — [dbgscope + windbg-mcp] Nothing can ask which thread the engine has selected
+- [Item 61](#61-windbg-mcp-attribute-the-cve-2026-83498-fix-independently-of-similarity-scores) — [windbg-mcp] Attribute the CVE-2026-83498 fix independently of similarity scores
+- [Item 62](#62-windbg-mcp--binja-windbg-mcp-capture-a-live-securekernel-handoff) — [windbg-mcp + binja-windbg-mcp] Capture a live securekernel handoff
+- [Item 64](#64-binary-ninja-upstream-verify-the-firstsetupdialog-shutdown-fix) — [Binary Ninja upstream] Verify the FirstSetupDialog shutdown fix
+- [Item 65](#65-binja-windbg-mcp-native-ultimate-validation--deferred-due-to-cost) — [binja-windbg-mcp] Native Ultimate validation — deferred due to cost
+- [Item 66](#66-windbg-mcp-the-switch-resolver-refuses-what-it-trips-over-rather-than-matching-what-a-compiler-emits) — [windbg-mcp] The switch resolver refuses what it trips over rather than matching what a compiler emits
+- [Item 67](#67-windbg-mcp-a-branch-with-a-constant-condition-has-a-dead-edge-the-walk-still-reads) — [windbg-mcp] A branch with a constant condition has a dead edge the walk still reads
+- [Item 68](#68-windbg-mcp-whether-a-device-can-have-no-security-descriptor-at-all) — [windbg-mcp] Whether a device can have no security descriptor at all
+- [Item 69](#69-windbg-mcp-record-what-the-ace-kind-rules-were-measured-against) — [windbg-mcp] Record what the ACE-kind rules were measured against
+- [Item 71](#71-windbg-mcp-driver_surface-does-not-say-which-control-code-reaches-which-sink) — [windbg-mcp] `driver_surface` does not say which control code reaches which sink
+- [Item 72](#72-windbg-mcp-the-driver-tools-name-a-module-refresh-they-could-run-themselves) — [windbg-mcp] The driver tools name a module refresh they could run themselves
+- [Item 73](#73-windbg-mcp-a-drivers-import-directory-can-be-in-a-section-the-loader-freed) — [windbg-mcp] A driver's import directory can be in a section the loader freed
+- [Item 74](#74-windbg-mcp-the-driver-tools-report-no-pool-tags) — [windbg-mcp] The driver tools report no pool tags
+- [Item 84](#84-windbg-mcp-an-adrpadd-table-base-is-lost-at-the-add) — [windbg-mcp] An `adrp`+`add` table base is lost at the `add`
+- [Item 87](#87-windbg-mcp-a-code-materialised-in-the-previous-block-is-lost-at-the-join) — [windbg-mcp] A code materialised in the previous block is lost at the join
+- [Item 91](#91-windbg-mcp-a-refusal-that-returns-through-a-shared-epilogue-is-not-recognised) — [windbg-mcp] A refusal that returns through a shared epilogue is not recognised
+- [Item 88](#88-windbg-mcp-a-call-that-outlives-its-budget-finishes-its-work-and-has-the-answer-discarded) — [windbg-mcp] A call that outlives its budget finishes its work and has the answer discarded
+- [Item 94](#94-windbg-mcp-disabling-a-breakpoint-has-no-typed-tool) — [windbg-mcp] Disabling a breakpoint has no typed tool
+- [Item 97](#97-dbgscope-an-lfh-block-awaiting-a-delayed-free-is-reported-allocated) — [dbgscope] An LFH block awaiting a delayed free is reported allocated
+- [Item 100](#100-dbgscope-the-vs-chunk-chain-comes-apart-on-29671--the-targets-paging-not-the-build) — [dbgscope] The VS chunk chain comes apart on 29671 — the target's paging, not the build — **measured and declined**
+- [Item 101](#101-dbgscope-the-vs-chunk-chain-drifts-0x10-and-not-from-where-it-starts) — [dbgscope] The VS chunk chain drifts 0x10, and not from where it starts
+- [Item 104](#104-windbg-mcp-a-fingerprint-field-that-was-refused-is-indistinguishable-from-one-that-does-not-apply) — [windbg-mcp] A fingerprint field that was *refused* is indistinguishable from one that does not apply
+- [Item 105](#105-windbg-mcp-opendump-is-documented-as-replacing-the-target-and-the-one-measurement-of-it-says-it-adds-one) — [windbg-mcp] `.opendump` is documented as replacing the target, and the one measurement of it says it adds one
+- [Item 106](#106-windbg-mcp-a-tool-group-every-caller-pays-for-and-few-can-use) — [windbg-mcp] A tool group every caller pays for and few can use — **blocked**
+- [Item 108](#108-windbg-mcp-a-kmdf-drivers-real-callbacks--step-1-landed-the-frameworks-per-device-config-is-what-is-left) — [windbg-mcp] A KMDF driver's real callbacks — step 1 landed, the framework's per-device config is what is left
+- [Item 109](#109-windbg-mcp-the-server-can-walk-a-call-graph-forward-and-find-calls-to-imports-and-cannot-answer-who-calls-this-address) — [windbg-mcp] The server can walk a call graph forward and find calls to imports, and cannot answer "who calls this address"
+- [Item 110](#110-windbg-mcp-initialized-secure-kernel-stopstep--hardening-remains) — [windbg-mcp] Initialized Secure Kernel stop/step — hardening remains
 
 ## 2. [dbgscope] Typed write primitives
 
@@ -2579,3 +2530,127 @@ The gated route in full — its bench facts, device-contract recovery and binary
 private plan at `target/private/vtl1-kernel-controlled-stop-plan.md`. It is deliberately untracked,
 and the guest configuration, disk lineage and host component detail stay there rather than in this
 public repository.
+
+## Where these items came from
+
+Each cluster above, and what filing it measured. Items named here as *"now in `DONE.md`"* have
+closed since this record was written, and the record is kept with them in it: what a cluster was
+filed against is most of why the items left in it are worded the way they are.
+
+Grouped by origin: items 2–6 come from the reachability-confirmation effort (path
+recipe + `run_to_address`, merged 2026-07-04), items 8–9, 11 and 88 from surveying this server
+against the MCP `2026-07-28` extensions (tasks, apps) and then re-measuring the tasks half of it
+(2026-09-19) — where rmcp and the reference TypeScript SDK turn out to implement two
+wire-incompatible generations of SEP-2663 while the client this server is actually driven by
+declares neither, and where the one thing a task would genuinely have bought surfaced as item 88
+instead: a call that outlives its budget finishes its work in the worker and has the answer
+thrown away — item 15 from the private worker channel (#65 / #72,
+2026-08-04), item 19 from
+`walk_memory` (#103, 2026-08-13), item 27 from completing the coordinate work (#156–#158,
+2026-08-18), item 32 from running the debugger tier on the ARM64 runner image that replaced
+`windows-11-arm` in September 2026 — now in [`DONE.md`](./DONE.md), the migration having landed on
+2026-09-23 — items 33 and 39 from driving the server with a **local model** —
+the lease grace measured against the wrong slow party (2026-08-22), and then running the surface,
+the window and the model as a **grid** rather than as a sighting (2026-08-23) — item 35 from
+measuring what a `registers` answer is actually made of (2026-08-22), item 47 from fixing
+[#226](https://github.com/glslang/windbg-mcp/issues/226), where making every target take the bounded
+wait left one target type nobody on this bench can measure (2026-08-25), item 50 from Windows
+Defender quarantining this project's own binary while the 32-bit worker was being tested
+(2026-08-26), items 52–53 from [#83](https://github.com/glslang/windbg-mcp/issues/83)'s asynchronous
+execution handles, where the invariant that stops a description naming a tool its client cannot call
+turned out to cover only half the prose a client is served (2026-08-29), and where a break arriving
+in the microseconds after a run built its stop is recorded in that result's prose and not in its flag
+(2026-08-30), item 54 from
+[#85](https://github.com/glslang/windbg-mcp/issues/85)'s module-inventory refresh, whose engine call
+no watchdog in either crate can currently cut short (2026-08-30), item 56 from closing item 14 —
+collapsing the coverage rule to "bound every command except `index_trace`" meant enumerating the
+`Execute` calls rather than the ops, which found one left on a shared helper that three callers
+reach on three different clocks (2026-08-31) — items 58–59 from
+[#286](https://github.com/glslang/windbg-mcp/pull/286)'s user-mode fault triage, where the engine
+call that names a target's machine turns out to name the *processor's*, and where nothing can ask
+which thread the engine has selected (2026-09-05), items
+61–62 and 64–65 from completing Personal similarity delivery while separating CVE-specific investigation,
+upstream Binary Ninja limitations, and unaffordable Ultimate validation (2026-09-12), and items
+66–67 from the IOCTL recovery in [#305](https://github.com/glslang/windbg-mcp/pull/305) and
+[#307](https://github.com/glslang/windbg-mcp/pull/307): thirty-nine review findings over fourteen
+rounds that were one default — a backwards walk refusing what it trips over rather than recognising
+what a compiler emits — and then, from the differential oracle those rounds produced, the walk
+reporting a code down the dead edge of a branch whose condition is a constant (2026-09-12), and items
+68–69 from `device_security` ([#311](https://github.com/glslang/windbg-mcp/pull/311)), where
+eleven rounds of review on one tool ended with its own live-kernel measurement contradicting the
+item an earlier round of it had produced (2026-09-13), and item 71 from `driver_surface`, the
+fourth driver tool, whose specification included a dispatch-to-sink traversal that did not land
+with it, and item 72 from running that tool's live-kernel tier, where a fresh attach turns out to
+leave the debugger's module inventory nearly empty and the driver tools with nothing to resolve
+against (2026-09-13), and items 73–74 from checking the four driver tools against Ghidra and
+Driver Buddy Revolutions over `mountmgr` and HEVD — an import directory the loader may have
+freed, and the one section of the ported program with no counterpart here (2026-09-14) — and item
+79 from item 78's own fix, which got the user-mode heap walker past the layout refusal and one step
+into the next wall: the PEB lists one heap where the debugger sees four (2026-09-16), and item 80
+from adding Apple's on-device model as the eval's third backend (#335 / #336, 2026-09-17), where
+two review rounds found `identity()` reporting something false about a run because it worked out
+what a record contributes by testing the backend again in each field that needs it — both now in
+[`DONE.md`](./DONE.md) — as is item 81 from
+[#341](https://github.com/glslang/windbg-mcp/pull/341)'s breakpoint-command guard, where both
+review bots independently reached the same finding: a command scanner that reads the first token
+of a segment cannot see `.opendump` inside an `.if`, a `.foreach` or an alias that resolves only
+when it runs (filed 2026-09-18, closed 2026-09-25 by reading the target rather than the command).
+And item **84** from running
+`ioctl_map` against a live **ARM64** target for the first time
+([#345](https://github.com/glslang/windbg-mcp/pull/345), 2026-09-19): an `adrp`+`add` table base
+lost at the `add`. That run filed five more, all now in
+[`DONE.md`](./DONE.md) -- the literal pool the fact walk could not read (item 82, which was the
+whole of why 235 codes carried no proven size or refusal), the switch tables the reachability
+walk did not follow while the map resolved them (item 83), the two things item 83's own
+fourteen review rounds left behind -- a resolver cap discarding the targets it had proved (item 90)
+and the last uncounted way a `NOT REACHABLE` can be short of the graph (item 89) -- and the ARM64
+second opinion that had never been diffed (item 85), whose lane, once written, found the published
+`mountmgr` agreement to have been between two different builds. And item 87 from verifying one of the review findings on
+[#347](https://github.com/glslang/windbg-mcp/pull/347), where checking which `untracked` entries
+`volmgr` actually had turned up a code the map loses beside three identical ones it keeps
+(2026-09-19), and item 91 from the one-sided half of that diff (2026-09-20): after item 82's
+literal-pool read landed, `rdyboost`'s thirteen length checks are all still `exact: false`, because
+the refusal they branch to returns through a shared epilogue the walk stops at the head of. And
+item 92 from item 85's lane finding a driver the two implementations disagree about
+(2026-09-20) -- A64 writes `a || b || c` as three compares feeding one branch, and this walk read
+the last of them and filed the rest in `untracked` -- is **now in [`DONE.md`](./DONE.md)**, closed
+2026-10-02 by reading the `nzcv` immediate the chain carries rather than by folding conditions; the
+companion's half of that disagreement is open in its own repository, so the lane's answer for that
+driver now differs in the other direction. And item 94 from giving the multiprocessor hypervisor
+investigation's harness the tools it was written against (2026-09-20) -- that investigation is
+item 93 and is now in [`DONE.md`](./DONE.md): a typed breakpoint listing and removal landed, and
+`bd`/`be` deliberately did not. And item 97 from running the heap tools on ARM64 for the
+first time ([dbgscope#177](https://github.com/glslang/dbgscope/pull/177), 2026-09-23), with the
+target's own `HeapWalk` as the oracle: an LFH block awaiting a delayed free, which `HeapWalk`
+calls free and the heap tools call allocated. That run filed two more, both now in
+[`DONE.md`](./DONE.md) — item 96, the pool walker's LFH reading, which it showed is not `nt`'s,
+and the ARM64 pool gate behind it; and item 98, the uncommitted memory that kept every live walk
+measured at `Partial` once the diagnostics were gone, which turned out to want the memory
+manager's answer rather than the allocator's. And item 105 from review on that item's PR after it had merged (2026-09-27): the
+measurement item 102 took to correct its own example contradicts a claim this server's design is
+introduced with, in about a dozen places that were never swept. And item 104 from closing item 102 (2026-09-26): the target fingerprint spells
+*"this field does not apply"* and *"this field could not be read"* the same way, so two failures
+compare equal and a recovery reads as a replacement — which a handle survives and a batch's
+rollback does not.
+And items 100–101 from checking its fixes end to
+end through the tool surface once they had merged (2026-09-23) — the VS chunk chain coming apart
+on **29671**, found while confirming those fixes were not fitted to 26100, which they are not; and
+the same chain drifting 0x10 on 26100, which is all that is left of item 99 now that it too is in
+[`DONE.md`](./DONE.md). They were filed as possibly one question and are **not** (2026-09-24):
+item 100 is the target's paged pool being trimmed out from under a KD link, with nothing in the
+walker to fix, and is measured and declined; item 101 is a real placement defect in readable
+memory.
+And item 110 from the 2026-10-01 VTL1 controlled-stop probe (item 103's control axis): stopping and
+resuming real `securekernel.exe` image code on a partition we own does not reach an *initialized*
+Secure Kernel, and the route that would needs the experiment to own a Windows/VBS boot — filed as a
+decision with its falsification first, because its one unvalidated step is likely to close it.
+**Item 103 closed on 2026-10-02 and is in [`DONE.md`](./DONE.md)** — the Secure Kernel capture route
+with its four tools, plus a live source since gate S5w, plus the four attempts that had kept it open.
+What decided the close was the **route** rather than the deliverable: inspection of VTL1 kernel mode
+is complete in both directions, and a controlled stop inside a *real* guest's Secure Kernel has no
+mechanism on a VM Hyper-V manages — so the realistic route is to own the boot, which is **item 110**.
+Its last two arms are declined on that ground rather than left open, each with the condition that
+reverses it, and exactly one moved to 110. Two drafts of that entry's status got the close wrong in
+opposite directions and both are recorded in it.
+`DECISIONS.md`'s 2026-08-02 entries are the bounded-command coverage review that produced
+item 13, now in [`DONE.md`](./DONE.md).
