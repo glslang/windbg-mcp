@@ -534,11 +534,18 @@ impl VmwpDispatcherState {
             address: requested_address,
             original,
         });
+        if created.replaced {
+            let why = "DbgEng replaced a pre-existing breakpoint while creating the owned one; \
+                       the displaced debugger state cannot be reconstructed, so vmwp remains \
+                       contained"
+                .to_string();
+            self.phase = DispatcherPhase::Contained(why.clone());
+            bail!(why);
+        }
         if created.cut_short
             || created.kind != BreakpointKind::Code
             || created.address != Some(requested_address)
             || !created.enabled
-            || created.replaced
         {
             bail!("DbgEng did not create the requested owned code breakpoint");
         }
@@ -2591,6 +2598,33 @@ mod tests {
         assert_eq!(owned.id, 7);
         assert_eq!(owned.address, address);
         assert_eq!(owned.original, original);
+    }
+
+    #[test]
+    fn a_created_breakpoint_replacement_contains_before_cleanup_can_detach() {
+        let mut state =
+            VmwpDispatcherState::new(profile(), 4242, 0x2000_0000_1000, "provider".into()).unwrap();
+        let address = 0x2000_0000_3000;
+
+        let error = state
+            .claim_created_breakpoint(
+                CreatedBreakpoint {
+                    id: 7,
+                    kind: BreakpointKind::Code,
+                    address: Some(address),
+                    enabled: true,
+                    cut_short: false,
+                    replaced: true,
+                },
+                address,
+                vec![0x90; 8],
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("pre-existing breakpoint"));
+        assert!(state.breakpoint.is_some());
+        assert!(matches!(state.phase, DispatcherPhase::Contained(_)));
+        assert!(state.refuse_unsafe_recovery().is_err());
     }
 
     #[test]
