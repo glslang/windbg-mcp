@@ -185,6 +185,8 @@ pub(crate) trait EventDispatcher {
         breakpoints: &[BreakpointGuard],
     ) -> Result<HexU64>;
     fn finish_arm(&mut self) -> Result<()>;
+    /// Whether a completed whole-target pause currently makes provider register access safe.
+    fn provider_writes_quiesced(&self) -> bool;
     /// Re-read a proposed current instruction while the owned event remains held.
     fn verify_instruction(&mut self, instruction: &InstructionGuard) -> Result<()>;
     /// Return an owned event only after re-establishing a whole-target pause. The controller can
@@ -1370,6 +1372,9 @@ impl<P: ControlProvider> LiveControl<P> {
         breakpoints: &[BreakpointGuard],
     ) -> Result<()> {
         let context = dispatcher.begin_arm(&self.targets(), breakpoints)?;
+        if !dispatcher.provider_writes_quiesced() {
+            bail!("the dispatcher did not prove whole-VM quiescence for provider writes");
+        }
         if context.0 == 0 {
             bail!("the debugger adapter returned a zero handler context");
         }
@@ -1593,38 +1598,50 @@ impl<P: ControlProvider> LiveControl<P> {
         event: Option<HeldEvent>,
     ) -> anyhow::Error {
         let mut recovery_errors = Vec::new();
-        let mut safe_to_resume = true;
+        let owns_provider_state = self
+            .providers
+            .iter()
+            .any(|provider| provider.baseline.is_some());
+        let mut safe_to_resume = !owns_provider_state || dispatcher.provider_writes_quiesced();
+        if owns_provider_state && !safe_to_resume {
+            recovery_errors.push(
+                "skipped VTL1 baseline restoration because whole-VM quiescence was not proved"
+                    .to_string(),
+            );
+        }
 
-        for provider in 0..self.providers.len() {
-            if self.providers[provider].baseline.is_none() {
-                continue;
-            }
-            let entered_arm = match self.providers[provider].provider_phase {
-                ProviderPhase::Running => match self.providers[provider].provider.begin_arm() {
-                    Ok(()) => {
-                        self.providers[provider].provider_phase = ProviderPhase::Arming;
-                        true
-                    }
-                    Err(error) => {
-                        recovery_errors.push(format!(
-                            "begin VP {} recovery arm: {error:#}",
-                            self.providers[provider].target.vp
-                        ));
-                        false
-                    }
-                },
-                ProviderPhase::Arming | ProviderPhase::Stopped => true,
-            };
-            if !entered_arm {
-                safe_to_resume = false;
-                continue;
-            }
-            if let Err(error) = self.restore_owned_state(provider) {
-                safe_to_resume = false;
-                recovery_errors.push(format!(
-                    "restore VP {} VTL1 baseline: {error:#}",
-                    self.providers[provider].target.vp
-                ));
+        if safe_to_resume {
+            for provider in 0..self.providers.len() {
+                if self.providers[provider].baseline.is_none() {
+                    continue;
+                }
+                let entered_arm = match self.providers[provider].provider_phase {
+                    ProviderPhase::Running => match self.providers[provider].provider.begin_arm() {
+                        Ok(()) => {
+                            self.providers[provider].provider_phase = ProviderPhase::Arming;
+                            true
+                        }
+                        Err(error) => {
+                            recovery_errors.push(format!(
+                                "begin VP {} recovery arm: {error:#}",
+                                self.providers[provider].target.vp
+                            ));
+                            false
+                        }
+                    },
+                    ProviderPhase::Arming | ProviderPhase::Stopped => true,
+                };
+                if !entered_arm {
+                    safe_to_resume = false;
+                    continue;
+                }
+                if let Err(error) = self.restore_owned_state(provider) {
+                    safe_to_resume = false;
+                    recovery_errors.push(format!(
+                        "restore VP {} VTL1 baseline: {error:#}",
+                        self.providers[provider].target.vp
+                    ));
+                }
             }
         }
 
@@ -1963,6 +1980,8 @@ mod tests {
         fail_release: bool,
         fail_begin: Option<&'static str>,
         fail_wait: Option<&'static str>,
+        fail_wait_quiesced: bool,
+        provider_writes_quiesced: bool,
         fail_recover: Option<&'static str>,
         fail_teardown: Option<&'static str>,
     }
@@ -1976,6 +1995,8 @@ mod tests {
                 fail_release: false,
                 fail_begin: None,
                 fail_wait: None,
+                fail_wait_quiesced: true,
+                provider_writes_quiesced: false,
                 fail_recover: None,
                 fail_teardown: None,
             }
@@ -1989,6 +2010,7 @@ mod tests {
             _breakpoints: &[BreakpointGuard],
         ) -> Result<HexU64> {
             self.actions.push(Action::BeginArm);
+            self.provider_writes_quiesced = true;
             if let Some(reason) = self.fail_begin {
                 bail!("{reason}");
             }
@@ -1998,6 +2020,10 @@ mod tests {
         fn finish_arm(&mut self) -> Result<()> {
             self.actions.push(Action::FinishArm);
             Ok(())
+        }
+
+        fn provider_writes_quiesced(&self) -> bool {
+            self.provider_writes_quiesced
         }
 
         fn verify_instruction(&mut self, instruction: &InstructionGuard) -> Result<()> {
@@ -2014,8 +2040,10 @@ mod tests {
             self.wait_targets
                 .push(targets.iter().map(|target| target.vp).collect());
             if let Some(reason) = self.fail_wait {
+                self.provider_writes_quiesced = self.fail_wait_quiesced;
                 bail!("{reason}");
             }
+            self.provider_writes_quiesced = true;
             self.stops.pop_front().context("no scripted stop")
         }
 
@@ -2023,6 +2051,9 @@ mod tests {
             self.actions.push(Action::Release(mode));
             if self.fail_release {
                 bail!("scripted native completion failure");
+            }
+            if mode == ReleaseMode::Resume {
+                self.provider_writes_quiesced = false;
             }
             Ok(())
         }
@@ -2450,6 +2481,57 @@ mod tests {
             dispatcher.actions.last(),
             Some(&Action::Recover {
                 safe: true,
+                owned_event: false,
+            })
+        );
+    }
+
+    #[test]
+    fn failed_pause_barrier_contains_without_touching_losing_vps() {
+        let mut dispatcher = FakeDispatcher::new([]);
+        dispatcher.fail_wait = Some("Suspend-VM timed out after the winning intercept");
+        dispatcher.fail_wait_quiesced = false;
+        let mut control =
+            LiveControl::open_many(vec![FakeProvider::new(), FakeProvider::new().with_vp(1)])
+                .unwrap();
+
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Natural)
+            .unwrap();
+        let error = control.wait_for_stop(&mut dispatcher).unwrap_err();
+
+        assert!(error.to_string().contains("Suspend-VM"), "{error:#}");
+        assert!(control.fault().unwrap().target_left_paused);
+        assert!(
+            control
+                .fault()
+                .unwrap()
+                .recovery_errors
+                .iter()
+                .any(|error| {
+                    error.contains("baseline restoration")
+                        && error.contains("quiescence was not proved")
+                })
+        );
+        assert!(control.providers.iter().all(|provider| {
+            provider.provider.phase == FakePhase::Running
+                && provider.provider.serial == 2
+                && provider.baseline.is_some()
+                && provider
+                    .provider
+                    .registers
+                    .iter()
+                    .find(|register| register.name == RegisterName::Dr7)
+                    .unwrap()
+                    .low
+                    .0
+                    & DR7_ENABLE_MASK
+                    != 0
+        }));
+        assert_eq!(
+            dispatcher.actions.last(),
+            Some(&Action::Recover {
+                safe: false,
                 owned_event: false,
             })
         );
