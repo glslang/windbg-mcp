@@ -14,7 +14,8 @@ beside it has open for symbols. It counts against the same limit, ends the same 
 
 `open_sk_live_control` is the eighth. Its worker binds operator-supplied providers and an
 exact-build `vmwp` debugger adapter to one selected VP in an explicitly disposable VBS VM. Opening
-validates the complete identity and capabilities but does not pause the VM or arm a breakpoint.
+validates the request, profile and register-provider handshake but does not pause, attach to or
+inspect the VM. The first arm validates the live target under pause before it mutates state.
 See [Live Secure Kernel control](#live-secure-kernel-control) below.
 
 Sessions are independent. Opening a second target does not disturb the first, a call against one
@@ -123,8 +124,10 @@ limits are recorded there rather than here.
 disposable VBS VM. The caller supplies the exact VM GUID, partition ID, VP, VTL1 CR3, `vmwp` PID,
 dispatcher address, an exact-build adapter profile, a register-control provider command and a live
 memory transport command. The repository supplies neither privileged provider. The worker validates
-their identity and capabilities, the VM-to-`vmwp` binding and the local `vmwp.exe` image before it
-accepts the session; opening itself does not change guest execution.
+the request, profile and register provider's declared identity and capabilities before it accepts
+the session; opening itself does not change guest execution. The first `sk_live_arm` pauses the VM,
+validates the VM-to-`vmwp` binding, live-memory CR3, guarded instructions and local `vmwp.exe`
+build, and proceeds to register or breakpoint mutation only after those checks pass.
 
 Six tools drive that session after the open:
 

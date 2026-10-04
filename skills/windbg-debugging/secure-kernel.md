@@ -301,8 +301,10 @@ tools are refused on this session so they cannot report `vmwp` state as guest st
 Use this route only for an exact, disposable VBS VM under an independent heartbeat, crash-record and
 unchanged-text audit. Before opening, collect the current VM GUID, partition ID, selected VP, VTL1
 CR3, `vmwp` PID and dispatcher VND; the exact-build `vmwp` profile or bounded profile directory; and
-the register-control and live-memory provider commands. `open_sk_live_control` validates all of
-those without pausing the VM or arming a breakpoint.
+the register-control and live-memory provider commands. `open_sk_live_control` validates the input
+shape, loads the profile and checks the register provider's declared identity and capabilities. It
+does not pause, attach to or inspect the VM. The first `sk_live_arm` pauses the VM and validates the
+live VM/`vmwp` binding, CR3, build and guarded instruction before it changes registers or breakpoints.
 
 The sequence is:
 
