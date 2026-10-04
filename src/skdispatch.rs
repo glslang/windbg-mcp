@@ -507,6 +507,44 @@ impl VmwpDispatcherState {
         Ok(())
     }
 
+    fn freeze_other_threads(&mut self, mut execute: impl FnMut(&str) -> Result<()>) -> Result<()> {
+        if self.threads_frozen {
+            bail!("vmwp threads are already frozen");
+        }
+        execute("~* f")?;
+        // The first command changed debugger state, so cleanup owns that state even
+        // when selecting the current thread fails.
+        self.threads_frozen = true;
+        execute("~# u")
+    }
+
+    fn claim_created_breakpoint(
+        &mut self,
+        created: CreatedBreakpoint,
+        requested_address: u64,
+        original: Vec<u8>,
+    ) -> Result<()> {
+        if self.breakpoint.is_some() {
+            bail!("the adapter already owns a breakpoint");
+        }
+        // DbgEng has already created this id. Claim it before rejecting any read-back field so
+        // recovery cannot detach while an untracked breakpoint remains in the session.
+        self.breakpoint = Some(OwnedBreakpoint {
+            id: created.id,
+            address: requested_address,
+            original,
+        });
+        if created.cut_short
+            || created.kind != BreakpointKind::Code
+            || created.address != Some(requested_address)
+            || !created.enabled
+            || created.replaced
+        {
+            bail!("DbgEng did not create the requested owned code breakpoint");
+        }
+        Ok(())
+    }
+
     fn claim_vm_pause(&mut self, targets: &[TargetIdentity]) -> Result<()> {
         if !self.targets.is_empty() && self.targets != targets {
             bail!("the dispatcher adapter is already bound to another target");
@@ -716,6 +754,16 @@ struct OwnedBreakpoint {
     id: u32,
     address: u64,
     original: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CreatedBreakpoint {
+    id: u32,
+    kind: BreakpointKind,
+    address: Option<u64>,
+    enabled: bool,
+    cut_short: bool,
+    replaced: bool,
 }
 
 struct LiveGuestMemory {
@@ -1385,9 +1433,13 @@ impl VmwpDispatcher<'_> {
         let saved_handler = self.read_u64(stack_handler)?;
         let saved_context = self.read_u64(stack_context)?;
 
-        self.engine.execute_command("~* f").map_err(debugger)?;
-        self.engine.execute_command("~# u").map_err(debugger)?;
-        self.state.threads_frozen = true;
+        let engine = self.engine;
+        self.state.freeze_other_threads(|command| {
+            engine
+                .execute_command(command)
+                .map(|_| ())
+                .map_err(debugger)
+        })?;
         self.set_dynamic_breakpoint(return_address)?;
         // From the first guest-memory mutation until the return boundary and original stack are
         // proved, recovery must keep vmwp attached and the VM paused. Detaching would let a
@@ -1655,9 +1707,13 @@ impl VmwpDispatcher<'_> {
 
         let rsp = self.register("rsp")?;
         let return_address = self.read_u64(rsp)?;
-        self.engine.execute_command("~* f").map_err(debugger)?;
-        self.engine.execute_command("~# u").map_err(debugger)?;
-        self.state.threads_frozen = true;
+        let engine = self.engine;
+        self.state.freeze_other_threads(|command| {
+            engine
+                .execute_command(command)
+                .map(|_| ())
+                .map_err(debugger)
+        })?;
         self.set_dynamic_breakpoint(return_address)?;
         // From the first register mutation until the return value is proved, a failed call cannot
         // be retried or detached: either could complete an unregister whose result we no longer
@@ -1915,20 +1971,16 @@ impl VmwpDispatcher<'_> {
             .engine
             .set_breakpoint(&BreakpointSpec::code(BreakpointAt::Address(address)))
             .map_err(debugger)?;
-        if set.cut_short.is_some()
-            || set.breakpoint.kind != BreakpointKind::Code
-            || set.breakpoint.address != Some(address)
-            || !set.breakpoint.enabled
-            || !set.replaced.is_empty()
-        {
-            bail!("DbgEng did not create the requested owned code breakpoint");
-        }
-        self.state.breakpoint = Some(OwnedBreakpoint {
+        let created = CreatedBreakpoint {
             id: set.breakpoint.id,
-            address,
-            original,
-        });
-        Ok(())
+            kind: set.breakpoint.kind,
+            address: set.breakpoint.address,
+            enabled: set.breakpoint.enabled,
+            cut_short: set.cut_short.is_some(),
+            replaced: !set.replaced.is_empty(),
+        };
+        self.state
+            .claim_created_breakpoint(created, address, original)
     }
 
     fn remove_owned_breakpoint(&mut self) -> Result<()> {
@@ -2484,6 +2536,61 @@ mod tests {
         state.record_handler_context(0x2000_0000_2000).unwrap();
         assert_eq!(state.handler_context, Some(0x2000_0000_2000));
         assert!(state.record_handler_context(0x2000_0000_3000).is_err());
+    }
+
+    #[test]
+    fn a_failed_current_thread_thaw_retains_all_thread_freeze_ownership() {
+        let mut state =
+            VmwpDispatcherState::new(profile(), 4242, 0x2000_0000_1000, "provider".into()).unwrap();
+        let mut commands = Vec::new();
+
+        let error = state
+            .freeze_other_threads(|command| {
+                commands.push(command.to_string());
+                if command == "~# u" {
+                    Err(anyhow!("current-thread thaw failed"))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("current-thread thaw failed"));
+        assert_eq!(commands, ["~* f", "~# u"]);
+        assert!(state.threads_frozen);
+    }
+
+    #[test]
+    fn a_rejected_created_breakpoint_remains_owned_for_cleanup() {
+        let mut state =
+            VmwpDispatcherState::new(profile(), 4242, 0x2000_0000_1000, "provider".into()).unwrap();
+        let address = 0x2000_0000_3000;
+        let original = vec![0x90; 8];
+
+        let error = state
+            .claim_created_breakpoint(
+                CreatedBreakpoint {
+                    id: 7,
+                    kind: BreakpointKind::Code,
+                    address: Some(address),
+                    enabled: false,
+                    cut_short: false,
+                    replaced: false,
+                },
+                address,
+                original.clone(),
+            )
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("requested owned code breakpoint")
+        );
+        let owned = state.breakpoint.expect("created breakpoint remains owned");
+        assert_eq!(owned.id, 7);
+        assert_eq!(owned.address, address);
+        assert_eq!(owned.original, original);
     }
 
     #[test]
