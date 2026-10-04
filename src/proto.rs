@@ -99,12 +99,12 @@ pub enum EngineOp {
         name: Option<String>,
         address: Option<u64>,
     },
-    /// Bind the live Secure Kernel controller to one selected VP. The opener validates the
-    /// provider identity and build profile but does not alter guest execution; arming is separate.
+    /// Bind the live Secure Kernel controller to a selected VP set. The opener validates provider
+    /// identities and the build profile but does not alter guest execution; arming is separate.
     OpenSecureKernelLive(Box<crate::skdispatch::OpenRequest>),
-    /// Save the VTL1 baseline and arm DR0 for one guarded instruction.
+    /// Save the VTL1 baseline and arm one to four guarded execution breakpoints.
     SkLiveArm {
-        instruction: crate::sklive::InstructionGuard,
+        breakpoints: Vec<crate::sklive::BreakpointGuard>,
         #[serde(default)]
         mode: crate::sklive::ArmMode,
     },

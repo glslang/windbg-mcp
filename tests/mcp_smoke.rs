@@ -19154,7 +19154,8 @@ fn a_live_secure_kernel_session_stops_steps_inspects_resumes_and_closes() {
         "vm_id": required("vm_id"),
         "partition_id": required("partition_id"),
         "vp": config.get("vp").cloned().unwrap_or(json!(0)),
-        "expected_cr3": required("expected_cr3")
+        "expected_cr3": required("expected_cr3"),
+        "additional_vps": config.get("additional_vps").cloned().unwrap_or(json!([]))
     });
 
     let mut server = Server::started();
@@ -19169,16 +19170,19 @@ fn a_live_secure_kernel_session_stops_steps_inspects_resumes_and_closes() {
         );
         let id = session.as_deref().expect("the handle was just stored");
 
-        let armed = server.tool_data(
-            "sk_live_arm",
-            json!({
-                "session_id": id,
-                "address": address,
-                "bytes": instruction_bytes,
-                "mode": config.get("arm_mode").cloned().unwrap_or(json!("redirect"))
-            }),
-            TARGET_STEP,
-        );
+        let mut arm = json!({
+            "session_id": id,
+            "address": address,
+            "bytes": instruction_bytes,
+            "mode": config.get("arm_mode").cloned().unwrap_or(json!("redirect"))
+        });
+        if let Some(slot) = config.get("slot") {
+            arm["slot"] = slot.clone();
+        }
+        if let Some(additional) = config.get("additional_breakpoints") {
+            arm["additional_breakpoints"] = additional.clone();
+        }
+        let armed = server.tool_data("sk_live_arm", arm, TARGET_STEP);
         assert_eq!(armed["phase"], "running", "{armed}");
 
         let hardware = server.tool_data("sk_live_wait", json!({ "session_id": id }), TARGET_STEP);
@@ -19186,7 +19190,11 @@ fn a_live_secure_kernel_session_stops_steps_inspects_resumes_and_closes() {
             hardware["event"]["reason"]["reason"], "hardware_breakpoint",
             "{hardware}"
         );
-        assert_eq!(hardware["event"]["reason"]["slot"], 0, "{hardware}");
+        assert_eq!(
+            hardware["event"]["reason"]["slot"],
+            config.get("expected_slot").cloned().unwrap_or(json!(0)),
+            "{hardware}"
+        );
         assert_eq!(hardware["event"]["vtl"], 1, "{hardware}");
         assert_eq!(hardware["event"]["cpl"], 0, "{hardware}");
         assert_eq!(

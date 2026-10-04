@@ -2327,6 +2327,16 @@ pre-mutation build mismatch. Live debugger-loss-after-restoration and VM-reset i
 broader exact-build profile coverage, remain open. The detailed bench sequence, profile, provider
 and evidence remain in the ignored private plan.
 
+The tracked controller was widened on 2026-10-04 without weakening those exact-build checks. A
+profile argument can now name a bounded directory and selects exactly one entry whose declared
+`vmwp.exe` hash matches the current local image. Natural mode accepts up to four explicitly slotted
+execution breakpoints and several VP-bound providers in one worker; the native event chooses the
+winning VP and DR6 chooses the winning slot, after which every losing VP is restored before the
+stop is returned. Redirect mode remains deliberately one VP and one address. Offline tests cover a
+VP1 win with VP0 restoration, multi-slot classification, duplicate refusal and baseline recovery.
+The fan-out path still needs a live multi-provider acceptance run; its predecessor's live proof is
+one selected VP at a time.
+
 The record below explains how the route was chosen. Cost and “still open” statements in it describe
 the decision point and are superseded by the result above.
 

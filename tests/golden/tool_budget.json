@@ -354,11 +354,11 @@
     {
       "annotations": 132,
       "description": 208,
-      "inputSchema": 1341,
-      "modelVisible": 1610,
+      "inputSchema": 1569,
+      "modelVisible": 1838,
       "name": "open_sk_live_control",
       "outputSchema": 4614,
-      "wire": 6387
+      "wire": 6615
     },
     {
       "annotations": 114,
@@ -497,12 +497,12 @@
     },
     {
       "annotations": 127,
-      "description": 240,
-      "inputSchema": 1148,
-      "modelVisible": 1440,
+      "description": 271,
+      "inputSchema": 2085,
+      "modelVisible": 2408,
       "name": "sk_live_arm",
       "outputSchema": 1291,
-      "wire": 2889
+      "wire": 3857
     },
     {
       "annotations": 127,
@@ -528,8 +528,8 @@
       "inputSchema": 343,
       "modelVisible": 491,
       "name": "sk_live_registers",
-      "outputSchema": 3830,
-      "wire": 4484
+      "outputSchema": 3967,
+      "wire": 4621
     },
     {
       "annotations": 123,
@@ -546,8 +546,8 @@
       "inputSchema": 343,
       "modelVisible": 569,
       "name": "sk_live_wait",
-      "outputSchema": 3830,
-      "wire": 4562
+      "outputSchema": 3967,
+      "wire": 4699
     },
     {
       "annotations": 126,
@@ -669,14 +669,14 @@
   ],
   "totals": {
     "annotations": 8082,
-    "description": 42288,
-    "inputSchema": 66217,
+    "description": 42319,
+    "inputSchema": 67382,
     "instructions": 2022,
-    "modelVisible": 112429,
-    "outputSchema": 198032,
-    "payload": 320682,
+    "modelVisible": 113625,
+    "outputSchema": 198306,
+    "payload": 322152,
     "tools": 74,
-    "wire": 320597,
+    "wire": 322067,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10842
   }

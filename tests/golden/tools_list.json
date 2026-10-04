@@ -1284,6 +1284,7 @@
         "root": "object"
       },
       "params": [
+        "additional_vps: array<integer/uint32>",
         "control_transport: string",
         "dispatcher_vnd: string",
         "expected_cr3: string",
@@ -1866,10 +1867,12 @@
         "root": "object"
       },
       "params": [
+        "additional_breakpoints: array<ref(#/$defs/SkLiveBreakpointArgs)>",
         "address: string",
         "bytes: string",
         "mode: ref(#/$defs/ArmMode)",
-        "session_id: string|null"
+        "session_id: string|null",
+        "slot: integer|null/uint8"
       ],
       "required": [
         "address",

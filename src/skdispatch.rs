@@ -26,8 +26,8 @@ use crate::sk;
 use crate::sk::RawSource;
 use crate::skcontrol::{HeldEvent, HexU64, StopReason, TargetIdentity};
 use crate::sklive::{
-    ArmMode, DispatcherProfile, DispatcherSite, EventDispatcher, InstructionGuard, LiveControl,
-    LivePhase, LiveTransition, ObservedStop, ReleaseMode, StopRecord,
+    ArmMode, BreakpointGuard, DispatcherProfile, DispatcherSite, EventDispatcher, InstructionGuard,
+    LiveControl, LivePhase, LiveTransition, ObservedStop, ReleaseMode, StopRecord,
 };
 
 pub(crate) const LIVE_CONTROL_FLAG: &str = "--sk-live-control";
@@ -61,7 +61,25 @@ impl Session {
             &request.control_transport,
             request.target.clone(),
         )?;
-        let control = LiveControl::open(provider)?;
+        let mut providers = vec![provider];
+        let mut skipped = skipped
+            .into_iter()
+            .map(|line| format!("VP {}: {line}", request.target.vp))
+            .collect::<Vec<_>>();
+        for additional in &request.additional_vps {
+            additional.target.validate()?;
+            let (provider, provider_skipped) = crate::skcontrol::ControlProcess::spawn(
+                &additional.control_transport,
+                additional.target.clone(),
+            )?;
+            skipped.extend(
+                provider_skipped
+                    .into_iter()
+                    .map(|line| format!("VP {}: {line}", additional.target.vp)),
+            );
+            providers.push(provider);
+        }
+        let control = LiveControl::open_many(providers)?;
         Ok((
             Self {
                 control,
@@ -82,11 +100,11 @@ impl Session {
     pub(crate) fn arm(
         &mut self,
         engine: &DebugEngine,
-        instruction: InstructionGuard,
+        breakpoints: Vec<BreakpointGuard>,
         mode: ArmMode,
     ) -> Result<LiveTransition> {
         let mut dispatcher = self.dispatcher.bind(engine);
-        let epoch = self.control.arm(&mut dispatcher, instruction, mode)?;
+        let epoch = self.control.arm(&mut dispatcher, breakpoints, mode)?;
         Ok(LiveTransition {
             phase: self.control.phase(),
             epoch,
@@ -150,6 +168,15 @@ pub(crate) struct OpenRequest {
     pub(crate) vmwp_pid: u32,
     pub(crate) dispatcher_vnd: u64,
     pub(crate) target: TargetIdentity,
+    #[serde(default)]
+    pub(crate) additional_vps: Vec<AdditionalVp>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AdditionalVp {
+    pub(crate) control_transport: String,
+    pub(crate) target: TargetIdentity,
 }
 
 impl fmt::Debug for OpenRequest {
@@ -164,6 +191,7 @@ impl fmt::Debug for OpenRequest {
                 &format_args!("{:#x}", self.dispatcher_vnd),
             )
             .field("target", &self.target)
+            .field("additional_vps", &self.additional_vps.len())
             .finish()
     }
 }
@@ -296,6 +324,7 @@ impl AcceptanceRequest {
                 vmwp_pid: vmwp_pid.context(live_control_usage())?,
                 dispatcher_vnd: dispatcher_vnd.context(live_control_usage())?,
                 target,
+                additional_vps: Vec::new(),
             },
             instruction,
             arm_mode,
@@ -319,7 +348,14 @@ pub(crate) fn run_acceptance(args: &[String], engine: &DebugEngine) -> Result<()
         eprintln!("control provider: {line}");
     }
     let result = (|| {
-        session.arm(engine, instruction, request.arm_mode)?;
+        session.arm(
+            engine,
+            vec![BreakpointGuard {
+                slot: 0,
+                instruction,
+            }],
+            request.arm_mode,
+        )?;
         let hardware_stop = session.wait_for_stop(engine)?;
         session.step(
             engine,
@@ -392,7 +428,7 @@ pub(crate) struct VmwpDispatcherState {
     vmwp_pid: u32,
     dispatcher_vnd: u64,
     live_transport: String,
-    target: Option<TargetIdentity>,
+    targets: Vec<TargetIdentity>,
     memory: Option<LiveGuestMemory>,
     vmwp_base: Option<u64>,
     handler_context: Option<u64>,
@@ -428,7 +464,7 @@ impl VmwpDispatcherState {
             vmwp_pid,
             dispatcher_vnd,
             live_transport,
-            target: None,
+            targets: Vec::new(),
             memory: None,
             vmwp_base: None,
             handler_context: None,
@@ -461,13 +497,11 @@ impl VmwpDispatcherState {
         Ok(())
     }
 
-    fn claim_vm_pause(&mut self, target: &TargetIdentity) -> Result<()> {
-        if let Some(bound) = &self.target
-            && bound != target
-        {
+    fn claim_vm_pause(&mut self, targets: &[TargetIdentity]) -> Result<()> {
+        if !self.targets.is_empty() && self.targets != targets {
             bail!("the dispatcher adapter is already bound to another target");
         }
-        self.target = Some(target.clone());
+        self.targets = targets.to_vec();
         // Claim this before Suspend-VM: a helper timeout or failed final verification cannot tell
         // whether the VM changed state, so recovery must conservatively issue Resume-VM.
         self.vm_paused = true;
@@ -567,7 +601,7 @@ pub(crate) struct VmwpDispatcher<'a> {
 enum DispatcherPhase {
     Fresh,
     Registering,
-    ReadyForStop(StopReason),
+    ReadyForStop,
     Holding(HeldEvent),
     ReturningCallback(HeldEvent),
     CallbackEntry(HeldEvent),
@@ -601,7 +635,7 @@ impl DispatcherPhase {
     fn arm_preparation(&self) -> Result<ArmPreparation> {
         match self {
             Self::Fresh => Ok(ArmPreparation::OpenAndRegister),
-            Self::ReadyForStop(_) | Self::NativeReturn(_) => Ok(ArmPreparation::VerifyAttached),
+            Self::ReadyForStop | Self::NativeReturn(_) => Ok(ArmPreparation::VerifyAttached),
             Self::Detached => Ok(ArmPreparation::Reattach),
             Self::Contained(why) => bail!("the dispatcher is fail-closed: {why}"),
             Self::Closed => bail!("the dispatcher is closed"),
@@ -758,22 +792,30 @@ impl LiveGuestMemory {
 impl EventDispatcher for VmwpDispatcher<'_> {
     fn begin_arm(
         &mut self,
-        target: &TargetIdentity,
-        instruction: &InstructionGuard,
+        targets: &[TargetIdentity],
+        breakpoints: &[BreakpointGuard],
     ) -> Result<HexU64> {
-        target.validate()?;
-        if let Some(bound) = &self.state.target
-            && bound != target
-        {
+        let target = targets.first().context("no live-control VP targets")?;
+        for candidate in targets {
+            candidate.validate()?;
+            if !candidate.vm_id.eq_ignore_ascii_case(&target.vm_id)
+                || candidate.partition_id != target.partition_id
+                || candidate.vtl != target.vtl
+                || candidate.expected_cr3 != target.expected_cr3
+            {
+                bail!("dispatcher VP targets do not share one VM identity");
+            }
+        }
+        if !self.state.targets.is_empty() && self.state.targets != targets {
             bail!("the dispatcher adapter is already bound to another target");
         }
 
         match self.state.phase.arm_preparation()? {
-            ArmPreparation::OpenAndRegister => self.open_and_register(target, instruction)?,
+            ArmPreparation::OpenAndRegister => self.open_and_register(targets, breakpoints)?,
             ArmPreparation::VerifyAttached => {
-                self.verify_instruction(instruction)?;
+                self.verify_breakpoints(breakpoints)?;
             }
-            ArmPreparation::Reattach => self.reattach_registered_handler(target, instruction)?,
+            ArmPreparation::Reattach => self.reattach_registered_handler(targets, breakpoints)?,
         }
         Ok(HexU64(
             self.state
@@ -785,7 +827,7 @@ impl EventDispatcher for VmwpDispatcher<'_> {
     fn finish_arm(&mut self) -> Result<()> {
         if !matches!(
             self.state.phase,
-            DispatcherPhase::ReadyForStop(_) | DispatcherPhase::NativeReturn(_)
+            DispatcherPhase::ReadyForStop | DispatcherPhase::NativeReturn(_)
         ) {
             bail!("finish_arm requires a debugger-stopped, armed dispatcher");
         }
@@ -798,16 +840,17 @@ impl EventDispatcher for VmwpDispatcher<'_> {
 
     fn wait_for_stop(
         &mut self,
-        target: &TargetIdentity,
-        instruction: &InstructionGuard,
+        targets: &[TargetIdentity],
+        instructions: &[InstructionGuard],
     ) -> Result<ObservedStop> {
-        if self.state.target.as_ref() != Some(target) {
+        if self.state.targets != targets {
             bail!("the stop request does not match the dispatcher target");
         }
-        let reason = match &self.state.phase {
-            DispatcherPhase::ReadyForStop(reason) => reason.clone(),
+        let primary = targets.first().context("no live-control VP targets")?;
+        match &self.state.phase {
+            DispatcherPhase::ReadyForStop => {}
             other => bail!("wait_for_stop requires an armed dispatcher, got {other:?}"),
-        };
+        }
         let event_site = self.site_address(&self.state.profile.event_held)?;
         if self.state.breakpoint.is_none() {
             let site = self.state.profile.event_held.clone();
@@ -816,13 +859,13 @@ impl EventDispatcher for VmwpDispatcher<'_> {
 
         if self.state.completion_kick.is_none() && self.state.vm_paused {
             self.state.completion_kick = Some(VmTransition::immediate(
-                target.vm_id.clone(),
+                primary.vm_id.clone(),
                 VmAction::Resume,
             ));
         }
 
         let deadline = Instant::now() + Duration::from_millis(u64::from(DEBUG_WAIT));
-        let event_pointer = loop {
+        let (event_pointer, target) = loop {
             self.run_to_current_breakpoint(deadline)?;
             if self.engine.instruction_pointer().map_err(debugger)? != event_site {
                 bail!("debugger stopped away from the owned dispatcher breakpoint");
@@ -839,11 +882,12 @@ impl EventDispatcher for VmwpDispatcher<'_> {
                     .checked_add(u64::from(self.state.profile.layout.event_vp))
                     .context("event VP address overflowed")?,
             )?;
+            let target = targets.iter().find(|target| target.vp == vp);
             if message_type == EVENT_TYPE_VECTOR_1
                 && context == self.state.handler_context.context("no handler context")?
-                && vp == target.vp
+                && let Some(target) = target
             {
-                break event_pointer;
+                break (event_pointer, target);
             }
             if Instant::now() >= deadline {
                 bail!("too many unrelated dispatcher events before the owned vector-1 event");
@@ -858,7 +902,7 @@ impl EventDispatcher for VmwpDispatcher<'_> {
             cpl: 0,
             dispatcher_context: HexU64(self.state.handler_context.context("no handler context")?),
             advance_instruction_pointer: false,
-            reason,
+            reason: StopReason::DebugException,
         };
         // Matching the vector, VP and registered context proves ownership of the native event.
         // Record it before any cleanup or live-memory operation can fail so recovery completes this
@@ -881,10 +925,13 @@ impl EventDispatcher for VmwpDispatcher<'_> {
             .as_mut()
             .context("the live VTL1 memory source is absent")?;
         memory.refresh()?;
-        let observed_instruction = memory.read_guard(instruction)?;
+        let observed_instructions = instructions
+            .iter()
+            .map(|instruction| memory.read_guard(instruction))
+            .collect::<Result<Vec<_>>>()?;
         Ok(ObservedStop {
             event,
-            instruction: observed_instruction,
+            instructions: observed_instructions,
         })
     }
 
@@ -1008,16 +1055,17 @@ impl VmwpDispatcher<'_> {
 
     fn open_and_register(
         &mut self,
-        target: &TargetIdentity,
-        instruction: &InstructionGuard,
+        targets: &[TargetIdentity],
+        breakpoints: &[BreakpointGuard],
     ) -> Result<()> {
-        self.state.claim_vm_pause(target)?;
+        let target = targets.first().context("no live-control VP targets")?;
+        self.state.claim_vm_pause(targets)?;
         run_vm_action(&target.vm_id, VmAction::Pause, POWERSHELL_WAIT)?;
         verify_vmwp_pid(&target.vm_id, self.state.vmwp_pid)?;
         if self.state.memory.is_none() {
             self.state.memory = Some(LiveGuestMemory::open(&self.state.live_transport, target)?);
         }
-        self.verify_instruction(instruction)?;
+        self.verify_breakpoints(breakpoints)?;
         let pending = self
             .engine
             .attach_process_begin(self.state.vmwp_pid)
@@ -1035,20 +1083,20 @@ impl VmwpDispatcher<'_> {
         self.register_handler()?;
         let site = self.state.profile.event_held.clone();
         self.set_site_breakpoint(&site)?;
-        self.state.phase =
-            DispatcherPhase::ReadyForStop(StopReason::HardwareBreakpoint { slot: 0 });
+        self.state.phase = DispatcherPhase::ReadyForStop;
         Ok(())
     }
 
     fn reattach_registered_handler(
         &mut self,
-        target: &TargetIdentity,
-        instruction: &InstructionGuard,
+        targets: &[TargetIdentity],
+        breakpoints: &[BreakpointGuard],
     ) -> Result<()> {
+        let target = targets.first().context("no live-control VP targets")?;
         if self.state.handler_context.is_none() || !self.state.scratch_allocated {
             bail!("the detached dispatcher no longer owns a registered handler");
         }
-        self.state.claim_vm_pause(target)?;
+        self.state.claim_vm_pause(targets)?;
         run_vm_action(&target.vm_id, VmAction::Pause, POWERSHELL_WAIT)?;
         verify_vmwp_pid(&target.vm_id, self.state.vmwp_pid)?;
         let pending = self
@@ -1063,11 +1111,10 @@ impl VmwpDispatcher<'_> {
             .map_err(debugger)?;
         self.verify_vmwp_build()?;
         self.verify_all_sites()?;
-        self.verify_instruction(instruction)?;
+        self.verify_breakpoints(breakpoints)?;
         let site = self.state.profile.event_held.clone();
         self.set_site_breakpoint(&site)?;
-        self.state.phase =
-            DispatcherPhase::ReadyForStop(StopReason::HardwareBreakpoint { slot: 0 });
+        self.state.phase = DispatcherPhase::ReadyForStop;
         Ok(())
     }
 
@@ -1126,6 +1173,13 @@ impl VmwpDispatcher<'_> {
         let observed = memory.read_guard(instruction)?;
         if &observed != instruction {
             bail!("the guarded VTL1 instruction does not match live memory");
+        }
+        Ok(())
+    }
+
+    fn verify_breakpoints(&mut self, breakpoints: &[BreakpointGuard]) -> Result<()> {
+        for breakpoint in breakpoints {
+            self.verify_instruction(&breakpoint.instruction)?;
         }
         Ok(())
     }
@@ -1329,7 +1383,7 @@ impl VmwpDispatcher<'_> {
             ReleaseMode::ArmNextStop => {
                 let site = self.state.profile.event_held.clone();
                 self.set_site_breakpoint(&site)?;
-                self.state.phase = DispatcherPhase::ReadyForStop(StopReason::SingleStep);
+                self.state.phase = DispatcherPhase::ReadyForStop;
             }
             ReleaseMode::Resume => {
                 self.detach_handled()?;
@@ -1819,8 +1873,8 @@ impl VmwpDispatcher<'_> {
     fn bound_vm_id(&self) -> Result<&str> {
         Ok(&self
             .state
-            .target
-            .as_ref()
+            .targets
+            .first()
             .context("the dispatcher target is not bound")?
             .vm_id)
     }
@@ -2088,11 +2142,7 @@ mod tests {
             DispatcherPhase::ReturningNative(event.clone()).held_event(),
             Some(&event)
         );
-        assert!(
-            DispatcherPhase::ReadyForStop(StopReason::HardwareBreakpoint { slot: 0 })
-                .held_event()
-                .is_none()
-        );
+        assert!(DispatcherPhase::ReadyForStop.held_event().is_none());
     }
 
     #[test]
@@ -2127,14 +2177,14 @@ mod tests {
             VmwpDispatcherState::new(profile(), 4242, 0x2000_0000_1000, "provider".into()).unwrap();
         let target = target();
 
-        state.claim_vm_pause(&target).unwrap();
+        state.claim_vm_pause(std::slice::from_ref(&target)).unwrap();
 
-        assert_eq!(state.target.as_ref(), Some(&target));
+        assert_eq!(state.targets, vec![target.clone()]);
         assert!(state.vm_paused);
         let mut other = target.clone();
         other.expected_cr3 = HexU64(0x120_2000);
-        assert!(state.claim_vm_pause(&other).is_err());
-        assert_eq!(state.target.as_ref(), Some(&target));
+        assert!(state.claim_vm_pause(&[other]).is_err());
+        assert_eq!(state.targets, vec![target]);
     }
 
     #[test]
