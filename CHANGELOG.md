@@ -134,9 +134,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **An empty list is evidence about the scan, not the target**, and the prose says so on every
   answer rather than when asked: an indirect transfer (`call rax`) carries no destination to
   compare, an address merely *stored* in a dispatch table or callback slot is never branched to,
-  only the one image is read, and code that did not decode is reported. **Ask it on a dump or a
-  live target** — on an image opened with no debuggee the scan reports ranges it did not really
-  read and answers nothing, which is item 111 and is a defect below this tool rather than in it.
+  only the one image is read, and code that did not decode is reported. It shipped with a fifth
+  clause — *ask it on a dump or a live target*, an image target answering nothing — which item 111
+  below withdrew two days later: the scan was never the thing misreading such a target, and the
+  read underneath it is fixed at the open.
 
   Verified as a round trip, because nothing else tests a search: the dump tier reads a direct call
   out of the disassembler first and requires that site back with its kind, module and RVA, with an
