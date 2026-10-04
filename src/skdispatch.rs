@@ -422,6 +422,7 @@ struct RetainedEvent {
     system_id: u32,
     return_ip: u64,
     event: HeldEvent,
+    release_eligible: bool,
 }
 
 pub(crate) struct VmwpDispatcherState {
@@ -549,6 +550,18 @@ impl VmwpDispatcherState {
     }
 
     fn refuse_unsafe_recovery(&mut self) -> Result<()> {
+        if matches!(
+            self.retained_event,
+            Some(RetainedEvent {
+                release_eligible: false,
+                ..
+            })
+        ) {
+            let why =
+                "the retained native event failed validation; vmwp remains contained".to_string();
+            self.phase = DispatcherPhase::Contained(why.clone());
+            bail!("{why}");
+        }
         if matches!(self.unregister, Some(UnregisterProgress::Calling)) {
             let why =
                 "handler unregister did not reach its return boundary; vmwp remains contained"
@@ -1169,6 +1182,7 @@ impl VmwpDispatcher<'_> {
             system_id,
             return_ip: event_site,
             event: event.clone(),
+            release_eligible: false,
         });
         let advance = self.read_u8(
             event_pointer
@@ -1178,7 +1192,13 @@ impl VmwpDispatcher<'_> {
         if advance != 0 {
             bail!("the native dispatcher event already requests instruction-pointer advance");
         }
-        self.prepare_held_event()
+        self.prepare_held_event()?;
+        self.state
+            .retained_event
+            .as_mut()
+            .context("the validated native event lost its retained-thread record")?
+            .release_eligible = true;
+        Ok(())
     }
 
     fn pause_for_provider_writes(&mut self, targets: &[TargetIdentity]) -> Result<()> {
@@ -2411,6 +2431,7 @@ mod tests {
             system_id: 0x1234,
             return_ip: 0x2000_0000_3000,
             event,
+            release_eligible: true,
         });
         let mut selected = target();
         selected.vp = 1;
@@ -2423,6 +2444,35 @@ mod tests {
         assert!(state.provider_writes_quiesced);
         selected.vp = 0;
         assert!(state.confirm_retained_provider_stop(&[selected]).is_err());
+    }
+
+    #[test]
+    fn an_unvalidated_retained_event_is_contained_before_recovery_can_release_it() {
+        let event = HeldEvent {
+            message_type: HexU64(EVENT_TYPE_VECTOR_1),
+            vector: 1,
+            vp: 0,
+            vtl: 1,
+            cpl: 0,
+            dispatcher_context: HexU64(0x2000_0000_2000),
+            advance_instruction_pointer: false,
+            reason: StopReason::DebugException,
+        };
+        let mut state =
+            VmwpDispatcherState::new(profile(), 4242, 0x2000_0000_1000, "provider".into()).unwrap();
+        state.phase = DispatcherPhase::Holding(event.clone());
+        state.retained_event = Some(RetainedEvent {
+            system_id: 0x1234,
+            return_ip: 0x2000_0000_3000,
+            event,
+            release_eligible: false,
+        });
+
+        let error = state.refuse_unsafe_recovery().unwrap_err();
+
+        assert!(error.to_string().contains("failed validation"));
+        assert!(matches!(state.phase, DispatcherPhase::Contained(_)));
+        assert!(state.retained_event.is_some());
     }
 
     #[test]

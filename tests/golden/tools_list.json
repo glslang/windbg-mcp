@@ -1284,7 +1284,6 @@
         "root": "object"
       },
       "params": [
-        "additional_vps: array<integer/uint32>",
         "control_transport: string",
         "dispatcher_vnd: string",
         "expected_cr3: string",
