@@ -7023,6 +7023,18 @@ mod tests {
     ///   step_into.", as copyable as any backticked name and invisible to the first rule. An
     ///   underscored name is an identifier and never an English word, so this half needs no
     ///   exceptions.
+    /// - **Or in double quotes**, which is the third rule and the one the other two leave a hole
+    ///   between: `Call "execute" instead` is as copyable as any of them and matches neither —
+    ///   not the first, which wants a backtick span, and not the second, which `execute` has no
+    ///   underscore for. Raised on review of
+    ///   [#456](https://github.com/glslang/windbg-mcp/pull/456) against the input-schema walk, and
+    ///   fixed here instead because the hole is in the predicate and all three channels read it.
+    ///   Measured 2026-10-05 before adding it: **no** description, instruction fragment or schema
+    ///   string on the 75-tool surface writes a tool's name in double quotes, so this costs
+    ///   nothing today. What it will cost is a value that happens to be spelled like a tool —
+    ///   `{"access": "execute", …}` is a [`structured::WatchAccess`] — which is the same trade
+    ///   `debug_batch`'s steps took when their exemption was deleted: such a value is documented
+    ///   by the schema that declares it rather than spelled in prose.
     fn names_tool(text: &str, tool: &str) -> bool {
         let as_code = text.split('`').skip(1).step_by(2).any(|span| {
             span == tool
@@ -7032,11 +7044,31 @@ mod tests {
         });
         let boundary = |c: Option<char>| c.is_none_or(|c| !c.is_alphanumeric() && c != '_');
         as_code
+            || text.contains(&format!("\"{tool}\""))
             || (tool.contains('_')
                 && text.match_indices(tool).any(|(at, _)| {
                     boundary(text[..at].chars().next_back())
                         && boundary(text[at + tool.len()..].chars().next())
                 }))
+    }
+
+    /// The third rule above, both ways round: a quoted name is a name, and the words around it are
+    /// not. Pinned here because the three walks that read [`names_tool`] can only report what it
+    /// detects, so a hole in it is invisible in all three.
+    #[test]
+    fn a_tool_named_in_double_quotes_is_named() {
+        assert!(names_tool(r#"Call "execute" instead."#, "execute"));
+        assert!(names_tool(
+            r#"The handle "wait_for_stop" returns."#,
+            "wait_for_stop"
+        ));
+        // An English word that happens to be a tool's name, unquoted and outside a code span, is
+        // still not a reference — the reason plain containment cannot be the rule.
+        assert!(!names_tool(
+            "frames are attributed to modules on the way out",
+            "modules"
+        ));
+        assert!(!names_tool("a stuck session does not let go", "go"));
     }
 
     /// **The property this whole split exists for**: whatever a client is served, its instructions

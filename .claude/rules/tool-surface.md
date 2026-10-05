@@ -56,8 +56,13 @@ about the surface — so a figure written into a *sentence* is still yours to re
 tables are where to re-derive it from. And the check for "names a tool" is deliberately not word containment — this
 prose says frames are "attributed to modules" and that a stuck session "does not let go", while a
 TTD description quotes `dx @$cursession.TTD.Calls(...)`, which is the debugger command and not the
-`dx` tool; the rule is a code span that *is* the name or opens a call with it, plus bare-if-it-has-
-an-underscore, which is what caught `step_back`'s "Reverse of step_into.".
+`dx` tool; the rule is a code span that *is* the name or opens a call with it, bare-if-it-has-an-
+underscore, which is what caught `step_back`'s "Reverse of step_into.", and **in double quotes**,
+which is the hole the other two leave between them — `Call "execute" instead` matches neither, and
+all three invariants could only ever report what the predicate detects. Adding it cost nothing
+(measured 2026-10-05: no description, fragment or schema string on the surface quotes a tool name)
+and will cost a value spelled like a tool, `{"access": "execute", …}` being a `WatchAccess`, which
+is the same trade as the next paragraph's.
 
 **And again for an argument's prose, which is a second channel out of the same file** (item 52).
 A doc comment on an argument lands in the tool's **`inputSchema`**, not in its description, so
