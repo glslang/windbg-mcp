@@ -1536,7 +1536,24 @@ fn simulate(
             // A callee leaves the flags as it likes, so whatever an idiom before the call settled
             // is not what the branch after it reads.
             decided = None;
-        } else if instruction.writes_flags {
+        // **An instruction whose flag write this walk can evaluate *is* a flag write, whatever
+        // `writes_flags` says.** That field is `rflags_written() != 0`, and iced reports the flags
+        // a **statically known** outcome fixes in `rflags_set`/`rflags_cleared` instead — measured:
+        // `xor ecx,ecx` answers `written=[] set=[ZF|PF] cleared=[OF|SF|CF]`, so `writes_flags` is
+        // **false** for it, while `xor ecx,eax` and `xor ah,al` are true, and `cmp`, `test`, `and`,
+        // `or` and `sbb` of a register with itself are all true. So the two idioms this fold exists
+        // for were taking the *no-flag-write* path: the pending compare outlived them and `decided`
+        // was never set, which made the whole fold inert on a real x86 target while every fixture
+        // passed — the fixture derives `writes_flags` from the effect, which is the trap its own
+        // doc comment warns about. Found by probing iced while declining a review finding about
+        // `stc` on [#454](https://github.com/glslang/windbg-mcp/pull/454), which named this field
+        // for the wrong reason.
+        //
+        // The *other* direction of the same gap is not closed and is conservative: `stc`, `clc`,
+        // `cmc` and `bt` leave `ZF` alone, so a known flag would survive them, and this clears it
+        // because `Instruction` carries no per-flag answer to ask. That costs a branch swept both
+        // ways, which is the walk's default.
+        } else if instruction.writes_flags || settles.is_some() {
             chain = absorb(
                 &mut compared,
                 &mut lost,
@@ -4971,6 +4988,9 @@ mod tests {
             }
             reads
         };
+        // Asked before the operands are moved into the value below, and spelled as a `let` for
+        // that reason alone.
+        let known = statically_zero(mnemonic, &operands);
         Instruction {
             address,
             bytes: String::new(),
@@ -4993,8 +5013,20 @@ mod tests {
             // files it there: what it leaves in the flags is its own comparison *or* the literal
             // `nzcv` it carries. It writes them either way, and a fixture that said otherwise
             // would leave the compare before it live and test nothing this walk does.
+            //
+            // **And a statically known outcome is reported in neither direction**, which is the
+            // one place deriving this from the effect said the opposite of the decoder. iced puts
+            // the flags a known result fixes in `rflags_set`/`rflags_cleared` rather than in
+            // `rflags_written`, so x86's `xor r,r` and `sub r,r` answer **false** here -- measured
+            // on iced 1.21.0, which also says `xor ah,al`, `xor eax,0`, `xor [rcx],ecx` and
+            // `cmp`/`test`/`and`/`or`/`sbb` of a register with itself are all **true**. A64 is
+            // unaffected: its decoder answers from the encoding's `S` bit, so `subs w9,w9,w9`
+            // writes them and `eor` never does.
+            //
+            // Two operands and one register name is the whole of the test, which is what keeps it
+            // from being a guess about iced: `xor ah,ah` is false and `xor ah,al` is true.
             writes_flags: matches!(mnemonic, "mul" | "div" | "ccmp" | "ccmn")
-                || matches!(
+                || (matches!(
                     effect,
                     Effect::Compare
                         | Effect::Test
@@ -5005,7 +5037,27 @@ mod tests {
                         | Effect::BitAnd
                         | Effect::BitOr
                         | Effect::BitXor
-                ),
+                ) && !known),
+        }
+    }
+
+    /// Whether x86 computes this instruction's result **statically**, so iced reports the flags it
+    /// leaves as set/cleared rather than as written.
+    ///
+    /// Spelled out beside `insn` for the reason the rest of its fields are: a fixture deriving a
+    /// decoder answer from the thing under test agrees with it about a wrong one, and this is the
+    /// field `simulate` branches on when it decides whether a flag write replaced the flags.
+    /// Measured on iced 1.21.0 rather than reasoned about — `xor ecx,ecx` and `sub ecx,ecx` answer
+    /// `rflags_written()` of nothing, and `xor ah,al`, `xor eax,0`, `xor [rcx],ecx`,
+    /// `cmp ecx,ecx`, `test ecx,ecx`, `and ecx,ecx`, `or ecx,ecx` and `sbb ecx,ecx` all answer
+    /// written flags.
+    fn statically_zero(mnemonic: &str, operands: &[Operand]) -> bool {
+        if !matches!(mnemonic, "xor" | "sub") {
+            return false;
+        }
+        match operands {
+            [Operand::Register(left), Operand::Register(right)] => left.name == right.name,
+            _ => false,
         }
     }
 
@@ -14103,11 +14155,19 @@ mod tests {
         );
 
         // **And a settled branch is not a test the map should mark**, which is the terminator's
-        // half of the rule rather than the edges'. `mov ecx,r13d` / `xor ecx,ecx` destroys a copy
-        // of the control code, so the walk has a pending loss when the branch below it is read --
-        // and committing that loss would put the `xor` in [`Map::untracked`], where every entry
-        // says a branch read flags this pass could not attribute to a code. Nothing was attributed
-        // here because nothing was tested: the branch goes to one place for every request.
+        // half of the rule rather than the edges'. `mov ecx,r13d` / `cmp ecx,ecx` compares the
+        // control code against itself: always equal, so the branch is settled — and it leaves the
+        // walk *two* things to suppress, which is why this is the construction rather than the
+        // `xor` one. The compare is a reading whose code is `None`, since nothing says what `ecx`
+        // held, and the compare also reads a register carrying the code, so there is a pending loss
+        // as well. Committed, each would put a site in [`Map::untracked`], where every entry says a
+        // branch read flags this pass could not attribute to a code. Nothing was attributed here
+        // because nothing was tested: the branch goes to one place for every request.
+        //
+        // **An `xor` cannot state this rule**, which took measuring iced to find out: `xor ecx,ecx`
+        // answers `writes_flags: false`, so `note_loss` returns before recording anything and this
+        // assertion would hold with the suppression backed out — green for a neighbouring rule's
+        // reason. `cmp ecx,ecx` answers `true`.
         let destroyed = settled_by(vec![
             insn(
                 DISPATCH + 8,
@@ -14117,7 +14177,7 @@ mod tests {
             ),
             insn(
                 DISPATCH + 0xb,
-                "xor",
+                "cmp",
                 vec![reg("ecx"), reg("ecx")],
                 Flow::Fallthrough,
             ),
