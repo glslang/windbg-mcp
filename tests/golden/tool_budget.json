@@ -75,11 +75,11 @@
     {
       "annotations": 117,
       "description": 1575,
-      "inputSchema": 1337,
-      "modelVisible": 2965,
+      "inputSchema": 1296,
+      "modelVisible": 2924,
       "name": "crash_triage",
       "outputSchema": 2617,
-      "wire": 5730
+      "wire": 5689
     },
     {
       "annotations": 69,
@@ -93,11 +93,11 @@
     {
       "annotations": 134,
       "description": 2246,
-      "inputSchema": 8544,
-      "modelVisible": 10842,
+      "inputSchema": 8010,
+      "modelVisible": 10308,
       "name": "debug_batch",
       "outputSchema": 3566,
-      "wire": 14573
+      "wire": 14039
     },
     {
       "annotations": 85,
@@ -146,12 +146,12 @@
     },
     {
       "annotations": 113,
-      "description": 614,
-      "inputSchema": 570,
-      "modelVisible": 1239,
+      "description": 690,
+      "inputSchema": 597,
+      "modelVisible": 1342,
       "name": "driver_hazards",
       "outputSchema": 3529,
-      "wire": 4912
+      "wire": 5015
     },
     {
       "annotations": 74,
@@ -299,12 +299,12 @@
     },
     {
       "annotations": 124,
-      "description": 513,
-      "inputSchema": 561,
-      "modelVisible": 1126,
+      "description": 612,
+      "inputSchema": 507,
+      "modelVisible": 1171,
       "name": "ioctl_trace",
       "outputSchema": 2585,
-      "wire": 3866
+      "wire": 3911
     },
     {
       "annotations": 76,
@@ -326,12 +326,12 @@
     },
     {
       "annotations": 65,
-      "description": 965,
-      "inputSchema": 2267,
-      "modelVisible": 3280,
+      "description": 1092,
+      "inputSchema": 2183,
+      "modelVisible": 3323,
       "name": "modules",
       "outputSchema": 3611,
-      "wire": 6987
+      "wire": 7030
     },
     {
       "annotations": 128,
@@ -407,12 +407,12 @@
     },
     {
       "annotations": 90,
-      "description": 556,
-      "inputSchema": 2111,
-      "modelVisible": 2731,
+      "description": 655,
+      "inputSchema": 2057,
+      "modelVisible": 2776,
       "name": "reachable_from_dispatch",
       "outputSchema": 5156,
-      "wire": 8008
+      "wire": 8053
     },
     {
       "annotations": 64,
@@ -453,11 +453,11 @@
     {
       "annotations": 114,
       "description": 529,
-      "inputSchema": 1873,
-      "modelVisible": 2457,
+      "inputSchema": 1823,
+      "modelVisible": 2407,
       "name": "run_to_address",
       "outputSchema": 1552,
-      "wire": 4154
+      "wire": 4104
     },
     {
       "annotations": 75,
@@ -678,15 +678,15 @@
   ],
   "totals": {
     "annotations": 8184,
-    "description": 43996,
-    "inputSchema": 68738,
+    "description": 44397,
+    "inputSchema": 67948,
     "instructions": 2022,
-    "modelVisible": 116707,
+    "modelVisible": 116318,
     "outputSchema": 200814,
-    "payload": 327876,
+    "payload": 327487,
     "tools": 75,
-    "wire": 327790,
+    "wire": 327401,
     "worstTool": "debug_batch",
-    "worstToolModelVisible": 10842
+    "worstToolModelVisible": 10308
   }
 }

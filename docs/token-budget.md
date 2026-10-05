@@ -346,21 +346,21 @@ None of these is a bug. They are recorded because they were invisible, and
    | group | tools | bytes | share |
    |---|---:|---:|---:|
    | `allocator` | 10 | 16,868 | 14.5% |
-   | `ioctl` | 11 | 15,895 | 13.6% |
-   | `securekernel` | 11 | 15,906 | 13.6% |
-   | `exec` | 10 | 15,137 | 13% |
+   | `ioctl` | 11 | 16,088 | 13.8% |
+   | `securekernel` | 11 | 15,906 | 13.7% |
+   | `exec` | 10 | 15,087 | 13% |
    | `session` | 10 | 14,013 | 12% |
-   | `inspect` | 10 | 13,442 | 11.5% |
-   | `batch` | 1 | 10,842 | 9.3% |
-   | `crash` | 3 | 7,514 | 6.4% |
+   | `inspect` | 10 | 13,485 | 11.6% |
+   | `batch` | 1 | 10,308 | 8.9% |
+   | `crash` | 3 | 7,473 | 6.4% |
    | `ttd` | 9 | 7,090 | 6.1% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 75 | 116,707 |
-   | `session,inspect,exec,crash` | 33 | 49,185 |
-   | `session,inspect,crash` | 23 | 33,895 |
-   | `crash` | 13 | 20,361 |
+   | *(absent)* | 75 | 116,318 |
+   | `session,inspect,exec,crash` | 33 | 49,137 |
+   | `session,inspect,crash` | 23 | 33,897 |
+   | `crash` | 13 | 20,320 |
 
    **The two tables do not reconcile, and that is the point of item 41.** The first is each group's
    share of the whole surface; the second is what a spec actually serves, which is less — `crash`
