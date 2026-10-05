@@ -3506,7 +3506,25 @@ code, `simulate` keeps that answer per block, and an equality terminator reading
 edge rather than two: the successor the condition excludes is not pushed. A block no live edge
 reaches then gets no facts and is read with nothing believed -- which is the state `map_within`
 already reads a block the graph cannot reach at all in, so its compares name no register the walk
-is following and recover no case.
+is following.
+
+**And that is a claim about what the walk *carries*, not about what the block recovers** -- a
+distinction this entry's first draft collapsed, and Codex filed the difference as a P2 on review
+round 2. A compare through a register recovers nothing along a dead edge, no path having left a
+control code in one; the bare `+0x18` fallback needs no fact at all, so
+`cmp dword ptr [rbx+18h],CODE` in a dead block still publishes that code. What the fold removes is
+therefore the **proved** fabricated case -- the one a reader has reason to trust -- and what
+remains is item 5's documented heuristic answering as it does in any block no edge reaches, marked
+`proved: false` and taking `code_proved` off the whole map with it. Measured both ways:
+`a_dropped_edge_does_not_suppress_the_bare_displacement_fallback` puts one compare of each kind on
+the dead edge, and backing the drop out turns the register one into a `proved: true` case.
+
+Suppressing that too was declined, and the reason is the shape of the only discriminator
+available. Telling a *pruned* block from one with no predecessors at all means graph reachability --
+and `cfg` deliberately gives an indirect transfer no edge, so a jump-table landing that also sits
+behind a settled branch would read as pruned and lose the compares in it, silently, which is the
+direction this module is arranged against. The residual is one shape already marked unproved; the
+remedy would trade it for a shorter list with nothing saying so.
 
 - **The three idioms the entry named turned out to be two questions, and six shapes.** Both
   operands naming one register is the single question; what differs is what has to be known about
