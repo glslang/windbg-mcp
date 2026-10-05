@@ -1967,21 +1967,16 @@ pub struct RunToAddressArgs {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DebugBatchArgs {
-    /// The steps to run, in order. Each is one flat object with an `op` field:
-    /// `{"op": "command", "command": "bp nt!NtCreateFile"}` runs a raw command;
-    /// `{"op": "resume", "command": "g"}` moves the target and waits for the next stop;
-    /// `{"op": "run_to", "address": "hevd!Trigger"}` reports a HIT/STOPPED ELSEWHERE/TIMEOUT/
-    /// TARGET GONE verdict; `{"op": "eval", "expr": "@rcx"}` reads a value; `{"op": "read_memory",
-    /// "address": "0xfffff8000012c000", "size": 64}` hex-dumps memory — this one takes a *number*
-    /// (decimal or `0x`-hex), not an expression, so for `@rsp` or `poi(...)` put an `eval` step in
-    /// front of it and read the capture. Three more ask the kernel pool the same questions the
-    /// `pool_*` tools do, because those are allocator walks rather than debugger commands and no
-    /// `command` step can stand in for them: `{"op": "pool_chunk", "address": "{{obj}}"}`,
-    /// `{"op": "pool_find_tag", "tag": "Tgsm", "paged": false}` and `{"op": "pool_census"}`, each
-    /// taking `refresh` (re-walk rather than reuse this session's snapshot) and the last two a
-    /// `limit`. Add `"expect"` to assert on the result and `"capture"`
-    /// (on an `eval` step) to bind its value for later steps as `{{name}}`.
-    /// The batch stops at the first step that fails or whose assertions do not hold.
+    /// The steps to run, in order. Each is one flat object with an `op` field —
+    /// `{"op": "command", "command": "bp nt!NtCreateFile"}` runs a raw command — and every `op`
+    /// this takes, with the fields and the defaults belonging to each, is a step variant of this
+    /// schema: a raw command, a `resume` that waits for the next stop, a `run_to` verdict, an
+    /// `eval` of an expression, a memory dump, and three kernel-pool walks. The pool steps are
+    /// there because they are allocator walks rather than debugger commands, so no `command` step
+    /// can stand in for them; each takes `refresh` (re-walk the pool rather than reuse this
+    /// session's snapshot) and the two that list rows take a `limit`. Add `"expect"` to assert on
+    /// a step's result and `"capture"` (on an `eval` step) to bind its value for later steps as
+    /// `{{name}}`. The batch stops at the first step that fails or whose assertions do not hold.
     pub steps: Vec<batch::BatchStep>,
     /// Cleanup/rollback steps, same shape as `steps`. They run **on every path this batch can
     /// still aim them at** — success, a debugger error, an assertion that did not hold, the
@@ -7309,66 +7304,40 @@ mod tests {
         }
     }
 
-    /// Every string a client **reads** in one surface's input schemas, with the vocabulary those
-    /// schemas declare beside it.
+    /// Every string a client **reads** in one surface's input schemas.
     ///
     /// Through the real `router()` for [`descriptions_for`]'s reason, and read back out of
     /// `input_schema` rather than off the argument structs — **because the two are not the same
     /// set, and the difference is not guessable from the source.** `schemars` 1.2.2 holds back no
     /// summary line, so a doc comment that is attached arrives whole, rationale paragraphs and
     /// all; but a `#[serde(flatten)]`'d type's own comment is not attached at all. Measured on
-    /// `debug_batch` (2026-10-05): the 23 strings its schema carries include every one of
+    /// `debug_batch` (2026-10-05): the strings its schema carries include every one of
     /// [`crate::batch::StepAction`]'s *variant* docs and [`crate::batch::Check`]'s own, and not
     /// one word of `StepAction`'s, which is flattened into `BatchStep`. A test reading the file
     /// would have audited four paragraphs no client is served and missed nothing that is.
-    ///
-    /// Prose and vocabulary are collected in one pass because the second is what makes the first
-    /// readable: a `description` is prose, while a `const` or `enum` value is the **caller's own
-    /// vocabulary**, and [`points_at_tool`] needs both to tell a step from a pointer. Two schemas
-    /// declare a value spelled like a tool — `debug_batch`'s four steps named after the tools they
-    /// stand in for (`read_memory`, `pool_chunk`, `pool_find_tag`, `pool_census`), and
-    /// `set_breakpoint`'s `execute`, which is a [`structured::WatchAccess`]. Measured 2026-10-05,
-    /// those are the whole overlap between declared values and tool names on the 75-tool surface,
-    /// and only `debug_batch`'s four are named in any prose at all.
-    fn input_schemas_for(
-        spec: &str,
-    ) -> Vec<(String, Vec<String>, std::collections::BTreeSet<String>)> {
-        /// `description` prose and declared string values, told apart from the **names** of fields
-        /// and types the way `mcp_smoke::output_schemas_carry_constraints_not_prose` tells them
-        /// apart: inside `properties` or `$defs` the keys are names, so a field called
-        /// `description` there is a name in that position rather than documentation.
-        fn walk(
-            node: &serde_json::Value,
-            names_not_keywords: bool,
-            prose: &mut Vec<String>,
-            vocabulary: &mut std::collections::BTreeSet<String>,
-        ) {
+    fn input_schemas_for(spec: &str) -> Vec<(String, Vec<String>)> {
+        /// The `description` prose, told apart from the **names** of fields and types the way
+        /// `mcp_smoke::output_schemas_carry_constraints_not_prose` tells them apart: inside
+        /// `properties` or `$defs` the keys are names, so a field called `description` there is a
+        /// name in that position rather than documentation.
+        fn walk(node: &serde_json::Value, names_not_keywords: bool, prose: &mut Vec<String>) {
             const NAME_MAPS: &[&str] = &["properties", "patternProperties", "$defs", "definitions"];
             let serde_json::Value::Object(members) = node else {
                 if let serde_json::Value::Array(items) = node {
                     for item in items {
-                        walk(item, false, prose, vocabulary);
+                        walk(item, false, prose);
                     }
                 }
                 return;
             };
             for (key, value) in members {
                 let keyword = !names_not_keywords;
-                match (keyword, key.as_str(), value) {
-                    (true, "description", serde_json::Value::String(text)) => {
-                        prose.push(text.clone());
-                    }
-                    (true, "const", serde_json::Value::String(word)) => {
-                        vocabulary.insert(word.clone());
-                    }
-                    (true, "enum", serde_json::Value::Array(words)) => {
-                        vocabulary
-                            .extend(words.iter().filter_map(|w| w.as_str()).map(str::to_owned));
-                    }
-                    _ => {}
+                if let (true, "description", serde_json::Value::String(text)) =
+                    (keyword, key.as_str(), value)
+                {
+                    prose.push(text.clone());
                 }
-                let names = keyword && NAME_MAPS.contains(&key.as_str());
-                walk(value, names, prose, vocabulary);
+                walk(value, keyword && NAME_MAPS.contains(&key.as_str()), prose);
             }
         }
 
@@ -7380,86 +7349,15 @@ mod tests {
             .list_all()
             .into_iter()
             .map(|tool| {
-                let (mut prose, mut vocabulary) = (Vec::new(), std::collections::BTreeSet::new());
+                let mut prose = Vec::new();
                 walk(
                     &serde_json::Value::Object(tool.input_schema.as_ref().clone()),
                     false,
                     &mut prose,
-                    &mut vocabulary,
                 );
-                (tool.name.to_string(), prose, vocabulary)
+                (tool.name.to_string(), prose)
             })
             .collect()
-    }
-
-    /// Whether this prose **points at** `tool`, rather than writing its name as one of the values
-    /// the schema declares.
-    ///
-    /// The distinction exists because a schema's vocabulary is spelled with the same words as the
-    /// tool table: `{"op": "pool_chunk"}` is a step a `--tools debug_batch` client can take, and
-    /// `set_breakpoint` declares the *value* `execute`, which is a [`structured::WatchAccess`] and
-    /// has nothing to do with the tool. Forbidding the name outright would stop either schema
-    /// documenting its own values.
-    ///
-    /// So what is exempt is **the occurrence, not the name**: every place the name is written as a
-    /// JSON value comes out of the text, and what is left is asked the ordinary question. A
-    /// sentence that writes `{"op": "pool_chunk"}` and goes on to say "the `pool_chunk` tool"
-    /// still points at a tool, and so does one naming `execute` in a schema that declares it as an
-    /// access — which is the hole in a per-schema exemption, raised on review of
-    /// [#456](https://github.com/glslang/windbg-mcp/pull/456). Scoping it per *subschema* instead
-    /// would have been the other obvious answer and is wrong here: `debug_batch`'s `steps`
-    /// description is the prose that documents the whole step vocabulary, and the `const`s it
-    /// documents are in `$defs/BatchStep` rather than under `steps`.
-    fn points_at_tool(
-        text: &str,
-        tool: &str,
-        vocabulary: &std::collections::BTreeSet<String>,
-    ) -> bool {
-        if !vocabulary.contains(tool) {
-            return names_tool(text, tool);
-        }
-        names_tool(&text.replace(&format!("\"{tool}\""), ""), tool)
-    }
-
-    /// The exemption both ways round, on the two shapes that are the whole of why it exists —
-    /// pinned here rather than only through the walk, because what the walk reads is prose nobody
-    /// is about to write the wrong way on purpose.
-    #[test]
-    fn a_declared_value_is_not_a_pointer_and_a_pointer_beside_it_still_is() {
-        let vocabulary: std::collections::BTreeSet<String> = ["pool_chunk", "execute"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-
-        // `debug_batch` documenting its own step, and `set_breakpoint` its own access.
-        assert!(!points_at_tool(
-            r#"`{"op": "pool_chunk", "address": "{{obj}}"}` asks the allocator what it is."#,
-            "pool_chunk",
-            &vocabulary,
-        ));
-        assert!(!points_at_tool(
-            r#"`{"access": "execute", "size": 1}` watches one byte of code."#,
-            "execute",
-            &vocabulary,
-        ));
-
-        // And a pointer at the tool of that name, in prose the schema's own vocabulary does not
-        // excuse — including in the same string as a legitimate value.
-        assert!(points_at_tool(
-            r#"`{"op": "pool_chunk"}`, or the `pool_chunk` tool for one address."#,
-            "pool_chunk",
-            &vocabulary,
-        ));
-        assert!(points_at_tool(
-            "Call `execute` instead.",
-            "execute",
-            &vocabulary
-        ));
-        assert!(points_at_tool(
-            r#"Run `execute { "command": "ba r4 nt!Foo" }` for the engine's own form."#,
-            "execute",
-            &vocabulary,
-        ));
     }
 
     /// **The same property again, on the channel the two tests above do not reach** — an
@@ -7481,9 +7379,20 @@ mod tests {
     /// rewrites a description per surface and nothing rewrites a schema — so rather than build a
     /// second mechanism for the same job, an argument's prose names no tool but its own and the
     /// always-served openers, and a cross-reference goes in `TOOL_NOTES`, where the all-of rule
-    /// already ships it only to the clients that can follow it. What makes the walk usable beside
-    /// that is [`points_at_tool`], which exempts the occurrence rather than the name — so a schema
-    /// may document the values it declares and may not point out of itself.
+    /// already ships it only to the clients that can follow it.
+    ///
+    /// **And no exemption, which took two review rounds to arrive at.** `debug_batch`'s step
+    /// vocabulary is spelled with four of the tool table's own words — `read_memory`,
+    /// `pool_chunk`, `pool_find_tag`, `pool_census` — and `set_breakpoint` declares the *value*
+    /// `execute`, which is a [`structured::WatchAccess`]; so the walk first exempted a name the
+    /// served schema **declares**, then exempted only the occurrences written as JSON values.
+    /// Review on [#456](https://github.com/glslang/windbg-mcp/pull/456) escaped both, correctly
+    /// and twice, and the second escape was a one-line variation on the first. What the mechanism
+    /// bought, measured before it went: **one description** — `debug_batch`'s `steps` — and four
+    /// names in it. So the prose gave them up and the schema kept them, in the `op` `const` of
+    /// each variant, which is the channel a client validates against rather than reads past. The
+    /// invariant is now the same sentence as its two siblings, and there is nothing left to decide
+    /// what counts as a value.
     ///
     /// Which way each of the eleven went
     /// was not a free choice either. Four were pointers at *what to call next* and became notes,
@@ -7498,15 +7407,12 @@ mod tests {
         let mut leaks: Vec<String> = Vec::new();
         for spec in crate::toolset::Toolset::every_tool() {
             let surface = crate::toolset::Toolset::parse(spec).expect("a tool name is a spec");
-            for (name, prose, vocabulary) in input_schemas_for(spec) {
+            for (name, prose) in input_schemas_for(spec) {
                 for tool in crate::toolset::Toolset::every_tool() {
                     if surface.includes(tool) {
                         continue;
                     }
-                    for text in prose
-                        .iter()
-                        .filter(|text| points_at_tool(text, tool, &vocabulary))
-                    {
+                    for text in prose.iter().filter(|text| names_tool(text, tool)) {
                         leaks.push(format!(
                             "`--tools {spec}` is not served `{tool}`, and `{name}`'s input \
                              schema names it:\n    {text}"

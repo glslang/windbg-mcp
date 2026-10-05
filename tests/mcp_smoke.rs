@@ -2243,7 +2243,7 @@ const MODEL_VISIBLE_CEILING: usize = 118_000;
 /// evidence move it another 1,827 B to 320,682 B, leaving 9,318 B (2.8%).
 const WIRE_CEILING: usize = 330_000;
 
-/// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,734
+/// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,308
 /// bytes (2026-10-05), because its `inputSchema` pulls the whole `StepAction`/`Check` vocabulary
 /// from `src/batch.rs` — and, since item 102, both that schema's `always` field and the tool's own
 /// description owe a sentence about the one path that drops the rollback. A tool costing more than this is not necessarily wrong, but it should be a

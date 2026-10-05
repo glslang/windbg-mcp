@@ -9201,18 +9201,28 @@ a second, unconditional copy of it. And five were `debug_batch` prose pointing o
 when its own step is the thing: four calling a step "the `X` tool" and one offering `go` for what
 a `resume` step does.
 
-**Two things only measurement said, and both changed the test.** A name the served schema
-**declares** as a value is the caller's own vocabulary rather than a pointer — `{"op":
-"pool_chunk"}` is a step a `--tools debug_batch` client can take — so the check exempts it, from
-the schema rather than from a list beside the test. Without that, the invariant forbids
-`debug_batch` from documenting its own ops, four of which are named after the tools they stand in
-for. But the exemption cannot be flat: `set_breakpoint` also declares a value spelled like a tool,
-and it is `WatchAccess::Execute` — nothing to do with `execute` — so a sentence offering
-`execute { "command": … }` there would have been exempted by a rule that only asked whether the
-name was declared. The exemption therefore holds only where the prose neither calls it "the `X`
-tool" nor opens a call with it, which are the two shapes every leak here actually had. Measured
-2026-10-05: those two schemas are the whole overlap between declared values and tool names on the
-75-tool surface.
+**The exemption that looked necessary, and the two review rounds that deleted it.**
+`debug_batch`'s step vocabulary is spelled with four of the tool table's own words — `read_memory`,
+`pool_chunk`, `pool_find_tag`, `pool_census` — and `set_breakpoint` declares the *value* `execute`,
+which is a `WatchAccess` and has nothing to do with the tool. Those two schemas are the whole
+overlap between declared values and tool names on the 75-tool surface (measured 2026-10-05), and
+the obvious reading is that the invariant must exempt a name the served schema declares, or no
+schema may document its own values. It was built that way — per schema, with "the `X` tool" and an
+opened call as the two shapes that are never a value — and **review escaped it twice**, correctly:
+per-schema meant any *third* phrasing of a pointer was free wherever a value of that name happened
+to be declared, and the occurrence-level repair that followed identified a value by its quotation
+alone, so `Use the "pool_chunk" tool` passed.
+
+What ended it was counting what the mechanism bought rather than fixing it a third time: **one
+description** — `debug_batch`'s `steps` — and four names in it. So the prose gave them up and the
+schema kept them, in the `op` `const` of each variant, which is the channel a client validates
+against rather than reads past; the per-op examples it had been spelling were a second copy of what
+those variants document. The invariant is now the same sentence as its two siblings with nothing
+left to decide what counts as a value, and `cargo test` is red if the catalogue comes back —
+mutation-verified by putting `{"op": "pool_chunk", …}` into that description and watching it name
+the right tool. The cost is a rule an author will find surprising: a step named after a tool is
+documented by its variant and not spelled in prose. That is on the record here and in
+`.claude/rules/tool-surface.md` rather than left for the next author to discover.
 
 **And the walk reads `input_schema`, not the source, because the two are not the same set.**
 `schemars` 1.2.2 holds back no summary line, so an attached doc comment arrives whole — rationale
@@ -9225,16 +9235,18 @@ rewording `StepAction`'s "`pool_diagnostics` is deliberately absent" for a clien
 reads it. That edit was reverted: naming the tool is correct where the reader is a maintainer.
 
 **What it cost the surface**, which is the question `docs/token-budget.md` asks of any change to a
-description: the model-visible surface moved 116,374 → **116,411 B** (+37 — four notes
-against eleven pointers taken out of seven schemas), `debug_batch` 10,842 → **10,734** and still the worst single tool,
-`inputSchema` across all 75 tools −364 B and `description` +401. Group and spec figures moved with
-them in `src/toolset.rs`, `docs/tool-surface.md` and `docs/token-budget.md`;
-`every_documented_surface_figure_matches_the_served_surface` printed every one of them, which is
-how they were updated. Measured on the ARM64 guest in a fresh clone of `2fffd98` with the change
-scp'd in: `cargo test`, **1,254** unit tests and **137** `mcp_smoke` tests, 0 failed.
+description: the model-visible surface moved 116,374 → **115,985 B** (−389 — four notes added
+against eleven pointers and one step catalogue removed), `debug_batch` 10,842 → **10,308** and
+still the worst single tool, `inputSchema` across all 75 tools −790 B and `description` +401. Group
+and spec figures moved with them in `src/toolset.rs`, `docs/tool-surface.md` and
+`docs/token-budget.md`; `every_documented_surface_figure_matches_the_served_surface` printed every
+one of them, which is how they were updated. Measured on the ARM64 guest in a fresh clone of
+`2fffd98` with the change scp'd in: `cargo test`, **1,254** unit tests and **137** `mcp_smoke`
+tests, 0 failed.
 
 **Where it landed:** `no_input_schema_names_a_tool_the_client_cannot_call` and
 `input_schemas_for` in `src/server.rs`'s tests, four new or extended `TOOL_NOTES` entries above
 them, the argument docs of `modules`, `crash_triage`, `driver_hazards`, `ioctl_trace`,
-`reachable_from_dispatch`, `run_to_address` and `debug_batch`, `StepAction`'s variant docs in
-`src/batch.rs`, and the schema-channel paragraph in `.claude/rules/tool-surface.md`.
+`reachable_from_dispatch`, `run_to_address` and `debug_batch` — `steps`' most of all —
+`StepAction`'s variant docs in `src/batch.rs`, and the schema-channel paragraph in
+`.claude/rules/tool-surface.md`.

@@ -92,12 +92,13 @@ The two halves moved independently, which is the whole argument for measuring th
 fell by 55% and the model-visible column did not move at all except for what the tools themselves
 have accumulated since.
 
-Worst single tool, **today** rather than at the baseline above: `debug_batch` at 10,734
+Worst single tool, **today** rather than at the baseline above: `debug_batch` at 10,308
 model-visible bytes (2026-10-05), because its `inputSchema` pulls the whole `StepAction`/`Check`
 vocabulary out of `src/batch.rs`. It is dated because it is the one figure in this section that has
 been kept current rather than frozen — it was updated 9,746 → 10,021 on 2026-08-30, which the
-finding below refers to as "the figure above", and 10,842 → 10,734 on 2026-10-05, when item 52 took
-four "the `X` tool" pointers out of that vocabulary — and a reader reconstructing the 51-tool surface
+finding below refers to as "the figure above", and 10,842 → 10,308 on 2026-10-05, when item 52 took
+four "the `X` tool" pointers out of that vocabulary and then the `steps` description's catalogue of
+the ops, which each variant documents anyway — and a reader reconstructing the 51-tool surface
 should take the table, not this line.
 
 The payload is measured as the **serialized result**, not as the sum of its tools, and the 118-byte
