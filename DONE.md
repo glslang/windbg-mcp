@@ -3471,8 +3471,9 @@ reading a register the pass did not compute.
   ([#307](https://github.com/glslang/windbg-mcp/pull/307)): the decoder's write set
   ([dbgscope#155](https://github.com/glslang/dbgscope/issues/155)), which is what lets one general
   rule -- *everything an instruction writes stops being believed* -- replace the per-shape
-  refusals, and the differential oracle, which is what made "lost nothing" a measurement. Nothing
-  outside `src/ioctl.rs` changed.
+  refusals, and the differential oracle, which is what made "lost nothing" a measurement. The
+  resolver itself needed no file but `src/ioctl.rs`: what else moved with it is the generator fix
+  above, the entry-width clause in `docs/structured-results.md`, and these records.
 - **It is longer than what it replaced, which is worth stating because this item's own framing
   implies otherwise.** The recognition is **169** code lines against the chain walk's **90** --
   comments and blank lines excluded on both sides, and `follow_table`'s signature and its
