@@ -3138,7 +3138,11 @@ fn branches_on_the_code(facts: &Facts, instruction: &Instruction) -> bool {
 /// reaches, which is what `FOLLOWUPS.md` item 67 was about and what [`simulate`]'s edges read this
 /// to avoid.
 ///
-/// **Two families, told apart by what they have to know.**
+/// **Three questions, and getting any of them from a neighbour is how this went wrong twice in one
+/// review round.** Are the two operands one register *slice*; is the operation one whose result is
+/// a constant when they are; and, for half of those, what does the slice hold.
+///
+/// **Two families answer the second question, told apart by what they then have to know.**
 ///
 /// - **Self-cancelling.** `cmp r,r`, `sub r,r` and `xor r,r` compute zero whatever `r` held, so
 ///   `ZF` is set and nothing about the register need be known -- and no width rule either, a self
@@ -3148,8 +3152,8 @@ fn branches_on_the_code(facts: &Facts, instruction: &Instruction) -> bool {
 ///   which is the rule [`scalar_of`] and [`compare`] already apply: `test cx,cx` is a statement
 ///   about sixteen bits of a literal, and [`Value::Literal`] is the whole of one.
 ///
-/// **A compiler emits neither between a compare and its branch**, which is why this is six shapes
-/// rather than an evaluator: it would break its own branch. So a routine that has one is
+/// **A compiler emits neither between a compare and its branch**, which is why this is a handful of
+/// spellings rather than an evaluator: it would break its own branch. So a routine that has one is
 /// hand-written or obfuscated, and these are what such a routine spells an unconditional branch as
 /// a conditional one with. Anything past them -- an `add r,K` over a register holding a literal, a
 /// flag write whose result depends on the **code** -- is a constant folder or path sensitivity, and
@@ -3171,12 +3175,48 @@ fn decides_zero(facts: &Facts, instruction: &Instruction) -> Option<bool> {
     let (Operand::Register(left), Operand::Register(right)) = (left, right) else {
         return None;
     };
-    if left.full != right.full {
+    // **The same register *slice*, which `full` does not answer.** A subregister aliases to the
+    // register it is part of, so `ah` and `al` are both `rax` at one byte wide and differ only in
+    // the spelling the decoder printed -- and `xor ah,al` is zero exactly where the two halves are
+    // equal, which is a data dependence rather than a constant. `full` is the right key for the
+    // *value* below, because that is how this pass files what a register holds; it is the wrong
+    // question for *are these one operand*, and asking it of `name` is the whole of the
+    // difference. Raised as a P2 by Codex on
+    // [#454](https://github.com/glslang/windbg-mcp/pull/454).
+    if left.name != right.name {
         return None;
     }
-    match instruction.effect {
-        Effect::Compare | Effect::Subtract | Effect::BitXor => Some(true),
-        Effect::Test | Effect::BitAnd | Effect::BitOr if left.width >= FIELD_WIDTH => {
+    // **The effect says which family; the spelling says the flags were not an *input*.** Both
+    // questions have to be asked, and the second one only looks redundant: the decoder files x86's
+    // `sbb` and A64's `sbc`/`sbcs` under [`Effect::Subtract`] beside `sub`, and `sbb r,r` is `-CF`
+    // -- zero with the carry clear and **all ones** with it set, which is the opposite answer.
+    // Enumerated over the pinned decoder rather than reasoned about (`dbgscope` 401fde3,
+    // `decoded_effect` and `arm64::operand`): those three are the only carry-borrowing spellings
+    // any of these six effects can arrive as, and `dec`/`neg`/`bic`/`eon`/`orn`/`ccmp` are already
+    // out, the first by having one operand and the rest by being [`Effect::Other`]. Raised by
+    // CodeRabbit on #454, which proposed naming the two it had found; they are named here the other
+    // way round.
+    //
+    // **The other way round is the point, and it is the opposite of the rule this module keeps for
+    // `movk`.** There a membership table over an open set is wrong by construction, because the
+    // entry nobody remembered is a silent wrong answer. Here the omission is a branch **swept both
+    // ways** -- the walk's own default, and what it did before this fold existed -- so the list is
+    // safe exactly because it is an allow-list: a borrowing mnemonic the decoder files under one of
+    // these effects later settles nothing rather than settling it wrongly.
+    //
+    // A64's `eor` and `orr` are absent because they write no flags at all -- A64 has no
+    // flag-setting form of either -- so `instruction.writes_flags` has already excluded them where
+    // [`simulate`] reads this, and listing them would imply a fold that cannot fire. `sub` and
+    // `and` are listed for x86, where they do write them, and are gated the same way on A64.
+    match (instruction.effect, instruction.mnemonic.as_str()) {
+        (Effect::Compare, "cmp") | (Effect::Subtract, "sub" | "subs") | (Effect::BitXor, "xor") => {
+            Some(true)
+        }
+        (Effect::Test, "test" | "tst")
+        | (Effect::BitAnd, "and" | "ands")
+        | (Effect::BitOr, "or")
+            if left.width >= FIELD_WIDTH =>
+        {
             match facts.registers.get(&left.full) {
                 Some(Value::Literal(value)) => Some(*value == 0),
                 _ => None,
@@ -4739,12 +4779,22 @@ mod tests {
             "cmp" => Effect::Compare,
             "test" => Effect::Test,
             "add" => Effect::Add,
-            "sub" => Effect::Subtract,
+            // **Every spelling the decoder files here, not the one this module folds.** iced's
+            // `decoded_effect` maps `Sub`, **`Sbb`** and `Dec` onto one effect, and A64's
+            // `add_subtract_with_carry` maps `sub`/`subs` beside **`sbc`/`sbcs`** -- so a fixture
+            // listing only `sub` could not state the rule that tells them apart, and
+            // `decides_zero`'s carry clause would be untestable. `subs` is A64's flag-setting
+            // form, which is the one that can reach that fold at all.
+            "sub" | "subs" | "sbb" | "sbc" | "sbcs" | "dec" => Effect::Subtract,
             "shl" | "sal" => Effect::ShiftLeft,
             "shr" | "sar" => Effect::ShiftRight,
-            "and" => Effect::BitAnd,
+            // A64's flag-setting `and`, which is the spelling `decides_zero`'s identity family has
+            // to accept there -- the plain `and` writes no flags on that target, and `tst` below
+            // is the `ands` whose destination is the zero register.
+            "and" | "ands" => Effect::BitAnd,
             "or" => Effect::BitOr,
             "xor" => Effect::BitXor,
+            "tst" => Effect::Test,
             "push" => Effect::Push,
             "pop" => Effect::Pop,
             // Every transfer of control, and everything else: `Flow` is what says where control
@@ -14040,6 +14090,190 @@ mod tests {
             destroyed.untracked.is_empty(),
             "and the branch tested nothing, so there is no site where the list went short: {:?}",
             destroyed.untracked
+        );
+
+        // **Two operands of one *register* are not two operands of one slice.** `ah` and `al` are
+        // both `rax` at one byte wide and differ only in the name the decoder printed, so a check
+        // asking `full` folds `xor ah,al` -- which is zero exactly where the two halves are equal,
+        // a data dependence. Both edges are swept, and the positive control beside it is the same
+        // instruction over one slice, which really is zero at any width. Raised as a P2 by Codex on
+        // [#454](https://github.com/glslang/windbg-mcp/pull/454).
+        assert_eq!(
+            codes(&settled_by(vec![insn(
+                DISPATCH + 8,
+                "xor",
+                vec![reg("ah"), reg("al")],
+                Flow::Fallthrough,
+            )])),
+            vec![(0x222003, LIVE + 0x20), (0x222007, FALLEN)],
+            "`ah` and `al` are one register and two operands"
+        );
+        assert_eq!(
+            codes(&settled_by(vec![insn(
+                DISPATCH + 8,
+                "xor",
+                vec![reg("ah"), reg("ah")],
+                Flow::Fallthrough,
+            )])),
+            vec![(0x222003, LIVE + 0x20)],
+            "while one slice exclusive-ored with itself is zero in whatever bits the flags are \
+             computed over, which is why the zeroing family has no width rule"
+        );
+
+        // **And the effect is not the operation.** The decoder files x86's `sbb` under
+        // `Effect::Subtract` beside `sub`, and `sbb r,r` is `-CF`: zero with the carry clear and
+        // all ones with it set, so the flags are an **input** and nothing is settled. Raised by
+        // CodeRabbit on #454; the remedy names the spellings that are folded rather than the two it
+        // found, so a borrowing mnemonic filed under one of these effects later sweeps both edges.
+        assert_eq!(
+            codes(&settled_by(vec![insn(
+                DISPATCH + 8,
+                "sbb",
+                vec![reg("ecx"), reg("ecx")],
+                Flow::Fallthrough,
+            )])),
+            vec![(0x222003, LIVE + 0x20), (0x222007, FALLEN)],
+            "a subtract-with-borrow of a register from itself is decided by the carry"
+        );
+    }
+
+    /// The same rule in A64's spellings, which are not x86's for any of the six.
+    ///
+    /// The fold reads the mnemonic as well as the effect, so every architecture it claims to work
+    /// on needs its own spellings exercised -- an entry that is wrong, or that names a form the
+    /// decoder never prints, leaves the fold silently inert on that target. A64's flag-setting
+    /// subtract is `subs` and its flag-setting `and` is `ands`; `eor` and `orr` have no
+    /// flag-setting form at all there, so they cannot reach this and are deliberately not listed.
+    /// And `sbcs` is the carry-borrowing one, filed under the same effect as `subs`.
+    #[test]
+    fn the_settled_branch_rule_reads_a64s_own_spellings() {
+        const LAND: u64 = DISPATCH + 0x100;
+
+        let settled_by = |between: Vec<Instruction>| {
+            let mut block = vec![
+                insn(
+                    DISPATCH,
+                    "ldr",
+                    vec![reg("x8"), pointer("x1", 0xb8)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 4,
+                    "ldr",
+                    vec![reg("w9"), mem("x8", 0x18)],
+                    Flow::Fallthrough,
+                ),
+            ];
+            block.extend(between);
+            block.extend([
+                insn(
+                    DISPATCH + 0x20,
+                    "b.eq",
+                    Vec::new(),
+                    Flow::Branch(Some(LAND)),
+                ),
+                // The fall-through, which a branch taken for every code never reaches. A64 cannot
+                // hold a control code in a compare's immediate, so the code is built with
+                // `movz`/`movk` and compared register to register.
+                insn(
+                    DISPATCH + 0x24,
+                    "mov",
+                    vec![reg("w10"), imm(3)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x28,
+                    "movk",
+                    vec![reg("w10"), imm(0x22_0000)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x2c,
+                    "cmp",
+                    vec![reg("w9"), reg("w10")],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x30,
+                    "b.eq",
+                    Vec::new(),
+                    Flow::Branch(Some(LAND + 0x40)),
+                ),
+                insn(DISPATCH + 0x34, "ret", Vec::new(), Flow::Return),
+                insn(
+                    LAND,
+                    "bl",
+                    vec![Operand::Target(0x7000)],
+                    Flow::Call(Some(0x7000)),
+                ),
+                insn(LAND + 4, "ret", Vec::new(), Flow::Return),
+                insn(
+                    LAND + 0x40,
+                    "bl",
+                    vec![Operand::Target(0x7000)],
+                    Flow::Call(Some(0x7000)),
+                ),
+                insn(LAND + 0x44, "ret", Vec::new(), Flow::Return),
+            ]);
+            let found = map(
+                DISPATCH,
+                &block,
+                Layout::ARM64,
+                unreadable,
+                in_image,
+                constant_data,
+                never,
+            );
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands))
+                .collect::<Vec<_>>()
+        };
+
+        assert!(
+            settled_by(vec![insn(
+                DISPATCH + 0x1c,
+                "subs",
+                vec![reg("w11"), reg("w11"), reg("w11")],
+                Flow::Fallthrough,
+            )])
+            .is_empty(),
+            "`subs` of a register from itself is zero, so the first `b.eq` is taken for every code \
+             and the compare chain below it is unreachable"
+        );
+
+        assert_eq!(
+            settled_by(vec![
+                insn(
+                    DISPATCH + 0x14,
+                    "mov",
+                    vec![reg("w11"), imm(1)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x18,
+                    "ands",
+                    vec![reg("w11"), reg("w11"), reg("w11")],
+                    Flow::Fallthrough,
+                ),
+            ]),
+            vec![(0x22_0003, LAND + 0x40)],
+            "and `ands` over a register holding one leaves the flag clear, so the first `b.eq` is \
+             never taken and the chain below it is the live edge"
+        );
+
+        assert_eq!(
+            settled_by(vec![insn(
+                DISPATCH + 0x1c,
+                "sbcs",
+                vec![reg("w11"), reg("w11"), reg("w11")],
+                Flow::Fallthrough,
+            )])
+            .len(),
+            1,
+            "while `sbcs` is decided by the carry, so both edges are swept and the chain's code is \
+             still recovered"
         );
     }
 
