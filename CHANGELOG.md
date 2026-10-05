@@ -191,6 +191,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   terminator's *condition* alone, which a `ccmp` carries, so a block ending in one left no case
   and no site; the block-boundary test caught it.
 
+- **A narrowed surface no longer reads argument prose pointing at tools it cannot call**
+  (`FOLLOWUPS.md` item 52, in `DONE.md`). An argument's doc comment lands in a tool's
+  **`inputSchema`**, which is model-visible on exactly the terms its description is -- counted
+  inside `modelVisible`, with a column of its own in `tool_budget.json` -- and the invariant that
+  keeps a cross-reference out of a description walked only the description. So a
+  `--tools run_to_address` client read "typically a block from `reachable_from_dispatch`", a
+  pointer to a tool it is refused, which is what item 41 exists to prevent on the one channel item
+  41 did not look at. **Eleven sentence/tool pairs across seven tools were leaking**, where the
+  item recorded one: four were pointers at what to call next and are now `TOOL_NOTES` entries,
+  which ship only where every tool they name is served; two were already in `TOOL_NOTES` and the
+  argument had a second copy; and five were `debug_batch` prose pointing out of the batch when its
+  own step is the thing -- four calling a step "the `X` tool", one offering `go` for what a
+  `resume` step does. `no_input_schema_names_a_tool_the_client_cannot_call` walks the served
+  schema, reports every leak rather than the first, and reads `input_schema` rather than the source
+  because the two are not the same set: `schemars` attaches a whole doc comment, rationale
+  paragraphs and all, but attaches none of a `#[serde(flatten)]`'d type's -- every one of
+  `StepAction`'s *variant* docs reaches a client and not a word of the enum's own. A name the
+  served schema **declares** as a value is the caller's own vocabulary and not a pointer
+  (`{"op": "pool_chunk"}` is a step, `set_breakpoint`'s `execute` is a `WatchAccess`), so it is
+  exempt -- but never where the prose calls it "the `X` tool" or opens a call with it. **There is
+  no third notes table**, which is the decision this closes: `annotate` rewrites a description per
+  surface and nothing rewrites a schema, so a cross-reference belongs in `TOOL_NOTES` rather than
+  in a second mechanism built for the same job. The model-visible surface moves 116,374 -> 116,411
+  B and `debug_batch`, still the worst single tool, 10,842 -> 10,734.
+
 ### Changed
 
 - **The IOCTL switch resolver matches what a compiler emits instead of refusing what it trips

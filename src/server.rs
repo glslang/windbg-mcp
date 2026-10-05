@@ -947,8 +947,7 @@ pub struct ModulesArgs {
     /// is the names that *start* with `nt`, and `"*"` is every module. Those two are the whole
     /// grammar: **every other character is literal**, including the rest of WinDbg's wildcard
     /// syntax (`[fd]`, `#`, `+`, `\`), so `"nt[fd]*"` matches a module actually called that and
-    /// otherwise nothing — run `execute { "command": "lm m <pattern>" }` for the engine's own
-    /// matcher.
+    /// otherwise nothing.
     #[serde(default)]
     pub filter: Option<String>,
     /// Maximum rows in the whole listing, the loaded and unloaded halves sharing it (default 64,
@@ -1694,9 +1693,9 @@ pub struct CrashTriageArgs {
     /// It is what supplies the pool tag, the failure bucket and the per-parameter explanations,
     /// and it is also the slow part — set false for a fast answer of code, parameters and frames.
     /// It is also what re-selects the faulting context on the bug checks that carry one, so with
-    /// false the stack is whichever context the session currently has selected — the same one
-    /// `backtrace` would print. On a freshly opened dump those are the same thing; on a session
-    /// where the context has been moved (`.thread`, `~Ns`, `.cxr`) they are not.
+    /// false the stack is whichever context the session currently has selected. On a freshly
+    /// opened dump those are the same thing; on a session where the context has been moved
+    /// (`.thread`, `~Ns`, `.cxr`) they are not.
     #[serde(default)]
     pub analyze: Option<bool>,
     /// Which session to act on. Omit for the current one; pass an opener's handle to route to that
@@ -1824,8 +1823,9 @@ pub struct XrefsArgs {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DriverHazardsArgs {
-    /// The driver to scan, as `modules` lists it, e.g. "mydriver". The image must be readable in
-    /// this session: on a dump that means the engine can obtain the binary.
+    /// The driver to scan, by the name the module inventory lists it under, e.g. "mydriver". The
+    /// image must be readable in this session: on a dump that means the engine can obtain the
+    /// binary.
     pub module: String,
     /// Which session to act on. Omit for the current one; pass an opener's handle to route to that
     /// session and be refused if its target was replaced or closed.
@@ -1890,7 +1890,7 @@ pub struct IrpStackArgs {
 #[serde(deny_unknown_fields)]
 pub struct IoctlTraceArgs {
     /// Virtual address of the IRP_MJ_DEVICE_CONTROL dispatch routine, rebased to the
-    /// live load base. Recover it via `driver_object` (MajorFunction[0x0e]).
+    /// live load base.
     pub dispatch: String,
     /// Which session to act on. Omit for the current one; pass an opener's handle to route to that
     /// session and be refused if its target was replaced or closed.
@@ -1903,8 +1903,8 @@ pub struct IoctlTraceArgs {
 pub struct ReachabilityArgs {
     /// Start of the search: the IRP_MJ_DEVICE_CONTROL dispatch routine — a symbol,
     /// address, or expression `uf` accepts (e.g. "mydriver!DispatchDeviceControl" or
-    /// "fffff8033e254750"). Recover it via `driver_object` (MajorFunction[0x0e]). Pass
-    /// a specific handler VA instead to scope the walk past a jump-table switch.
+    /// "fffff8033e254750"). Pass a specific handler VA instead to scope the walk past
+    /// a jump-table switch.
     pub from: String,
     /// Target code block as an absolute virtual address, in any WinDbg form — a bare
     /// value is hex (e.g. "fffff803`3e254750" or "00401234"), and "0x"-hex or a symbol
@@ -1942,7 +1942,7 @@ pub struct ReachabilityArgs {
 #[serde(deny_unknown_fields)]
 pub struct RunToAddressArgs {
     /// Address, symbol, or expression to run until (any WinDbg form — a bare value is
-    /// hex, "0x"-hex and symbols also work). Typically a block from `reachable_from_dispatch`.
+    /// hex, "0x"-hex and symbols also work).
     #[serde(default)]
     pub address: Option<String>,
     /// Identity-guarded image location. Requires an explicit session and no other location.
@@ -1986,12 +1986,12 @@ pub struct DebugBatchArgs {
     /// Cleanup/rollback steps, same shape as `steps`. They run **on every path this batch can
     /// still aim them at** — success, a debugger error, an assertion that did not hold, the
     /// deadline expiring — inside the engine process, before this call returns. This is where an
-    /// unpatch, a `bc *`, or a re-`go` belongs: a client cannot be relied on to send it after a
-    /// call that timed out. Their failures are reported separately and never replace the batch's
-    /// own outcome. The exception is a step after which nothing can certify that the debugger
-    /// still holds the target the steps ran against: the block is then dropped on purpose
-    /// (`rollback: NOT ATTEMPTED`), a restore that cannot be aimed being worse than one that is
-    /// missing.
+    /// unpatch, a `bc *`, or another `resume` belongs: a client cannot be relied on to send it
+    /// after a call that timed out. Their failures are reported separately and never replace the
+    /// batch's own outcome. The exception is a step after which nothing can certify that the
+    /// debugger still holds the target the steps ran against: the block is then dropped on
+    /// purpose (`rollback: NOT ATTEMPTED`), a restore that cannot be aimed being worse than one
+    /// that is missing.
     #[serde(default)]
     pub always: Vec<batch::BatchStep>,
     /// Deadline for the whole batch in milliseconds (default 120000). Part of it is reserved for
@@ -6544,6 +6544,13 @@ const SUMMARY_NOTES: &[SummaryNote] = &[
 /// invariant rather than a sample of it - a fragment only ever ships when its own names are
 /// served, so if the base description is clean on the tightest surface it is clean on every wider
 /// one.
+///
+/// **This is also where an *argument's* cross-reference goes** (item 52), which is why the table
+/// holds notes for tools whose own description never pointed anywhere:
+/// `no_input_schema_names_a_tool_the_client_cannot_call` walks the other half of the prose a
+/// client reads, and a schema has no `annotate` of its own to narrow it per surface. So a note
+/// here reads as a sentence about the tool and may be the only home a sentence about one of its
+/// arguments has.
 const TOOL_NOTES: &[ToolNote] = &[
     ToolNote {
         tool: "xrefs_to",
@@ -6626,6 +6633,23 @@ const TOOL_NOTES: &[ToolNote] = &[
         note: "`driver_object` names the dispatch routine to pass here -- the MajorFunction                table's index 0x0e -- and `decode_ioctl` takes one code apart on its own.",
     },
     ToolNote {
+        tool: "ioctl_trace",
+        names: &["driver_object"],
+        note: "`driver_object` names the dispatch routine to pass here — the MajorFunction \
+               table's index 0x0e.",
+    },
+    ToolNote {
+        tool: "reachable_from_dispatch",
+        names: &["driver_object"],
+        note: "`driver_object` names the dispatch routine `from` wants — the MajorFunction \
+               table's index 0x0e.",
+    },
+    ToolNote {
+        tool: "driver_hazards",
+        names: &["modules"],
+        note: "`modules` is where `module` comes from: the name it lists the image under.",
+    },
+    ToolNote {
         tool: "driver_object",
         names: &["ioctl_map"],
         note: "`ioctl_map` recovers the control codes that dispatch routine accepts.",
@@ -6696,7 +6720,9 @@ const TOOL_NOTES: &[ToolNote] = &[
     ToolNote {
         tool: "modules",
         names: &["execute"],
-        note: "For the engine's own listing verbatim, `execute { \"command\": \"lm\" }`.",
+        note: "For the engine's own listing verbatim, `execute { \"command\": \"lm\" }` — and \
+               `lm m <pattern>` for its own matcher, which takes the rest of WinDbg's wildcard \
+               syntax that `filter` treats as literal.",
     },
     ToolNote {
         tool: "modules",
@@ -7281,6 +7307,156 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Every string a client **reads** in one surface's input schemas, with the vocabulary those
+    /// schemas declare beside it.
+    ///
+    /// Through the real `router()` for [`descriptions_for`]'s reason, and read back out of
+    /// `input_schema` rather than off the argument structs — **because the two are not the same
+    /// set, and the difference is not guessable from the source.** `schemars` 1.2.2 holds back no
+    /// summary line, so a doc comment that is attached arrives whole, rationale paragraphs and
+    /// all; but a `#[serde(flatten)]`'d type's own comment is not attached at all. Measured on
+    /// `debug_batch` (2026-10-05): the 23 strings its schema carries include every one of
+    /// [`crate::batch::StepAction`]'s *variant* docs and [`crate::batch::Check`]'s own, and not
+    /// one word of `StepAction`'s, which is flattened into `BatchStep`. A test reading the file
+    /// would have audited four paragraphs no client is served and missed nothing that is.
+    ///
+    /// Prose and vocabulary are collected in one pass because the second is what makes the first
+    /// readable. A `description` is prose; a `const` or `enum` value is the **caller's own
+    /// vocabulary**, and `{"op": "pool_chunk"}` is a step a `--tools debug_batch` client can take
+    /// — so a sentence naming it points at something that client can reach. Two schemas declare a
+    /// value spelled like a tool, and they are the two reasons the exemption below is narrow:
+    /// `debug_batch`'s four steps named after the tools they stand in for (`read_memory`,
+    /// `pool_chunk`, `pool_find_tag`, `pool_census`), and `set_breakpoint`'s `execute`, which is a
+    /// [`structured::WatchAccess`] and has nothing to do with the tool of that name.
+    fn input_schemas_for(
+        spec: &str,
+    ) -> Vec<(String, Vec<String>, std::collections::BTreeSet<String>)> {
+        /// `description` prose and declared string values, told apart from the **names** of fields
+        /// and types the way `mcp_smoke::output_schemas_carry_constraints_not_prose` tells them
+        /// apart: inside `properties` or `$defs` the keys are names, so a field called
+        /// `description` there is a name in that position rather than documentation.
+        fn walk(
+            node: &serde_json::Value,
+            names_not_keywords: bool,
+            prose: &mut Vec<String>,
+            vocabulary: &mut std::collections::BTreeSet<String>,
+        ) {
+            const NAME_MAPS: &[&str] = &["properties", "patternProperties", "$defs", "definitions"];
+            let serde_json::Value::Object(members) = node else {
+                if let serde_json::Value::Array(items) = node {
+                    for item in items {
+                        walk(item, false, prose, vocabulary);
+                    }
+                }
+                return;
+            };
+            for (key, value) in members {
+                let keyword = !names_not_keywords;
+                match (keyword, key.as_str(), value) {
+                    (true, "description", serde_json::Value::String(text)) => {
+                        prose.push(text.clone());
+                    }
+                    (true, "const", serde_json::Value::String(word)) => {
+                        vocabulary.insert(word.clone());
+                    }
+                    (true, "enum", serde_json::Value::Array(words)) => {
+                        vocabulary
+                            .extend(words.iter().filter_map(|w| w.as_str()).map(str::to_owned));
+                    }
+                    _ => {}
+                }
+                let names = keyword && NAME_MAPS.contains(&key.as_str());
+                walk(value, names, prose, vocabulary);
+            }
+        }
+
+        let surface = crate::toolset::Toolset::parse(spec)
+            .unwrap_or_else(|e| panic!("`{spec}` should be a valid spec: {e}"));
+        WindbgServer::new(Sessions::new(Duration::from_secs(1)))
+            .with_tools(surface, crate::toolset::Chosen::ForTheRun)
+            .router()
+            .list_all()
+            .into_iter()
+            .map(|tool| {
+                let (mut prose, mut vocabulary) = (Vec::new(), std::collections::BTreeSet::new());
+                walk(
+                    &serde_json::Value::Object(tool.input_schema.as_ref().clone()),
+                    false,
+                    &mut prose,
+                    &mut vocabulary,
+                );
+                (tool.name.to_string(), prose, vocabulary)
+            })
+            .collect()
+    }
+
+    /// **The same property again, on the channel the two tests above do not reach** — an
+    /// argument's doc comment, which lands in the tool's `inputSchema` and not in its description
+    /// (`FOLLOWUPS.md` item 52).
+    ///
+    /// It is model-visible on exactly the same terms as the description: `docs/token-budget.md`
+    /// counts it inside `modelVisible` and `tool_budget.json` gives it a column. So a
+    /// `--tools run_to_address` client read "Typically a block from `reachable_from_dispatch`" —
+    /// a pointer to a tool it is refused, on the one channel
+    /// [`no_description_names_a_tool_the_client_cannot_call`] never looked at.
+    ///
+    /// **Eleven sentence/tool pairs were leaking across seven tools, not the one the item
+    /// recorded** (measured 2026-10-05, and the item said "at least one"), which is why this
+    /// reports every leak it finds rather than stopping at the first: a one-at-a-time assertion
+    /// costs a build per sentence, and what the walk is for is the whole set.
+    ///
+    /// **There is no third notes table, and that is the decision this closes.** `annotate`
+    /// rewrites a description per surface and nothing rewrites a schema — so rather than build a
+    /// second mechanism for the same job, an argument's prose names no tool but its own and the
+    /// always-served openers, and a cross-reference goes in `TOOL_NOTES`, where the all-of rule
+    /// already ships it only to the clients that can follow it. Which way each of the eleven went
+    /// was not a free choice either. Four were pointers at *what to call next* and became notes,
+    /// one of them by extending the note already on that tool. Two were in `TOOL_NOTES` already,
+    /// the leaking sentence being a second copy of what the note says — `run_to_address`'s
+    /// "typically a block from `reachable_from_dispatch`" and `crash_triage`'s "the same one
+    /// `backtrace` would print". And five were `debug_batch` prose pointing out of the batch when
+    /// its own step is the thing: four calling a step "the `X` tool", and one offering `go` for
+    /// what a `resume` step does.
+    #[test]
+    fn no_input_schema_names_a_tool_the_client_cannot_call() {
+        let mut leaks: Vec<String> = Vec::new();
+        for spec in crate::toolset::Toolset::every_tool() {
+            let surface = crate::toolset::Toolset::parse(spec).expect("a tool name is a spec");
+            for (name, prose, vocabulary) in input_schemas_for(spec) {
+                for tool in crate::toolset::Toolset::every_tool() {
+                    if surface.includes(tool) {
+                        continue;
+                    }
+                    for text in prose.iter().filter(|text| names_tool(text, tool)) {
+                        // A name this schema declares as a value is the caller's own vocabulary
+                        // rather than a pointer, and the step or access it names is one this
+                        // client can use. Two shapes are not covered by that, and both are how
+                        // the leak reads when it comes back: calling it "the `X` tool", and
+                        // opening a call with it, which is an invocation whatever any schema
+                        // declares.
+                        let as_value = vocabulary.contains(tool)
+                            && !text.contains(&format!("`{tool}` tool"))
+                            && !text.contains(&format!("`{tool} {{"));
+                        if as_value {
+                            continue;
+                        }
+                        leaks.push(format!(
+                            "`--tools {spec}` is not served `{tool}`, and `{name}`'s input \
+                             schema names it:\n    {text}"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            leaks.is_empty(),
+            "{} input-schema cross-reference(s) ship to a client that cannot follow them. Move \
+             each into `TOOL_NOTES`, which appends per surface, or reword it:\n\n{}",
+            leaks.len(),
+            leaks.join("\n\n"),
+        );
     }
 
     /// And the other direction, which is the half worth having: the client that *can* act on a

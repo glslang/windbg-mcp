@@ -21,13 +21,13 @@
 //! ```text
 //!   group        tools   bytes   what it is for
 //!   allocator       10   16,868  pool and heap walks, and `walk_memory`
-//!   inspect         10   13,442  registers, stacks, memory, modules, symbols, location, raw commands
+//!   inspect         10   13,485  registers, stacks, memory, modules, symbols, location, raw commands
 //!   session         10   14,013  opening a target, ending it, and watching this server
-//!   exec            10   15,137  breakpoints and execution control
-//!   batch            1   10,842  `debug_batch`
-//!   crash            3    7,514  a bug check, a user-mode fault, and an error code
+//!   exec            10   15,087  breakpoints and execution control
+//!   batch            1   10,734  `debug_batch`
+//!   crash            3    7,473  a bug check, a user-mode fault, and an error code
 //!   ttd              9    7,090  recording, indexing and querying a Time Travel trace
-//!   ioctl           11   15,895  driver objects, IRP stacks, reachability, hazards, IOCTL maps,
+//!   ioctl           11   16,088  driver objects, IRP stacks, reachability, hazards, IOCTL maps,
 //!                                  references to an address, device security and the
 //!                                  whole-driver survey
 //!   securekernel    11   15,906  captured and live VTL1 inspection and execution control
@@ -38,7 +38,7 @@
 //! Re-derive rather than quoting them.
 //!
 //! **Those are shares of the whole surface, and they do not sum to a narrowed one.** `crash` reads
-//! 20,361 bytes, not the 21,527 its two rows add to, because the thirteen tools it keeps also stop
+//! 20,320 bytes, not the 21,486 its two rows add to, because the thirteen tools it keeps also stop
 //! carrying the sentences that pointed at `modules`, `debug_batch`, `backtrace`, `continue_async`
 //! and `break_in` — 1,166 bytes of them. A spec is always cheaper than its rows suggest, never
 //! dearer.

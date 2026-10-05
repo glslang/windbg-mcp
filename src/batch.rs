@@ -196,22 +196,21 @@ pub enum StepAction {
     Eval { expr: String },
     /// Hex-dump `size` bytes at `address`.
     ///
-    /// `address` is a **number** — decimal or `0x`-hex — not a debugger expression, matching the
-    /// `read_memory` tool. That is not a limitation in a batch: an `eval` step binds its value as
-    /// `0x`-hex, so `@rsp` or `poi(@rbx+8)` is one `eval` with a `capture` and then `{{name}}`
-    /// here.
+    /// `address` is a **number** — decimal or `0x`-hex — not a debugger expression. That is not a
+    /// limitation in a batch: an `eval` step binds its value as `0x`-hex, so `@rsp` or
+    /// `poi(@rbx+8)` is one `eval` with a `capture` and then `{{name}}` here.
     ReadMemory { address: String, size: u32 },
-    /// Identify the pool chunk containing `address` and its neighbours — the `pool_chunk` tool.
+    /// Identify the pool chunk containing `address` and its neighbours.
     ///
     /// The step the transaction shape needs: an `eval` captures a pointer the target just handed
-    /// over, and this asks the allocator what it is. `address` takes the same forms the tool does,
+    /// over, and this asks the allocator what it is. `address` takes the forms the pool walk takes,
     /// and a `{{capture}}` is one of them.
     PoolChunk {
         address: String,
         #[serde(default)]
         refresh: Option<bool>,
     },
-    /// Allocated chunks carrying `tag` — the `pool_find_tag` tool.
+    /// Allocated chunks carrying `tag`.
     PoolFindTag {
         tag: String,
         /// true = paged only, false = nonpaged only, omitted = both.
@@ -226,7 +225,7 @@ pub enum StepAction {
         #[serde(default)]
         limit: Option<u32>,
     },
-    /// Per-tag totals across the pool, heaviest first — the `pool_census` tool.
+    /// Per-tag totals across the pool, heaviest first.
     PoolCensus {
         #[serde(default)]
         refresh: Option<bool>,

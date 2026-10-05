@@ -92,11 +92,12 @@ The two halves moved independently, which is the whole argument for measuring th
 fell by 55% and the model-visible column did not move at all except for what the tools themselves
 have accumulated since.
 
-Worst single tool, **today** rather than at the baseline above: `debug_batch` at 10,842
-model-visible bytes (2026-09-26), because its `inputSchema` pulls the whole `StepAction`/`Check`
+Worst single tool, **today** rather than at the baseline above: `debug_batch` at 10,734
+model-visible bytes (2026-10-05), because its `inputSchema` pulls the whole `StepAction`/`Check`
 vocabulary out of `src/batch.rs`. It is dated because it is the one figure in this section that has
 been kept current rather than frozen — it was updated 9,746 → 10,021 on 2026-08-30, which the
-finding below refers to as "the figure above" — and a reader reconstructing the 51-tool surface
+finding below refers to as "the figure above", and 10,842 → 10,734 on 2026-10-05, when item 52 took
+four "the `X` tool" pointers out of that vocabulary — and a reader reconstructing the 51-tool surface
 should take the table, not this line.
 
 The payload is measured as the **serialized result**, not as the sum of its tools, and the 118-byte
@@ -339,7 +340,7 @@ None of these is a bug. They are recorded because they were invisible, and
    and, since item 41, for the sentences the tools it keeps used to spend on pointing at them.
    Where the bytes sit, and what each profile costs:
 
-   Both tables are measurements of **2026-10-04** and move with any edit to a description.
+   Both tables are measurements of **2026-10-05** and move with any edit to a description.
 
    | group | tools | bytes | share |
    |---|---:|---:|---:|
@@ -362,7 +363,7 @@ None of these is a bug. They are recorded because they were invisible, and
 
    **The two tables do not reconcile, and that is the point of item 41.** The first is each group's
    share of the whole surface; the second is what a spec actually serves, which is less — `crash`
-   is 20,361 rather than the 21,527 its two rows sum to, because the cross-references leave with
+   is 20,320 rather than the 21,486 its two rows sum to, because the cross-references leave with
    the tools they name — 1,166 B of them, pointing at `modules`, `debug_batch`, `backtrace`,
    `continue_async` and `break_in`.
 

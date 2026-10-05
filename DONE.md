@@ -161,6 +161,7 @@ engine — it adds a target and leaves the current one alone. The entry records 
 - [Item 109](#109-windbg-mcp-the-server-can-walk-a-call-graph-forward-and-find-calls-to-imports-and-cannot-answer-who-calls-this-address--done-2026-10-04) — [windbg-mcp] The server can walk a call graph forward and find calls to imports, and cannot answer "who calls this address" — done (2026-10-04)
 - [Item 111](#111-windbg-mcp--dbgscope-an-image-targets-memory-reads-only-after-something-else-has-read-it-and-a-walk-counts-what-it-did-not-get-as-scanned--done-2026-10-04-the-second-half-withdrawn) — [windbg-mcp] An image target's memory does not read until its module is loaded — done (2026-10-04), with the entry's second claim withdrawn
 - [Item 84](#84-windbg-mcp-an-adrpadd-table-base-is-lost-at-the-add--done-2026-10-04) — [windbg-mcp] An `adrp`+`add` table base is lost at the `add` — done (2026-10-04)
+- [Item 52](#52-windbg-mcp-the-no-description-names-a-tool-the-client-cannot-call-invariant-does-not-cover-input-schemas--done-2026-10-05) — [windbg-mcp] The "no description names a tool the client cannot call" invariant does not cover **input schemas** — done (2026-10-05)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -9131,3 +9132,109 @@ position, which is the reason the fixture exists.
 **Where it landed:** `ioctl::update`'s `Effect::Add` arm (`src/ioctl.rs`), ahead of the
 `_ => set(facts, &destination, None)` fall-through, which still answers for everything else an
 `add` can be.
+
+## 52. [windbg-mcp] The "no description names a tool the client cannot call" invariant does not cover **input schemas** — **done** (2026-10-05)
+
+**Repo:** `windbg-mcp`.
+
+**Where it came from.** Writing #83's three tools (2026-08-29). Their argument docs wanted to say
+"the handle `continue_async` reported", which is the natural sentence — and
+`no_description_names_a_tool_the_client_cannot_call` would not have caught it, because it walks
+`descriptions_for(spec)` and an argument's doc comment ends up in the **input schema**, not the
+description. The schema is model-visible: `docs/token-budget.md` counts it inside `modelVisible`,
+and `tool_budget.json` has an `inputSchema` column of its own. So a `--tools wait_for_stop` client
+would read a pointer to a tool it is refused, which is exactly what item 41 exists to prevent, on
+the one channel item 41 did not look at.
+
+**This is pre-existing, and there is at least one live instance.** `RunToAddressArgs::address` says
+"Typically a block from `reachable_from_dispatch`" (`src/server.rs`). `run_to_address` is `exec` and
+`reachable_from_dispatch` is `ioctl`, so any surface with the first and not the second — `exec`
+alone, `session,exec,crash`, the bench's `lean` — ships that pointer to a client that cannot follow
+it. #83's own tools were reworded to name no tool rather than adding a second instance while
+reporting the first.
+
+**What would close it.** Extend the walk to the input schema — `descriptions_for` already builds a
+router per spec, so the schema is in hand beside the description and it is the same `names_tool`
+predicate over a second string. Then either move the `reachable_from_dispatch` sentence into
+`TOOL_NOTES` (which appends per-tool and already has the all-of rule) or reword it, and check
+whether the fix wants a third table for *schema* notes, since `annotate` rewrites descriptions and
+nothing today rewrites a schema.
+
+**Why it was deferred.** It is a second channel with a second mechanism, and finding it in the
+middle of a feature is the wrong moment to build one: the fix has to decide whether an argument's
+prose can carry a cross-reference at all, and that decision changes how every future argument is
+documented. The immediate hazard is one sentence, on surfaces that hold `exec` without `ioctl`.
+
+**Where it picks up.** `no_description_names_a_tool_the_client_cannot_call` and `descriptions_for`
+in `src/server.rs`'s tests, `TOOL_NOTES` and `annotate` beside them, and item 41 for the argument
+about which channels a narrowed surface has to narrow.
+
+**What landed is the walk the entry asked for, and it found eleven leaks rather than one.**
+`no_input_schema_names_a_tool_the_client_cannot_call` sits beside the description test in
+`src/server.rs`, over the same `--tools <that tool>` surfaces and the same `names_tool` predicate,
+reading the `inputSchema` the router actually serves. Eleven sentence/tool pairs across seven
+tools: `modules` → `execute`, `crash_triage` → `backtrace`, `driver_hazards` → `modules`,
+`ioctl_trace` → `driver_object`, `reachable_from_dispatch` → `driver_object`, `run_to_address` →
+`reachable_from_dispatch`, and five in `debug_batch`. The entry's "at least one" was literally
+true and read as an estimate; what makes the difference matter is that the fix it proposed —
+reword that one sentence — would have left ten.
+
+**The decision the entry said the fix had to take: no third table.** `annotate` rewrites a
+description per surface and nothing rewrites a schema, and the answer is not to build the second
+mechanism but to stop needing it. An argument's prose names no tool but its own and the
+always-served openers; a cross-reference goes in `TOOL_NOTES`, where the all-of rule already ships
+it only to the clients that can follow it. That is also why the invariant is stated on the
+*channel* rather than on the table: a schema note table would have had to be kept complete by the
+same walk, so it would have bought a mechanism and no coverage.
+
+**Which way each of the eleven went was not a free choice.** Four were pointers at what to call
+next and became notes — `ioctl_trace` and `reachable_from_dispatch` each gained
+"`driver_object` names the dispatch routine", `driver_hazards` gained "`modules` is where `module`
+comes from", and `modules`' existing `execute` note was extended to carry the `lm m <pattern>`
+matcher the `filter` argument used to point at. Two were already in `TOOL_NOTES`, the leaking
+argument holding a second copy of what the note says: `run_to_address`'s "typically a block from
+`reachable_from_dispatch`" against a note that says "the block can be one
+`reachable_from_dispatch` reported", and `crash_triage`'s "the same one `backtrace` would print"
+against "the stack it falls back to is the one `backtrace` would show". Those two are the shape
+worth remembering — the pointer was *already* being shipped correctly, and the argument prose was
+a second, unconditional copy of it. And five were `debug_batch` prose pointing out of the batch
+when its own step is the thing: four calling a step "the `X` tool" and one offering `go` for what
+a `resume` step does.
+
+**Two things only measurement said, and both changed the test.** A name the served schema
+**declares** as a value is the caller's own vocabulary rather than a pointer — `{"op":
+"pool_chunk"}` is a step a `--tools debug_batch` client can take — so the check exempts it, from
+the schema rather than from a list beside the test. Without that, the invariant forbids
+`debug_batch` from documenting its own ops, four of which are named after the tools they stand in
+for. But the exemption cannot be flat: `set_breakpoint` also declares a value spelled like a tool,
+and it is `WatchAccess::Execute` — nothing to do with `execute` — so a sentence offering
+`execute { "command": … }` there would have been exempted by a rule that only asked whether the
+name was declared. The exemption therefore holds only where the prose neither calls it "the `X`
+tool" nor opens a call with it, which are the two shapes every leak here actually had. Measured
+2026-10-05: those two schemas are the whole overlap between declared values and tool names on the
+75-tool surface.
+
+**And the walk reads `input_schema`, not the source, because the two are not the same set.**
+`schemars` 1.2.2 holds back no summary line, so an attached doc comment arrives whole — rationale
+paragraphs included, which is its own token-budget wart. But a `#[serde(flatten)]`'d type's own
+comment is not attached at all: of the 23 strings `debug_batch`'s schema carries, every one of
+`StepAction`'s *variant* docs is there and `Check`'s own item doc is there, and not one word of
+`StepAction`'s, which is flattened into `BatchStep`. A test reading the file would have audited
+four paragraphs no client is served — and the first draft of this change did exactly that,
+rewording `StepAction`'s "`pool_diagnostics` is deliberately absent" for a client that never
+reads it. That edit was reverted: naming the tool is correct where the reader is a maintainer.
+
+**What it cost the surface**, which is the question `docs/token-budget.md` asks of any change to a
+description: the model-visible surface moved 116,374 → **116,411 B** (+37 — four notes
+against eleven pointers taken out of seven schemas), `debug_batch` 10,842 → **10,734** and still the worst single tool,
+`inputSchema` across all 75 tools −364 B and `description` +401. Group and spec figures moved with
+them in `src/toolset.rs`, `docs/tool-surface.md` and `docs/token-budget.md`;
+`every_documented_surface_figure_matches_the_served_surface` printed every one of them, which is
+how they were updated. Measured on the ARM64 guest in a fresh clone of `2fffd98` with the change
+scp'd in: `cargo test`, **1,254** unit tests and **137** `mcp_smoke` tests, 0 failed.
+
+**Where it landed:** `no_input_schema_names_a_tool_the_client_cannot_call` and
+`input_schemas_for` in `src/server.rs`'s tests, four new or extended `TOOL_NOTES` entries above
+them, the argument docs of `modules`, `crash_triage`, `driver_hazards`, `ioctl_trace`,
+`reachable_from_dispatch`, `run_to_address` and `debug_batch`, `StepAction`'s variant docs in
+`src/batch.rs`, and the schema-channel paragraph in `.claude/rules/tool-surface.md`.
