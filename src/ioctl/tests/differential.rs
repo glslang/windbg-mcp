@@ -761,11 +761,21 @@ fn routine(seed: &mut Seed) -> Routine {
 /// * a call returns over the volatile registers,
 /// * a call leaves the flags as it likes, so a branch after one is not reading the compare before.
 ///
-/// And one more since [`Flags::Settled`] widened what may sit between a compare and its branch:
-/// **a branch whose condition the flags already decide has one live edge** (`FOLLOWUPS.md` item
-/// 67). With the edge drop in `ioctl::simulate` backed out, this fails on **seed 29** — the map
-/// says `0x6dd7a9` reaches a landing one block past the one execution arrives at, which is the
-/// whole shape in one line (2026-10-05).
+/// And two more since [`Flags::Settled`] widened what may sit between a compare and its branch,
+/// both of them **a branch whose condition the flags already decide has one live edge**
+/// (`FOLLOWUPS.md` item 67) and both failing on **seed 29** — the map says `0x6dd7a9` reaches a
+/// landing one block past the one execution arrives at, which is the whole shape in one line
+/// (2026-10-05):
+///
+/// * the edge drop in `ioctl::simulate`, backed out;
+/// * and the `|| settles.is_some()` half of the flag-write test beside it, which is what makes the
+///   two zeroing idioms reach that drop at all. x86 reports `rflags_written()` of **nothing** for
+///   `xor r,r`, the outcome being statically known, so a walk reading `writes_flags` alone takes
+///   the no-flag-write path for exactly the instruction this oracle emits. That was live until
+///   review round 5, invisible because [`insn`] derived `writes_flags` from the effect — a fixture
+///   agreeing with the thing under test about a wrong answer, which is the trap its own comment
+///   warns about. The fixture mirrors iced now, so this sweep is what says the walk reads the
+///   decoder rather than the fixture.
 ///
 /// Two more were tried and are **not** reached from here, for reasons worth knowing rather than
 /// fixing by contorting the generator. Removing the copy-width rule in `source_value` changes

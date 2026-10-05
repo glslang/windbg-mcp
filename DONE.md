@@ -3610,10 +3610,28 @@ is asked of `Instruction::reads` rather than of a mnemonic list -- a branch whos
 flags' alone names no register -- which also excludes `jrcxz`, `loop` and whatever mixes the two
 later, by construction rather than by being remembered.
 
-**All three rounds found the same mistake**, which is worth more than any of them: each asked a
-question of a *classification* instead of of the thing itself. `full` for "one register" where the
+**And the fifth round found the one that mattered, by declining it.** Codex asked for `ZF` to be
+preserved across a flag write that does not touch it — `stc` after a settled idiom — which needs
+per-flag decoder information `Instruction` does not carry, and costs a branch swept both ways,
+which is the walk's default. Declined. Measuring the premise is what found the defect: `stc`
+answers `rflags_written()` of **nothing**, with `CF` in `rflags_set()`, so it never cleared
+`decided` and the example was backwards — **and so does `xor r,r`**, whose outcome x86 knows
+statically. `writes_flags` was therefore `false` for the two idioms the fold exists for, which took
+them down the no-flag-write path: the pending compare outlived them and `decided` was never set, so
+the fold was **inert on a real x86 target** while every fixture passed, the fixture having derived
+`writes_flags` from the effect. Both halves are fixed — the test is now
+`writes_flags || settles.is_some()`, and `insn` mirrors iced (`xor ah,ah` false, `xor ah,al` true)
+— and the proof is that backing the new half out fails four tests including the generated oracle on
+seed 29, where before the fixture correction it failed none. The generator's figures did not move,
+which is what says the corrections restored the behaviour the fixture had been claiming rather than
+changing an answer.
+
+**All three of the earlier rounds found the same mistake**, which is worth more than any of them:
+each asked a question of a *classification* instead of of the thing itself. `full` for "one register" where the
 question was one slice; `Effect` for "what was computed" where the carry made the spelling matter;
-`Condition` for "what this branch reads" where it describes the flags half only. The enumeration
+`Condition` for "what this branch reads" where it describes the flags half only — and round 5's is
+the fourth of them, `writes_flags` for "did this replace the flags" where it answers about run-time
+writes alone. The enumeration
 that ends it is in `decides_zero`'s own comments and was done against the pinned decoder
 (`dbgscope` 401fde3 and `iced-x86` 1.21.0, measured with a probe rather than read off a doc
 comment -- dbgscope's says the whole `loop` family carries no condition, and iced answers
