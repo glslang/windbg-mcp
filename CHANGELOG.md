@@ -216,7 +216,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   schema declares and then only the occurrences written as JSON values -- and review escaped both.
   What the mechanism bought was one description, `debug_batch`'s `steps`, and four names in it, so
   the prose gave them up and the schema kept them in each variant's `op` `const`, which is the
-  channel a client validates against. The model-visible surface moves 116,374 -> **115,985** B and
+  channel a client validates against. The model-visible surface moves 116,707 -> **116,318** B and
   `debug_batch`, still the worst single tool, 10,842 -> **10,308** -- the step catalogue the
   variants already carried being 426 B of it.
 

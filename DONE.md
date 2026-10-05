@@ -9235,14 +9235,15 @@ rewording `StepAction`'s "`pool_diagnostics` is deliberately absent" for a clien
 reads it. That edit was reverted: naming the tool is correct where the reader is a maintainer.
 
 **What it cost the surface**, which is the question `docs/token-budget.md` asks of any change to a
-description: the model-visible surface moved 116,374 → **115,985 B** (−389 — four notes added
+description: the model-visible surface moved 116,707 → **116,318 B** (−389 — four notes added
 against eleven pointers and one step catalogue removed), `debug_batch` 10,842 → **10,308** and
 still the worst single tool, `inputSchema` across all 75 tools −790 B and `description` +401. Group
 and spec figures moved with them in `src/toolset.rs`, `docs/tool-surface.md` and
 `docs/token-budget.md`; `every_documented_surface_figure_matches_the_served_surface` printed every
-one of them, which is how they were updated. Measured on the ARM64 guest in a fresh clone of
-`2fffd98` with the change scp'd in: `cargo test`, **1,254** unit tests and **137** `mcp_smoke`
-tests, 0 failed.
+one of them, which is how they were updated — and again after the rebase onto `5bdb23a`, where
+main's own VTL1 work had moved the denominator and `rmcp` had gone 3.4.1 → 3.5.0 without changing
+a single schema byte. Measured on the ARM64 guest in a clone reset to this branch: `cargo test`,
+**1,257** unit tests and **137** `mcp_smoke` tests, 0 failed.
 
 **Where it landed:** `no_input_schema_names_a_tool_the_client_cannot_call` and
 `input_schemas_for` in `src/server.rs`'s tests, four new or extended `TOOL_NOTES` entries above

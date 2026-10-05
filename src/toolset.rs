@@ -33,8 +33,8 @@
 //!   securekernel    11   15,906  captured and live VTL1 inspection and execution control
 //! ```
 //!
-//! Those bytes are a measurement of **2026-10-04** and move with any edit to a description — the
-//! whole surface they are shares of is 75 tools and 116,707 B, which is what the rows above sum to.
+//! Those bytes are a measurement of **2026-10-05** and move with any edit to a description — the
+//! whole surface they are shares of is 75 tools and 116,318 B, which is what the rows above sum to.
 //! Re-derive rather than quoting them.
 //!
 //! **Those are shares of the whole surface, and they do not sum to a narrowed one.** `crash` reads
