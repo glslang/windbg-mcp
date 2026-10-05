@@ -133,6 +133,7 @@ engine — it adds a target and leaves the current one alone. The entry records 
 - [Item 60](#60-windbg-mcp-structured-dispatch-reachability-paths-for-the-binary-ninja-bridge--done-2026-09-10) — [windbg-mcp] Structured dispatch reachability paths for the Binary Ninja bridge — done (2026-09-10)
 - [Item 63](#63-binja-windbg-mcp-decode-aarch64-clrbhb-in-instruction-text-and-analysis--done-locally-2026-09-15) — [binja-windbg-mcp] Native CLRBHB decoding and analysis — done locally (2026-09-15)
 - [Item 66](#66-windbg-mcp-the-switch-resolver-refuses-what-it-trips-over-rather-than-matching-what-a-compiler-emits--done-2026-10-05) — [windbg-mcp] The switch resolver refuses what it trips over rather than matching what a compiler emits — done (2026-10-05)
+- [Item 67](#67-windbg-mcp-a-branch-with-a-constant-condition-has-a-dead-edge-the-walk-still-reads--done-2026-10-05) — [windbg-mcp] A branch with a constant condition has a dead edge the walk still reads — done (2026-10-05)
 - [Item 70](#70-dbgscope-a-path-component-is-matched-by-folding-ascii--done-2026-09-14) — [dbgscope] A path component is matched by folding ASCII — done (2026-09-14)
 - [Item 75](#75-dbgscope--windbg-mcp-an-instructions-operands-are-not-every-register-it-reads--done-2026-09-14) — [dbgscope + windbg-mcp] An instruction's operands are not every register it reads — done (2026-09-14)
 - [Item 76](#76-dbgscope-a-fold-that-cannot-decide-one-code-unit-declines-the-whole-comparison--deleted-unbuilt-2026-09-14) — [dbgscope] A fold that cannot decide one code unit declines the whole comparison — deleted unbuilt (2026-09-14)
@@ -3488,6 +3489,108 @@ reading a register the pass did not compute.
 **Where it picks up, if it does.** `stages_in`, `stage`, `as_map` and `switch_at` in `src/ioctl.rs`
 are the whole of the recognition; `follow_table` below them reads the table and is unchanged, as
 are `folded_base`, `entry_width`, `entry_value` and `keeps_a_bound`.
+
+## 67. [windbg-mcp] A branch with a constant condition has a dead edge the walk still reads — **done** (2026-10-05)
+
+**Repo:** `windbg-mcp`.
+
+`ioctl::map_within` swept **both** edges of every conditional branch, which is what a
+path-insensitive walk does and is right wherever the condition depends on anything. It is wrong
+when the condition is a constant: `xor ecx,ecx` immediately before a `je` sets the zero flag, so
+that branch is taken for every request and its fall-through is unreachable -- and every compare the
+walk then found along it was reported with a landing, a handler and sizes, with nothing in the
+answer saying the path was hypothetical.
+
+**What landed.** `ioctl::decides_zero` answers whether a flag write fixes `ZF` for every control
+code, `simulate` keeps that answer per block, and an equality terminator reading it takes **one**
+edge rather than two: the successor the condition excludes is not pushed. A block no live edge
+reaches then gets no facts and is read with nothing believed -- which is the state `map_within`
+already reads a block the graph cannot reach at all in, so its compares name no register the walk
+is following and recover no case.
+
+- **The three idioms the entry named turned out to be two questions, and six shapes.** Both
+  operands naming one register is the single question; what differs is what has to be known about
+  it. `cmp r,r`, `sub r,r` and `xor r,r` compute zero whatever the register held, so `ZF` is set
+  and no width rule is needed. `test r,r`, `and r,r` and `or r,r` leave the register's own value,
+  so they are decided exactly where this pass has watched a `Value::Literal` into it, at
+  `FIELD_WIDTH` or wider -- the rule `scalar_of` and `compare` already apply, `test cx,cx` being a
+  statement about sixteen bits of a literal. Writing the three the entry listed as three clauses
+  would have answered for the shapes somebody thought of and nothing for `and r,r`, which is how
+  this module's case lists have gone short before.
+
+- **It is not a new kind of fact in `Facts`, which is what the entry predicted and priced it at.**
+  A carried-in flag state is **one path's**, and a claim that *removes* an edge has to hold on
+  every path -- the opposite join from the one `Facts::pending` gets, so the field would have had
+  to be intersected rather than unioned, and the `own_flags` asymmetry beside it is there for
+  exactly that reason (Codex raised the union half as a P1 on
+  [#439](https://github.com/glslang/windbg-mcp/pull/439)). Block-local needs no join at all: the
+  deciding write is in the same block as the terminator and therefore dominates it, so soundness
+  does not rest on a lattice argument. What that costs is a label falling between the flag write
+  and the branch, where both edges are swept -- the answer every other cross-block flag shape here
+  already gets.
+
+- **Dropping needs neither of the two things the entry said marking would need.** "A field on
+  `IoctlCase` and a sentence in every renderer" was the price of *marking*; dropping has no price,
+  because the state a dead block is then read in already existed and already recovers nothing. No
+  tool, schema, renderer or golden moved, and the diff is `src/ioctl.rs` and its generated
+  differential.
+
+- **The terminator owes one thing besides the edge, and it is the half that is easy to miss.** A
+  settled branch commits no `untracked` site. There is no test there to name -- the write that
+  settled it replaced the readings, and the one reading it can leave, `cmp r,r`'s own, names no
+  code and is not a test on one either -- so committing the pending loss would put an entry in
+  `Map::untracked`, where every entry says a branch read flags this pass could not attribute.
+  `mov ecx,r13d` / `xor ecx,ecx` / `je` is the fixture for it: the copy of the code really is
+  destroyed, and the branch really does test nothing.
+
+- **The oracle measures it, which is what the entry said closing this would be worth.**
+  `src/ioctl/tests/differential.rs` kept flag writes out from between a compare and its branch
+  because the walk could not settle one; `Flags::Settled` now puts the two zeroing idioms there.
+  With the edge drop backed out the sweep fails on **seed 29** -- the map says `0x6dd7a9` reaches a
+  landing one block past the one execution arrives at -- and with the terminator half backed out
+  the new fixture fails on the `untracked` site. Both were run (2026-10-05).
+
+- **Its figures moved down by 9%, and that is the measurement rather than a loss.** A settled
+  branch makes the **rest of the generated routine** unreachable -- the later chain links, the
+  switch and all -- so a seed that draws one has fewer cases to check *because* the walk now
+  declines to invent them. The committed sweep goes from **1,097 cases over 262 tables** to
+  **1,002 over 248** on its 1,024 seeds; run wide at **65,536 seeds** it reports **65,210 cases
+  over 14,628 tables** with no mismatches, in 8.85s (1.51s release) against 0.19s for the
+  committed one. Item 66 could hold its rewrite to *identical* figures, which is the only form in
+  which a generator says a rewrite lost nothing; this item cannot be held that way, its whole point
+  being that some of those cases were never real -- so what stands in for it is the stated
+  direction and the named seed above.
+
+- **And a real driver's answer does not move at all, which is the result to expect rather than a
+  null one.** A compiler cannot emit a flag write between a compare and its branch -- its own
+  branch would break -- so a routine with one is hand-written or obfuscated, and the fold should be
+  inert on compiled code. Measured as `.claude/rules/measurement-provenance.md` requires, two clean
+  named builds one commit apart (`0.21.0+gd602280e` against `0.21.0+gd8558c53`) driven against
+  driver images opened with `open_dump`: `rdyboost.sys` 10.0.26100.1 /
+  `D872CFF761A83D3D508076FA76F90027EDA1C3360CD6BF3DBE3FE5637C87F4AA`, dispatch `rdyboost+0xf6a0`,
+  **21 codes**; and `mountmgr.sys` 10.0.26100.1 /
+  `68F56A95A7CEF4D741AD18EC091B4E5055F975CDEE10E32DFE76405B0AA78872`, dispatch `mountmgr+0x17880`,
+  **48 codes**. Both maps are byte-identical across the two builds. `cargo test` with
+  `WINDBG_MCP_SMOKE_DUMP=1` is 1,249 unit tests and 137 of 156 `mcp_smoke` tests, 0 failed, on the
+  ARM64 bench.
+
+**What did *not* close, and it is the larger half of the shape.** A flag write whose result depends
+on the **code** is still swept both ways, because deciding it is deciding per request rather than
+once -- which is path sensitivity, and this module deliberately has none. `cmp eax,A` /
+`sub r13w,8` / `je` is the live case: the `sub` leaves a zero flag for exactly the codes whose low
+sixteen bits are 8, so a later link's code can take that earlier branch while the map reports it
+reaching its own landing. The generator keeps that shape out for the same reason it used to keep
+all of them out, so the oracle cannot find it either; `Flags::Settled`'s doc comment is where that
+restriction is now recorded, and it is the one worth reading before widening `decides_zero`.
+Neither is a known-`ZF` branch that is not an equality: `ja` needs `ZF=0` **and** `CF=0`, and `jbe`
+takes either, so a known zero flag settles those in one direction and the fold does not read them
+-- a bounds check whose compare the settling write replaced founds no bound and resolves no table
+anyway, so nothing is lost by stopping at equality.
+
+**Where it picks up.** `ioctl::decides_zero` is the fold; `simulate`'s `decided`, its `settled`,
+the `Flow::Branch(_) if settled.is_some()` arm and the `dead` filter over `to` are the four places
+that read it. `a_branch_a_constant_condition_settles_has_one_live_edge` is the fixture, and
+`Flags::Settled` in `src/ioctl/tests/differential.rs` is the generator's half.
 
 ## 70. [dbgscope] A path component is matched by folding ASCII — **done** (2026-09-14)
 
