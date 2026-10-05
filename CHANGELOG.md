@@ -30,7 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   construction. And the test for *whether the flags were replaced* is
   `writes_flags || settles.is_some()`, not the field alone: x86 reports `rflags_written()` of
   nothing for `xor r,r`, the outcome being statically known, so reading the field alone sent the
-  two idioms the fold exists for down the no-flag-write path and made it inert on a real target. **No
+  two idioms the fold exists for down the no-flag-write path and made it inert on a real target. That
+  stand-in is gated on `Layout::static_outcome_hides_flag_write`, because A64's non-`S` `sub` writes
+  no flags at all and standing in for it would drop the compare a following `b.eq` is really
+  reading. **No
   compiler emits any of this** -- its own branch is what it would break -- so the answer for a
   compiled driver should not move, and does not: `rdyboost+0xf6a0` (21 codes) and
   `mountmgr+0x17880` (48 codes) are byte-identical across the two builds. What it is measured by is

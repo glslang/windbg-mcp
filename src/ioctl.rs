@@ -341,6 +341,24 @@ pub(crate) struct Layout {
     /// followed there, so a code comes from the bare displacement and every case says
     /// `proved: false`. A real limitation, reported rather than silent.
     irp_register: Option<&'static str>,
+    /// Whether this target's compare and logical instructions write the flags **whatever their
+    /// operands**, which is what lets [`decides_zero`]'s answer stand in for
+    /// `Instruction::writes_flags`.
+    ///
+    /// **x86 and x64: yes, and the decoder understates it.** `xor ecx,ecx` sets `ZF` as surely as
+    /// `xor ecx,eax` does, but iced reports a statically-known outcome in `rflags_set`/
+    /// `rflags_cleared` rather than in `rflags_written` -- measured, `xor ecx,ecx` answers
+    /// `written=[] set=[ZF|PF]` -- so `writes_flags` is `false` for exactly the idioms the fold
+    /// exists for. This field is what recovers them.
+    ///
+    /// **A64: no, and the decoder is already exact.** Only the `S` forms write the flags, and
+    /// dbgscope answers from the encoding's `S` bit, so `subs`/`ands` are `true` and `sub`/`and`
+    /// are `false`. Standing in for that would take `cmp w9,w10` / `sub w11,w11,w11` / `b.eq` for
+    /// a branch reading the `sub` -- dropping the compare the `b.eq` is really reading and settling
+    /// the branch on flags that instruction never touched. Raised as a P2 by Codex on
+    /// [#454](https://github.com/glslang/windbg-mcp/pull/454), against the round that added the
+    /// stand-in.
+    static_outcome_hides_flag_write: bool,
 }
 
 impl Layout {
@@ -355,6 +373,7 @@ impl Layout {
         status_field: 0x30,
         volatile: &["rax", "rcx", "rdx", "r8", "r9", "r10", "r11"],
         irp_register: Some("rdx"),
+        static_outcome_hides_flag_write: true,
     };
     pub(crate) const X86: Self = Self {
         current_stack_location: 0x60,
@@ -367,6 +386,7 @@ impl Layout {
         status_field: 0x18,
         volatile: &["eax", "ecx", "edx"],
         irp_register: None,
+        static_outcome_hides_flag_write: true,
     };
     /// **The same structures as [`Self::X64`] and none of the same registers.** Both are 64-bit
     /// targets, so every offset here is that layout's -- the IRP is laid out around a pointer and
@@ -401,6 +421,7 @@ impl Layout {
         ],
         // AAPCS64's second argument, which is where a dispatch routine's `Irp` arrives.
         irp_register: Some("x1"),
+        static_outcome_hides_flag_write: false,
     };
 }
 
@@ -1553,7 +1574,9 @@ fn simulate(
         // `cmc` and `bt` leave `ZF` alone, so a known flag would survive them, and this clears it
         // because `Instruction` carries no per-flag answer to ask. That costs a branch swept both
         // ways, which is the walk's default.
-        } else if instruction.writes_flags || settles.is_some() {
+        } else if instruction.writes_flags
+            || (layout.static_outcome_hides_flag_write && settles.is_some())
+        {
             chain = absorb(
                 &mut compared,
                 &mut lost,
@@ -14403,6 +14426,108 @@ mod tests {
             vec![0x222003, 0x222007],
             "while `loope` also decrements and tests `rCX`, which the flag says nothing about — so \
              both edges stay live and the code on the fall-through is still recovered"
+        );
+    }
+
+    /// A64's non-`S` arithmetic writes no flags, so it stands in for no flag write.
+    ///
+    /// `sub w11,w11,w11` computes zero whatever `w11` held — [`decides_zero`] says so, and is
+    /// right — but on A64 it leaves `NZCV` alone, so a `b.eq` after it is reading the `cmp` before
+    /// it. Letting the evaluated answer stand in for a flag write there drops that compare and
+    /// settles the branch on flags the `sub` never wrote: the case goes, and so does an edge that
+    /// is live. x86 needs the stand-in and A64 must not have it, which is why it is a property of
+    /// the [`Layout`] rather than of the instruction.
+    ///
+    /// Raised as a P2 by Codex on [#454](https://github.com/glslang/windbg-mcp/pull/454), against
+    /// the round that added the stand-in — so this is a regression caught in review rather than a
+    /// gap, and the fixture has to spell `writes_flags` itself to state it: `sub` is x86's
+    /// spelling too, where it *does* write them, and `insn` derives the field from the effect for
+    /// both. That blindness is `FOLLOWUPS.md` item 112.
+    #[test]
+    fn a64s_non_flag_setting_arithmetic_stands_in_for_no_flag_write() {
+        const LAND: u64 = DISPATCH + 0x100;
+
+        let between = |mut instruction: Instruction, writes_flags: bool| {
+            instruction.writes_flags = writes_flags;
+            let mut block = vec![
+                insn(
+                    DISPATCH,
+                    "ldr",
+                    vec![reg("x8"), pointer("x1", 0xb8)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 4,
+                    "ldr",
+                    vec![reg("w9"), mem("x8", 0x18)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 8,
+                    "mov",
+                    vec![reg("w10"), imm(3)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xc,
+                    "movk",
+                    vec![reg("w10"), imm(0x22_0000)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x10,
+                    "cmp",
+                    vec![reg("w9"), reg("w10")],
+                    Flow::Fallthrough,
+                ),
+            ];
+            block.push(instruction);
+            block.extend([
+                insn(
+                    DISPATCH + 0x20,
+                    "b.eq",
+                    Vec::new(),
+                    Flow::Branch(Some(LAND)),
+                ),
+                insn(DISPATCH + 0x24, "ret", Vec::new(), Flow::Return),
+                insn(
+                    LAND,
+                    "bl",
+                    vec![Operand::Target(0x7000)],
+                    Flow::Call(Some(0x7000)),
+                ),
+                insn(LAND + 4, "ret", Vec::new(), Flow::Return),
+            ]);
+            let found = map(
+                DISPATCH,
+                &block,
+                Layout::ARM64,
+                unreadable,
+                in_image,
+                constant_data,
+                never,
+            );
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands))
+                .collect::<Vec<_>>()
+        };
+
+        let sub = insn(
+            DISPATCH + 0x1c,
+            "sub",
+            vec![reg("w11"), reg("w11"), reg("w11")],
+            Flow::Fallthrough,
+        );
+        assert_eq!(
+            between(sub.clone(), false),
+            vec![(0x22_0003, LAND)],
+            "a `sub` without the `S` bit leaves the flags alone, so the `b.eq` reads the `cmp` and              its case is recovered"
+        );
+        assert!(
+            between(sub, true).is_empty(),
+            "while the `S` form really does replace them, and then the branch is settled and the              compare it would have read is gone — which is the answer for `subs` and must not be              the answer for `sub`"
         );
     }
 

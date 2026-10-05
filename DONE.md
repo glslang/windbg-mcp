@@ -3626,7 +3626,20 @@ seed 29, where before the fixture correction it failed none. The generator's fig
 which is what says the corrections restored the behaviour the fixture had been claiming rather than
 changing an answer.
 
-**All three of the earlier rounds found the same mistake**, which is worth more than any of them:
+**And round 6 found the regression round 5 introduced**, which is the pattern the rounds kept
+rewarding: the stand-in was unconditional, and A64's non-`S` `sub` writes no flags at all, so
+`cmp w9,w10` / `sub w11,w11,w11` / `b.eq` had the compare dropped and the branch settled on flags
+the `sub` never wrote -- a case lost *and* a live edge dropped. It is a property of the target
+rather than of the instruction, so `Layout::static_outcome_hides_flag_write` gates it: x86 needs the
+stand-in because its decoder understates a known outcome, and A64 must not have it because its
+decoder is already exact. Pinned by
+`a64s_non_flag_setting_arithmetic_stands_in_for_no_flag_write`, which has to spell `writes_flags`
+itself -- `sub` is x86's spelling too, and `insn` derives the field from the effect for both. That
+blindness is filed as item 112 rather than fixed here: it is the A64 half of round 5's correction,
+its blast radius is 55 fixtures, and what it would correct is a fixture's claim rather than the
+walk's answer.
+
+**All four of the earlier rounds found the same mistake**, which is worth more than any of them:
 each asked a question of a *classification* instead of of the thing itself. `full` for "one register" where the
 question was one slice; `Effect` for "what was computed" where the carry made the spelling matter;
 `Condition` for "what this branch reads" where it describes the flags half only — and round 5's is
