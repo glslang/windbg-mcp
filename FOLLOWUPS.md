@@ -92,6 +92,7 @@ line is simply open.
 - [Item 106](#106-windbg-mcp-a-tool-group-every-caller-pays-for-and-few-can-use) — [windbg-mcp] A tool group every caller pays for and few can use — **blocked**
 - [Item 108](#108-windbg-mcp-a-kmdf-drivers-real-callbacks--step-1-landed-the-frameworks-per-device-config-is-what-is-left) — [windbg-mcp] A KMDF driver's real callbacks — step 1 landed, the framework's per-device config is what is left
 - [Item 110](#110-windbg-mcp-initialized-secure-kernel-stopstep--hardening-remains) — [windbg-mcp] Initialized Secure Kernel stop/step — hardening remains
+- [Item 112](#112-windbg-mcp-the-ioctl-fixtures-writes_flags-is-architecture-blind) — [windbg-mcp] The IOCTL fixture's `writes_flags` is architecture-blind
 
 ## 2. [dbgscope] Typed write primitives
 
@@ -2387,6 +2388,42 @@ The gated route in full — its bench facts, device-contract recovery and binary
 private plan at `target/private/vtl1-kernel-controlled-stop-plan.md`. It is deliberately untracked,
 and the guest configuration, disk lineage and host component detail stay there rather than in this
 public repository.
+
+## 112. [windbg-mcp] The IOCTL fixture's `writes_flags` is architecture-blind
+
+`insn` in `src/ioctl.rs`'s test module derives `writes_flags` from the [`Effect`] it assigned, so
+every spelling that maps to `Effect::Subtract` writes the flags in a fixture. That is right for x86
+and **wrong for A64**, where only the `S` forms do: dbgscope answers from the encoding's `S` bit, so
+a real `sub w10,w9,#K` writes none and a real `subs` writes them. The two architectures share the
+`sub`, `add` and `and` spellings, so the field cannot be derived from the mnemonic either.
+
+Found while closing item 67 (`DONE.md`), whose regression test needed one A64 instruction with the
+honest answer and sets `writes_flags` on it by hand rather than teaching `insn` the rule --
+`a64s_non_flag_setting_arithmetic_stands_in_for_no_flag_write`.
+
+- **What is not known, and is the whole of the item:** whether any *existing* A64 fixture relies on
+  a non-`S` `sub` leaving a pending compare that a flag-reading branch then consumes. There are 55
+  three-operand arithmetic fixtures in the module and the two sampled while finding this both end
+  in `cbz`, which reads the **register** through `folded_compare` and so is unaffected -- that being
+  the shape a real A64 compare chain has, per `folded_compare`'s own doc. So the suspicion is that
+  the blindness is benign today. It has not been measured, and a sample of two is not the answer.
+- **What would close it:** teach `insn` the distinction -- the honest discriminator is the operand
+  **arity**, exact against both decoders since A64's `sub`/`add`/`and` are three-operand and x86 has
+  no three-operand form, while A64's two-operand `cmp` and `tst` aliases map to `Effect::Compare`
+  and `Effect::Test` and do write them -- then run the suite and read what fails. A fixture that
+  fails is a shape no A64 target produces and wants rewriting to `cbz` or to the `S` spelling; one
+  that passes was never relying on it.
+- **Why deferred:** it is a change to the one constructor every fixture in a 20,000-line module goes
+  through, its blast radius is 55 call sites, and the thing it would correct is a fixture's *claim*
+  rather than the walk's answer. Item 67's own round 5 is the argument for doing it: a fixture that
+  derived `writes_flags` from the effect hid a defect that made that whole change inert on x86, and
+  the fix there was to make `insn` mirror iced for the x86 half. This is the A64 half of the same
+  correction, and leaving the two halves in different states is how the next reader gets it wrong.
+
+**Where it picks up.** `insn`'s `writes_flags` field and `statically_zero` beside it
+(`src/ioctl.rs`), the three-operand fixtures reachable from `grep -n 'vec!\[reg("[wx]'`, and
+`Layout::static_outcome_hides_flag_write`, which is the production side of the same distinction and
+is already exact.
 
 ## Where these items came from
 
