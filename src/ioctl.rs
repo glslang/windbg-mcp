@@ -1561,11 +1561,28 @@ fn simulate(
     // at all, so those keep both edges -- and a bounds check whose compare the settling write
     // replaced founds no bound and resolves no table anyway. Read twice below, by the terminator
     // and by the edges.
-    let settled = last.and_then(|last| match (decided, last.flow, last.condition) {
-        (Some(zero), Flow::Branch(_), Some(Condition::Equal)) => Some(zero),
-        (Some(zero), Flow::Branch(_), Some(Condition::NotEqual)) => Some(!zero),
-        _ => None,
-    });
+    let settled = last
+        // **A conditional branch that reads a register is not reading the flags alone**, and
+        // `Condition` is not the field that says so: x86's `loope`/`loopne` carry `Equal` and
+        // `NotEqual` *and* require `--rCX != 0`, so a known `ZF` answers half the question and the
+        // counter decides the rest -- which makes dropping an edge there a real case lost, in the
+        // one direction this module is arranged against. Raised as a P2 by Codex on
+        // [#454](https://github.com/glslang/windbg-mcp/pull/454).
+        //
+        // **Asked of the reads rather than of a mnemonic list**, which is both shorter and
+        // stronger: a branch whose outcome is the flags' alone names no register, so `jrcxz`,
+        // `loop` and whatever else ever mixes a counter into a flag condition are excluded by
+        // construction rather than by being remembered. Measured against the decoder rather than
+        // read off its doc comment, which says the whole `loop` family carries no condition and is
+        // right about `loop` and `jrcxz` only -- iced answers `cond=e reads=[RCX]` for `loope` and
+        // `cond=e reads=[]` for `je`. A64 has no such branch at all: `cbz`/`cbnz`/`tbz`/`tbnz`
+        // read a register and carry no condition, and `b.eq` names only its target.
+        .filter(|last| last.reads.is_empty())
+        .and_then(|last| match (decided, last.flow, last.condition) {
+            (Some(zero), Flow::Branch(_), Some(Condition::Equal)) => Some(zero),
+            (Some(zero), Flow::Branch(_), Some(Condition::NotEqual)) => Some(!zero),
+            _ => None,
+        });
     // The terminator reads the flags the block left and decides where control goes.
     if let Some(last) = last {
         match last.flow {
@@ -4826,6 +4843,13 @@ mod tests {
         let condition = match mnemonic {
             "je" | "jz" | "b.eq" => Some(Condition::Equal),
             "jne" | "jnz" | "b.ne" => Some(Condition::NotEqual),
+            // **x86's counter branches carry a condition and are not the flags' alone**, which is
+            // the shape the settled-edge rule has to exclude -- and a fixture giving them no
+            // condition could not state that rule. Measured against iced rather than taken from
+            // dbgscope's doc comment, which says the whole `loop` family has none: `loope` answers
+            // `e` and `loopne` answers `ne`, while `loop` and `jrcxz` really do answer `None`.
+            "loope" | "loopz" => Some(Condition::Equal),
+            "loopne" | "loopnz" => Some(Condition::NotEqual),
             // `b.hi` is A64's `ja`, and it is the branch a switch's bounds check leaves on.
             "ja" | "jnbe" | "b.hi" => Some(Condition::UnsignedAbove),
             "jae" | "jnb" | "jnc" => Some(Condition::UnsignedAboveOrEqual),
@@ -4859,6 +4883,10 @@ mod tests {
         let writes: Vec<RegisterOperand> = match (mnemonic, effect) {
             // `push rax` reads `rax` and writes `rsp`, which nothing here tracks.
             (_, Effect::Compare | Effect::Test | Effect::Push) => Vec::new(),
+            // **The counter branches read and write `rCX` and name it nowhere**, which iced
+            // reports as one `ReadWrite` access -- so it is in both this list and `reads` below,
+            // and the first-operand rule would say they touch nothing.
+            ("loope" | "loopz" | "loopne" | "loopnz" | "loop" | "jrcxz", _) => vec![named("rcx")],
             // **A64's compare-and-branch reads a register and writes none**, which the first-
             // operand rule below would get backwards -- and a fixture saying `cbz w9` writes `w9`
             // would clear the very fact the branch is about, so the test would pass for having
@@ -4910,6 +4938,10 @@ mod tests {
             let mut reads: Vec<RegisterOperand> = match mnemonic {
                 "mul" | "div" => vec![named("rax")],
                 "push" | "pop" | "ret" => vec![named("rsp")],
+                // The counter the branch tests, which it names nowhere. This is the field the
+                // settled-edge rule asks, so a fixture leaving it empty would fold a `loope`
+                // and pass for having nothing to find.
+                "loope" | "loopz" | "loopne" | "loopnz" | "loop" | "jrcxz" => vec![named("rcx")],
                 _ => Vec::new(),
             };
             // A destination that is only written: the copies, and `pop`. Everything else here
@@ -14143,6 +14175,102 @@ mod tests {
             )])),
             vec![(0x222003, LIVE + 0x20), (0x222007, FALLEN)],
             "a subtract-with-borrow of a register from itself is decided by the carry"
+        );
+    }
+
+    /// A branch that reads a **counter** as well as the flags is not settled by the flags.
+    ///
+    /// `loope` is `ZF` *and* `--rCX != 0`, and the decoder's `Condition` says only the first half —
+    /// it answers `Equal` for `loope` exactly as it does for `je`. So a known zero flag settles a
+    /// `je` outright and settles nothing about a `loope`, whose counter can take the other edge
+    /// whatever the flag holds; dropping that edge would lose the cases along it with nothing in
+    /// the answer saying so. The two arms here differ only in the branch, which is what makes this
+    /// about the instruction rather than about the idiom in front of it.
+    ///
+    /// Raised as a P2 by Codex on [#454](https://github.com/glslang/windbg-mcp/pull/454). The rule
+    /// is asked of `Instruction::reads` rather than of a mnemonic list, measured: iced reports
+    /// `reads=[RCX]` for `loope` and `reads=[]` for `je`.
+    #[test]
+    fn a_counter_branch_is_not_settled_by_the_zero_flag() {
+        const LIVE: u64 = DISPATCH + 0x40;
+        const FALLEN: u64 = DISPATCH + 0x80;
+        const HANDLER: u64 = 0x7000;
+
+        let branching_with = |mnemonic: &str| {
+            let mut block = prologue(DISPATCH);
+            block.extend([
+                insn(
+                    DISPATCH + 8,
+                    "xor",
+                    vec![reg("ecx"), reg("ecx")],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xb,
+                    mnemonic,
+                    Vec::new(),
+                    Flow::Branch(Some(LIVE)),
+                ),
+                insn(
+                    DISPATCH + 0x11,
+                    "cmp",
+                    vec![reg("r13d"), imm(0x222007)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x17,
+                    "je",
+                    Vec::new(),
+                    Flow::Branch(Some(FALLEN)),
+                ),
+                insn(DISPATCH + 0x1d, "ret", Vec::new(), Flow::Return),
+                insn(
+                    LIVE,
+                    "cmp",
+                    vec![reg("r13d"), imm(0x222003)],
+                    Flow::Fallthrough,
+                ),
+                insn(LIVE + 6, "je", Vec::new(), Flow::Branch(Some(LIVE + 0x20))),
+                insn(LIVE + 0xc, "ret", Vec::new(), Flow::Return),
+                insn(
+                    LIVE + 0x20,
+                    "call",
+                    vec![Operand::Target(HANDLER)],
+                    Flow::Call(Some(HANDLER)),
+                ),
+                insn(LIVE + 0x25, "ret", Vec::new(), Flow::Return),
+                insn(
+                    FALLEN,
+                    "call",
+                    vec![Operand::Target(HANDLER)],
+                    Flow::Call(Some(HANDLER)),
+                ),
+                insn(FALLEN + 5, "ret", Vec::new(), Flow::Return),
+            ]);
+            let found = map(
+                DISPATCH,
+                &block,
+                Layout::X64,
+                unreadable,
+                in_image,
+                constant_data,
+                never,
+            );
+            let mut recovered: Vec<u32> = found.cases.iter().map(|case| case.code).collect();
+            recovered.sort_unstable();
+            recovered
+        };
+
+        assert_eq!(
+            branching_with("je"),
+            vec![0x222003],
+            "a `je` reads the flags and nothing else, so the zero flag settles it"
+        );
+        assert_eq!(
+            branching_with("loope"),
+            vec![0x222003, 0x222007],
+            "while `loope` also decrements and tests `rCX`, which the flag says nothing about — so \
+             both edges stay live and the code on the fall-through is still recovered"
         );
     }
 
