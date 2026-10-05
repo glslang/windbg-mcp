@@ -18,7 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   self-cancelling idioms into a known zero flag -- `cmp r,r`, `sub r,r` and `xor r,r`, whose result
   is zero whatever the register held, plus `test r,r`, `and r,r` and `or r,r` over a register this
   pass watched a literal into -- an equality branch reading one takes a single edge, and a settled
-  branch records no `untracked` site either, there being no test to name. A flag write whose result
+  branch records no `untracked` site either, there being no test to name. What that removes is the
+  **proved** fabricated case: a compare through a register recovers nothing along a dead edge,
+  while the bare `+0x18` fallback needs no fact and still publishes its code there, marked unproved
+  and taking `code_proved` off the map with it -- item 5's heuristic answering as it does in any
+  block no edge reaches, and pinned by a test of its own. A flag write whose result
   depends on the **code** is still swept both ways: `sub r13w,8` leaves a zero for exactly the codes
   ending in 8, which is decided per request rather than once, and that is path sensitivity. **No
   compiler emits any of this** -- its own branch is what it would break -- so the answer for a

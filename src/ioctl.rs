@@ -1935,10 +1935,19 @@ fn simulate(
     // the answer saying the path was hypothetical (`FOLLOWUPS.md` item 67).
     //
     // **Dropped rather than marked.** A block no live edge reaches gets no facts, and
-    // [`map_within`] already reads one of those with nothing believed -- so its compares name no
-    // register this walk is following and recover no case, which is the same answer a block the
-    // graph cannot reach at all already gets. Marking instead would be a field on every case and a
+    // [`map_within`] already reads one of those with nothing believed -- the same state a block the
+    // graph cannot reach at all is read in. Marking instead would be a field on every case and a
     // sentence in every renderer, for a path that is not there.
+    //
+    // **What that stops is the walk *carrying* something down the edge, which is not the same as
+    // the block recovering nothing.** A compare through a register recovers nothing there, no path
+    // having left a control code in one. The bare `+0x18` fallback needs no fact at all, so
+    // `cmp dword ptr [rbx+18h],CODE` in a dead block still publishes that code -- **unproved**,
+    // which also takes `code_proved` off the whole map. So what this removes is the *proved*
+    // fabricated case, and the remainder is item 5's heuristic answering as it does everywhere
+    // else. Raised as a P2 by Codex against the sentence this one replaces, which claimed the
+    // block recovered nothing;
+    // [`a_dropped_edge_does_not_suppress_the_bare_displacement_fallback`] pins both halves.
     let dead = match settled {
         // Taken whatever the request was, so nothing arrives at the instruction after it.
         //
@@ -14134,6 +14143,124 @@ mod tests {
             )])),
             vec![(0x222003, LIVE + 0x20), (0x222007, FALLEN)],
             "a subtract-with-borrow of a register from itself is decided by the carry"
+        );
+    }
+
+    /// **What a dropped edge does not suppress**, which is the limit rather than the rule.
+    ///
+    /// Dropping the edge stops the walk *carrying* anything down it, so a compare through a
+    /// register recovers nothing there — the register holds no control code, nothing having put one
+    /// in it on a path that reaches the block. It does **not** stop the bare-displacement fallback,
+    /// which needs no fact at all: `cmp dword ptr [rbx+18h],CODE` with nothing believed about `rbx`
+    /// reads as the control code by displacement alone (`FOLLOWUPS.md` item 5, the heuristic this
+    /// module's own doc bounds), so a dead block still publishes that code — as **unproved**, which
+    /// also takes `code_proved` away from the whole map.
+    ///
+    /// So what the fold removes is the *proved* fabricated case, and the shape above is the same
+    /// answer a block the graph cannot reach at all has always given. Raised as a P2 by Codex on
+    /// [#454](https://github.com/glslang/windbg-mcp/pull/454) against a sentence of this change's
+    /// own that claimed a dead block recovers no case; pinned here rather than closed, because the
+    /// only discriminator available is graph reachability and this graph deliberately has no edge
+    /// for an indirect transfer — see that round's commit message.
+    #[test]
+    fn a_dropped_edge_does_not_suppress_the_bare_displacement_fallback() {
+        const LIVE: u64 = DISPATCH + 0x40;
+        const HANDLER: u64 = 0x7000;
+
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "xor",
+                vec![reg("ecx"), reg("ecx")],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0xb, "je", Vec::new(), Flow::Branch(Some(LIVE))),
+            // The dead fall-through, with one compare of each kind in it. The displacement form
+            // needs no fact and survives; the register form has nothing to read and does not.
+            insn(
+                DISPATCH + 0x11,
+                "cmp",
+                vec![mem("rbx", 0x18), imm(0x222007)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x17,
+                "je",
+                Vec::new(),
+                Flow::Branch(Some(LIVE + 0x40)),
+            ),
+            insn(
+                DISPATCH + 0x1d,
+                "cmp",
+                vec![reg("r13d"), imm(0x222009)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x23,
+                "je",
+                Vec::new(),
+                Flow::Branch(Some(LIVE + 0x60)),
+            ),
+            insn(DISPATCH + 0x29, "ret", Vec::new(), Flow::Return),
+            // The live edge.
+            insn(
+                LIVE,
+                "cmp",
+                vec![reg("r13d"), imm(0x222003)],
+                Flow::Fallthrough,
+            ),
+            insn(LIVE + 6, "je", Vec::new(), Flow::Branch(Some(LIVE + 0x20))),
+            insn(LIVE + 0xc, "ret", Vec::new(), Flow::Return),
+            insn(
+                LIVE + 0x20,
+                "call",
+                vec![Operand::Target(HANDLER)],
+                Flow::Call(Some(HANDLER)),
+            ),
+            insn(LIVE + 0x25, "ret", Vec::new(), Flow::Return),
+            insn(
+                LIVE + 0x40,
+                "call",
+                vec![Operand::Target(HANDLER)],
+                Flow::Call(Some(HANDLER)),
+            ),
+            insn(LIVE + 0x45, "ret", Vec::new(), Flow::Return),
+            insn(
+                LIVE + 0x60,
+                "call",
+                vec![Operand::Target(HANDLER)],
+                Flow::Call(Some(HANDLER)),
+            ),
+            insn(LIVE + 0x65, "ret", Vec::new(), Flow::Return),
+        ]);
+
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
+
+        let mut recovered: Vec<(u32, bool)> = found
+            .cases
+            .iter()
+            .map(|case| (case.code, case.proved))
+            .collect();
+        recovered.sort_unstable();
+        assert_eq!(
+            recovered,
+            vec![(0x222003, true), (0x222007, false)],
+            "the live edge's traced case, and the dead edge's displacement one — and not \
+             `0x222009`, which was compared through a register no path leaves a code in: {:?}",
+            found.cases
+        );
+        assert!(
+            !found.code_proved,
+            "and one unproved case is what takes `code_proved` off the whole map"
         );
     }
 
