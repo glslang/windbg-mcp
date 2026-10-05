@@ -74,7 +74,6 @@ line is simply open.
 - [Item 62](#62-windbg-mcp--binja-windbg-mcp-capture-a-live-securekernel-handoff) — [windbg-mcp + binja-windbg-mcp] Capture a live securekernel handoff
 - [Item 64](#64-binary-ninja-upstream-verify-the-firstsetupdialog-shutdown-fix) — [Binary Ninja upstream] Verify the FirstSetupDialog shutdown fix
 - [Item 65](#65-binja-windbg-mcp-native-ultimate-validation--deferred-due-to-cost) — [binja-windbg-mcp] Native Ultimate validation — deferred due to cost
-- [Item 67](#67-windbg-mcp-a-branch-with-a-constant-condition-has-a-dead-edge-the-walk-still-reads) — [windbg-mcp] A branch with a constant condition has a dead edge the walk still reads
 - [Item 68](#68-windbg-mcp-whether-a-device-can-have-no-security-descriptor-at-all) — [windbg-mcp] Whether a device can have no security descriptor at all
 - [Item 69](#69-windbg-mcp-record-what-the-ace-kind-rules-were-measured-against) — [windbg-mcp] Record what the ACE-kind rules were measured against
 - [Item 71](#71-windbg-mcp-driver_surface-does-not-say-which-control-code-reaches-which-sink) — [windbg-mcp] `driver_surface` does not say which control code reaches which sink
@@ -1089,42 +1088,6 @@ is ready; no native comparison execution is claimed.
   comparisons, cancellation, and lifecycle behavior against the native backend.
 - **Where it picks up:** [similarity plan](docs/binja6-similarity-plan.md). Native-boundary
   test doubles do not count as Ultimate execution evidence.
-
-## 67. [windbg-mcp] A branch with a constant condition has a dead edge the walk still reads
-
-`ioctl::map_within` explores **both** edges of every conditional branch, which is what a
-path-insensitive walk does and is right whenever the condition depends on anything. It is wrong when
-the condition is a constant. `xor ecx,ecx` immediately before a `je` sets the zero flag, so that
-branch is taken for every input and its fall-through is unreachable — and every compare the walk
-then finds along it is a case the driver has, in a block execution never enters. The map reports
-those codes with landings, handlers and sizes, and nothing in the answer says the path was
-hypothetical.
-
-The walk already does half of this correctly: an instruction that writes the flags drops the pending
-compare (`instruction.writes_flags`, pinned by
-`a_compare_survives_an_instruction_that_writes_no_flags`), so no case is invented **at** the poisoned
-branch. What it does not do is stop believing the edge.
-
-- **Why deferred:** the shape needs a flag write between a compare and its branch, which a compiler
-  cannot emit — its own branch would break — so this is a hand-written or obfuscated driver rather
-  than a compiled one, and no measured driver moves. The general fix is path sensitivity, which this
-  module deliberately does not have; the specific one below is small but is a new kind of fact in
-  `Facts` and belongs on a clock somebody chooses.
-- **What would close it:** fold the self-cancelling idioms — `xor r,r`, `sub r,r`, and `test r,r`
-  against a register known to hold a literal — into a known zero flag, and drop the edge the
-  condition excludes rather than sweeping it. A case recovered in a block no live edge reaches is
-  then not recovered at all. The alternative, marking such cases rather than dropping them, needs a
-  field on `IoctlCase` and a sentence in every renderer.
-- **How it was found, which is the part worth keeping:** the differential oracle in
-  `src/ioctl/tests/differential.rs`, on seed 102 of the 512 it ran then, the first time its
-  interpreter modelled the flags the logical operations write. The walk said code `0x6dfffe` reached a landing; execution
-  took the earlier branch and never arrived. The generator now keeps flag writes out from between a
-  compare and its branch — see `noise` — so the property measures the walk's **recovery** rather
-  than this assumption, and closing this item is what would let that restriction go.
-
-**Where it picks up.** The terminator arm in `ioctl::map_within` that reads `compared` against
-`Flow::Branch`, the `writes_flags` fold above it, and `noise` in `src/ioctl/tests/differential.rs`,
-whose `flags` parameter exists only because of this.
 
 ## 68. [windbg-mcp] Whether a device can have no security descriptor at all
 

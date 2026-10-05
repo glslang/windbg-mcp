@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`ioctl_map` recovered control codes from blocks execution never enters** (`FOLLOWUPS.md`
+  item 67, in `DONE.md`). The walk swept both edges of every conditional branch, which is right
+  wherever the condition depends on anything and wrong where it is a constant: `xor ecx,ecx` before
+  a `je` sets the zero flag, so the branch is taken for every request and its fall-through is
+  unreachable -- and every compare along that fall-through was reported with a landing, a handler
+  and sizes, with nothing saying the path was hypothetical. `decides_zero` now folds the six
+  self-cancelling idioms into a known zero flag -- `cmp r,r`, `sub r,r` and `xor r,r`, whose result
+  is zero whatever the register held, plus `test r,r`, `and r,r` and `or r,r` over a register this
+  pass watched a literal into -- an equality branch reading one takes a single edge, and a settled
+  branch records no `untracked` site either, there being no test to name. A flag write whose result
+  depends on the **code** is still swept both ways: `sub r13w,8` leaves a zero for exactly the codes
+  ending in 8, which is decided per request rather than once, and that is path sensitivity. **No
+  compiler emits any of this** -- its own branch is what it would break -- so the answer for a
+  compiled driver should not move, and does not: `rdyboost+0xf6a0` (21 codes) and
+  `mountmgr+0x17880` (48 codes) are byte-identical across the two builds. What it is measured by is
+  the generated differential, whose `noise` could not put a flag write between a compare and its
+  branch while the walk could not settle one and now can: backing the edge drop out fails its sweep
+  on seed 29.
+
 - **`ioctl_map`'s documented entry width said `DWORD` where the code admits one, two or four bytes**
   (`docs/structured-results.md`). `entry_width` takes any of those so long as the load's scale
   equals the width, because A64 picks the narrowest that reaches every case --
