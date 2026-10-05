@@ -1475,6 +1475,18 @@ fn simulate(
     // the shape `FOLLOWUPS.md` item 87 is about, and the same answer every other cross-block chain
     // shape gets here.
     let mut own_flags = false;
+    // **The zero flag, where the last flag write fixed it for every control code.** A
+    // self-cancelling idiom ([`decides_zero`]) settles an equality branch outright, which makes one
+    // of that branch's edges a block execution never enters -- so this is read by the terminator to
+    // take the edge away rather than to decide anything about the code.
+    //
+    // **Block-local, and seeded `None` on purpose.** A flag state carried in is one path's, and a
+    // claim that **removes** an edge has to hold on every path -- the opposite join from the one
+    // [`Facts::pending`] gets, and the same asymmetry `own_flags` above is for. Where that costs
+    // something is a label falling between the flag write and the branch that reads it, which is
+    // answered the way every other cross-block flag shape here is answered: conservatively, by
+    // sweeping both edges.
+    let mut decided: Option<bool> = None;
     let mut blind = 0usize;
     let mut cases = Vec::new();
     let mut table = None;
@@ -1491,6 +1503,11 @@ fn simulate(
             break;
         }
         let mut chained = None;
+        // **Asked before the instruction is applied**, because the identity half of it reads the
+        // register the instruction is about to write: `and ecx,ecx` leaves `ecx` alone on the
+        // machine and `update` clears it here, so asking afterwards answers `None` for exactly the
+        // shape this is for. Consulted only where the instruction writes the flags, below.
+        let settles = decides_zero(&facts, instruction);
         let next = update(
             &mut facts,
             instruction,
@@ -1516,6 +1533,9 @@ fn simulate(
             forced = None;
             chain = None;
             own_flags = false;
+            // A callee leaves the flags as it likes, so whatever an idiom before the call settled
+            // is not what the branch after it reads.
+            decided = None;
         } else if instruction.writes_flags {
             chain = absorb(
                 &mut compared,
@@ -1527,13 +1547,34 @@ fn simulate(
                 own_flags,
             );
             own_flags = true;
+            // Replaced rather than kept, exactly as the readings are: this write is what the
+            // branch below will be reading, and [`decides_zero`] answers `None` for every write
+            // whose result depends on something.
+            decided = settles;
         }
     }
 
     let last = instructions.last();
+    // **Which way a terminator the flags already settle goes.** `Some(true)` is a branch taken for
+    // every control code and `Some(false)` one never taken, and a known **zero flag** settles an
+    // equality branch and nothing else: `ja` reads `ZF` against a carry and `jb` does not read it
+    // at all, so those keep both edges -- and a bounds check whose compare the settling write
+    // replaced founds no bound and resolves no table anyway. Read twice below, by the terminator
+    // and by the edges.
+    let settled = last.and_then(|last| match (decided, last.flow, last.condition) {
+        (Some(zero), Flow::Branch(_), Some(Condition::Equal)) => Some(zero),
+        (Some(zero), Flow::Branch(_), Some(Condition::NotEqual)) => Some(!zero),
+        _ => None,
+    });
     // The terminator reads the flags the block left and decides where control goes.
     if let Some(last) = last {
         match last.flow {
+            // **A settled branch reads nothing about the control code**, so the arm below is not
+            // its arm. There is no test here to name -- the flag write that settled it replaced the
+            // readings ([`absorb`]), and the one reading it can leave, `cmp r,r`'s own, names no
+            // code and is not a test on one either. What a settled branch owes the answer is an
+            // edge taken away, which is further down.
+            Flow::Branch(_) if settled.is_some() => {}
             Flow::Branch(target) => {
                 // **A branch reading flags an unmodelled instruction wrote.** The compare is gone,
                 // so there is a test on the control code here that cannot be named -- which is the
@@ -1836,6 +1877,12 @@ fn simulate(
     // [`Compared::chained`]), so a forced arm that outlives this block is an ordinary loss to
     // whichever branch reads it next.
     let lost = lost.or(forced);
+    // **The branch's own target**, read by the bound's edges below, by the ordinary ones, and by
+    // the settled-edge filter after them.
+    let taken = match last.map(|last| last.flow) {
+        Some(Flow::Branch(Some(target))) => index_of.get(&target).and_then(|&at| graph.holding(at)),
+        _ => None,
+    };
     if let Some(bound) = bounding {
         let target = bound.default;
         let mut bounded = carried.clone();
@@ -1864,12 +1911,6 @@ fn simulate(
         // The taken edge is the branch's own target; every other successor of a block that
         // does not branch carries nothing, which is what `equality_survives` answers `(false,
         // false)` for.
-        let taken = match last.map(|last| last.flow) {
-            Some(Flow::Branch(Some(target))) => {
-                index_of.get(&target).and_then(|&at| graph.holding(at))
-            }
-            _ => None,
-        };
         for &successor in &graph.blocks[index].successors {
             let mut edge = facts.clone();
             edge.pending = match (Some(successor) == fall_through, Some(successor) == taken) {
@@ -1885,6 +1926,33 @@ fn simulate(
             edge.lost = lost;
             to.push((successor, edge));
         }
+    }
+
+    // **The edge a settled condition excludes is not an edge.** A branch whose flags a
+    // self-cancelling idiom fixed goes one way for every control code, so its other successor is a
+    // block execution never enters -- and sweeping it is what had every compare in that block
+    // reported as a code the driver recognises, with a landing, a handler and sizes, and nothing in
+    // the answer saying the path was hypothetical (`FOLLOWUPS.md` item 67).
+    //
+    // **Dropped rather than marked.** A block no live edge reaches gets no facts, and
+    // [`map_within`] already reads one of those with nothing believed -- so its compares name no
+    // register this walk is following and recover no case, which is the same answer a block the
+    // graph cannot reach at all already gets. Marking instead would be a field on every case and a
+    // sentence in every renderer, for a path that is not there.
+    let dead = match settled {
+        // Taken whatever the request was, so nothing arrives at the instruction after it.
+        //
+        // **Unless the two edges are one block**, which the filter is for: `je` to the instruction
+        // after itself arrives there whichever way the flag went, and `cfg` has deduplicated the
+        // pair into a single successor -- so dropping it would take the only edge out of this block
+        // away rather than the dead half of two.
+        Some(true) => fall_through.filter(|fallen| Some(*fallen) != taken),
+        // Never taken, which is the same statement about the other edge.
+        Some(false) => taken.filter(|target| Some(*target) != fall_through),
+        None => None,
+    };
+    if let Some(dead) = dead {
+        to.retain(|&(successor, _)| successor != dead);
     }
 
     Run {
@@ -3060,6 +3128,62 @@ fn branches_on_the_code(facts: &Facts, instruction: &Instruction) -> bool {
         ),
         _ => false,
     })
+}
+
+/// Whether this flag write fixes the **zero flag** for every control code, and to what.
+///
+/// A branch reading flags like that is not a test on the request: it goes the same way whatever the
+/// control code was, and the edge its condition excludes is a block execution never enters. Every
+/// compare the walk then finds along that edge is a code the driver recognises in code nothing
+/// reaches, which is what `FOLLOWUPS.md` item 67 was about and what [`simulate`]'s edges read this
+/// to avoid.
+///
+/// **Two families, told apart by what they have to know.**
+///
+/// - **Self-cancelling.** `cmp r,r`, `sub r,r` and `xor r,r` compute zero whatever `r` held, so
+///   `ZF` is set and nothing about the register need be known -- and no width rule either, a self
+///   `xor` leaving zero in whatever bits the flags are computed over.
+/// - **Identity.** `test r,r`, `and r,r` and `or r,r` leave the register's own value, so `ZF` is
+///   decided exactly where this pass has watched a literal into it. At [`FIELD_WIDTH`] or wider,
+///   which is the rule [`scalar_of`] and [`compare`] already apply: `test cx,cx` is a statement
+///   about sixteen bits of a literal, and [`Value::Literal`] is the whole of one.
+///
+/// **A compiler emits neither between a compare and its branch**, which is why this is six shapes
+/// rather than an evaluator: it would break its own branch. So a routine that has one is
+/// hand-written or obfuscated, and these are what such a routine spells an unconditional branch as
+/// a conditional one with. Anything past them -- an `add r,K` over a register holding a literal, a
+/// flag write whose result depends on the **code** -- is a constant folder or path sensitivity, and
+/// this module deliberately has neither. The cost of stopping here is the conservative one: a
+/// branch this cannot settle keeps both its edges, which is what the whole walk does.
+///
+/// **And a conditional compare cannot reach this**, which matters because it is the one flag write
+/// here whose result already depends on the flags it was handed: `ccmp` leaves either its own
+/// comparison or the `nzcv` the encoding carries, and the decoder files it under [`Effect::Other`]
+/// -- not a family below. [`absorb`] is where a chain is read instead.
+fn decides_zero(facts: &Facts, instruction: &Instruction) -> Option<bool> {
+    // The two values the flags are computed over, which are the **last two** operands on both
+    // encodings: x86's destination and source, and A64's two sources (`sub w9,w8,w8`). Taking
+    // operand zero would answer for `sub w9,w9,w8`, where the register named twice is the one being
+    // written rather than one of the pair.
+    let [.., left, right] = instruction.operands.as_slice() else {
+        return None;
+    };
+    let (Operand::Register(left), Operand::Register(right)) = (left, right) else {
+        return None;
+    };
+    if left.full != right.full {
+        return None;
+    }
+    match instruction.effect {
+        Effect::Compare | Effect::Subtract | Effect::BitXor => Some(true),
+        Effect::Test | Effect::BitAnd | Effect::BitOr if left.width >= FIELD_WIDTH => {
+            match facts.registers.get(&left.full) {
+                Some(Value::Literal(value)) => Some(*value == 0),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 fn compare(
@@ -13749,6 +13873,173 @@ mod tests {
             between("add").cases.is_empty(),
             "and an `add` is what the branch would then be reading: {:?}",
             between("add").cases
+        );
+    }
+
+    /// A branch whose condition the flags already decide has **one** live edge.
+    ///
+    /// `xor ecx,ecx` sets the zero flag, so the `je` after it is taken for every control code and
+    /// its fall-through is unreachable. Sweeping that edge anyway — which is what a
+    /// path-insensitive walk does, and is right wherever the condition depends on anything — has
+    /// every compare along it reported as a code the driver recognises, with a landing, a handler
+    /// and sizes, and nothing in the answer saying the path was hypothetical (`FOLLOWUPS.md`
+    /// item 67).
+    ///
+    /// Three arms, and the third is the one that says what the rule is about. A `test` of a
+    /// register holding a literal settles the branch the **other** way, so the edge that dies is
+    /// the branch's own target rather than its fall-through; and an `add` over a register this walk
+    /// has no value for settles nothing, so both edges are swept, which is the answer every flag
+    /// write got before this rule and the answer every undecidable one still gets.
+    ///
+    /// **A compiler cannot emit any of this** — a flag write between a compare and its branch would
+    /// break its own branch — so this is a hand-written or obfuscated routine. The reason to answer
+    /// it is that the walk's answer for one was not short but **invented**:
+    /// `src/ioctl/tests/differential.rs` found it by executing a generated routine, and its `noise`
+    /// is what pins the same rule end to end.
+    #[test]
+    fn a_branch_a_constant_condition_settles_has_one_live_edge() {
+        const LIVE: u64 = DISPATCH + 0x40;
+        const FALLEN: u64 = DISPATCH + 0x80;
+        const HANDLER: u64 = 0x7000;
+
+        let settled_by = |between: Vec<Instruction>| {
+            let mut block = prologue(DISPATCH);
+            block.extend(between);
+            block.extend([
+                insn(DISPATCH + 0x10, "je", Vec::new(), Flow::Branch(Some(LIVE))),
+                // The fall-through, which a branch taken for every code never reaches.
+                insn(
+                    DISPATCH + 0x16,
+                    "cmp",
+                    vec![reg("r13d"), imm(0x222007)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x1c,
+                    "je",
+                    Vec::new(),
+                    Flow::Branch(Some(FALLEN)),
+                ),
+                insn(DISPATCH + 0x22, "ret", Vec::new(), Flow::Return),
+                // And the taken edge, which a branch that is never taken never reaches. Both sides
+                // carry a compare of their own, so each arm below says which of the two the walk
+                // believed rather than merely that it reported less.
+                insn(
+                    LIVE,
+                    "cmp",
+                    vec![reg("r13d"), imm(0x222003)],
+                    Flow::Fallthrough,
+                ),
+                insn(LIVE + 6, "je", Vec::new(), Flow::Branch(Some(LIVE + 0x20))),
+                insn(LIVE + 0xc, "ret", Vec::new(), Flow::Return),
+                insn(
+                    LIVE + 0x20,
+                    "call",
+                    vec![Operand::Target(HANDLER)],
+                    Flow::Call(Some(HANDLER)),
+                ),
+                insn(LIVE + 0x25, "ret", Vec::new(), Flow::Return),
+                insn(
+                    FALLEN,
+                    "call",
+                    vec![Operand::Target(HANDLER)],
+                    Flow::Call(Some(HANDLER)),
+                ),
+                insn(FALLEN + 5, "ret", Vec::new(), Flow::Return),
+            ]);
+            map(
+                DISPATCH,
+                &block,
+                Layout::X64,
+                unreadable,
+                in_image,
+                constant_data,
+                never,
+            )
+        };
+        let codes = |found: &Map| {
+            let mut recovered: Vec<(u32, u64)> = found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands))
+                .collect();
+            recovered.sort_unstable();
+            recovered
+        };
+
+        assert_eq!(
+            codes(&settled_by(vec![insn(
+                DISPATCH + 8,
+                "xor",
+                vec![reg("ecx"), reg("ecx")],
+                Flow::Fallthrough,
+            )])),
+            vec![(0x222003, LIVE + 0x20)],
+            "a self-exclusive-or leaves zero, so the `je` is taken whatever the code was and the \
+             compare on its fall-through is in a block execution never enters"
+        );
+
+        assert_eq!(
+            codes(&settled_by(vec![
+                insn(
+                    DISPATCH + 8,
+                    "mov",
+                    vec![reg("ecx"), imm(1)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xb,
+                    "test",
+                    vec![reg("ecx"), reg("ecx")],
+                    Flow::Fallthrough,
+                ),
+            ])),
+            vec![(0x222007, FALLEN)],
+            "and a `test` of a register holding one clears the flag, which takes the branch's own \
+             target away instead"
+        );
+
+        assert_eq!(
+            codes(&settled_by(vec![insn(
+                DISPATCH + 8,
+                "add",
+                vec![reg("ecx"), imm(1)],
+                Flow::Fallthrough,
+            )])),
+            vec![(0x222003, LIVE + 0x20), (0x222007, FALLEN)],
+            "while an `add` over a register this walk has no value for settles nothing, and both \
+             edges are swept"
+        );
+
+        // **And a settled branch is not a test the map should mark**, which is the terminator's
+        // half of the rule rather than the edges'. `mov ecx,r13d` / `xor ecx,ecx` destroys a copy
+        // of the control code, so the walk has a pending loss when the branch below it is read --
+        // and committing that loss would put the `xor` in [`Map::untracked`], where every entry
+        // says a branch read flags this pass could not attribute to a code. Nothing was attributed
+        // here because nothing was tested: the branch goes to one place for every request.
+        let destroyed = settled_by(vec![
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("ecx"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xb,
+                "xor",
+                vec![reg("ecx"), reg("ecx")],
+                Flow::Fallthrough,
+            ),
+        ]);
+        assert_eq!(
+            codes(&destroyed),
+            vec![(0x222003, LIVE + 0x20)],
+            "the live edge is read with the code still in `r13d`"
+        );
+        assert!(
+            destroyed.untracked.is_empty(),
+            "and the branch tested nothing, so there is no site where the list went short: {:?}",
+            destroyed.untracked
         );
     }
 

@@ -250,15 +250,17 @@ impl Machine {
         // agreed with here.
         //
         // **Everything that writes them is in this list, whatever the generator can currently
-        // put where a branch reads it.** `noise` keeps a flag write out from between a compare and
-        // its branch, so today nothing here reaches a conditional that is not the compare's own --
-        // but a machine that is right only for the positions one vocabulary happens to use is one
-        // the next change to that vocabulary makes wrong in silence. What the omission cost when
-        // the logical operations were missing: `xor ecx,ecx` before a `je` sets the zero flag, so
-        // the branch is taken whatever the code is, and a machine still reading the compare falls
-        // through to the next case and confirms a landing execution never reaches.
-        // `the_machine_reads_the_flags_the_last_instruction_left` is what holds this, since the
-        // property above no longer can.
+        // put where a branch reads it.** A machine that is right only for the positions one
+        // vocabulary happens to use is one the next change to that vocabulary makes wrong in
+        // silence -- and that change has since been made: [`Flags::Settled`] now puts a
+        // self-cancelling write between a compare and its branch, which is a conditional reading
+        // flags that are not the compare's own. What the omission cost while the logical
+        // operations were missing from this list: `xor ecx,ecx` before a `je` sets the zero flag,
+        // so the branch is taken whatever the code is, and a machine still reading the compare
+        // falls through to the next case and **confirms** a landing execution never reaches -- an
+        // oracle wrong in the one direction that makes it useless.
+        // `the_machine_reads_the_flags_the_last_instruction_left` is what holds this directly,
+        // the generator having had no way to reach it when it was written.
         if matches!(
             instruction.effect,
             Effect::Add
@@ -358,8 +360,12 @@ impl Machine {
 /// `xor ecx,ecx` between a compare and its branch sets the zero flag, so the `je` after it is taken
 /// whatever was compared. A machine that skipped it would keep reading the compare, fall through,
 /// and agree with the walk about a landing execution never reaches -- an oracle wrong in the one
-/// direction that makes it useless. The generator deliberately never emits that shape (see
-/// [`noise`]), so this is where the rule is held.
+/// direction that makes it useless.
+///
+/// [`Flags::Settled`] now emits that shape, so the property is reachable from the sweep as well --
+/// but only for the two idioms it admits, and only where a seed draws one. This states the rule for
+/// the whole list in [`Machine::step`], which is what it was written for when the generator could
+/// not reach it at all.
 #[test]
 fn the_machine_reads_the_flags_the_last_instruction_left() {
     const TAKEN: u64 = DISPATCH + 0x100;
@@ -433,25 +439,44 @@ struct Routine {
     landings: Vec<u64>,
 }
 
+/// What a noise position may leave in the flags.
+#[derive(Clone, Copy)]
+enum Flags {
+    /// Anything this vocabulary has.
+    Any,
+    /// Only a write whose result is the same for every control code, which is what the walk can
+    /// **settle** (`ioctl::decides_zero`). This is the menu for the position between a compare and
+    /// its branch, and both halves of that are deliberate.
+    ///
+    /// A flag write there is not something a compiler emits -- its own branch would break -- so a
+    /// routine with one is hand-written or obfuscated. What it measures is the edge the walk
+    /// believes: `xor ecx,ecx` before a `je` makes the branch unconditional and the fall-through
+    /// dead, and until `FOLLOWUPS.md` item 67 closed, every case recovered along that fall-through
+    /// was one execution never reaches. The walk now drops the edge, and a routine built this way
+    /// is where that is measured end to end rather than against a fixture.
+    ///
+    /// A write whose result depends on the **code** stays out, and that is the restriction item 67
+    /// did not lift: `sub r13w,N` leaves a zero flag for exactly the codes ending in `N`, so a
+    /// branch reading it is decided per code rather than once -- which is path sensitivity, and
+    /// this module deliberately has none. The walk sweeps both edges there, correctly, and a
+    /// generator emitting one would be asserting the thing it declines to do.
+    Settled,
+}
+
 /// Instructions that do something the walk has to keep up with, dropped between the parts of a
 /// dispatch routine.
 ///
 /// Each is a shape a review finding on #305 was about: a partial write, an exchange writing its
 /// second operand, an implicit destination, a call over the volatile registers, a narrow copy.
 ///
-/// `flags` says whether this position may hold something that **writes** them. Between a compare
-/// and its branch it may not, and that is a statement about compilers rather than a convenience:
-/// a compiler cannot put a flag write there without breaking its own branch, so a routine with one
-/// is not a routine this generator is a model of. What it would measure instead is the walk's
-/// assumption that **both edges of a branch it cannot decide are live** -- `xor ecx,ecx` before a
-/// `je` makes that branch unconditional, the fall-through dead, and every case recovered along it
-/// one execution never reaches. That assumption is `FOLLOWUPS.md` item 67 and is a property of a
-/// path-insensitive walk, not of this vocabulary.
-fn noise(seed: &mut Seed, at: u64, flags: bool) -> Vec<Instruction> {
+/// `flags` says what this position may leave in them; see [`Flags`].
+fn noise(seed: &mut Seed, at: u64, flags: Flags) -> Vec<Instruction> {
     let which = match flags {
-        true => seed.below(9),
-        // The three that write no flag, and the empty one.
-        false => [0, 1, 4, 8][seed.below(4) as usize],
+        Flags::Any => seed.below(9),
+        // The three that write no flag, the empty one, and the two whose result is zero whatever
+        // the code was. One draw either way, so widening this menu moves which instruction a seed
+        // picks and not how much of the stream it consumes.
+        Flags::Settled => [0, 1, 4, 8, 2, 9][seed.below(6) as usize],
     };
     let one = |mnemonic: &str, operands: Vec<Operand>, flow: Flow| {
         vec![insn(at, mnemonic, operands, flow)]
@@ -473,6 +498,11 @@ fn noise(seed: &mut Seed, at: u64, flags: bool) -> Vec<Instruction> {
             Flow::Fallthrough,
         ),
         7 => one("mul", vec![reg("ecx")], Flow::Fallthrough),
+        // The second self-cancelling idiom, which differs from the `xor` in what it does to the
+        // register rather than in what it leaves in the flags: `sub ecx,ecx` is zero for every
+        // input too, and the walk has to read it off the pair of operands rather than off the
+        // mnemonic.
+        9 => one("sub", vec![reg("ecx"), reg("ecx")], Flow::Fallthrough),
         _ => Vec::new(),
     }
 }
@@ -545,7 +575,7 @@ fn routine(seed: &mut Seed) -> Routine {
 
     // Noise between the load and the first compare, which is where a value has to survive.
     for _ in 0..seed.below(3) {
-        listing.extend(noise(seed, at, true));
+        listing.extend(noise(seed, at, Flags::Any));
         at += 8;
     }
 
@@ -607,9 +637,13 @@ fn routine(seed: &mut Seed) -> Routine {
         ));
         at += 8;
         // Noise between the compare and its branch, which a compiler really does emit -- and
-        // which is why it writes no flags: see `noise`.
+        // which is why what it may leave in the flags is restricted: see [`Flags::Settled`]. A
+        // self-cancelling write drawn here makes this `je` unconditional, so **the rest of the
+        // routine is in blocks execution never enters** -- the later links, the switch and all. A
+        // seed that draws one therefore measures fewer cases and that is the shape being measured:
+        // the walk must report none of them.
         if seed.chance(3) {
-            listing.extend(noise(seed, at, false));
+            listing.extend(noise(seed, at, Flags::Settled));
             at += 8;
         }
         listing.push(insn(at, "je", Vec::new(), Flow::Branch(Some(land))));
@@ -648,7 +682,7 @@ fn routine(seed: &mut Seed) -> Routine {
         at += 32;
         // After the bounds check has been branched on, so this one is free to write flags.
         if seed.chance(3) {
-            listing.extend(noise(seed, at, true));
+            listing.extend(noise(seed, at, Flags::Any));
             at += 8;
         }
         listing.extend([
@@ -727,6 +761,12 @@ fn routine(seed: &mut Seed) -> Routine {
 /// * a call returns over the volatile registers,
 /// * a call leaves the flags as it likes, so a branch after one is not reading the compare before.
 ///
+/// And one more since [`Flags::Settled`] widened what may sit between a compare and its branch:
+/// **a branch whose condition the flags already decide has one live edge** (`FOLLOWUPS.md` item
+/// 67). With the edge drop in `ioctl::simulate` backed out, this fails on **seed 29** — the map
+/// says `0x6dd7a9` reaches a landing one block past the one execution arrives at, which is the
+/// whole shape in one line (2026-10-05).
+///
 /// Two more were tried and are **not** reached from here, for reasons worth knowing rather than
 /// fixing by contorting the generator. Removing the copy-width rule in `source_value` changes
 /// nothing, because the destination-width filter in `update` refuses the same thing one step later
@@ -794,16 +834,27 @@ fn every_case_the_map_reports_is_one_the_machine_produces() {
     }
     // **A green run has to mean something was run.** These routines are generated, so a change to
     // the vocabulary or the seeds could quietly stop producing cases and leave this test passing
-    // over nothing. Measured at 1,097 cases over 262 resolved tables on 1,024 seeds (2026-10-05,
-    // against 1,098 before `SWITCH_CODES` took the switch's own codes out of the chain's draw);
-    // the floors are well under that and are here to catch a collapse rather than to pin a number.
+    // over nothing. Measured at **1,002 cases over 248 resolved tables** on 1,024 seeds
+    // (2026-10-05, against 1,097 over 262 before [`Flags::Settled`] widened the compare-to-branch
+    // position, and 1,098 before `SWITCH_CODES` took the switch's own codes out of the chain's
+    // draw); the floors are well under that and are here to catch a collapse rather than to pin a
+    // number.
+    //
+    // **That 9% is the measurement rather than a loss**, and it is worth knowing which way round:
+    // a settled branch makes the **rest of the routine** unreachable -- the later chain links, the
+    // switch and all -- so a seed that draws one has fewer cases to check *because* the walk now
+    // declines to invent them. Reading the number back up would mean narrowing the generator to the
+    // shapes the walk already handled.
     //
     // **And it is worth running wide when something it covers is rewritten**, which is a different
     // use of the same instrument rather than a reason to raise the number here: at **65,536
-    // seeds** it reports 74,189 cases over 15,954 tables and takes 8.8s, against 0.15s for this
-    // sweep. Item 66 held its resolver rewrite to those figures on the old code and the new -- the
-    // same numbers rather than two green runs, which is the only form in which a generator can say
-    // a rewrite lost nothing (2026-10-05).
+    // seeds** it reports 65,210 cases over 14,628 tables and takes 8.85s, against 0.19s for this
+    // sweep (release: 1.51s). Item 66 held its resolver rewrite to those figures on the old code
+    // and the new -- the same numbers rather than two green runs, which is the only form in which a
+    // generator can say a rewrite lost nothing (2026-10-05). Item 67 could not be held that way,
+    // its whole point being that some of those cases were never real, so it is held by the
+    // mutation above instead: the figures moved by a stated amount, in a stated direction, and the
+    // backed-out guard fails on a named seed.
     assert!(
         checked > 500 && tables > 50,
         "the generator stopped producing routines worth checking: {checked} cases, {tables} tables"
