@@ -14176,6 +14176,78 @@ mod tests {
             vec![(0x222003, LIVE + 0x20), (0x222007, FALLEN)],
             "a subtract-with-borrow of a register from itself is decided by the carry"
         );
+
+        // **The identity family's other answer**, which the `mov ecx,1` arm above is the mirror of:
+        // a literal that *is* zero sets the flag, so the branch is taken and the fall-through dies.
+        assert_eq!(
+            codes(&settled_by(vec![
+                insn(
+                    DISPATCH + 8,
+                    "mov",
+                    vec![reg("eax"), imm(0)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xb,
+                    "test",
+                    vec![reg("eax"), reg("eax")],
+                    Flow::Fallthrough,
+                ),
+            ])),
+            vec![(0x222003, LIVE + 0x20)],
+            "a literal of zero sets the flag the `je` reads"
+        );
+
+        // **A literal wider than the slice tested cannot arise, and this is the measurement rather
+        // than the argument.** `Value::Literal` is a `u32` and every path that records one caps
+        // itself there -- `source_value`'s immediate arm through `u32::try_from`, a register copy
+        // through `Value::carried_by`, `movk_literal` through `u32::try_from` again, and a narrow
+        // write clears the register outright -- so `mov rax,100000000h` records **nothing** and the
+        // `test eax,eax` after it settles nothing, where on the machine it would set the flag.
+        // Both edges are swept, which is the conservative direction and the walk's own default.
+        // Raised as a P2 by Codex on [#454](https://github.com/glslang/windbg-mcp/pull/454),
+        // reasoning from a literal whose high half is believed; there is no such literal.
+        assert_eq!(
+            codes(&settled_by(vec![
+                insn(
+                    DISPATCH + 8,
+                    "mov",
+                    vec![reg("rax"), imm(0x1_0000_0000)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xb,
+                    "test",
+                    vec![reg("eax"), reg("eax")],
+                    Flow::Fallthrough,
+                ),
+            ])),
+            vec![(0x222003, LIVE + 0x20), (0x222007, FALLEN)],
+            "an immediate that does not fit a `ULONG` leaves no literal to read, so nothing is \
+             settled and both edges are swept"
+        );
+
+        // **And the slice has to be at least the literal's width**, which is the guard that makes
+        // the arm above's reasoning complete rather than lucky: `test ax,ax` reads two bytes of a
+        // four-byte value, so what it sets the flag from is not the value this pass recorded.
+        assert_eq!(
+            codes(&settled_by(vec![
+                insn(
+                    DISPATCH + 8,
+                    "mov",
+                    vec![reg("eax"), imm(0)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xb,
+                    "test",
+                    vec![reg("ax"), reg("ax")],
+                    Flow::Fallthrough,
+                ),
+            ])),
+            vec![(0x222003, LIVE + 0x20), (0x222007, FALLEN)],
+            "a narrow test is a statement about part of the literal, so it settles nothing"
+        );
     }
 
     /// A branch that reads a **counter** as well as the flags is not settled by the flags.
