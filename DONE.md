@@ -132,6 +132,7 @@ engine — it adds a target and leaves the current one alone. The entry records 
 - [Item 57](#57-windbg-mcp-ioctl_trace-installs-a-breakpoint-and-reports-nothing-about-it--done-2026-09-02) — [windbg-mcp] `ioctl_trace` installs a breakpoint and reports nothing about it — done (2026-09-02)
 - [Item 60](#60-windbg-mcp-structured-dispatch-reachability-paths-for-the-binary-ninja-bridge--done-2026-09-10) — [windbg-mcp] Structured dispatch reachability paths for the Binary Ninja bridge — done (2026-09-10)
 - [Item 63](#63-binja-windbg-mcp-decode-aarch64-clrbhb-in-instruction-text-and-analysis--done-locally-2026-09-15) — [binja-windbg-mcp] Native CLRBHB decoding and analysis — done locally (2026-09-15)
+- [Item 66](#66-windbg-mcp-the-switch-resolver-refuses-what-it-trips-over-rather-than-matching-what-a-compiler-emits--done-2026-10-05) — [windbg-mcp] The switch resolver refuses what it trips over rather than matching what a compiler emits — done (2026-10-05)
 - [Item 70](#70-dbgscope-a-path-component-is-matched-by-folding-ascii--done-2026-09-14) — [dbgscope] A path component is matched by folding ASCII — done (2026-09-14)
 - [Item 75](#75-dbgscope--windbg-mcp-an-instructions-operands-are-not-every-register-it-reads--done-2026-09-14) — [dbgscope + windbg-mcp] An instruction's operands are not every register it reads — done (2026-09-14)
 - [Item 76](#76-dbgscope-a-fold-that-cannot-decide-one-code-unit-declines-the-whole-comparison--deleted-unbuilt-2026-09-14) — [dbgscope] A fold that cannot decide one code unit declines the whole comparison — deleted unbuilt (2026-09-14)
@@ -3406,6 +3407,86 @@ The companion's 197 tests pass, including ten new package tests. The app bundle 
 normal profile were not modified. Older-build exporter fallback remains in place.
 Upstream submission and eventual removal of the replacement are subsequent work;
 items 61, 62, 64 and 65 retain their separate closure conditions.
+
+## 66. [windbg-mcp] The switch resolver refuses what it trips over rather than matching what a compiler emits — **done** (2026-10-05)
+
+**Repo:** `windbg-mcp`.
+
+`ioctl::follow_table` reasoned **backwards** from an indirect jump: it walked the block for
+whatever defined the register, accepted a shape it recognised, and refused when something stopped
+it. That is the wrong way round for a pass whose answer is published as fact -- every instruction
+the walk had not been told about was a hole that failed toward a *resolved* table, so the rule list
+grew one review round at a time: one fold and not two, a `DWORD` entry and not a `QWORD`, no `call`
+in the chain, no second byte map, a pointer-width copy, a bound read at the load.
+
+**What landed.** The stages a switch is made of are matched **forwards** over the block, in one
+pass. `ioctl::stages_in` answers what each register holds -- nothing, a value one of the stages
+left there (`Held::Read`), or a muddle (`Held::Muddled`) -- and the **decoder's write set** is what
+takes a register out of it, so an instruction this pass does not recognise ends a chain by writing
+over it rather than by being named anywhere. `switch_at` then asks one question at the jump: does
+the register it reads hold an entry this watched being loaded, through which index, with what
+folded into it. The refusals are **deleted rather than kept beside the new rules**, which was the
+whole of the ask: an `xchg` into the register, a copy that narrows it, a helper call that returns
+over it, a second fold and a second byte map are none of them named, and all of them leave the jump
+reading a register the pass did not compute.
+
+- **The three idioms turned out to be two questions, and that is what matching them forwards made
+  visible.** Whether a byte map stands in front of the load, and whether an image base is folded
+  into each entry -- four answers between them, of which this item named three: one table of
+  displacements, that table behind a byte map, and the 32-bit form that jumps through absolute
+  entries. The fourth is a dense switch *over* absolute entries, which MSVC emits in a 32-bit
+  image, and three hand-written matchers would have met it as a shape nobody had anticipated --
+  which is the failure this item was filed about. `a_dense_switch_over_absolute_entries_is_followed`
+  pins it now, and **nothing in the suite covered it before**: backing the map lookup out of the
+  absolute arm fails that test and no other.
+- **Nothing was lost, and the oracle says so in numbers rather than in a colour.** The generated
+  differential in `src/ioctl/tests/differential.rs` was run at **65,536 seeds** -- 64x its
+  committed sweep -- against the old resolver and the new one in the same clone, and reports
+  **74,189 cases over 15,954 tables with no mismatches** on each. Identical figures rather than
+  two green runs, which is the only form in which a generator can say a rewrite lost nothing. The
+  checked-in fixtures went 159 to 160 and the suite 1,247 to 1,248, green on the ARM64 bench
+  (2026-10-05).
+- **The wide run found a defect in the oracle, and it was the generator's rather than the walk's.**
+  Seed 8099 fails on **both** resolvers, which is what said so: its `cmp`/`je` recognises
+  `0x6dc001`, a code the switch below also routes, so execution leaves at the `je` while the map --
+  correctly, as a case per **site** -- reports both. The generator's own comment said the two sets
+  of codes do not overlap and nothing enforced it: a chain code is `BASE + offset` with `offset`
+  under `0x2_0000` while `SWITCHED` is `BASE + 0xc000`, so four of the 131,072 values a draw can
+  take land in the window. **It was never a flake, and the committed sweep could not have found it**: a routine is a
+  function of its seed, so seeds 0..1,024 are the same ones every run -- seed **623** draws into
+  the window on the same `0x6dc001` and emits no switch, so the property holds on it, and 8099 is
+  the first seed where both happen. `SWITCH_CODES` now bounds the switch's limit and the window the
+  chain draws outside it, from one constant so the two cannot disagree -- unconditionally, whether or
+  not a switch follows, so the committed sweep now measures **1,097 cases over 262 tables** where
+  that file's figure said 1,098, seed 623's compare being the one it loses.
+- **What is still unmatched, and deliberately.** An unshifted non-destructive A64 fold --
+  `add x10,x9,x8` / `br x10` -- is a shape the forward direction *could* name and the backwards one
+  could not: with the value in hand the other addend is the base, where `folded_base` has to infer
+  it from the destination and answers `None` for both. It stays unmatched because nothing says a
+  compiler emits it -- A64's own `mountmgr` uses the aliasing `add x8,x9,x8,lsl #2`, and the
+  shifted form is already read whatever its destination is. Widening is a clause in `folded_base`
+  plus a fixture, and the downstream guard makes it safe either way: a base register holding no
+  `Value::Address` refuses the table. So this is a decision about evidence rather than about risk.
+- **What it was waiting for, and what that bought.** Both prerequisites were in by 2026-09-12
+  ([#307](https://github.com/glslang/windbg-mcp/pull/307)): the decoder's write set
+  ([dbgscope#155](https://github.com/glslang/dbgscope/issues/155)), which is what lets one general
+  rule -- *everything an instruction writes stops being believed* -- replace the per-shape
+  refusals, and the differential oracle, which is what made "lost nothing" a measurement. Nothing
+  outside `src/ioctl.rs` changed.
+- **It is longer than what it replaced, which is worth stating because this item's own framing
+  implies otherwise.** The recognition is **169** code lines against the chain walk's **90** --
+  comments and blank lines excluded on both sides, and `follow_table`'s signature and its
+  `facts_at` closure, retained unchanged, counted on neither. What the refusals cost in rules, a
+  forward pass pays in a type: what a register holds becomes a value with a name (`Held`) rather
+  than a position in a backwards loop, and the stages that produce one are written out instead of
+  being that loop's break conditions. The trade is what the item asked for rather than a
+  concession against it -- a shape nobody anticipated ends a chain by writing over the value, and
+  no rule names it -- but *"the general statement is short, because the thing being recognised is
+  short"* was true of the statement and not of the code.
+
+**Where it picks up, if it does.** `stages_in`, `stage`, `as_map` and `switch_at` in `src/ioctl.rs`
+are the whole of the recognition; `follow_table` below them reads the table and is unchanged, as
+are `folded_base`, `entry_width`, `entry_value` and `keeps_a_bound`.
 
 ## 70. [dbgscope] A path component is matched by folding ASCII — **done** (2026-09-14)
 

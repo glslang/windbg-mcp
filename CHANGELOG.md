@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`ioctl_map`'s documented entry width said `DWORD` where the code admits one, two or four bytes**
+  (`docs/structured-results.md`). `entry_width` takes any of those so long as the load's scale
+  equals the width, because A64 picks the narrowest that reaches every case --
+  `mountmgr!MountMgrDeviceControl` has a four-byte `ldrsw` table and a single-byte `ldrsb` one,
+  feeding two different `br`s -- so that clause described a rule this tool stopped having when the
+  A64 widths landed, and a reader checking an answer against it would have expected a byte table to
+  be refused. It states both halves now: one whole entry for a table read through a register, and
+  four bytes for the 32-bit form that jumps through its own table, where nothing is folded in and an
+  entry **is** the address. Found while closing item 66, whose rewrite does not touch it.
+
+- **The differential oracle kept its chain's codes and its switch's apart in a comment and nowhere
+  else** (`src/ioctl/tests/differential.rs`). A chain code is drawn as `BASE + offset` with
+  `offset` under `0x2_0000` while the switch's own base is `BASE + 0xc000`, so four draws in
+  131,072 land on codes the switch's bounds check admits -- a routine whose `cmp`/`je` recognises a
+  code the table below also routes. Execution leaves at the `je`; the map reports a case per
+  **site**, which is the answer it documents; and the property fails on a map that is right. **It
+  was never a flake**: a routine is a function of its seed, so the committed sweep builds the same
+  1,024 routines every run -- seed **623** draws into the window and emits no switch, so the
+  property holds on it, and seed **8099**, the first where both happen, is eight times past where
+  any committed run looks. It was found by running the sweep at 65,536 seeds for item 66, where it
+  failed identically on the resolver *before* that rewrite, which is what said the defect was the
+  generator's. `SWITCH_CODES` now bounds both the
+  switch's limit and the window the chain draws outside, from one constant so the two cannot
+  disagree. The committed sweep measures **1,097 cases over 262 tables** where the figure beside it
+  said 1,098: the one case is a compare in that window whose routine emits no switch at all, the
+  rejection being unconditional.
+
 - **A jump-table base the compiler built in two instructions survives the second one**
   (`FOLLOWUPS.md` item 84, in `DONE.md`). A64 materialises a page-relative address as
   `adrp x8,<page>` / `add x8,x8,#<offset>`, and `ioctl::update` modelled `Effect::Add` only as
@@ -131,6 +158,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which published an invented case as definitive -- and the first draft of the one that keeps a dropped chain visible keyed on the
   terminator's *condition* alone, which a `ccmp` carries, so a block ending in one left no case
   and no site; the block-boundary test caught it.
+
+### Changed
+
+- **The IOCTL switch resolver matches what a compiler emits instead of refusing what it trips
+  over** (`FOLLOWUPS.md` item 66, in `DONE.md`). `ioctl::follow_table` walked **backwards** from an
+  indirect jump and refused when something stopped it, so every instruction nobody had anticipated
+  was a hole that failed toward a *resolved* table and the rule list grew a review round at a time
+  -- one fold and not two, no `call` in the chain, no second byte map, a pointer-width copy. The
+  stages a switch is made of are matched **forwards** now, in one pass over the block
+  (`ioctl::stages_in`): a register holds either nothing or a value one of the stages left there,
+  the **decoder's write set** is what takes it out again, and `switch_at` asks one question at the
+  jump -- does the register it reads hold an entry this watched being loaded. The refusals are gone
+  rather than restated: an `xchg` into the register, a copy that narrows it, a helper call that
+  returns over it and a second fold are none of them named, and all of them leave the jump reading
+  a register the pass did not compute. **Behaviour is unchanged, which is the claim that needed the
+  evidence**: the generated differential in `src/ioctl/tests/differential.rs`, run at **65,536
+  seeds** -- 64x its committed sweep -- against both resolvers in one clone, reports **74,189 cases
+  over 15,954 tables with no mismatches** on each, the same figures rather than two green runs.
+  **And the three idioms turned out to be two questions**: whether a byte map stands in front of
+  the load, and whether an image base is folded into each entry. Three of the four answers are the
+  shapes the item named; the fourth is a dense switch over *absolute* entries, which MSVC emits in
+  a 32-bit image and which three hand-written matchers would have met as a shape nobody had
+  anticipated. `a_dense_switch_over_absolute_entries_is_followed` pins it, mutation-verified
+  against the map lookup it needs, and nothing in the suite reached it before.
 
 ### Added
 
