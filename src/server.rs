@@ -7323,13 +7323,13 @@ mod tests {
     /// would have audited four paragraphs no client is served and missed nothing that is.
     ///
     /// Prose and vocabulary are collected in one pass because the second is what makes the first
-    /// readable. A `description` is prose; a `const` or `enum` value is the **caller's own
-    /// vocabulary**, and `{"op": "pool_chunk"}` is a step a `--tools debug_batch` client can take
-    /// — so a sentence naming it points at something that client can reach. Two schemas declare a
-    /// value spelled like a tool, and they are the two reasons the exemption below is narrow:
-    /// `debug_batch`'s four steps named after the tools they stand in for (`read_memory`,
-    /// `pool_chunk`, `pool_find_tag`, `pool_census`), and `set_breakpoint`'s `execute`, which is a
-    /// [`structured::WatchAccess`] and has nothing to do with the tool of that name.
+    /// readable: a `description` is prose, while a `const` or `enum` value is the **caller's own
+    /// vocabulary**, and [`points_at_tool`] needs both to tell a step from a pointer. Two schemas
+    /// declare a value spelled like a tool — `debug_batch`'s four steps named after the tools they
+    /// stand in for (`read_memory`, `pool_chunk`, `pool_find_tag`, `pool_census`), and
+    /// `set_breakpoint`'s `execute`, which is a [`structured::WatchAccess`]. Measured 2026-10-05,
+    /// those are the whole overlap between declared values and tool names on the 75-tool surface,
+    /// and only `debug_batch`'s four are named in any prose at all.
     fn input_schemas_for(
         spec: &str,
     ) -> Vec<(String, Vec<String>, std::collections::BTreeSet<String>)> {
@@ -7392,6 +7392,76 @@ mod tests {
             .collect()
     }
 
+    /// Whether this prose **points at** `tool`, rather than writing its name as one of the values
+    /// the schema declares.
+    ///
+    /// The distinction exists because a schema's vocabulary is spelled with the same words as the
+    /// tool table: `{"op": "pool_chunk"}` is a step a `--tools debug_batch` client can take, and
+    /// `set_breakpoint` declares the *value* `execute`, which is a [`structured::WatchAccess`] and
+    /// has nothing to do with the tool. Forbidding the name outright would stop either schema
+    /// documenting its own values.
+    ///
+    /// So what is exempt is **the occurrence, not the name**: every place the name is written as a
+    /// JSON value comes out of the text, and what is left is asked the ordinary question. A
+    /// sentence that writes `{"op": "pool_chunk"}` and goes on to say "the `pool_chunk` tool"
+    /// still points at a tool, and so does one naming `execute` in a schema that declares it as an
+    /// access — which is the hole in a per-schema exemption, raised on review of
+    /// [#456](https://github.com/glslang/windbg-mcp/pull/456). Scoping it per *subschema* instead
+    /// would have been the other obvious answer and is wrong here: `debug_batch`'s `steps`
+    /// description is the prose that documents the whole step vocabulary, and the `const`s it
+    /// documents are in `$defs/BatchStep` rather than under `steps`.
+    fn points_at_tool(
+        text: &str,
+        tool: &str,
+        vocabulary: &std::collections::BTreeSet<String>,
+    ) -> bool {
+        if !vocabulary.contains(tool) {
+            return names_tool(text, tool);
+        }
+        names_tool(&text.replace(&format!("\"{tool}\""), ""), tool)
+    }
+
+    /// The exemption both ways round, on the two shapes that are the whole of why it exists —
+    /// pinned here rather than only through the walk, because what the walk reads is prose nobody
+    /// is about to write the wrong way on purpose.
+    #[test]
+    fn a_declared_value_is_not_a_pointer_and_a_pointer_beside_it_still_is() {
+        let vocabulary: std::collections::BTreeSet<String> = ["pool_chunk", "execute"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        // `debug_batch` documenting its own step, and `set_breakpoint` its own access.
+        assert!(!points_at_tool(
+            r#"`{"op": "pool_chunk", "address": "{{obj}}"}` asks the allocator what it is."#,
+            "pool_chunk",
+            &vocabulary,
+        ));
+        assert!(!points_at_tool(
+            r#"`{"access": "execute", "size": 1}` watches one byte of code."#,
+            "execute",
+            &vocabulary,
+        ));
+
+        // And a pointer at the tool of that name, in prose the schema's own vocabulary does not
+        // excuse — including in the same string as a legitimate value.
+        assert!(points_at_tool(
+            r#"`{"op": "pool_chunk"}`, or the `pool_chunk` tool for one address."#,
+            "pool_chunk",
+            &vocabulary,
+        ));
+        assert!(points_at_tool(
+            "Call `execute` instead.",
+            "execute",
+            &vocabulary
+        ));
+        assert!(points_at_tool(
+            r#"Run `execute { "command": "ba r4 nt!Foo" }` for the engine's own form."#,
+            "execute",
+            &vocabulary,
+        ));
+    }
+
     /// **The same property again, on the channel the two tests above do not reach** — an
     /// argument's doc comment, which lands in the tool's `inputSchema` and not in its description
     /// (`FOLLOWUPS.md` item 52).
@@ -7411,7 +7481,11 @@ mod tests {
     /// rewrites a description per surface and nothing rewrites a schema — so rather than build a
     /// second mechanism for the same job, an argument's prose names no tool but its own and the
     /// always-served openers, and a cross-reference goes in `TOOL_NOTES`, where the all-of rule
-    /// already ships it only to the clients that can follow it. Which way each of the eleven went
+    /// already ships it only to the clients that can follow it. What makes the walk usable beside
+    /// that is [`points_at_tool`], which exempts the occurrence rather than the name — so a schema
+    /// may document the values it declares and may not point out of itself.
+    ///
+    /// Which way each of the eleven went
     /// was not a free choice either. Four were pointers at *what to call next* and became notes,
     /// one of them by extending the note already on that tool. Two were in `TOOL_NOTES` already,
     /// the leaking sentence being a second copy of what the note says — `run_to_address`'s
@@ -7429,19 +7503,10 @@ mod tests {
                     if surface.includes(tool) {
                         continue;
                     }
-                    for text in prose.iter().filter(|text| names_tool(text, tool)) {
-                        // A name this schema declares as a value is the caller's own vocabulary
-                        // rather than a pointer, and the step or access it names is one this
-                        // client can use. Two shapes are not covered by that, and both are how
-                        // the leak reads when it comes back: calling it "the `X` tool", and
-                        // opening a call with it, which is an invocation whatever any schema
-                        // declares.
-                        let as_value = vocabulary.contains(tool)
-                            && !text.contains(&format!("`{tool}` tool"))
-                            && !text.contains(&format!("`{tool} {{"));
-                        if as_value {
-                            continue;
-                        }
+                    for text in prose
+                        .iter()
+                        .filter(|text| points_at_tool(text, tool, &vocabulary))
+                    {
                         leaks.push(format!(
                             "`--tools {spec}` is not served `{tool}`, and `{name}`'s input \
                              schema names it:\n    {text}"

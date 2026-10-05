@@ -71,8 +71,12 @@ description per surface and nothing rewrites a schema, so an argument's prose na
 own and the always-served openers, and a cross-reference goes in `TOOL_NOTES`. Two things that only
 measurement says. A `description` is prose but a `const`/`enum` value is the **caller's own
 vocabulary** — `{"op": "pool_chunk"}` is a step a `--tools debug_batch` client can take, and
-`set_breakpoint` declares the *value* `execute`, which is a `WatchAccess` — so the check exempts a
-name the served schema declares, but never one called "the `X` tool" or opening a call. And what
+`set_breakpoint` declares the *value* `execute`, which is a `WatchAccess` — so `points_at_tool`
+exempts **the occurrence and not the name**: the places the name is written as a JSON value come
+out of the text and what is left is asked the ordinary question, which is why a sentence may
+document a step and may not point out of the schema beside it. Per-*subschema* scoping is the other
+obvious answer and is wrong here — `debug_batch`'s `steps` description documents the whole step
+vocabulary, whose `const`s live in `$defs/BatchStep`. And what
 reaches a client is not the set of doc comments in the file: `schemars` 1.2.2 holds back no summary
 line, so an attached comment arrives whole, but a `#[serde(flatten)]`'d type's own comment is not
 attached at all — every one of `StepAction`'s *variant* docs ships and not a word of the enum's own
