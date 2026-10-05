@@ -1284,6 +1284,7 @@
         "root": "object"
       },
       "params": [
+        "allow_transition_cr3: boolean",
         "control_transport: string",
         "dispatcher_vnd: string",
         "expected_cr3: string",

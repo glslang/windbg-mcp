@@ -1158,6 +1158,11 @@ pub struct SkLiveOpenArgs {
     pub partition_id: String,
     /// VTL1 page-table root read for this boot, decimal or `0x` hexadecimal.
     pub expected_cr3: String,
+    /// Allow a natural-flow stop to enter through a different, nonzero page-aligned CR3. This is
+    /// required for a VTL1 user-to-Secure-Kernel exception or syscall transition. The initial
+    /// paused baseline and live-memory source must still match `expected_cr3` exactly.
+    #[serde(default)]
+    pub allow_transition_cr3: bool,
     /// Virtual processor to control. Defaults to VP 0. The native event must report this VP.
     #[serde(default)]
     pub vp: Option<u32>,
@@ -4074,6 +4079,7 @@ impl WindbgServer {
                 vmwp_pid: args.vmwp_pid,
                 dispatcher_vnd,
                 target,
+                allow_transition_cr3: args.allow_transition_cr3,
                 additional_vps: Vec::new(),
             })),
         )

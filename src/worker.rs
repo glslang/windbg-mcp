@@ -11553,6 +11553,7 @@ mod tests {
                 vtl: 1,
                 expected_cr3: crate::skcontrol::HexU64(0x1000),
             },
+            allow_transition_cr3: false,
             additional_vps: Vec::new(),
         }))
     }
