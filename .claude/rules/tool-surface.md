@@ -59,6 +59,25 @@ TTD description quotes `dx @$cursession.TTD.Calls(...)`, which is the debugger c
 `dx` tool; the rule is a code span that *is* the name or opens a call with it, plus bare-if-it-has-
 an-underscore, which is what caught `step_back`'s "Reverse of step_into.".
 
+**And again for an argument's prose, which is a second channel out of the same file** (item 52).
+A doc comment on an argument lands in the tool's **`inputSchema`**, not in its description, so
+`no_description_names_a_tool_the_client_cannot_call` walked straight past it — eleven
+sentence/tool pairs across seven tools, where the item recorded one. `docs/token-budget.md` counts
+that schema inside `modelVisible` and `tool_budget.json` gives it a column, so it is model-visible
+on exactly the description's terms. `no_input_schema_names_a_tool_the_client_cannot_call` beside it
+is the walk, and it reports every leak rather than the first, because the fix for this channel's
+first failure was eleven sentences. **There is no third notes table**: `annotate` rewrites a
+description per surface and nothing rewrites a schema, so an argument's prose names no tool but its
+own and the always-served openers, and a cross-reference goes in `TOOL_NOTES`. Two things that only
+measurement says. A `description` is prose but a `const`/`enum` value is the **caller's own
+vocabulary** — `{"op": "pool_chunk"}` is a step a `--tools debug_batch` client can take, and
+`set_breakpoint` declares the *value* `execute`, which is a `WatchAccess` — so the check exempts a
+name the served schema declares, but never one called "the `X` tool" or opening a call. And what
+reaches a client is not the set of doc comments in the file: `schemars` 1.2.2 holds back no summary
+line, so an attached comment arrives whole, but a `#[serde(flatten)]`'d type's own comment is not
+attached at all — every one of `StepAction`'s *variant* docs ships and not a word of the enum's own
+(measured 2026-10-05), which is why the walk reads `input_schema` and not the source.
+
 **And the same rule again for a *result*, which is the channel that took longest to find** (item
 43). `SUMMARY_NOTES` beside `TOOL_NOTES`, appended by `annotated_report` rather than `annotate`.
 The reason it is a second table and not a wider first one is where the text is built: an opener's

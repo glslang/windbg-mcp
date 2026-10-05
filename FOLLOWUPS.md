@@ -64,7 +64,6 @@ line is simply open.
 - [Item 39](#39-windbg-mcp-the-eval-measures-single-questions-not-an-investigation) — [windbg-mcp] The eval measures single questions, not an investigation
 - [Item 47](#47-windbg-mcp--dbgscope-the-bounded-wait-is-unmeasured-on-a-ttd-replay-target) — [windbg-mcp + dbgscope] The bounded wait is unmeasured on a TTD replay target
 - [Item 50](#50-windbg-mcp-the-released-binary-is-unsigned--only-the-certificate-is-left) — [windbg-mcp] The released binary is unsigned — only the certificate is left — **half landed**
-- [Item 52](#52-windbg-mcp-the-no-description-names-a-tool-the-client-cannot-call-invariant-does-not-cover-input-schemas) — [windbg-mcp] The "no description names a tool the client cannot call" invariant does not cover **input schemas**
 - [Item 53](#53-windbg-mcp-a-break-raised-after-a-runs-stop-is-built-labels-the-result-cut-short) — [windbg-mcp] A break raised *after* a run's stop is built labels the result cut short
 - [Item 54](#54-dbgscope--windbg-mcp-modules--refresh-true--has-no-wall-clock-bound) — [dbgscope + windbg-mcp] `modules { "refresh": true }` has no wall-clock bound
 - [Item 56](#56-windbg-mcp-resolves--expr-is-a-callers-command-on-nobodys-clock) — [windbg-mcp] `resolve`'s `? <expr>` is a caller's command on nobody's clock
@@ -777,40 +776,6 @@ question `serverInfo.version` does. Four things that entry did not see:
 **Where it picks up.** The *Build & publish binary* job in `.github/workflows/release.yml`, and
 [`docs/releasing.md`](./docs/releasing.md) if the submission becomes a step.
 
-
-## 52. [windbg-mcp] The "no description names a tool the client cannot call" invariant does not cover **input schemas**
-
-**Where it came from.** Writing #83's three tools (2026-08-29). Their argument docs wanted to say
-"the handle `continue_async` reported", which is the natural sentence — and
-`no_description_names_a_tool_the_client_cannot_call` would not have caught it, because it walks
-`descriptions_for(spec)` and an argument's doc comment ends up in the **input schema**, not the
-description. The schema is model-visible: `docs/token-budget.md` counts it inside `modelVisible`,
-and `tool_budget.json` has an `inputSchema` column of its own. So a `--tools wait_for_stop` client
-would read a pointer to a tool it is refused, which is exactly what item 41 exists to prevent, on
-the one channel item 41 did not look at.
-
-**This is pre-existing, and there is at least one live instance.** `RunToAddressArgs::address` says
-"Typically a block from `reachable_from_dispatch`" (`src/server.rs`). `run_to_address` is `exec` and
-`reachable_from_dispatch` is `ioctl`, so any surface with the first and not the second — `exec`
-alone, `session,exec,crash`, the bench's `lean` — ships that pointer to a client that cannot follow
-it. #83's own tools were reworded to name no tool rather than adding a second instance while
-reporting the first.
-
-**What would close it.** Extend the walk to the input schema — `descriptions_for` already builds a
-router per spec, so the schema is in hand beside the description and it is the same `names_tool`
-predicate over a second string. Then either move the `reachable_from_dispatch` sentence into
-`TOOL_NOTES` (which appends per-tool and already has the all-of rule) or reword it, and check
-whether the fix wants a third table for *schema* notes, since `annotate` rewrites descriptions and
-nothing today rewrites a schema.
-
-**Why it was deferred.** It is a second channel with a second mechanism, and finding it in the
-middle of a feature is the wrong moment to build one: the fix has to decide whether an argument's
-prose can carry a cross-reference at all, and that decision changes how every future argument is
-documented. The immediate hazard is one sentence, on surfaces that hold `exec` without `ioctl`.
-
-**Where it picks up.** `no_description_names_a_tool_the_client_cannot_call` and `descriptions_for`
-in `src/server.rs`'s tests, `TOOL_NOTES` and `annotate` beside them, and item 41 for the argument
-about which channels a narrowed surface has to narrow.
 
 ## 53. [windbg-mcp] A break raised *after* a run's stop is built labels the result cut short
 
@@ -2452,7 +2417,9 @@ wait left one target type nobody on this bench can measure (2026-08-25), item 50
 Defender quarantining this project's own binary while the 32-bit worker was being tested
 (2026-08-26), items 52–53 from [#83](https://github.com/glslang/windbg-mcp/issues/83)'s asynchronous
 execution handles, where the invariant that stops a description naming a tool its client cannot call
-turned out to cover only half the prose a client is served (2026-08-29), and where a break arriving
+turned out to cover only half the prose a client is served (2026-08-29 — item 52 is now in
+[`DONE.md`](./DONE.md), the other half having been walked on 2026-10-05, which found eleven leaks
+where the entry recorded one), and where a break arriving
 in the microseconds after a run built its stop is recorded in that result's prose and not in its flag
 (2026-08-30), item 54 from
 [#85](https://github.com/glslang/windbg-mcp/issues/85)'s module-inventory refresh, whose engine call
