@@ -515,8 +515,29 @@ fn routine(seed: &mut Seed) -> Routine {
     // code has to reach the landing the map named for it. Two sites recognising one code makes
     // that ill-posed rather than false -- the map reports a case per **site**, which is its
     // documented answer, and the chain would simply catch the code before the switch saw it.
+    //
+    // **And it is kept apart below rather than only asserted here, which is all it was.** The
+    // chain draws its codes as `BASE + offset` with `offset` under `0x2_0000`, and `SWITCHED` is
+    // `BASE + 0xc000` -- so four of the 131,072 values an `offset` draw can take land on codes the
+    // switch's own bounds check admits, three draws in four coming from that range. A routine
+    // built that way has a `cmp`/`je` recognising a code the table below also routes: execution
+    // leaves at the `je`, the map reports both sites, which is the answer it documents, and the
+    // property fails on a map that is right.
+    //
+    // **And it was never a flake, which is the part worth knowing**: a routine is a function of its
+    // seed, so seeds 0..1,024 are the same ones every run. One of them *does* draw into the
+    // window -- **seed 623**, on `0x6dc001`, the very code seed 8099 collides on -- and its
+    // routine emits no switch at all, so nothing recognises that code twice and the property
+    // holds. That one compare is the case the figure below loses. The first seed where both happen is
+    // **8099**, past where any committed run has ever looked. It turned up on a 65,536-seed sweep
+    // run for `FOLLOWUPS.md` item 66, failing identically on the resolver *before* that rewrite,
+    // which is what said the defect was here rather than in the walk (2026-10-05).
     const BASE: u64 = 0x6d0000;
     const SWITCHED: u64 = 0x6dc000;
+    // The most indices the switch's bounds check admits, and so the width of the window the
+    // chain keeps out of. One constant for both, because two cannot disagree: `1 + below(n)` is
+    // at most `n`, so the codes the switch routes are `SWITCHED..=SWITCHED + SWITCH_CODES`.
+    const SWITCH_CODES: u64 = 3;
     let mut listing = opening(seed);
     let mut at = DISPATCH + 8;
     let mut landings = Vec::new();
@@ -570,6 +591,13 @@ fn routine(seed: &mut Seed) -> Routine {
         if already.contains(&code) {
             continue;
         }
+        // **A code the switch below also recognises is a routine this property cannot be stated
+        // about**, so it is passed over rather than emitted -- the same move the duplicate check
+        // above makes, and for the same reason. The effective code is `BASE + offset` whether or
+        // not the chain was rebased, a rebased chain comparing what `sub eax,BASE` left.
+        if (SWITCHED..=SWITCHED + SWITCH_CODES).contains(&(BASE + offset)) {
+            continue;
+        }
         already.push(code);
         listing.push(insn(
             at,
@@ -594,7 +622,7 @@ fn routine(seed: &mut Seed) -> Routine {
     let mut table_at = 0;
     let mut entries = Vec::new();
     if seed.chance(2) {
-        let limit = 1 + seed.below(3);
+        let limit = 1 + seed.below(SWITCH_CODES);
         table_at = IMAGE_BASE + 0x9000;
         listing.extend([
             insn(at, "mov", vec![reg("eax"), reg("r13d")], Flow::Fallthrough),
@@ -766,8 +794,16 @@ fn every_case_the_map_reports_is_one_the_machine_produces() {
     }
     // **A green run has to mean something was run.** These routines are generated, so a change to
     // the vocabulary or the seeds could quietly stop producing cases and leave this test passing
-    // over nothing. Measured at 1,098 cases over 262 resolved tables on 1,024 seeds (2026-09-12); the
-    // floors are well under that and are here to catch a collapse rather than to pin a number.
+    // over nothing. Measured at 1,097 cases over 262 resolved tables on 1,024 seeds (2026-10-05,
+    // against 1,098 before `SWITCH_CODES` took the switch's own codes out of the chain's draw);
+    // the floors are well under that and are here to catch a collapse rather than to pin a number.
+    //
+    // **And it is worth running wide when something it covers is rewritten**, which is a different
+    // use of the same instrument rather than a reason to raise the number here: at **65,536
+    // seeds** it reports 74,189 cases over 15,954 tables and takes 8.8s, against 0.15s for this
+    // sweep. Item 66 held its resolver rewrite to those figures on the old code and the new -- the
+    // same numbers rather than two green runs, which is the only form in which a generator can say
+    // a rewrite lost nothing (2026-10-05).
     assert!(
         checked > 500 && tables > 50,
         "the generator stopped producing routines worth checking: {checked} cases, {tables} tables"

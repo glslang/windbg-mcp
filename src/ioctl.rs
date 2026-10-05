@@ -3184,6 +3184,7 @@ struct Resolved {
 }
 
 /// The image base a compiler folds into every table entry, and where the fold stands.
+#[derive(Clone)]
 struct Fold {
     /// The register holding the base. Recorded because that -- and not the load's base -- is what
     /// execution adds to each entry; a compiler is free to use one register for both and A64's
@@ -3353,11 +3354,311 @@ fn entry_value(raw: &[u8], effect: Effect, destination: Option<u32>) -> Option<i
     Some((value as u64 & (u64::MAX >> (64 - kept))) as i64)
 }
 
+/// What a register holds while a switch's stages are matched over the block.
+///
+/// **One variant covers both tables of a dense switch**, because one instruction can be either:
+/// a byte per index is `movzx eax,byte ptr [map+rax]` and a one-byte table of entries is the same
+/// instruction. Which it is turns on what the *next* stage does with the value -- index a second
+/// table by it, or fold an image base into it and jump -- so a reading is kept and the stage that
+/// consumes it decides, rather than this guessing at the load.
+#[derive(Clone)]
+enum Held<'a> {
+    /// A value read out of a table: the load, where it stands, the memory operand it read, the
+    /// byte map that selected its index where one did, and the image base folded into it so far.
+    Read {
+        load: &'a Instruction,
+        entries: &'a MemoryOperand,
+        at_load: usize,
+        map: Option<(&'a MemoryOperand, usize)>,
+        fold: Option<Fold>,
+    },
+    /// A value a stage produced out of something it cannot be a stage **of**: a byte map read
+    /// through a case number another map already produced, a second base folded into an entry
+    /// that carries one.
+    ///
+    /// **Kept rather than forgotten, because forgetting it lets the shorter idiom match.** Two
+    /// byte maps in a row make the case number `second[first[code]]`; an entry load whose index
+    /// simply has nothing known about it reads as the one-table form, which pairs every code with
+    /// the entry some other index selects and publishes them wherever they happen to be
+    /// executable. A muddle matches no idiom, so the jump goes back unresolved instead.
+    Muddled,
+}
+
+/// The instructions one switch is made of, as the block executes them.
+///
+/// **The idioms are two questions rather than three shapes**, which is what matching them
+/// forwards makes visible: whether a byte map stands in front of the load, and whether a base is
+/// folded into each entry. A compiler's three switches are three of the four answers, and the
+/// fourth is one MSVC emits for a 32-bit image:
+///
+/// | `map` | `fold` | what it is |
+/// |---|---|---|
+/// | `None` | `Some` | one table of displacements from an image base -- `lea`/`mov`/`add`/`jmp` |
+/// | `Some` | `Some` | MSVC's dense switch: a byte per index, then that table |
+/// | `None` | `None` | the 32-bit form, `jmp dword ptr [table+index*4]` -- an entry is an address |
+/// | `Some` | `None` | a dense switch over absolute entries, which is the 32-bit form with a map |
+///
+/// Writing the first three as three matchers would have made the fourth a shape nobody had
+/// anticipated -- and it is the one combination of the two questions that no rule here has to
+/// name.
+struct Switch<'a> {
+    /// The byte map a dense switch reads first -- a byte per index, naming the case that index is
+    /// -- and where it stands in the block.
+    map: Option<(&'a MemoryOperand, usize)>,
+    /// The load that reads one entry, the memory operand it reads it through, and where it
+    /// stands.
+    load: &'a Instruction,
+    entries: &'a MemoryOperand,
+    at_load: usize,
+    /// The `add` that folds an image base into every entry. Absent where an entry is already a
+    /// whole address.
+    fold: Option<Fold>,
+}
+
+/// The byte map a stage is, where it is one: a byte per index, read with a zero-extending load.
+///
+/// **The mirror of [`keeps_a_bound`]'s exemption**, which is what carries the bounds check over
+/// this load to the one that reads the table proper -- so the two have to agree about what a map
+/// is. A sign-extending load is not this stage: a case number cannot be negative and MSVC emits
+/// `movzx`, and accepting one paired every code with the wrong target. A scale says the load is
+/// walking entries rather than bytes, and a map in front of a map is not a map -- which is the
+/// whole of what used to be a count of candidate stages, refused when it came to more than one.
+fn as_map<'a>(stage: &Held<'a>) -> Option<(&'a MemoryOperand, usize)> {
+    match stage {
+        Held::Read {
+            load,
+            entries,
+            at_load,
+            map: None,
+            fold: None,
+        } => (load.effect == Effect::Move && entries.scale == 1 && entries.size == Some(1))
+            .then_some((*entries, *at_load)),
+        _ => None,
+    }
+}
+
+/// What one instruction leaves in the register it writes, where that is one of a switch's stages.
+///
+/// **Positively, and in the order the stages run.** Every instruction this does not recognise
+/// leaves the register holding nothing -- the loop in [`stages_in`] forgets it from the decoder's
+/// write set -- so a shape nobody anticipated takes the value out of the chain rather than being
+/// stepped over. That is where this pass's list of refusals has gone: an `xchg` into the
+/// register, a copy that narrows it, a helper call that returns over it, a second fold, a second
+/// byte map. None of them is named here, and all of them leave the jump reading a register this
+/// did not compute, which is the only question [`switch_at`] asks at the end.
+fn stage<'a>(
+    instruction: &'a Instruction,
+    position: usize,
+    held: &HashMap<String, Held<'a>>,
+    layout: Layout,
+) -> Option<(String, Held<'a>)> {
+    // The destination, and only where the decoder says the instruction **writes** it: A64 names a
+    // store's *source* first, so `str w9,[x8,#0x30]` arrives here with a register in operand zero
+    // and leaves it alone -- read as a load it makes `w9` an entry of a table at `x8`. `cmp
+    // rcx,[rdx+rax*4+9000h]` is the same question on x86: it names `rcx` and writes nothing but
+    // the flags, and read as the load it turns an unrelated array into a switch table.
+    let Some(Operand::Register(written)) = instruction.operands.first() else {
+        return None;
+    };
+    if !instruction
+        .writes
+        .iter()
+        .any(|register| register.full == written.full)
+    {
+        return None;
+    }
+    match instruction.operands.get(1)? {
+        // **A load of one whole entry, indexed**: either table of a switch. [`entry_width`]
+        // settles what one entry is -- a `mov rax,qword ptr [base+index*4]` taken for this is
+        // read as two halves of one entry and a pair of addresses nobody computed.
+        Operand::Memory(entries) => {
+            let indexed = entries.index.as_ref()?;
+            if entry_width(entries).is_none()
+                || !matches!(instruction.effect, Effect::Move | Effect::MoveSigned)
+            {
+                return None;
+            }
+            let map = match held.get(&indexed.full) {
+                // The index reaches this load as the bounds check left it, which is the one-table
+                // form. Whether that check covers *this* register is [`follow_table`]'s question,
+                // asked of the facts at this position.
+                None => None,
+                // Something this walk watched being read stands in front of the load. A byte map
+                // is the first stage of a dense switch; anything else it could be -- a second
+                // map, an entry with a base already folded in -- is a muddle, and an index this
+                // cannot name makes the whole switch one.
+                Some(stage) => match as_map(stage) {
+                    Some(map) => Some(map),
+                    None => return Some((written.full.clone(), Held::Muddled)),
+                },
+            };
+            Some((
+                written.full.clone(),
+                Held::Read {
+                    load: instruction,
+                    entries,
+                    at_load: position,
+                    map,
+                    fold: None,
+                },
+            ))
+        }
+        Operand::Register(source) => {
+            // **The fold**, which [`folded_base`] reads in either architecture's shape and
+            // answers with the register the *entry* is in -- the destination on x86, where the
+            // add is destructive, and the shifted operand on A64, where it need not be. What it
+            // adds is recorded rather than the load's base, because that is what execution adds
+            // to every entry and so is what one entry is worth.
+            if let Some((base, scale, entry)) = folded_base(instruction, &written.full, layout)
+                && let Some(carried) = held.get(&entry)
+            {
+                return Some((
+                    written.full.clone(),
+                    match carried {
+                        // **One fold, and not several.** `add rcx,rdx` / `add rcx,r8` makes the
+                        // target the sum of the entry and *both*, and keeping one of them
+                        // reconstructs addresses nobody computed -- published as cases wherever
+                        // they happen to be executable.
+                        Held::Read { fold: Some(_), .. } | Held::Muddled => Held::Muddled,
+                        Held::Read {
+                            load,
+                            entries,
+                            at_load,
+                            map,
+                            fold: None,
+                        } => Held::Read {
+                            load,
+                            entries,
+                            at_load: *at_load,
+                            map: *map,
+                            fold: Some(Fold {
+                                register: base,
+                                at: position,
+                                scale,
+                            }),
+                        },
+                    },
+                ));
+            }
+            // **A copy, and copied at the target's width.** Everything from the fold to the jump
+            // is an *address*, so `mov edx,ecx` zero-extends the low half of one: the jump goes
+            // somewhere this did not compute, and the table's targets would be published for it.
+            // The **load** is the exception, and it is matched above: a table entry really is
+            // narrower than an address, and `mov eax,[table+rax*4]` really does zero-extend it on
+            // purpose.
+            let carried = held.get(&source.full)?;
+            (instruction.effect == Effect::Move
+                && written.width >= layout.pointer
+                && source.width >= layout.pointer)
+                .then(|| (written.full.clone(), carried.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// What every register holds where the block ends, as a switch's stages leave it.
+///
+/// One forward pass, which is the direction the stages run in.
+fn stages_in<'a>(instructions: &'a [Instruction], layout: Layout) -> HashMap<String, Held<'a>> {
+    let mut held: HashMap<String, Held<'a>> = HashMap::new();
+    for (position, instruction) in instructions.iter().enumerate() {
+        // **A call ends every chain, whatever it names.** A callee returns over the volatile
+        // registers, so `mov rax,[table+index*4]` / `call helper` / `jmp rax` jumps to whatever
+        // the helper returned -- and the call names no destination operand, so a pass that asks
+        // only what writes a register steps straight over it and resolves the jump from a load
+        // execution overwrote. That reports a table's worth of codes for a jump that goes
+        // somewhere else, and takes the jump out of `unresolved` where it belongs.
+        if matches!(instruction.flow, Flow::Call(_)) {
+            held.clear();
+            continue;
+        }
+        let left = stage(instruction, position, &held, layout);
+        // **Everything this instruction writes stops holding what it held**, and the decoder says
+        // what that is rather than the destination operand: `xchg edx,eax` writes `eax` as its
+        // *second* operand, and `mul ecx` writes `rax` and `rdx` and names neither. A later load
+        // into a register an earlier one wrote takes the earlier value out of the chain here,
+        // which is why the last load that reaches the jump is the one execution jumps through
+        // without this having to rank them.
+        for written in &instruction.writes {
+            held.remove(&written.full);
+        }
+        if let Some((register, value)) = left {
+            held.insert(register, value);
+        }
+    }
+    held
+}
+
+/// The switch an indirect jump reads, where the block it ends holds one.
+///
+/// Two spellings of the jump, and the stages answer for both: a register the block loaded an
+/// entry into, or -- in a 32-bit image -- the table itself as the jump's own operand, with no
+/// register in between.
+fn switch_at<'a>(
+    instructions: &'a [Instruction],
+    jump: &'a Instruction,
+    layout: Layout,
+) -> Option<Switch<'a>> {
+    let held = stages_in(instructions, layout);
+    match jump.operands.first() {
+        // **The 32-bit form jumps through the table itself**: `jmp dword ptr [table+eax*4]`, the
+        // entry a whole address rather than an offset from the image. Held to a `DWORD` and not to
+        // [`entry_width`]'s range: there is no fold here, so the entry *is* the address, and one
+        // byte of an address is not one.
+        Some(Operand::Memory(entries)) => {
+            let indexed = entries.index.as_ref()?;
+            if u32::from(entries.scale) != TABLE_ENTRY || entries.size != Some(TABLE_ENTRY) {
+                return None;
+            }
+            // A byte map reaches this form too, MSVC pairing one with a table of addresses in a
+            // 32-bit image, and the question is the same one the entry load asks: what the index
+            // holds where the table is read.
+            let map = match held.get(&indexed.full) {
+                None => None,
+                Some(stage) => Some(as_map(stage)?),
+            };
+            Some(Switch {
+                map,
+                load: jump,
+                entries,
+                at_load: instructions.len(),
+                fold: None,
+            })
+        }
+        // A register, which has to be one the stages left an entry in. **Anything else is a jump
+        // this cannot follow** -- a function pointer out of a structure, a value a callee
+        // returned, a register this walk lost -- and it goes back unresolved rather than being
+        // read as a table.
+        Some(Operand::Register(reads)) => match held.get(&reads.full)? {
+            Held::Read {
+                load,
+                entries,
+                at_load,
+                map,
+                fold,
+            } => Some(Switch {
+                map: *map,
+                load,
+                entries,
+                at_load: *at_load,
+                fold: fold.clone(),
+            }),
+            Held::Muddled => None,
+        },
+        _ => None,
+    }
+}
+
 /// Follows an indirect jump's table, when every part of it was recovered from **this block**.
 ///
 /// Three things have to hold, and each is a way a table is otherwise invented: the load has to
 /// define the register the jump reads, the index has to be one a bounds check on this path covered,
 /// and every entry has to be code in this image.
+///
+/// **Which instructions the switch is made of is [`switch_at`]'s answer**, matched forwards over
+/// the block; this reads what it names. The split is the point: recognising a shape and reading a
+/// table are different questions, and the refusals that used to stand between them accumulated on
+/// the first while reading as caution about the second.
 ///
 /// **Every register is read where the code reads it**, and the block's facts at its *jump* answer
 /// for none of them. A block is free to reuse a register after the load -- `movsxd rcx,[rbx+rax*4]`
@@ -3395,116 +3696,13 @@ fn follow_table(
         replay
     };
 
-    // **The 32-bit form jumps through the table itself**: `jmp dword ptr [table+eax*4]`, with no
-    // register in between and the entry a whole address rather than an offset from the image. Held
-    // to a `DWORD` and not to [`entry_width`]'s range: there is no fold here, so the entry *is*
-    // the address, and one byte of an address is not one.
-    let ((load, memory, at_load), added) = match jump.operands.first() {
-        Some(Operand::Memory(memory))
-            if u32::from(memory.scale) == TABLE_ENTRY
-                && memory.size == Some(TABLE_ENTRY)
-                && memory.index.is_some() =>
-        {
-            ((jump, memory, instructions.len()), None)
-        }
-        Some(Operand::Register(register)) => {
-            let mut wanted = register.full.clone();
-            let mut found = None;
-            let mut added: Option<Fold> = None;
-            for (position, instruction) in instructions.iter().enumerate().rev() {
-                // **A call ends the chain, whatever it names.** A callee returns over the volatile
-                // registers, so `mov rax,[table+index*4]` / `call helper` / `jmp rax` jumps to
-                // whatever the helper returned -- and the call names no destination operand, so a
-                // walk that asks only "what defines this register" steps straight over it and
-                // resolves the jump from a load execution overwrote. That reports a table's worth
-                // of codes for a jump that goes somewhere else, and takes the jump out of
-                // `unresolved` where it belongs.
-                if matches!(instruction.flow, Flow::Call(_)) {
-                    return None;
-                }
-                // **Only an instruction that *writes* the register continues the chain**, and the
-                // decoder says which do. A `cmp rcx,[base+rax*4+table]` reads it and writes
-                // nothing but the flags, so reading that as the load would turn an unrelated array
-                // into a table; `xchg edx,eax` writes `eax` as its *second* operand, so a walk
-                // looking only at the first would step over it and resolve the jump from a load
-                // execution had overwritten.
-                if !instruction
-                    .writes
-                    .iter()
-                    .any(|register| register.full == wanted)
-                {
-                    continue;
-                }
-                // It writes it. Either it is one of the shapes below, or this walk cannot say what
-                // is in the register and stops -- including the case where the write is not the
-                // first operand at all, which is what an `xchg` is.
-                let Some(Operand::Register(written)) = instruction.operands.first() else {
-                    return None;
-                };
-                if written.full != wanted {
-                    return None;
-                }
-                match instruction.operands.get(1) {
-                    // **And it reads one whole entry**, which is what [`entry_width`] settles: a
-                    // `mov rax,qword ptr [base+index*4]` taken for this pattern is read as two
-                    // halves of one entry and a pair of addresses nobody computed -- published as
-                    // codes if they happen to land inside the image.
-                    Some(Operand::Memory(memory))
-                        if entry_width(memory).is_some()
-                            && memory.index.is_some()
-                            && matches!(instruction.effect, Effect::Move | Effect::MoveSigned) =>
-                    {
-                        found = Some((instruction, memory, position));
-                        break;
-                    }
-                    Some(Operand::Register(source)) => {
-                        // `add rcx,rdx` folds the image base into the entry: the value being
-                        // followed is still the one in `rcx`. **Which register was added is
-                        // recorded**, because that -- and not the load's base -- is what execution
-                        // adds to every entry, and so is what one entry is *worth*, which A64
-                        // folds into the same instruction.
-                        if let Some((base, scale, entry)) =
-                            folded_base(instruction, &wanted, layout)
-                        {
-                            // **One fold, and not several.** `add rcx,rdx` / `add rcx,r8` makes
-                            // the target the sum of the entry and *both*, and keeping one of them
-                            // reconstructs addresses nobody computed -- published as cases
-                            // wherever they happen to be executable. A compiler emits one;
-                            // anything else is a shape this does not follow.
-                            if added.is_some() {
-                                return None;
-                            }
-                            added = Some(Fold {
-                                register: base,
-                                at: position,
-                                scale,
-                            });
-                            // **And the walk goes on following the entry**, which the fold named
-                            // and which need not be what it wrote into.
-                            wanted = entry;
-                            continue;
-                        }
-                        // **And copied at the target's width.** Everything from the `add` to the
-                        // jump is an *address*, so `mov edx,ecx` zero-extends the low half of one:
-                        // the jump goes somewhere this walk did not compute, and the table's
-                        // targets are published for it. The **load** is the exception and is
-                        // matched above: a table entry really is narrower than an address, and
-                        // `mov eax,[table+rax*4]` really does zero-extend it on purpose.
-                        if instruction.effect != Effect::Move
-                            || written.width < layout.pointer
-                            || source.width < layout.pointer
-                        {
-                            return None;
-                        }
-                        wanted = source.full.clone();
-                    }
-                    _ => return None,
-                }
-            }
-            (found?, added)
-        }
-        _ => return None,
-    };
+    let Switch {
+        map: byte_map,
+        load,
+        entries: memory,
+        at_load,
+        fold: added,
+    } = switch_at(instructions, jump, layout)?;
 
     // **The bound that matters is the one standing at the load.** That is the only instruction
     // the index means anything to: what a block does to the register afterwards -- folding an
@@ -3556,40 +3754,6 @@ fn follow_table(
         Some(Operand::Register(register)) => Some(register.width),
         _ => None,
     };
-
-    // **MSVC's dense switch has two tables**: a byte per index saying which case it is, then a
-    // dword per case holding its RVA. It reuses one register for both, so the dword load's index
-    // carries the bounded register's name and none of its meaning unless the byte map is read too.
-    // **Before the dword load, because that is the stage it feeds.** Searching the whole block
-    // takes a later, unrelated byte load for the first stage -- the target was already in hand by
-    // then -- and remaps every code through arbitrary bytes.
-    let stages: Vec<_> = instructions[..at_load.min(instructions.len())]
-        .iter()
-        .enumerate()
-        .rev()
-        .filter_map(|(position, instruction)| {
-            if instruction.effect != Effect::Move {
-                return None;
-            }
-            let written = instruction.operands.first().and_then(register_full)?;
-            if written != index {
-                return None;
-            }
-            let Some(Operand::Memory(memory)) = instruction.operands.get(1) else {
-                return None;
-            };
-            (memory.scale == 1 && memory.size.unwrap_or(1) == 1).then_some((memory, position))
-        })
-        .collect();
-    // **One stage, and not several.** Two byte maps in a row make the case number
-    // `second[first[code]]`, and reading only the nearest pairs every code with the entry some
-    // other index selects -- published wherever that entry happens to be executable, with the jump
-    // reported as followed. Composing them is readable in principle and is a second table's worth
-    // of reads for a shape no compiler emits; one is the switch, more is not this.
-    if stages.len() > 1 {
-        return None;
-    }
-    let byte_map = stages.into_iter().next();
 
     let cases: Vec<usize> = match byte_map {
         Some((map, at_map)) => {
@@ -11265,6 +11429,140 @@ mod tests {
             found.cases
         );
         assert_eq!(found.tables.len(), 1, "{:?}", found.tables);
+        assert!(found.unresolved.is_empty(), "{:?}", found.unresolved);
+    }
+
+    /// A byte map in front of a table of **addresses**, which is the combination no shape was
+    /// written for.
+    ///
+    /// A switch is matched by two questions -- whether a byte map stands in front of the load, and
+    /// whether an image base is folded into each entry -- and they have four answers between them.
+    /// A resolver written as the three idioms a compiler is described as emitting names three:
+    /// one table of displacements, that table behind a byte map, and the 32-bit form that jumps
+    /// through absolute entries. This is the fourth, and MSVC emits it for a dense switch in a
+    /// 32-bit image: `movzx eax,byte ptr [eax+MAP]` remaps the index, and
+    /// `jmp dword ptr [eax*4+TABLE]` jumps through entries that are already addresses with
+    /// nothing added to them. Two indices select one case here, which is what says the map was
+    /// read rather than stepped over.
+    #[test]
+    fn a_dense_switch_over_absolute_entries_is_followed() {
+        const MAP: i64 = 0x0041_1000;
+        const TABLE: i64 = 0x0041_0000;
+        const CODE_BASE: u64 = 0x0040_0000;
+        let in_image32 = |address: u64| (CODE_BASE..CODE_BASE + 0x2_0000).contains(&address);
+        let block = vec![
+            insn(
+                DISPATCH,
+                "mov",
+                vec![reg32("esi"), mem32("ebp", 0x0c)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 3,
+                "mov",
+                vec![reg32("edi"), mem32("esi", 0x60)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 6,
+                "mov",
+                vec![reg32("eax"), mem32("edi", 0x0c)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 9,
+                "sub",
+                vec![reg32("eax"), imm(0x222000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xf,
+                "cmp",
+                vec![reg32("eax"), imm(4)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x12,
+                "ja",
+                Vec::new(),
+                Flow::Branch(Some(0xfa11)),
+            ),
+            insn(
+                DISPATCH + 0x18,
+                "movzx",
+                vec![
+                    reg32("eax"),
+                    Operand::Memory(MemoryOperand {
+                        size: Some(1),
+                        segment: None,
+                        base: None,
+                        index: Some(named32("eax")),
+                        scale: 1,
+                        displacement: MAP,
+                        address: None,
+                    }),
+                ],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x1f,
+                "jmp",
+                vec![indexed32("eax", TABLE)],
+                Flow::Jmp(None),
+            ),
+        ];
+        let read = |at: u64, len: usize| match (at, len) {
+            // Five indices, three cases: 0, 1, 0, 2, 1.
+            (address, 5) if address == MAP as u64 => Some(vec![0u8, 1, 0, 2, 1]),
+            (address, 12) if address == TABLE as u64 => Some(
+                [
+                    (CODE_BASE + 0x1000) as u32,
+                    (CODE_BASE + 0x1100) as u32,
+                    (CODE_BASE + 0x1200) as u32,
+                ]
+                .iter()
+                .flat_map(|address| address.to_le_bytes())
+                .collect(),
+            ),
+            _ => None,
+        };
+
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X86,
+            read,
+            in_image32,
+            constant_data,
+            never,
+        );
+
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands))
+                .collect::<Vec<_>>(),
+            vec![
+                (0x222000, CODE_BASE + 0x1000),
+                (0x222001, CODE_BASE + 0x1100),
+                (0x222002, CODE_BASE + 0x1000),
+                (0x222003, CODE_BASE + 0x1200),
+                (0x222004, CODE_BASE + 0x1100),
+            ],
+            "the map selects the case and the entry is the address: {:?}",
+            found.cases
+        );
+        assert_eq!(
+            found.tables,
+            vec![Table {
+                at: DISPATCH + 0x1f,
+                table: TABLE as u64,
+                entries: 5,
+                followed: 5,
+                default: None,
+            }]
+        );
         assert!(found.unresolved.is_empty(), "{:?}", found.unresolved);
     }
 

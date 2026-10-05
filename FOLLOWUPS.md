@@ -74,7 +74,6 @@ line is simply open.
 - [Item 62](#62-windbg-mcp--binja-windbg-mcp-capture-a-live-securekernel-handoff) — [windbg-mcp + binja-windbg-mcp] Capture a live securekernel handoff
 - [Item 64](#64-binary-ninja-upstream-verify-the-firstsetupdialog-shutdown-fix) — [Binary Ninja upstream] Verify the FirstSetupDialog shutdown fix
 - [Item 65](#65-binja-windbg-mcp-native-ultimate-validation--deferred-due-to-cost) — [binja-windbg-mcp] Native Ultimate validation — deferred due to cost
-- [Item 66](#66-windbg-mcp-the-switch-resolver-refuses-what-it-trips-over-rather-than-matching-what-a-compiler-emits) — [windbg-mcp] The switch resolver refuses what it trips over rather than matching what a compiler emits
 - [Item 67](#67-windbg-mcp-a-branch-with-a-constant-condition-has-a-dead-edge-the-walk-still-reads) — [windbg-mcp] A branch with a constant condition has a dead edge the walk still reads
 - [Item 68](#68-windbg-mcp-whether-a-device-can-have-no-security-descriptor-at-all) — [windbg-mcp] Whether a device can have no security descriptor at all
 - [Item 69](#69-windbg-mcp-record-what-the-ace-kind-rules-were-measured-against) — [windbg-mcp] Record what the ACE-kind rules were measured against
@@ -1090,43 +1089,6 @@ is ready; no native comparison execution is claimed.
   comparisons, cancellation, and lifecycle behavior against the native backend.
 - **Where it picks up:** [similarity plan](docs/binja6-similarity-plan.md). Native-boundary
   test doubles do not count as Ultimate execution evidence.
-
-## 66. [windbg-mcp] The switch resolver refuses what it trips over rather than matching what a compiler emits
-
-`ioctl::follow_table` reasons **backwards** from an indirect jump: it walks the block for whatever
-defined the register, accepts a shape it recognises, and refuses when something stops it. That is
-the wrong way round for a pass whose answer is published as fact. Every instruction the walk has not
-been told about is a hole that fails toward a resolved table, so the rule list grows one review
-round at a time — one fold and not two, a `DWORD` entry and not a `QWORD`, no `call` in the chain,
-no second byte map, a pointer-width copy, a bound read at the load. Each is locally right and none
-of them is the general statement.
-
-The general statement is short, because the thing being recognised is short: MSVC and Clang emit two
-or three switch idioms, and a driver's dispatch routine is one of them or is not a switch this can
-follow. Matching those **positively** — a pattern over the block, tried in order, with anything
-unmatched left unresolved — says the same thing the accumulated refusals say, and says it in a form
-where an instruction nobody anticipated falls out rather than falls through.
-
-- **Why deferred:** it is a rewrite of the resolver rather than a fix, and it lands after the two
-  changes that cost less and buy more: the decoder's write set
-  ([dbgscope#155](https://github.com/glslang/dbgscope/issues/155)), which closes the
-  implicit-destination family at the source, and the differential oracle in
-  `src/ioctl/tests/differential.rs`, which is what would tell a rewrite it had not lost anything. Both are
-  in [#307](https://github.com/glslang/windbg-mcp/pull/307).
-- **What would close it:** `follow_table` replaced by a small set of named idioms — the one-table
-  `lea`/`mov`/`add`/`jmp` form, the two-table dense switch, and the 32-bit `jmp [table+idx*4]` —
-  each matched forwards over the block with its own test, and the refusals that exist today deleted
-  rather than kept beside them. `mountmgr` in the checked-in dump is the oracle: 48 case records
-  over 24 codes with both 81-entry tables followed, asserted by
-  `an_ioctl_map_of_a_driver_in_a_dump_is_its_chain_and_both_its_tables`.
-- **What it costs meanwhile:** nothing a measured driver shows. Every refusal added on #305 left
-  that oracle unmoved, which is the evidence that these shapes are adversarial rather than
-  compiled — and also the reason this is worth doing on a clock somebody chooses rather than under
-  a review round.
-
-**Where it picks up.** `ioctl::follow_table` and `keeps_a_bound` in `src/ioctl.rs`, the fixtures
-around `a_two_table_switch_is_read_through_its_byte_map`, and the generated routines in
-`src/ioctl/tests/differential.rs`, which is where a rewrite would be shown not to have lost a shape.
 
 ## 67. [windbg-mcp] A branch with a constant condition has a dead edge the walk still reads
 
