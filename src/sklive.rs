@@ -1091,9 +1091,14 @@ impl<P: ControlProvider> LiveControl<P> {
             if first != second {
                 bail!("VTL1 registers changed while the dispatcher event was held");
             }
+            dispatcher.bind_stop_cr3(stop_cr3)?;
+            if self.allow_transition_cr3 {
+                for instruction in &expected_instructions {
+                    dispatcher.verify_instruction(instruction)?;
+                }
+            }
             let (reason, instruction, expected_rips) =
                 self.validate_stop_registers(&observed.event, &first, &expected_stop)?;
-            dispatcher.bind_stop_cr3(stop_cr3)?;
             let mut event = observed.event.clone();
             event.reason = reason;
             Ok(StopRecord {
@@ -2051,6 +2056,8 @@ mod tests {
         actions: Vec<Action>,
         wait_targets: Vec<Vec<u32>>,
         bound_cr3s: Vec<u64>,
+        verification_roots: Vec<Option<u64>>,
+        current_root: Option<u64>,
         fail_release: bool,
         fail_begin: Option<&'static str>,
         fail_wait: Option<&'static str>,
@@ -2059,6 +2066,7 @@ mod tests {
         provider_writes_quiesced: bool,
         fail_recover: Option<&'static str>,
         fail_teardown: Option<&'static str>,
+        fail_verify: Option<&'static str>,
     }
 
     impl FakeDispatcher {
@@ -2068,6 +2076,8 @@ mod tests {
                 actions: Vec::new(),
                 wait_targets: Vec::new(),
                 bound_cr3s: Vec::new(),
+                verification_roots: Vec::new(),
+                current_root: None,
                 fail_release: false,
                 fail_begin: None,
                 fail_wait: None,
@@ -2076,6 +2086,7 @@ mod tests {
                 provider_writes_quiesced: false,
                 fail_recover: None,
                 fail_teardown: None,
+                fail_verify: None,
             }
         }
     }
@@ -2124,6 +2135,10 @@ mod tests {
 
         fn verify_instruction(&mut self, instruction: &InstructionGuard) -> Result<()> {
             self.actions.push(Action::Verify(instruction.clone()));
+            self.verification_roots.push(self.current_root);
+            if let Some(reason) = self.fail_verify {
+                bail!("{reason}");
+            }
             Ok(())
         }
 
@@ -2145,6 +2160,7 @@ mod tests {
 
         fn bind_stop_cr3(&mut self, cr3: u64) -> Result<()> {
             self.bound_cr3s.push(cr3);
+            self.current_root = Some(cr3);
             Ok(())
         }
 
@@ -3076,6 +3092,7 @@ mod tests {
             hardware.registers.low(RegisterName::Cr3).unwrap(),
             0xdead_0000
         );
+        assert_eq!(dispatcher.verification_roots, [Some(0xdead_0000)]);
         control
             .step(&mut dispatcher, &hardware.epoch, straight_step())
             .unwrap();
@@ -3089,6 +3106,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(dispatcher.bound_cr3s, [0xdead_0000, 0xdead_0000]);
+        assert_eq!(
+            dispatcher.verification_roots,
+            [Some(0xdead_0000), Some(0xdead_0000), Some(0xdead_0000)]
+        );
         let registers = &control.test_provider().registers;
         for name in [
             RegisterName::Dr0,
@@ -3115,6 +3136,31 @@ mod tests {
                 .0,
             0x400
         );
+    }
+
+    #[test]
+    fn transition_cr3_guard_failure_faults_after_rebinding_the_stop_root() {
+        let mut dispatcher =
+            FakeDispatcher::new([observed(StopReason::HardwareBreakpoint { slot: 0 })]);
+        dispatcher.fail_verify = Some("guard changed in the transition address space");
+        let mut control =
+            LiveControl::open_with_transition(FakeProvider::new().with_stopped_cr3_change(), true)
+                .unwrap();
+
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Natural)
+            .unwrap();
+        let error = control.wait_for_stop(&mut dispatcher).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("guard changed in the transition address space"),
+            "{error:#}"
+        );
+        assert_eq!(dispatcher.bound_cr3s, [0xdead_0000]);
+        assert_eq!(dispatcher.verification_roots, [Some(0xdead_0000)]);
+        assert_eq!(control.phase(), LivePhase::Faulted);
     }
 
     #[test]

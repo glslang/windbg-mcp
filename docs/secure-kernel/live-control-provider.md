@@ -39,6 +39,12 @@ Each provider target contains the VM GUID, hypervisor partition ID, VP, VTL, and
 Every request and response repeats that target and the current opaque epoch. A session may own one
 provider per selected VP; their VM, partition, VTL and CR3 coordinates must agree.
 
+`expected_cr3` always identifies the paused baseline and the address space used to validate an arm.
+By default every accepted stop must report that same root. `open_sk_live_control` may opt into
+`allow_transition_cr3` for natural mode when VTL1 user execution enters Secure Kernel through a
+different address space. The first hardware stop may then establish a different nonzero,
+page-aligned CR3; redirect mode cannot use the option.
+
 Provider stdout is read on a dedicated non-DbgEng thread. Each complete protocol line has a
 10-second deadline, including the startup banner and hello, so a provider which remains alive but
 stops answering cannot pin the worker's engine thread indefinitely. EOF is reported immediately.
@@ -132,9 +138,12 @@ The state machine implements both the narrow redirected gate and natural control
 4. in `redirect` mode move RIP to the guarded instruction; in `natural` mode leave RIP untouched
    and require TF and RF to have been clear;
 5. accept only the registered dispatcher context, a native event from the selected VP set, VTL1
-   CPL0 vector 1, the bound CR3, one exact armed DR6 slot, and two identical held-state reads. The
-   build-guarded live adapter accepts one selected VP, whose native intercept is the provider-write
-   barrier for the stop;
+   CPL0 vector 1, one exact armed DR6 slot, and two identical held-state reads. The default path
+   requires the baseline CR3. With transition-CR3 control enabled, a natural hardware stop may
+   establish a different nonzero, page-aligned root. The worker binds memory translation to that
+   root and re-reads every guarded instruction through it before exposing the stop. Every
+   single-step must retain the same root. The build-guarded live adapter accepts one selected VP,
+   whose native intercept is the provider-write barrier for the stop;
 6. consume each stop epoch once to arm TF. The first step may reuse the hardware-stop instruction;
    every later step must re-prove the exact current instruction bytes. A step accepts one default
    fall-through address or at most four explicit destinations for a branch;
@@ -173,17 +182,19 @@ changes that VP:
    dispatcher pointer, profile and provider commands. It validates their shape, loads the profile,
    and validates the register provider's declared identity and capabilities. Its MCP schema exposes
    one VP; multi-provider coordination remains a separate gate. Opening does not pause, attach to or
-   inspect the VM.
+   inspect the VM. `allow_transition_cr3` defaults to false and is accepted only with natural
+   arming; the paused baseline must still match `expected_cr3` exactly.
 2. The first `sk_live_arm` pauses the VM, verifies its `vmwp` binding, opens and checks live memory
    against the requested CR3, verifies each guarded instruction, attaches to `vmwp`, and checks its
    exact build and dispatcher sites. Only then does it save the selected VP's writable baseline and
    install one to four explicitly slotted execution breakpoints. Redirect mode requires one VP and
    one breakpoint. Natural mode arms the full VP and breakpoint set.
 3. `sk_live_wait` pumps `vmwp` until the selected VP reaches any armed address. It retains that exact
-   callback thread and returns the winning DR slot with complete stop evidence and a fresh
-   controller epoch.
+   callback thread. In transition mode it validates two identical register snapshots, binds the
+   observed CR3, and rechecks the guarded instruction bytes through that root before returning the
+   winning DR slot with complete stop evidence and a fresh controller epoch.
 4. `sk_live_registers` and `sk_live_read_memory` inspect only that stopped epoch. The memory path
-   uses the bound VTL1 CR3 and refuses an unmapped range whole.
+   uses the validated stop CR3 and refuses an unmapped range whole.
 5. `sk_live_step` consumes the stopped epoch once, clears the hardware breakpoint and arms TF.
    It may be repeated from any owned stop. Each later step supplies the exact current instruction;
    the next wait accepts only the supplied bounded destination set.
