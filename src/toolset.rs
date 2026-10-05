@@ -24,7 +24,7 @@
 //!   inspect         10   13,485  registers, stacks, memory, modules, symbols, location, raw commands
 //!   session         10   14,013  opening a target, ending it, and watching this server
 //!   exec            10   15,087  breakpoints and execution control
-//!   batch            1   10,734  `debug_batch`
+//!   batch            1   10,308  `debug_batch`
 //!   crash            3    7,473  a bug check, a user-mode fault, and an error code
 //!   ttd              9    7,090  recording, indexing and querying a Time Travel trace
 //!   ioctl           11   16,088  driver objects, IRP stacks, reachability, hazards, IOCTL maps,

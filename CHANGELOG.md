@@ -207,14 +207,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   schema, reports every leak rather than the first, and reads `input_schema` rather than the source
   because the two are not the same set: `schemars` attaches a whole doc comment, rationale
   paragraphs and all, but attaches none of a `#[serde(flatten)]`'d type's -- every one of
-  `StepAction`'s *variant* docs reaches a client and not a word of the enum's own. A name the
-  served schema **declares** as a value is the caller's own vocabulary and not a pointer
-  (`{"op": "pool_chunk"}` is a step, `set_breakpoint`'s `execute` is a `WatchAccess`), so it is
-  exempt -- but never where the prose calls it "the `X` tool" or opens a call with it. **There is
-  no third notes table**, which is the decision this closes: `annotate` rewrites a description per
+  `StepAction`'s *variant* docs reaches a client and not a word of the enum's own. **There is no
+  third notes table**, which is the decision this closes: `annotate` rewrites a description per
   surface and nothing rewrites a schema, so a cross-reference belongs in `TOOL_NOTES` rather than
-  in a second mechanism built for the same job. The model-visible surface moves 116,374 -> 116,411
-  B and `debug_batch`, still the worst single tool, 10,842 -> 10,734.
+  in a second mechanism built for the same job. **And no exemption either**, though two were
+  tried: `debug_batch`'s step vocabulary is spelled with four of the tool table's own words and
+  `set_breakpoint` declares the *value* `execute`, so the walk first exempted a name the served
+  schema declares and then only the occurrences written as JSON values -- and review escaped both.
+  What the mechanism bought was one description, `debug_batch`'s `steps`, and four names in it, so
+  the prose gave them up and the schema kept them in each variant's `op` `const`, which is the
+  channel a client validates against. The model-visible surface moves 116,374 -> **115,985** B and
+  `debug_batch`, still the worst single tool, 10,842 -> **10,308** -- the step catalogue the
+  variants already carried being 426 B of it.
 
 ### Changed
 

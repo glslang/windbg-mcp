@@ -68,16 +68,16 @@ on exactly the description's terms. `no_input_schema_names_a_tool_the_client_can
 is the walk, and it reports every leak rather than the first, because the fix for this channel's
 first failure was eleven sentences. **There is no third notes table**: `annotate` rewrites a
 description per surface and nothing rewrites a schema, so an argument's prose names no tool but its
-own and the always-served openers, and a cross-reference goes in `TOOL_NOTES`. Two things that only
-measurement says. A `description` is prose but a `const`/`enum` value is the **caller's own
-vocabulary** — `{"op": "pool_chunk"}` is a step a `--tools debug_batch` client can take, and
-`set_breakpoint` declares the *value* `execute`, which is a `WatchAccess` — so `points_at_tool`
-exempts **the occurrence and not the name**: the places the name is written as a JSON value come
-out of the text and what is left is asked the ordinary question, which is why a sentence may
-document a step and may not point out of the schema beside it. Per-*subschema* scoping is the other
-obvious answer and is wrong here — `debug_batch`'s `steps` description documents the whole step
-vocabulary, whose `const`s live in `$defs/BatchStep`. And what
-reaches a client is not the set of doc comments in the file: `schemars` 1.2.2 holds back no summary
+own and the always-served openers, and a cross-reference goes in `TOOL_NOTES`. **And no exemption**,
+which is the part two review rounds went into. `debug_batch`'s step vocabulary is spelled with four
+of the tool table's own words, and `set_breakpoint` declares the *value* `execute`, which is a
+`WatchAccess` — so the walk exempted a name the served schema declares, then only the occurrences
+written as JSON values, and review escaped both. What the mechanism bought was **one description**,
+`debug_batch`'s `steps`, and four names in it: the prose gave them up and the schema kept them, in
+each variant's `op` `const`, which is the channel a client validates against. So a step whose name
+is also a tool's is documented by its variant and not spelled in prose that ships to a client
+without that tool — and nothing has to decide what counts as a value. And what reaches a client is
+not the set of doc comments in the file: `schemars` 1.2.2 holds back no summary
 line, so an attached comment arrives whole, but a `#[serde(flatten)]`'d type's own comment is not
 attached at all — every one of `StepAction`'s *variant* docs ships and not a word of the enum's own
 (measured 2026-10-05), which is why the walk reads `input_schema` and not the source.
