@@ -24,7 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and taking `code_proved` off the map with it -- item 5's heuristic answering as it does in any
   block no edge reaches, and pinned by a test of its own. A flag write whose result
   depends on the **code** is still swept both ways: `sub r13w,8` leaves a zero for exactly the codes
-  ending in 8, which is decided per request rather than once, and that is path sensitivity. **No
+  ending in 8, which is decided per request rather than once, and that is path sensitivity. Nor is
+  a branch reading a register beside the flags -- `loope` is `ZF` and a counter both, and the fold
+  asks `Instruction::reads` rather than a mnemonic list, so `jrcxz` and `loop` are out by
+  construction. **No
   compiler emits any of this** -- its own branch is what it would break -- so the answer for a
   compiled driver should not move, and does not: `rdyboost+0xf6a0` (21 codes) and
   `mountmgr+0x17880` (48 codes) are byte-identical across the two builds. What it is measured by is

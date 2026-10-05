@@ -3603,7 +3603,21 @@ restriction is now recorded, and it is the one worth reading before widening `de
 Neither is a known-`ZF` branch that is not an equality: `ja` needs `ZF=0` **and** `CF=0`, and `jbe`
 takes either, so a known zero flag settles those in one direction and the fold does not read them
 -- a bounds check whose compare the settling write replaced founds no bound and resolves no table
-anyway, so nothing is lost by stopping at equality.
+anyway, so nothing is lost by stopping at equality. **And not an equality branch that reads a
+register either**, which is round 3's finding and the third on one seam: `loope`/`loopne` carry
+`Equal`/`NotEqual` *and* require `--rCX != 0`, so a known flag answers half the question. That one
+is asked of `Instruction::reads` rather than of a mnemonic list -- a branch whose outcome is the
+flags' alone names no register -- which also excludes `jrcxz`, `loop` and whatever mixes the two
+later, by construction rather than by being remembered.
+
+**All three rounds found the same mistake**, which is worth more than any of them: each asked a
+question of a *classification* instead of of the thing itself. `full` for "one register" where the
+question was one slice; `Effect` for "what was computed" where the carry made the spelling matter;
+`Condition` for "what this branch reads" where it describes the flags half only. The enumeration
+that ends it is in `decides_zero`'s own comments and was done against the pinned decoder
+(`dbgscope` 401fde3 and `iced-x86` 1.21.0, measured with a probe rather than read off a doc
+comment -- dbgscope's says the whole `loop` family carries no condition, and iced answers
+`cond=e reads=[RCX]` for `loope`).
 
 **Where it picks up.** `ioctl::decides_zero` is the fold; `simulate`'s `decided`, its `settled`,
 the `Flow::Branch(_) if settled.is_some()` arm and the `dead` filter over `to` are the four places
