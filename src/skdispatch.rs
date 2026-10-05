@@ -73,7 +73,7 @@ impl Session {
             .into_iter()
             .map(|line| format!("VP {}: {line}", request.target.vp))
             .collect::<Vec<_>>();
-        let control = LiveControl::open(provider)?;
+        let control = LiveControl::open_with_transition(provider, request.allow_transition_cr3)?;
         Ok((
             Self {
                 control,
@@ -162,6 +162,8 @@ pub(crate) struct OpenRequest {
     pub(crate) vmwp_pid: u32,
     pub(crate) dispatcher_vnd: u64,
     pub(crate) target: TargetIdentity,
+    #[serde(default)]
+    pub(crate) allow_transition_cr3: bool,
     #[serde(default)]
     pub(crate) additional_vps: Vec<AdditionalVp>,
 }
@@ -318,6 +320,7 @@ impl AcceptanceRequest {
                 vmwp_pid: vmwp_pid.context(live_control_usage())?,
                 dispatcher_vnd: dispatcher_vnd.context(live_control_usage())?,
                 target,
+                allow_transition_cr3: false,
                 additional_vps: Vec::new(),
             },
             instruction,
@@ -701,6 +704,9 @@ enum DispatcherPhase {
     Fresh,
     Registering,
     ReadyForStop,
+    /// The event-site breakpoint remained armed until DbgEng's own wait deadline interrupted
+    /// ordinary vmwp execution. This is the only no-event stop that may detach before Suspend-VM.
+    ReadyForStopDeadline,
     Holding(HeldEvent),
     ReturningCallback(HeldEvent),
     CallbackEntry(HeldEvent),
@@ -859,6 +865,16 @@ impl LiveGuestMemory {
         Ok(())
     }
 
+    fn bind_root(&mut self, cr3: u64) -> Result<()> {
+        if cr3 == 0 || cr3 & 0xfff != 0 {
+            bail!("live VTL1 stop CR3 must be nonzero and page aligned");
+        }
+        let root = sk::Gpa(cr3);
+        self.space = Self::walk_space(&self.source, root, "stop-CR3 rebind")?;
+        self.root = root;
+        Ok(())
+    }
+
     fn walk_space(
         source: &crate::livesrc::LiveSource,
         root: sk::Gpa,
@@ -923,6 +939,11 @@ impl EventDispatcher for VmwpDispatcher<'_> {
             ArmPreparation::OpenAndRegister => self.open_and_register(targets, breakpoints)?,
             ArmPreparation::VerifyAttached => {
                 self.pause_for_provider_writes(targets)?;
+                self.state
+                    .memory
+                    .as_mut()
+                    .context("the live VTL1 memory source is absent")?
+                    .bind_root(target.expected_cr3.0)?;
                 self.verify_breakpoints(breakpoints)?;
             }
             ArmPreparation::Reattach => self.reattach_registered_handler(targets, breakpoints)?,
@@ -932,6 +953,27 @@ impl EventDispatcher for VmwpDispatcher<'_> {
                 .handler_context
                 .context("the registered handler returned no context")?,
         ))
+    }
+
+    fn begin_disarm(&mut self, targets: &[TargetIdentity]) -> Result<()> {
+        targets
+            .first()
+            .context("running disarm requires at least one selected VP")?;
+        if self.state.targets != targets
+            || !matches!(self.state.phase, DispatcherPhase::ReadyForStop)
+            || self.state.retained_event.is_some()
+            || !self.state.attached
+            || self.state.breakpoint.is_none()
+        {
+            bail!("running disarm requires the armed target set with no retained event");
+        }
+
+        // Suspend-VM can block behind an attached DbgEng target even when no native event exists.
+        // Stop vmwp with the ordinary watchdog, remove the exact owned breakpoint, and detach
+        // before asking Hyper-V to pause. Reattach only after that pause proves provider-write
+        // quiescence; teardown still owns the registered callback and scratch allocation.
+        self.settle_native_completion()?;
+        self.pause_armed_without_event(targets)
     }
 
     fn finish_arm(&mut self) -> Result<()> {
@@ -959,7 +1001,9 @@ impl EventDispatcher for VmwpDispatcher<'_> {
         // event, join that helper before a fresh Suspend-VM proves recovery quiescence. An incomplete
         // callback whose exact thread was not retained remains fail-closed.
         let transition_error = self.state.finish_completion_kick().err();
-        let pause = if matches!(
+        let pause = if matches!(self.state.phase, DispatcherPhase::ReadyForStopDeadline) {
+            self.pause_armed_without_event(targets)
+        } else if matches!(
             self.state.phase,
             DispatcherPhase::Holding(_)
                 | DispatcherPhase::ReturningCallback(_)
@@ -1045,6 +1089,14 @@ impl EventDispatcher for VmwpDispatcher<'_> {
             event,
             instructions: observed_instructions,
         })
+    }
+
+    fn bind_stop_cr3(&mut self, cr3: u64) -> Result<()> {
+        self.state
+            .memory
+            .as_mut()
+            .context("the live VTL1 memory source is absent")?
+            .bind_root(cr3)
     }
 
     fn release_event(&mut self, event: &HeldEvent, mode: ReleaseMode) -> Result<()> {
@@ -1173,7 +1225,7 @@ impl VmwpDispatcher<'_> {
     }
 
     fn wait_for_owned_event(
-        &self,
+        &mut self,
         targets: &[TargetIdentity],
         event_site: u64,
         deadline: Instant,
@@ -1264,6 +1316,46 @@ impl VmwpDispatcher<'_> {
         self.state.confirm_vm_pause()
     }
 
+    fn pause_armed_without_event(&mut self, targets: &[TargetIdentity]) -> Result<()> {
+        let target = targets
+            .first()
+            .context("no-event disarm requires at least one selected VP")?;
+        if self.state.targets != targets
+            || !matches!(
+                self.state.phase,
+                DispatcherPhase::ReadyForStop | DispatcherPhase::ReadyForStopDeadline
+            )
+            || self.state.retained_event.is_some()
+            || !self.state.attached
+            || self.state.breakpoint.is_none()
+        {
+            bail!("no-event disarm requires the debugger-stopped armed target set");
+        }
+
+        self.remove_owned_breakpoint()?;
+        self.detach_handled()?;
+        self.state.finish_completion_kick()?;
+        self.state.claim_vm_pause(targets)?;
+        run_vm_action(&target.vm_id, VmAction::Pause, POWERSHELL_WAIT)?;
+        self.state.confirm_vm_pause()?;
+
+        verify_vmwp_pid(&target.vm_id, self.state.vmwp_pid)?;
+        let pending = self
+            .engine
+            .attach_process_begin(self.state.vmwp_pid)
+            .map_err(debugger)?;
+        self.state.attached = true;
+        pending.wait().map_err(debugger)?;
+        self.engine.execute_command("sxd 6ba").map_err(debugger)?;
+        self.engine
+            .execute_command("sxd e06d7363")
+            .map_err(debugger)?;
+        self.verify_vmwp_build()?;
+        self.verify_all_sites()?;
+        self.state.phase = DispatcherPhase::ReadyForStop;
+        Ok(())
+    }
+
     fn open_and_register(
         &mut self,
         targets: &[TargetIdentity],
@@ -1320,6 +1412,11 @@ impl VmwpDispatcher<'_> {
             .map_err(debugger)?;
         self.verify_vmwp_build()?;
         self.verify_all_sites()?;
+        self.state
+            .memory
+            .as_mut()
+            .context("the live VTL1 memory source is absent")?
+            .bind_root(target.expected_cr3.0)?;
         self.verify_breakpoints(breakpoints)?;
         let site = self.state.profile.event_held.clone();
         self.set_site_breakpoint(&site)?;
@@ -1884,7 +1981,7 @@ impl VmwpDispatcher<'_> {
         Ok(())
     }
 
-    fn run_to_current_breakpoint(&self, deadline: Instant) -> Result<()> {
+    fn run_to_current_breakpoint(&mut self, deadline: Instant) -> Result<()> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             bail!("the debugger did not reach the owned breakpoint before its deadline");
@@ -1894,16 +1991,19 @@ impl VmwpDispatcher<'_> {
             .engine
             .execute_and_wait("g", timeout)
             .map_err(debugger)?;
+        if run.target_gone {
+            bail!("vmwp left the debugger while an owned breakpoint was pending");
+        }
         if let Some(interruption) = run.cut_short {
             match interruption {
                 Interruption::OnRequest => bail!("the debugger wait was interrupted on request"),
                 Interruption::Deadline { .. } => {
+                    if matches!(self.state.phase, DispatcherPhase::ReadyForStop) {
+                        self.state.phase = DispatcherPhase::ReadyForStopDeadline;
+                    }
                     bail!("the debugger wait reached its deadline")
                 }
             }
-        }
-        if run.target_gone {
-            bail!("vmwp left the debugger while an owned breakpoint was pending");
         }
         let expected = self
             .state
@@ -2405,6 +2505,7 @@ mod tests {
             vmwp_pid: 4242,
             dispatcher_vnd: 0x2000_0000_1000,
             target: target(),
+            allow_transition_cr3: false,
             additional_vps: vec![AdditionalVp {
                 control_transport: "provider --vp 1".into(),
                 target: additional,

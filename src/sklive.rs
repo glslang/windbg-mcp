@@ -170,6 +170,9 @@ pub(crate) trait EventDispatcher {
         targets: &[TargetIdentity],
         breakpoints: &[BreakpointGuard],
     ) -> Result<HexU64>;
+    /// Detach before pausing an armed target that produced no event, then reattach while paused so
+    /// provider state and the registered handler can be removed without deadlocking Hyper-V.
+    fn begin_disarm(&mut self, targets: &[TargetIdentity]) -> Result<()>;
     fn finish_arm(&mut self) -> Result<()>;
     /// Whether every provider whose registers may be accessed is currently quiesced.
     fn provider_writes_quiesced(&self) -> bool;
@@ -183,6 +186,8 @@ pub(crate) trait EventDispatcher {
         targets: &[TargetIdentity],
         instructions: &[InstructionGuard],
     ) -> Result<ObservedStop>;
+    /// Rebind live virtual-memory translation to the CR3 proved by the held register snapshot.
+    fn bind_stop_cr3(&mut self, cr3: u64) -> Result<()>;
     fn release_event(&mut self, event: &HeldEvent, mode: ReleaseMode) -> Result<()>;
     fn recover(&mut self, safe_to_resume: bool, event: Option<&HeldEvent>) -> Result<()>;
     fn teardown(&mut self) -> Result<()>;
@@ -640,7 +645,11 @@ pub(crate) struct RegisterSnapshot {
 }
 
 impl RegisterSnapshot {
-    fn from_values(values: Vec<RegisterValue>, target: &TargetIdentity) -> Result<Self> {
+    fn from_values(
+        values: Vec<RegisterValue>,
+        expected_cr3: Option<u64>,
+        allow_transition_cr3: bool,
+    ) -> Result<Self> {
         if values.len() != SNAPSHOT_REGISTERS.len() {
             bail!(
                 "register snapshot returned {} values, expected {}",
@@ -664,8 +673,18 @@ impl RegisterSnapshot {
             }
         }
         let snapshot = Self { values };
-        if snapshot.low(RegisterName::Cr3)? != target.expected_cr3.0 {
-            bail!("the stopped CR3 does not match the bound target identity");
+        let observed_cr3 = snapshot.low(RegisterName::Cr3)?;
+        match expected_cr3 {
+            Some(expected) if observed_cr3 != expected => {
+                bail!("the stopped CR3 does not match the required address space");
+            }
+            None if !allow_transition_cr3 => {
+                bail!("a transition CR3 was not enabled for this session");
+            }
+            None if observed_cr3 == 0 || observed_cr3 & 0xfff != 0 => {
+                bail!("the transition CR3 must be nonzero and page aligned");
+            }
+            _ => {}
         }
         Ok(snapshot)
     }
@@ -727,6 +746,7 @@ enum ExpectedStop {
     SingleStep {
         instruction: InstructionGuard,
         expected_rips: Vec<HexU64>,
+        cr3: HexU64,
     },
 }
 
@@ -745,6 +765,7 @@ struct VpControl<P> {
     target: TargetIdentity,
     provider_phase: ProviderPhase,
     baseline: Option<RegisterSnapshot>,
+    observed_cr3: Option<u64>,
 }
 
 /// One-VM coordinator for selected VPs and up to four execution breakpoints per VP. The dispatcher
@@ -762,15 +783,29 @@ pub(crate) struct LiveControl<P> {
     dispatcher_context: Option<HexU64>,
     dispatcher_event: Option<HeldEvent>,
     expected_stop: Option<ExpectedStop>,
+    allow_transition_cr3: bool,
     fault: Option<FaultRecord>,
 }
 
 impl<P: ControlProvider> LiveControl<P> {
+    #[cfg(test)]
     pub(crate) fn open(provider: P) -> Result<Self> {
-        Self::open_many(vec![provider])
+        Self::open_with_transition(provider, false)
     }
 
-    pub(crate) fn open_many(mut providers: Vec<P>) -> Result<Self> {
+    pub(crate) fn open_with_transition(provider: P, allow_transition_cr3: bool) -> Result<Self> {
+        Self::open_many_with_transition(vec![provider], allow_transition_cr3)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_many(providers: Vec<P>) -> Result<Self> {
+        Self::open_many_with_transition(providers, false)
+    }
+
+    fn open_many_with_transition(
+        mut providers: Vec<P>,
+        allow_transition_cr3: bool,
+    ) -> Result<Self> {
         if providers.is_empty() {
             bail!("live control requires at least one VP provider");
         }
@@ -805,6 +840,7 @@ impl<P: ControlProvider> LiveControl<P> {
                 target,
                 provider_phase: ProviderPhase::Running,
                 baseline: None,
+                observed_cr3: None,
             });
         }
         Ok(Self {
@@ -821,6 +857,7 @@ impl<P: ControlProvider> LiveControl<P> {
             dispatcher_context: None,
             dispatcher_event: None,
             expected_stop: None,
+            allow_transition_cr3,
             fault: None,
         })
     }
@@ -864,6 +901,9 @@ impl<P: ControlProvider> LiveControl<P> {
     ) -> Result<StopEpoch> {
         self.require_running_unarmed()?;
         validate_breakpoints(&breakpoints, mode)?;
+        if self.allow_transition_cr3 && mode != ArmMode::Natural {
+            bail!("transition CR3 control requires natural arm mode");
+        }
         if mode == ArmMode::Redirect && self.providers.len() != 1 {
             bail!("redirect arming requires exactly one VP provider");
         }
@@ -904,7 +944,8 @@ impl<P: ControlProvider> LiveControl<P> {
         breakpoints: &[BreakpointGuard],
         mode: ArmMode,
     ) -> Result<()> {
-        let baseline = self.read_snapshot(index)?;
+        self.providers[index].observed_cr3 = None;
+        let baseline = self.read_snapshot(index, self.providers[index].target.expected_cr3.0)?;
         if baseline.low(RegisterName::Dr7)? & DR7_ENABLE_MASK != 0 {
             bail!("the guest already has an enabled hardware breakpoint");
         }
@@ -1034,13 +1075,25 @@ impl<P: ControlProvider> LiveControl<P> {
                 bail!("provider changed the dispatcher event after publication");
             }
             self.restore_inactive_providers(active)?;
-            let first = self.read_snapshot(active)?;
-            let second = self.read_snapshot(active)?;
+            let first =
+                if matches!(expected_stop, ExpectedStop::Hardware) && self.allow_transition_cr3 {
+                    self.read_transition_snapshot(active)?
+                } else {
+                    let required = match &expected_stop {
+                        ExpectedStop::Hardware => self.providers[active].target.expected_cr3.0,
+                        ExpectedStop::SingleStep { cr3, .. } => cr3.0,
+                    };
+                    self.read_snapshot(active, required)?
+                };
+            let stop_cr3 = first.low(RegisterName::Cr3)?;
+            self.providers[active].observed_cr3 = Some(stop_cr3);
+            let second = self.read_snapshot(active, stop_cr3)?;
             if first != second {
                 bail!("VTL1 registers changed while the dispatcher event was held");
             }
             let (reason, instruction, expected_rips) =
                 self.validate_stop_registers(&observed.event, &first, &expected_stop)?;
+            dispatcher.bind_stop_cr3(stop_cr3)?;
             let mut event = observed.event.clone();
             event.reason = reason;
             Ok(StopRecord {
@@ -1128,6 +1181,7 @@ impl<P: ControlProvider> LiveControl<P> {
         self.expected_stop = Some(ExpectedStop::SingleStep {
             instruction,
             expected_rips,
+            cr3: HexU64(stop.registers.low(RegisterName::Cr3)?),
         });
         self.state = State::Running;
         Ok(self.commit_epoch(next_epoch))
@@ -1160,6 +1214,7 @@ impl<P: ControlProvider> LiveControl<P> {
             return Err(self.enter_fault(dispatcher, error, Some(dispatcher_event)));
         }
         self.providers[active].baseline = None;
+        self.providers[active].observed_cr3 = None;
         self.active_provider = None;
         self.breakpoints.clear();
         self.arm_mode = None;
@@ -1202,8 +1257,10 @@ impl<P: ControlProvider> LiveControl<P> {
                     if self.breakpoints.is_empty() {
                         bail!("the armed session has no breakpoint guards");
                     }
-                    let breakpoints = self.breakpoints.clone();
-                    self.begin_dispatcher_arm(dispatcher, &breakpoints)?;
+                    dispatcher.begin_disarm(&self.targets())?;
+                    if !dispatcher.provider_writes_quiesced() {
+                        bail!("the dispatcher did not prove quiescence for disarming providers");
+                    }
                     for index in 0..self.providers.len() {
                         if self.providers[index].baseline.is_none() {
                             continue;
@@ -1314,6 +1371,7 @@ impl<P: ControlProvider> LiveControl<P> {
             ExpectedStop::SingleStep {
                 instruction,
                 expected_rips,
+                ..
             } => {
                 if !expected_rips.contains(&HexU64(registers.low(RegisterName::Rip)?))
                     || registers.low(RegisterName::Dr6)? & (1 << 14) == 0
@@ -1341,13 +1399,30 @@ impl<P: ControlProvider> LiveControl<P> {
             .collect()
     }
 
-    fn read_snapshot(&mut self, provider: usize) -> Result<RegisterSnapshot> {
+    fn read_snapshot(&mut self, provider: usize, expected_cr3: u64) -> Result<RegisterSnapshot> {
         RegisterSnapshot::from_values(
             self.providers[provider]
                 .provider
                 .read_registers(SNAPSHOT_REGISTERS.to_vec())?,
-            &self.providers[provider].target,
+            Some(expected_cr3),
+            self.allow_transition_cr3,
         )
+    }
+
+    fn read_transition_snapshot(&mut self, provider: usize) -> Result<RegisterSnapshot> {
+        RegisterSnapshot::from_values(
+            self.providers[provider]
+                .provider
+                .read_registers(SNAPSHOT_REGISTERS.to_vec())?,
+            None,
+            self.allow_transition_cr3,
+        )
+    }
+
+    fn provider_cr3(&self, provider: usize) -> u64 {
+        self.providers[provider]
+            .observed_cr3
+            .unwrap_or(self.providers[provider].target.expected_cr3.0)
     }
 
     fn begin_dispatcher_arm(
@@ -1406,7 +1481,8 @@ impl<P: ControlProvider> LiveControl<P> {
             .baseline
             .clone()
             .context("there is no saved VTL1 baseline")?;
-        let current = self.read_snapshot(provider)?;
+        let cr3 = self.provider_cr3(provider);
+        let current = self.read_snapshot(provider, cr3)?;
         let current_dr7 = current.low(RegisterName::Dr7)?;
         self.write_one(
             provider,
@@ -1426,14 +1502,14 @@ impl<P: ControlProvider> LiveControl<P> {
         ] {
             self.write_one(provider, name, current.low(name)?, baseline.low(name)?)?;
         }
-        let disabled_dr7 = self.read_snapshot(provider)?.low(RegisterName::Dr7)?;
+        let disabled_dr7 = self.read_snapshot(provider, cr3)?.low(RegisterName::Dr7)?;
         self.write_one(
             provider,
             RegisterName::Dr7,
             disabled_dr7,
             baseline.low(RegisterName::Dr7)?,
         )?;
-        let restored = self.read_snapshot(provider)?;
+        let restored = self.read_snapshot(provider, cr3)?;
         if restored != baseline {
             bail!("restored VTL1 state does not match the saved baseline");
         }
@@ -1447,7 +1523,8 @@ impl<P: ControlProvider> LiveControl<P> {
             .baseline
             .clone()
             .context("there is no saved VTL1 baseline")?;
-        let mut current = self.read_snapshot(provider)?;
+        let cr3 = self.provider_cr3(provider);
+        let mut current = self.read_snapshot(provider, cr3)?;
         let current_dr7 = current.low(RegisterName::Dr7)?;
         self.write_one(
             provider,
@@ -1455,7 +1532,7 @@ impl<P: ControlProvider> LiveControl<P> {
             current_dr7,
             current_dr7 & !DR7_ENABLE_MASK,
         )?;
-        current = self.read_snapshot(provider)?;
+        current = self.read_snapshot(provider, cr3)?;
         let current_flags = current.low(RegisterName::Rflags)?;
         let restored_flags =
             (current_flags & !(TF | RF)) | (baseline.low(RegisterName::Rflags)? & (TF | RF));
@@ -1472,10 +1549,10 @@ impl<P: ControlProvider> LiveControl<P> {
             RegisterName::Dr3,
             RegisterName::Dr6,
         ] {
-            let expected = self.read_snapshot(provider)?.low(name)?;
+            let expected = self.read_snapshot(provider, cr3)?.low(name)?;
             self.write_one(provider, name, expected, baseline.low(name)?)?;
         }
-        let disabled_dr7 = self.read_snapshot(provider)?.low(RegisterName::Dr7)?;
+        let disabled_dr7 = self.read_snapshot(provider, cr3)?.low(RegisterName::Dr7)?;
         self.write_one(
             provider,
             RegisterName::Dr7,
@@ -1483,7 +1560,7 @@ impl<P: ControlProvider> LiveControl<P> {
             baseline.low(RegisterName::Dr7)?,
         )?;
 
-        let restored = self.read_snapshot(provider)?;
+        let restored = self.read_snapshot(provider, cr3)?;
         for name in [
             RegisterName::Dr0,
             RegisterName::Dr1,
@@ -1959,6 +2036,7 @@ mod tests {
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum Action {
         BeginArm,
+        BeginDisarm,
         FinishArm,
         Verify(InstructionGuard),
         Wait,
@@ -1972,6 +2050,7 @@ mod tests {
         stops: VecDeque<ObservedStop>,
         actions: Vec<Action>,
         wait_targets: Vec<Vec<u32>>,
+        bound_cr3s: Vec<u64>,
         fail_release: bool,
         fail_begin: Option<&'static str>,
         fail_wait: Option<&'static str>,
@@ -1988,6 +2067,7 @@ mod tests {
                 stops: stops.into_iter().collect(),
                 actions: Vec::new(),
                 wait_targets: Vec::new(),
+                bound_cr3s: Vec::new(),
                 fail_release: false,
                 fail_begin: None,
                 fail_wait: None,
@@ -2012,6 +2092,15 @@ mod tests {
                 bail!("{reason}");
             }
             Ok(HexU64(0x2000_0000_1000))
+        }
+
+        fn begin_disarm(&mut self, _targets: &[TargetIdentity]) -> Result<()> {
+            self.actions.push(Action::BeginDisarm);
+            self.provider_writes_quiesced = true;
+            if let Some(reason) = self.fail_begin {
+                bail!("{reason}");
+            }
+            Ok(())
         }
 
         fn finish_arm(&mut self) -> Result<()> {
@@ -2052,6 +2141,11 @@ mod tests {
             }
             self.provider_writes_quiesced = true;
             self.stops.pop_front().context("no scripted stop")
+        }
+
+        fn bind_stop_cr3(&mut self, cr3: u64) -> Result<()> {
+            self.bound_cr3s.push(cr3);
+            Ok(())
         }
 
         fn release_event(&mut self, _event: &HeldEvent, mode: ReleaseMode) -> Result<()> {
@@ -2768,6 +2862,37 @@ mod tests {
     }
 
     #[test]
+    fn close_while_armed_restores_every_selected_vp_before_teardown() {
+        let baseline = register_values(BASE_RIP, 0xffff_0ff0, 0x400, 0x46);
+        let mut dispatcher = FakeDispatcher::new([]);
+        let mut control =
+            LiveControl::open_many(vec![FakeProvider::new(), FakeProvider::new().with_vp(1)])
+                .unwrap();
+
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Natural)
+            .unwrap();
+        control.close(&mut dispatcher).unwrap();
+
+        assert_eq!(control.phase(), LivePhase::Closed);
+        assert!(control.providers.iter().all(|provider| {
+            provider.baseline.is_none()
+                && provider.provider.phase == FakePhase::Running
+                && provider.provider.registers == baseline
+        }));
+        assert_eq!(
+            dispatcher.actions,
+            vec![
+                Action::BeginArm,
+                Action::FinishArm,
+                Action::BeginDisarm,
+                Action::FinishArm,
+                Action::Teardown,
+            ]
+        );
+    }
+
+    #[test]
     fn dispatcher_timeout_restores_the_baseline_and_resumes_before_faulting() {
         let mut dispatcher = FakeDispatcher::new([]);
         dispatcher.fail_wait = Some("dispatcher wait timed out");
@@ -2927,6 +3052,69 @@ mod tests {
         let error = control.wait_for_stop(&mut dispatcher).unwrap_err();
         assert!(error.to_string().contains("CR3"), "{error:#}");
         assert!(control.fault().unwrap().target_left_paused);
+    }
+
+    #[test]
+    fn natural_transition_cr3_is_bound_through_step_and_restored_control_state() {
+        let mut dispatcher = FakeDispatcher::new([
+            observed(StopReason::HardwareBreakpoint { slot: 0 }),
+            observed(StopReason::SingleStep),
+        ]);
+        let mut control =
+            LiveControl::open_with_transition(FakeProvider::new().with_stopped_cr3_change(), true)
+                .unwrap();
+        let redirect = control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Redirect)
+            .unwrap_err();
+        assert!(redirect.to_string().contains("natural arm mode"));
+
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Natural)
+            .unwrap();
+        let hardware = control.wait_for_stop(&mut dispatcher).unwrap();
+        assert_eq!(
+            hardware.registers.low(RegisterName::Cr3).unwrap(),
+            0xdead_0000
+        );
+        control
+            .step(&mut dispatcher, &hardware.epoch, straight_step())
+            .unwrap();
+        let stepped = control.wait_for_stop(&mut dispatcher).unwrap();
+        assert_eq!(
+            stepped.registers.low(RegisterName::Cr3).unwrap(),
+            0xdead_0000
+        );
+        control
+            .continue_from(&mut dispatcher, &stepped.epoch)
+            .unwrap();
+
+        assert_eq!(dispatcher.bound_cr3s, [0xdead_0000, 0xdead_0000]);
+        let registers = &control.test_provider().registers;
+        for name in [
+            RegisterName::Dr0,
+            RegisterName::Dr1,
+            RegisterName::Dr2,
+            RegisterName::Dr3,
+        ] {
+            assert_eq!(
+                registers
+                    .iter()
+                    .find(|value| value.name == name)
+                    .unwrap()
+                    .low
+                    .0,
+                0
+            );
+        }
+        assert_eq!(
+            registers
+                .iter()
+                .find(|value| value.name == RegisterName::Dr7)
+                .unwrap()
+                .low
+                .0,
+            0x400
+        );
     }
 
     #[test]
