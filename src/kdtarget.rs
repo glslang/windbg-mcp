@@ -7,13 +7,17 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use dbgscope::dbgeng::DebugEngine;
-use iced_x86::{Decoder as InstructionDecoder, DecoderOptions, FlowControl};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use dbgscope::dbgeng::{BreakRequest, DebugEngine, InterruptHandle};
+use iced_x86::{
+    Decoder as InstructionDecoder, DecoderOptions, FlowControl, Mnemonic, OpKind, Register,
+};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::windows::named_pipe::ServerOptions;
+use tokio::sync::mpsc;
 
 use crate::kdapi::{Amd64Context, Amd64ContextValues, ManipulateRequest, Version64};
 use crate::kdwire::{Decoder, Frame, TargetLink};
@@ -31,6 +35,13 @@ const CODE_BACKSCAN_BYTES: u64 = 0x2b;
 const CODE_LOOKAHEAD_BYTES: u64 = 0x80;
 const STACK_BOOKKEEPING_BYTES: u64 = 0x80;
 const KUSER_SHARED_DATA: u64 = 0xffff_f780_0000_0000;
+const TRANSPORT_QUEUE_DEPTH: usize = 64;
+const KUSER_STARTUP_PROBES: [(u64, u32); 4] = [
+    (KUSER_SHARED_DATA + 0x268, 1),
+    (KUSER_SHARED_DATA + 0x3d8, 0x358),
+    (KUSER_SHARED_DATA + 0x14, 0x80),
+    (KUSER_SHARED_DATA + 0x08, 0x0c),
+];
 
 #[derive(Debug)]
 struct Disconnected;
@@ -42,6 +53,163 @@ impl fmt::Display for Disconnected {
 }
 
 impl std::error::Error for Disconnected {}
+
+enum TransportMessage {
+    Frame(Frame),
+    Disconnected,
+    Failed(String),
+}
+
+#[derive(Clone, Debug)]
+enum WaitWakeReason {
+    BreakIn,
+    Reset,
+    Disconnected,
+    Transport(String),
+    Idle,
+}
+
+impl fmt::Display for WaitWakeReason {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BreakIn => out.write_str("WinDbg requested Ctrl+Break while VTL1 was running"),
+            Self::Reset => out.write_str("WinDbg reset the KD link while VTL1 was running"),
+            Self::Disconnected => out.write_str("WinDbg disconnected while VTL1 was running"),
+            Self::Transport(why) => {
+                write!(out, "the KD reader failed while VTL1 was running: {why}")
+            }
+            Self::Idle => {
+                out.write_str("WinDbg sent no KD traffic before the running idle timeout")
+            }
+        }
+    }
+}
+
+struct ActiveWait {
+    activity: crate::skdispatch::WaitActivity,
+    last_traffic: Instant,
+    reason: Option<WaitWakeReason>,
+}
+
+#[derive(Clone)]
+struct WaitWaker {
+    interrupt: Arc<InterruptHandle>,
+    active: Arc<Mutex<Option<ActiveWait>>>,
+}
+
+impl WaitWaker {
+    fn new(interrupt: InterruptHandle) -> Self {
+        Self {
+            interrupt: Arc::new(interrupt),
+            active: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn begin(&self, activity: crate::skdispatch::WaitActivity) {
+        *self
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(ActiveWait {
+            activity,
+            last_traffic: Instant::now(),
+            reason: None,
+        });
+    }
+
+    fn finish(&self) -> Option<WaitWakeReason> {
+        self.active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .and_then(|wait| wait.reason)
+    }
+
+    fn note_traffic(&self) {
+        if let Some(wait) = self
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_mut()
+        {
+            wait.last_traffic = Instant::now();
+        }
+    }
+
+    fn request(&self, reason: WaitWakeReason) {
+        self.request_for(None, reason);
+    }
+
+    fn request_for(
+        &self,
+        expected: Option<&crate::skdispatch::WaitActivity>,
+        reason: WaitWakeReason,
+    ) {
+        let activity = {
+            let mut active = self
+                .active
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let Some(wait) = active.as_mut() else {
+                return;
+            };
+            if expected.is_some_and(|expected| !wait.activity.same_wait(expected)) {
+                return;
+            }
+            if wait.reason.is_some() {
+                return;
+            }
+            wait.reason = Some(reason);
+            wait.activity.clone()
+        };
+        let interrupt = self.interrupt.clone();
+        tokio::spawn(async move {
+            loop {
+                match activity.phase() {
+                    crate::skdispatch::WaitActivityPhase::Armed => {}
+                    crate::skdispatch::WaitActivityPhase::Active => match interrupt.interrupt() {
+                        Ok(BreakRequest::Raised { .. }) => return,
+                        Ok(BreakRequest::NothingRunning) => {}
+                        Err(error) => {
+                            eprintln!("KD wait interrupt failed: {error}");
+                            return;
+                        }
+                    },
+                    crate::skdispatch::WaitActivityPhase::Finished => return,
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+    }
+
+    fn start_idle_watchdog(&self, timeout: Duration, activity: crate::skdispatch::WaitActivity) {
+        let wake = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let remaining = {
+                    let active = wake
+                        .active
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    let Some(wait) = active.as_ref() else {
+                        return;
+                    };
+                    if !wait.activity.same_wait(&activity) {
+                        return;
+                    }
+                    if wait.reason.is_some() {
+                        return;
+                    }
+                    timeout.saturating_sub(wait.last_traffic.elapsed())
+                };
+                if remaining.is_zero() {
+                    wake.request_for(Some(&activity), WaitWakeReason::Idle);
+                    return;
+                }
+                tokio::time::sleep(remaining).await;
+            }
+        });
+    }
+}
 
 #[derive(Debug)]
 struct Options {
@@ -189,7 +357,10 @@ pub(crate) fn run(args: &[String], engine: &DebugEngine) -> Result<()> {
     for line in skipped {
         eprintln!("control provider: {line}");
     }
-    let result = tokio::runtime::Builder::new_current_thread()
+    // DbgEng remains on this calling thread. Tokio's worker threads service only the KD pipe and
+    // may use the engine's narrow `InterruptHandle` while this thread is inside the owned wait.
+    let result = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()?
         .block_on(run_async(&options, engine, &mut session));
@@ -232,7 +403,7 @@ async fn run_async(
     let mut reported_instruction = read_instruction_guard(session, values.rip)?;
 
     let path = format!(r"\\.\pipe\{}", options.pipe);
-    let mut pipe = ServerOptions::new()
+    let pipe = ServerOptions::new()
         .first_pipe_instance(true)
         .create(&path)
         .with_context(|| format!("creating Secure Kernel KD pipe {path}"))?;
@@ -244,40 +415,44 @@ async fn run_async(
         .await
         .context("waiting for WinDbg to connect timed out")??;
 
-    let mut decoder = Decoder::default();
+    let (reader, mut writer) = tokio::io::split(pipe);
+    let (transport_tx, mut transport_rx) = mpsc::channel(TRANSPORT_QUEUE_DEPTH);
+    let wait_waker = WaitWaker::new(engine.interrupt_handle());
+    let reader_waker = wait_waker.clone();
+    tokio::spawn(read_transport(reader, transport_tx, reader_waker));
     let mut link = TargetLink::new();
     tokio::time::timeout(
         options.connect_timeout,
-        wait_for_reset(&mut pipe, &mut decoder, &mut link),
+        wait_for_reset(&mut writer, &mut transport_rx, &mut link),
     )
     .await
     .context("waiting for WinDbg's KD reset timed out")??;
-    send_stop(&mut pipe, &mut link, &reported_instruction.bytes, &values).await?;
+    send_stop(&mut writer, &mut link, &reported_instruction.bytes, &values).await?;
     eprintln!("initial KD state change sent");
 
     let mut breakpoints = BTreeMap::<u32, BreakpointGuard>::new();
     let mut compatibility = CompatibilityMemory::default();
     loop {
-        let frame = tokio::time::timeout(options.idle_timeout, read_frame(&mut pipe, &mut decoder))
+        let frame = tokio::time::timeout(options.idle_timeout, read_frame(&mut transport_rx))
             .await
             .context("WinDbg sent no KD traffic before the idle timeout")??;
         let inbound = link.receive(frame);
         let peer_reset = inbound.peer_reset;
         for write in inbound.writes {
-            pipe.write_all(&write).await?;
+            writer.write_all(&write).await?;
         }
         if peer_reset {
             compatibility = CompatibilityMemory::default();
-            send_stop(&mut pipe, &mut link, &reported_instruction.bytes, &values).await?;
+            send_stop(&mut writer, &mut link, &reported_instruction.bytes, &values).await?;
             eprintln!("KD peer reset; current held stop resent");
             continue;
         }
         let Some(packet) = inbound.packet else {
-            pipe.flush().await?;
+            writer.flush().await?;
             continue;
         };
         if packet.packet_type != crate::kdwire::PACKET_TYPE_STATE_MANIPULATE {
-            pipe.flush().await?;
+            writer.flush().await?;
             continue;
         }
         let request = ManipulateRequest::decode(&packet.payload)?;
@@ -372,11 +547,21 @@ async fn run_async(
                     breakpoints.values().cloned().collect(),
                 )?;
             }
-            pipe.flush().await?;
-            stop = session.wait_for_stop(engine)?;
+            writer.flush().await?;
+            let activity = crate::skdispatch::WaitActivity::default();
+            wait_waker.begin(activity.clone());
+            wait_waker.start_idle_watchdog(options.idle_timeout, activity.clone());
+            let waited = session.wait_for_stop_interruptible(engine, &activity);
+            let wake = wait_waker.finish();
+            stop = match (waited, wake) {
+                (Ok(stop), _) => stop,
+                (Err(_), Some(WaitWakeReason::Disconnected)) => return Err(Disconnected.into()),
+                (Err(error), Some(reason)) => return Err(error.context(reason.to_string())),
+                (Err(error), None) => return Err(error),
+            };
             (values, context) = read_context(session, &stop)?;
             reported_instruction = read_instruction_guard(session, values.rip)?;
-            send_stop(&mut pipe, &mut link, &reported_instruction.bytes, &values).await?;
+            send_stop(&mut writer, &mut link, &reported_instruction.bytes, &values).await?;
             continue;
         } else {
             eprintln!("KD API {:#x} is not implemented", request.api_number());
@@ -385,47 +570,107 @@ async fn run_async(
         let response = link
             .send(crate::kdwire::PACKET_TYPE_STATE_MANIPULATE, &response)
             .map_err(anyhow::Error::msg)?;
-        pipe.write_all(&response).await?;
-        pipe.flush().await?;
+        writer.write_all(&response).await?;
+        writer.flush().await?;
     }
 }
 
-async fn wait_for_reset(
-    pipe: &mut tokio::net::windows::named_pipe::NamedPipeServer,
-    decoder: &mut Decoder,
+async fn wait_for_reset<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    transport: &mut mpsc::Receiver<TransportMessage>,
     link: &mut TargetLink,
 ) -> Result<()> {
     loop {
-        let inbound = link.receive(read_frame(pipe, decoder).await?);
+        let inbound = link.receive(read_frame(transport).await?);
         for write in inbound.writes {
-            pipe.write_all(&write).await?;
+            writer.write_all(&write).await?;
         }
-        pipe.flush().await?;
+        writer.flush().await?;
         if inbound.peer_reset {
             return Ok(());
         }
     }
 }
 
-async fn read_frame(
-    pipe: &mut tokio::net::windows::named_pipe::NamedPipeServer,
-    decoder: &mut Decoder,
-) -> Result<Frame> {
-    loop {
-        if let Some(frame) = decoder.next().context("decoding the WinDbg KD stream")? {
-            return Ok(frame);
-        }
-        let mut bytes = [0; 4096];
-        let read = pipe.read(&mut bytes).await?;
-        if read == 0 {
-            return Err(Disconnected.into());
-        }
-        decoder.push(&bytes[..read]);
+async fn read_frame(transport: &mut mpsc::Receiver<TransportMessage>) -> Result<Frame> {
+    match transport.recv().await {
+        Some(TransportMessage::Frame(frame)) => Ok(frame),
+        Some(TransportMessage::Disconnected) | None => Err(Disconnected.into()),
+        Some(TransportMessage::Failed(why)) => bail!("reading the WinDbg KD stream failed: {why}"),
     }
 }
 
-async fn send_stop(
-    pipe: &mut tokio::net::windows::named_pipe::NamedPipeServer,
+async fn read_transport<R: AsyncRead + Unpin>(
+    mut reader: R,
+    transport: mpsc::Sender<TransportMessage>,
+    wait_waker: WaitWaker,
+) {
+    let mut decoder = Decoder::default();
+    loop {
+        loop {
+            let frame = match decoder.next() {
+                Ok(Some(frame)) => frame,
+                Ok(None) => break,
+                Err(error) => {
+                    let why = error.to_string();
+                    wait_waker.request(WaitWakeReason::Transport(why.clone()));
+                    let _ = queue_transport(&transport, TransportMessage::Failed(why), &wait_waker);
+                    return;
+                }
+            };
+            wait_waker.note_traffic();
+            let wake = match &frame {
+                Frame::BreakIn => Some(WaitWakeReason::BreakIn),
+                Frame::Control {
+                    packet_type: crate::kdwire::PACKET_TYPE_RESET,
+                    ..
+                } => Some(WaitWakeReason::Reset),
+                _ => None,
+            };
+            if let Some(reason) = wake {
+                wait_waker.request(reason);
+            }
+            if !queue_transport(&transport, TransportMessage::Frame(frame), &wait_waker) {
+                return;
+            }
+        }
+        let mut bytes = [0; 4096];
+        match reader.read(&mut bytes).await {
+            Ok(0) => {
+                wait_waker.request(WaitWakeReason::Disconnected);
+                let _ = queue_transport(&transport, TransportMessage::Disconnected, &wait_waker);
+                return;
+            }
+            Ok(read) => decoder.push(&bytes[..read]),
+            Err(error) => {
+                let why = error.to_string();
+                wait_waker.request(WaitWakeReason::Transport(why.clone()));
+                let _ = queue_transport(&transport, TransportMessage::Failed(why), &wait_waker);
+                return;
+            }
+        }
+    }
+}
+
+fn queue_transport(
+    transport: &mpsc::Sender<TransportMessage>,
+    message: TransportMessage,
+    wait_waker: &WaitWaker,
+) -> bool {
+    match transport.try_send(message) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            wait_waker.request(WaitWakeReason::Transport(format!(
+                "the bounded KD input queue exceeded {TRANSPORT_QUEUE_DEPTH} frames"
+            )));
+            false
+        }
+    }
+}
+
+async fn send_stop<W: AsyncWrite + Unpin>(
+    writer: &mut W,
     link: &mut TargetLink,
     instruction: &[u8],
     values: &Amd64ContextValues,
@@ -434,8 +679,8 @@ async fn send_stop(
     let packet = link
         .send(crate::kdwire::PACKET_TYPE_STATE_CHANGE64, &state)
         .map_err(anyhow::Error::msg)?;
-    pipe.write_all(&packet).await?;
-    pipe.flush().await?;
+    writer.write_all(&packet).await?;
+    writer.flush().await?;
     Ok(())
 }
 
@@ -587,6 +832,17 @@ fn fallthrough_step_guard(instruction: InstructionGuard) -> Result<StepGuard> {
             instruction.address.0
         );
     }
+    let writes_ss = decoded.op0_kind() == OpKind::Register
+        && decoded.op0_register() == Register::SS
+        && matches!(decoded.mnemonic(), Mnemonic::Mov | Mnemonic::Pop);
+    if writes_ss || decoded.mnemonic() == Mnemonic::Lss {
+        bail!(
+            "WinDbg single-step is refused because {:?} can defer the trap-flag exception past \
+             the linear successor at {:#x}",
+            decoded.mnemonic(),
+            instruction.address.0
+        );
+    }
     Ok(StepGuard {
         instruction: Some(instruction),
         expected_rips: Vec::new(),
@@ -615,7 +871,7 @@ fn decode_hex(text: &str) -> Result<Vec<u8>> {
 /// Supplies the bounded scaffolding that WinDbg reads while treating this non-NT target as KD.
 ///
 /// The synthetic thread page is the wait-state identity. Its zero links make WinDbg inspect the
-/// null page next. The KUSER page covers fixed shared-data probes made during target startup.
+/// null page next. Four exact, measured KUSER reads cover shared-data probes made during startup.
 /// WinDbg also probes the reported RSP as an NT trap frame and disassembles backwards across bytes
 /// preceding the current instruction. Neither assumption holds for this redirected Secure Kernel
 /// stop: the selected NOP follows embedded data, and the backscan changes WinDbg's current address
@@ -626,6 +882,7 @@ struct CompatibilityMemory {
     stack_bookkeeping: bool,
     code_backscan: bool,
     code_lookahead: bool,
+    kuser_startup_probes: [bool; KUSER_STARTUP_PROBES.len()],
 }
 
 impl Default for CompatibilityMemory {
@@ -634,6 +891,7 @@ impl Default for CompatibilityMemory {
             stack_bookkeeping: true,
             code_backscan: true,
             code_lookahead: true,
+            kuser_startup_probes: [true; KUSER_STARTUP_PROBES.len()],
         }
     }
 }
@@ -653,7 +911,17 @@ impl CompatibilityMemory {
                 && end <= base + COMPATIBILITY_PAGE_BYTES
                 && u64::from(count) <= COMPATIBILITY_PAGE_BYTES
         };
-        if inside(crate::kdapi::SYNTHETIC_THREAD) || inside(0) || inside(KUSER_SHARED_DATA) {
+        if inside(crate::kdapi::SYNTHETIC_THREAD) || inside(0) {
+            return Some(vec![0; count as usize]);
+        }
+        if let Some((index, _)) = KUSER_STARTUP_PROBES
+            .iter()
+            .enumerate()
+            .find(|(index, probe)| {
+                self.kuser_startup_probes[*index] && address == probe.0 && count == probe.1
+            })
+        {
+            self.kuser_startup_probes[index] = false;
             return Some(vec![0; count as usize]);
         }
         let stack_bookkeeping = self.stack_bookkeeping
@@ -719,9 +987,21 @@ mod tests {
             Some(vec![0; 16])
         );
         assert_eq!(memory.read(0, 16, 0x8000, 0x9000, 5), Some(vec![0; 16]));
+        for (address, count) in KUSER_STARTUP_PROBES {
+            assert_eq!(
+                memory.read(address, count, 0x8000, 0x9000, 5),
+                Some(vec![0; count as usize])
+            );
+            assert_eq!(
+                memory.read(address, count, 0x8000, 0x9000, 5),
+                None,
+                "an explicit repeat must read the real KUSER page"
+            );
+        }
         assert_eq!(
             memory.read(KUSER_SHARED_DATA + 0x268, 8, 0x8000, 0x9000, 5),
-            Some(vec![0; 8])
+            None,
+            "unmeasured KUSER request shapes are never synthetic"
         );
         assert_eq!(
             memory.read(
@@ -766,6 +1046,18 @@ mod tests {
         for bytes in [&[0xeb, 0x05][..], &[0xe8, 0, 0, 0, 0], &[0xc3]] {
             let error = fallthrough_step_guard(guard(bytes)).unwrap_err();
             assert!(error.to_string().contains("control flow"), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn single_step_rejects_linear_instructions_that_defer_the_debug_trap() {
+        let guard = |bytes: &[u8]| InstructionGuard {
+            address: crate::skcontrol::HexU64(0x1000),
+            bytes: bytes.to_vec(),
+        };
+        for bytes in [&[0x8e, 0xd0][..], &[0x48, 0x0f, 0xb2, 0x20][..]] {
+            let error = fallthrough_step_guard(guard(bytes)).unwrap_err();
+            assert!(error.to_string().contains("defer"), "{error:#}");
         }
     }
 

@@ -13,7 +13,8 @@ use std::fmt;
 use std::io::Read;
 use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -108,6 +109,25 @@ impl Session {
     pub(crate) fn wait_for_stop(&mut self, engine: &DebugEngine) -> Result<StopRecord> {
         let mut dispatcher = self.dispatcher.bind(engine);
         self.control.wait_for_stop(&mut dispatcher)
+    }
+
+    /// Wait while exposing only the lifetime of the owned DbgEng wait to a transport thread.
+    ///
+    /// The transport may use that fact to deliver DbgEng's documented cross-thread
+    /// `SetInterrupt`. It cannot reach the engine, dispatcher state or live-control providers.
+    pub(crate) fn wait_for_stop_interruptible(
+        &mut self,
+        engine: &DebugEngine,
+        activity: &WaitActivity,
+    ) -> Result<StopRecord> {
+        self.dispatcher.wait_activity = Some(activity.clone());
+        let result = {
+            let mut dispatcher = self.dispatcher.bind(engine);
+            self.control.wait_for_stop(&mut dispatcher)
+        };
+        activity.finish();
+        self.dispatcher.wait_activity = None;
+        result
     }
 
     pub(crate) fn step(
@@ -475,6 +495,8 @@ pub(crate) struct VmwpDispatcherState {
     retained_event: Option<RetainedEvent>,
     completion_kick: Option<VmTransition>,
     unregister: Option<UnregisterProgress>,
+    /// Present only for the KD facade's current running wait. It exposes no DbgEng object.
+    wait_activity: Option<WaitActivity>,
 }
 
 impl VmwpDispatcherState {
@@ -513,6 +535,7 @@ impl VmwpDispatcherState {
             retained_event: None,
             completion_kick: None,
             unregister: None,
+            wait_activity: None,
         })
     }
 
@@ -723,14 +746,66 @@ pub(crate) struct VmwpDispatcher<'a> {
     state: &'a mut VmwpDispatcherState,
 }
 
+const WAIT_ARMED: u8 = 0;
+const WAIT_ACTIVE: u8 = 1;
+const WAIT_FINISHED: u8 = 2;
+
+/// Cross-thread observation of the exact interval in which DbgEng waits for the owned vmwp site.
+///
+/// This carries no engine interface. The KD transport pairs it with an `InterruptHandle`, whose
+/// sole operation is the repository's documented `SetInterrupt` exception.
+#[derive(Clone, Default)]
+pub(crate) struct WaitActivity(Arc<AtomicU8>);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WaitActivityPhase {
+    Armed,
+    Active,
+    Finished,
+}
+
+impl WaitActivity {
+    pub(crate) fn phase(&self) -> WaitActivityPhase {
+        match self.0.load(Ordering::Acquire) {
+            WAIT_ARMED => WaitActivityPhase::Armed,
+            WAIT_ACTIVE => WaitActivityPhase::Active,
+            WAIT_FINISHED => WaitActivityPhase::Finished,
+            _ => unreachable!("WaitActivity stores only declared phases"),
+        }
+    }
+
+    pub(crate) fn finish(&self) {
+        self.0.store(WAIT_FINISHED, Ordering::Release);
+    }
+
+    pub(crate) fn same_wait(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    fn enter(&self) -> Result<WaitActivityGuard> {
+        self.0
+            .compare_exchange(WAIT_ARMED, WAIT_ACTIVE, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| anyhow!("the interruptible DbgEng wait was entered more than once"))?;
+        Ok(WaitActivityGuard(self.clone()))
+    }
+}
+
+struct WaitActivityGuard(WaitActivity);
+
+impl Drop for WaitActivityGuard {
+    fn drop(&mut self) {
+        self.0.finish();
+    }
+}
+
 #[derive(Clone, Debug)]
 enum DispatcherPhase {
     Fresh,
     Registering,
     ReadyForStop,
-    /// The event-site breakpoint remained armed until DbgEng's own wait deadline interrupted
+    /// The event-site breakpoint remained armed until a deadline or scoped request interrupted
     /// ordinary vmwp execution. This is the only no-event stop that may detach before Suspend-VM.
-    ReadyForStopDeadline,
+    ReadyForStopInterrupted,
     Holding(HeldEvent),
     ReturningCallback(HeldEvent),
     CallbackEntry(HeldEvent),
@@ -1025,7 +1100,7 @@ impl EventDispatcher for VmwpDispatcher<'_> {
         // event, join that helper before a fresh Suspend-VM proves recovery quiescence. An incomplete
         // callback whose exact thread was not retained remains fail-closed.
         let transition_error = self.state.finish_completion_kick().err();
-        let pause = if matches!(self.state.phase, DispatcherPhase::ReadyForStopDeadline) {
+        let pause = if matches!(self.state.phase, DispatcherPhase::ReadyForStopInterrupted) {
             self.pause_armed_without_event(targets)
         } else if matches!(
             self.state.phase,
@@ -1254,6 +1329,8 @@ impl VmwpDispatcher<'_> {
         event_site: u64,
         deadline: Instant,
     ) -> Result<(u64, HeldEvent)> {
+        let activity = self.state.wait_activity.clone();
+        let _activity = activity.as_ref().map(WaitActivity::enter).transpose()?;
         loop {
             self.run_to_current_breakpoint(deadline)?;
             if self.engine.instruction_pointer().map_err(debugger)? != event_site {
@@ -1347,7 +1424,7 @@ impl VmwpDispatcher<'_> {
         if self.state.targets != targets
             || !matches!(
                 self.state.phase,
-                DispatcherPhase::ReadyForStop | DispatcherPhase::ReadyForStopDeadline
+                DispatcherPhase::ReadyForStop | DispatcherPhase::ReadyForStopInterrupted
             )
             || self.state.retained_event.is_some()
             || !self.state.attached
@@ -2019,12 +2096,12 @@ impl VmwpDispatcher<'_> {
             bail!("vmwp left the debugger while an owned breakpoint was pending");
         }
         if let Some(interruption) = run.cut_short {
+            if matches!(self.state.phase, DispatcherPhase::ReadyForStop) {
+                self.state.phase = DispatcherPhase::ReadyForStopInterrupted;
+            }
             match interruption {
                 Interruption::OnRequest => bail!("the debugger wait was interrupted on request"),
                 Interruption::Deadline { .. } => {
-                    if matches!(self.state.phase, DispatcherPhase::ReadyForStop) {
-                        self.state.phase = DispatcherPhase::ReadyForStopDeadline;
-                    }
                     bail!("the debugger wait reached its deadline")
                 }
             }
@@ -2479,6 +2556,22 @@ impl VmTransition {
 mod tests {
     use super::*;
     use crate::sklive::DispatcherLayout;
+
+    #[test]
+    fn interruptible_wait_activity_exposes_only_its_owned_interval() {
+        let activity = WaitActivity::default();
+        assert_eq!(activity.phase(), WaitActivityPhase::Armed);
+        {
+            let _guard = activity.enter().unwrap();
+            assert_eq!(activity.phase(), WaitActivityPhase::Active);
+        }
+        assert_eq!(activity.phase(), WaitActivityPhase::Finished);
+
+        let cancelled_before_entry = WaitActivity::default();
+        cancelled_before_entry.finish();
+        assert_eq!(cancelled_before_entry.phase(), WaitActivityPhase::Finished);
+        assert!(cancelled_before_entry.enter().is_err());
+    }
 
     #[test]
     fn acceptance_request_keeps_the_runtime_vnd_out_of_the_build_profile() {
