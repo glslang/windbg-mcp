@@ -442,6 +442,7 @@ async fn run_async(
         }
         if peer_reset {
             compatibility = CompatibilityMemory::default();
+            breakpoints.clear();
             send_stop(&mut writer, &mut link, &reported_instruction.bytes, &values).await?;
             eprintln!("KD peer reset; current held stop resent");
             continue;
@@ -532,19 +533,33 @@ async fn run_async(
             request.success_response()
         } else if let Some(trace) = request.continue2_trace() {
             eprintln!("KD Continue2 trace={trace}");
-            if trace {
+            let resume = if trace {
                 let rip = stopped_low(&stop, RegisterName::Rip)?;
-                let guard = fallthrough_step_guard(read_instruction_guard(session, rip)?)?;
-                session.step(engine, &stop.epoch, guard)?;
+                read_instruction_guard(session, rip)
+                    .and_then(fallthrough_step_guard)
+                    .and_then(|guard| session.step(engine, &stop.epoch, guard).map(|_| ()))
             } else {
                 if breakpoints.is_empty() {
-                    bail!("WinDbg requested continue with no hardware breakpoint installed");
+                    Err(anyhow!(
+                        "WinDbg requested continue with no hardware breakpoint installed"
+                    ))
+                } else {
+                    session
+                        .continue_to_breakpoints(
+                            engine,
+                            &stop.epoch,
+                            breakpoints.values().cloned().collect(),
+                        )
+                        .map(|_| ())
                 }
-                session.continue_to_breakpoints(
-                    engine,
-                    &stop.epoch,
-                    breakpoints.values().cloned().collect(),
-                )?;
+            };
+            if let Err(error) = resume {
+                if session.phase() != crate::sklive::LivePhase::Stopped {
+                    return Err(error);
+                }
+                eprintln!("KD Continue2 refused; current held stop preserved: {error:#}");
+                send_stop(&mut writer, &mut link, &reported_instruction.bytes, &values).await?;
+                continue;
             }
             writer.flush().await?;
             let activity = crate::skdispatch::WaitActivity::new(options.idle_timeout);
@@ -847,6 +862,16 @@ fn fallthrough_step_guard(instruction: InstructionGuard) -> Result<StepGuard> {
     let writes_ss = decoded.op0_kind() == OpKind::Register
         && decoded.op0_register() == Register::SS
         && matches!(decoded.mnemonic(), Mnemonic::Mov | Mnemonic::Pop);
+    let repeats = decoded.is_string_instruction()
+        && (decoded.has_rep_prefix() || decoded.has_repe_prefix() || decoded.has_repne_prefix());
+    if repeats {
+        bail!(
+            "WinDbg single-step is refused for repeated {:?} at {:#x}; the trap can stop before \
+             the linear successor",
+            decoded.mnemonic(),
+            instruction.address.0
+        );
+    }
     if writes_ss || decoded.mnemonic() == Mnemonic::Lss {
         bail!(
             "WinDbg single-step is refused because {:?} can defer the trap-flag exception past \
@@ -1101,9 +1126,16 @@ mod tests {
             address: crate::skcontrol::HexU64(0x1000),
             bytes: bytes.to_vec(),
         };
-        for bytes in [&[0x8e, 0xd0][..], &[0x48, 0x0f, 0xb2, 0x20][..]] {
+        for bytes in [
+            &[0x8e, 0xd0][..],
+            &[0x48, 0x0f, 0xb2, 0x20][..],
+            &[0xf3, 0xa4][..],
+        ] {
             let error = fallthrough_step_guard(guard(bytes)).unwrap_err();
-            assert!(error.to_string().contains("defer"), "{error:#}");
+            assert!(
+                error.to_string().contains("defer") || error.to_string().contains("repeated"),
+                "{error:#}"
+            );
         }
     }
 

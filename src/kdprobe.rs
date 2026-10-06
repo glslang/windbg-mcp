@@ -280,7 +280,6 @@ async fn run_async(options: Options) -> Result<()> {
                 }
                 if peer_reset {
                     resets += 1;
-                    deadline = tokio::time::Instant::now() + options.timeout;
                     last_activity_after_ack = None;
                     repeat_state_after_ack = false;
                     let packet = link
