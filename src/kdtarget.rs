@@ -493,10 +493,11 @@ async fn run_async(
                 }
             }
         } else if let Some(read) = request.read_control_space() {
-            let count = read
-                .count
-                .min((crate::kdwire::MAX_PACKET_BYTES - crate::kdapi::MANIPULATE_BYTES) as u32);
-            request.read_control_space_response(&vec![0; count as usize])?
+            eprintln!(
+                "KD control-space read {:#x}+{:#x} is unsupported",
+                read.address, read.count
+            );
+            request.failure_response()
         } else if let Some((write, _)) = request.write_control_space() {
             eprintln!(
                 "KD control-space write {:#x}+{:#x} is unsupported",
@@ -533,11 +534,14 @@ async fn run_async(
             request.success_response()
         } else if let Some(trace) = request.continue2_trace() {
             eprintln!("KD Continue2 trace={trace}");
+            let activity = crate::skdispatch::WaitActivity::new(options.idle_timeout);
+            wait_waker.begin(activity.clone());
             let resume = if trace {
-                let rip = stopped_low(&stop, RegisterName::Rip)?;
-                read_instruction_guard(session, rip)
-                    .and_then(fallthrough_step_guard)
-                    .and_then(|guard| session.step(engine, &stop.epoch, guard).map(|_| ()))
+                stopped_low(&stop, RegisterName::Rip).and_then(|rip| {
+                    read_instruction_guard(session, rip)
+                        .and_then(fallthrough_step_guard)
+                        .and_then(|guard| session.step(engine, &stop.epoch, guard).map(|_| ()))
+                })
             } else {
                 if breakpoints.is_empty() {
                     Err(anyhow!(
@@ -554,6 +558,8 @@ async fn run_async(
                 }
             };
             if let Err(error) = resume {
+                activity.finish();
+                wait_waker.finish();
                 if session.phase() != crate::sklive::LivePhase::Stopped {
                     return Err(error);
                 }
@@ -561,10 +567,12 @@ async fn run_async(
                 send_stop(&mut writer, &mut link, &reported_instruction.bytes, &values).await?;
                 continue;
             }
-            writer.flush().await?;
-            let activity = crate::skdispatch::WaitActivity::new(options.idle_timeout);
-            wait_waker.begin(activity.clone());
             wait_waker.start_idle_watchdog(activity.clone());
+            if let Err(error) = writer.flush().await {
+                activity.finish();
+                wait_waker.finish();
+                return Err(error.into());
+            }
             let waited = session.wait_for_stop_interruptible(engine, &activity);
             let wake = wait_waker.finish();
             stop = match (waited, wake) {
