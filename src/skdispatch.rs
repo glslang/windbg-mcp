@@ -14,7 +14,7 @@ use std::io::Read;
 use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -754,8 +754,14 @@ const WAIT_FINISHED: u8 = 2;
 ///
 /// This carries no engine interface. The KD transport pairs it with an `InterruptHandle`, whose
 /// sole operation is the repository's documented `SetInterrupt` exception.
-#[derive(Clone, Default)]
-pub(crate) struct WaitActivity(Arc<AtomicU8>);
+#[derive(Clone)]
+pub(crate) struct WaitActivity(Arc<WaitActivityState>);
+
+struct WaitActivityState {
+    phase: AtomicU8,
+    last_traffic: Mutex<Instant>,
+    idle_timeout: Duration,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WaitActivityPhase {
@@ -765,8 +771,16 @@ pub(crate) enum WaitActivityPhase {
 }
 
 impl WaitActivity {
+    pub(crate) fn new(idle_timeout: Duration) -> Self {
+        Self(Arc::new(WaitActivityState {
+            phase: AtomicU8::new(WAIT_ARMED),
+            last_traffic: Mutex::new(Instant::now()),
+            idle_timeout,
+        }))
+    }
+
     pub(crate) fn phase(&self) -> WaitActivityPhase {
-        match self.0.load(Ordering::Acquire) {
+        match self.0.phase.load(Ordering::Acquire) {
             WAIT_ARMED => WaitActivityPhase::Armed,
             WAIT_ACTIVE => WaitActivityPhase::Active,
             WAIT_FINISHED => WaitActivityPhase::Finished,
@@ -775,15 +789,34 @@ impl WaitActivity {
     }
 
     pub(crate) fn finish(&self) {
-        self.0.store(WAIT_FINISHED, Ordering::Release);
+        self.0.phase.store(WAIT_FINISHED, Ordering::Release);
     }
 
     pub(crate) fn same_wait(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
 
+    pub(crate) fn note_traffic(&self) {
+        *self
+            .0
+            .last_traffic
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Instant::now();
+    }
+
+    pub(crate) fn remaining_idle(&self) -> Duration {
+        self.0.idle_timeout.saturating_sub(
+            self.0
+                .last_traffic
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .elapsed(),
+        )
+    }
+
     fn enter(&self) -> Result<WaitActivityGuard> {
         self.0
+            .phase
             .compare_exchange(WAIT_ARMED, WAIT_ACTIVE, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| anyhow!("the interruptible DbgEng wait was entered more than once"))?;
         Ok(WaitActivityGuard(self.clone()))
@@ -1366,7 +1399,13 @@ impl VmwpDispatcher<'_> {
                     },
                 ));
             }
-            if Instant::now() >= deadline {
+            let deadline_expired = self
+                .state
+                .wait_activity
+                .as_ref()
+                .map(|activity| activity.remaining_idle().is_zero())
+                .unwrap_or_else(|| Instant::now() >= deadline);
+            if deadline_expired {
                 bail!("too many unrelated dispatcher events before the owned vector-1 event");
             }
         }
@@ -2083,39 +2122,68 @@ impl VmwpDispatcher<'_> {
     }
 
     fn run_to_current_breakpoint(&mut self, deadline: Instant) -> Result<()> {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            bail!("the debugger did not reach the owned breakpoint before its deadline");
-        }
-        let timeout = remaining.as_millis().min(u128::from(u32::MAX)) as u32;
-        let run = self
-            .engine
-            .execute_and_wait("g", timeout)
-            .map_err(debugger)?;
-        if run.target_gone {
-            bail!("vmwp left the debugger while an owned breakpoint was pending");
-        }
-        if let Some(interruption) = run.cut_short {
-            if matches!(self.state.phase, DispatcherPhase::ReadyForStop) {
-                self.state.phase = DispatcherPhase::ReadyForStopInterrupted;
-            }
-            match interruption {
-                Interruption::OnRequest => bail!("the debugger wait was interrupted on request"),
-                Interruption::Deadline { .. } => {
-                    bail!("the debugger wait reached its deadline")
-                }
-            }
-        }
         let expected = self
             .state
             .breakpoint
             .as_ref()
             .context("no owned breakpoint is armed")?
             .address;
-        if self.engine.instruction_pointer().map_err(debugger)? == expected {
-            return Ok(());
+        loop {
+            let remaining = self
+                .state
+                .wait_activity
+                .as_ref()
+                .map(WaitActivity::remaining_idle)
+                .unwrap_or_else(|| deadline.saturating_duration_since(Instant::now()));
+            if remaining.is_zero() {
+                if matches!(self.state.phase, DispatcherPhase::ReadyForStop) {
+                    self.state.phase = DispatcherPhase::ReadyForStopInterrupted;
+                }
+                bail!("the debugger did not reach the owned breakpoint before its deadline");
+            }
+            let timeout = remaining.as_millis().min(u128::from(u32::MAX)) as u32;
+            let run = self
+                .engine
+                .execute_and_wait("g", timeout)
+                .map_err(debugger)?;
+            if run.target_gone {
+                bail!("vmwp left the debugger while an owned breakpoint was pending");
+            }
+            if let Some(interruption) = run.cut_short {
+                match interruption {
+                    Interruption::OnRequest => {
+                        if matches!(self.state.phase, DispatcherPhase::ReadyForStop) {
+                            self.state.phase = DispatcherPhase::ReadyForStopInterrupted;
+                        }
+                        bail!("the debugger wait was interrupted on request")
+                    }
+                    Interruption::Deadline { .. }
+                        if self.engine.instruction_pointer().map_err(debugger)? == expected =>
+                    {
+                        return Ok(());
+                    }
+                    Interruption::Deadline { .. }
+                        if self
+                            .state
+                            .wait_activity
+                            .as_ref()
+                            .is_some_and(|activity| !activity.remaining_idle().is_zero()) =>
+                    {
+                        continue;
+                    }
+                    Interruption::Deadline { .. } => {
+                        if matches!(self.state.phase, DispatcherPhase::ReadyForStop) {
+                            self.state.phase = DispatcherPhase::ReadyForStopInterrupted;
+                        }
+                        bail!("the debugger wait reached its deadline")
+                    }
+                }
+            }
+            if self.engine.instruction_pointer().map_err(debugger)? == expected {
+                return Ok(());
+            }
+            bail!("the debugger stopped for an event the live-control adapter does not own")
         }
-        bail!("the debugger stopped for an event the live-control adapter does not own")
     }
 
     fn set_site_breakpoint(&mut self, site: &DispatcherSite) -> Result<()> {
@@ -2559,7 +2627,7 @@ mod tests {
 
     #[test]
     fn interruptible_wait_activity_exposes_only_its_owned_interval() {
-        let activity = WaitActivity::default();
+        let activity = WaitActivity::new(Duration::from_secs(1));
         assert_eq!(activity.phase(), WaitActivityPhase::Armed);
         {
             let _guard = activity.enter().unwrap();
@@ -2567,7 +2635,7 @@ mod tests {
         }
         assert_eq!(activity.phase(), WaitActivityPhase::Finished);
 
-        let cancelled_before_entry = WaitActivity::default();
+        let cancelled_before_entry = WaitActivity::new(Duration::from_secs(1));
         cancelled_before_entry.finish();
         assert_eq!(cancelled_before_entry.phase(), WaitActivityPhase::Finished);
         assert!(cancelled_before_entry.enter().is_err());
