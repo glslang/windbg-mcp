@@ -38,7 +38,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The two skip messages also lost their `(issue #142)`, the other half of the report: they are
   printed into a CI log, where a parenthesised closed issue about a *stack walk* reads as a live
   tracker for the *symbol* failure in front of you. The pointer stays in the doc comments above
-  them, which link it as the history it is. **And the retry is asserted somewhere a green tier run
+  them, which link it as the history it is. `tools/local_model_eval.py`'s `kernel_symbols` gate
+  loses the same parenthetical, for the first of those reasons and not the second: the symptom it
+  names — a stack walk giving back the bug check's own parameters — *is* #142's, so that citation was
+  pointed at the right thing, and what it shared with the other two is a closed issue sitting in
+  output a reader is invited to go and open, under a title ("an ARM64 engine cannot read virtual
+  memory from an x64 kernel dump") the repo has since recorded as the wrong reading of it. **And the retry is asserted somewhere a green tier run
   can reach**, because the tier itself cannot: symbols resolve on the first ask on both CI entries,
   so every claim about the second and third would have rested on nothing having run — the same
   vacuity the `!analyze` assertions were found in. `before_ask` returns the schedule as a value, and
