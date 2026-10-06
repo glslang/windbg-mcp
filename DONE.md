@@ -9334,3 +9334,14 @@ across the entry and the note already in the file is the only cross-check availa
 a weaker one than a re-measurement -- a sweep of a different guest, or of a machine with a
 third-party driver's installer in it, is the thing that would actually test the bound these notes
 state.
+
+**And review on the close found that the figures' own arithmetic does not close.** 7 ACEs carrying
+generic bits and "the other 141" come to 148 against a stated total of **149** -- and the one-off is
+in the *record* rather than in this close's reading of it: the sweep's own commit (2026-09-13,
+`4630c7c`) states all three figures exactly as `data_access` did. The finding read 141 as a typo for
+142, which is the likeliest of the three to be wrong and is still a guess about which number was
+mistyped: the `7` is stated three times in that note and is what the rule rests on, and the `149` is
+corroborated only by this entry, written from the same sweep. So the remainder is **left unstated**
+instead -- the other side of a partition needs no count, and dropping it leaves no third figure to
+keep in step -- with the gap recorded beside it. Settling it wants the sweep re-taken on that guest,
+which is the same measurement the bound above wants anyway.
