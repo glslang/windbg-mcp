@@ -149,6 +149,23 @@ impl AceKind {
     /// -- `0x11` is the mandatory label. It was first written `0x04`..=`0x0f` out of doubt about
     /// whether `0x10` was a type at all; it is one, and leaving it out was the same mistake in
     /// miniature as leaving the object-callback types out of [`Ace::callback`].
+    ///
+    /// **Nothing measured on a real machine exercises that range, and what the measurement bounds
+    /// is one machine's *defaults* rather than this parser's input** (`FOLLOWUPS.md` item 69).
+    /// Across every distinct descriptor behind every device in `\Device` on a live Windows Server
+    /// 26100 guest -- 41 descriptors, 149 ACEs, 2026-09-13, the sweep whose generic-bit half
+    /// [`data_access`] reports -- **every ACE is type `0x00`**: not one callback ACE of any kind,
+    /// let alone an object-callback one. A device's DACL is whatever was assigned to it, so an
+    /// installer is free to put any documented type in one, and a descriptor read off a target is
+    /// bytes rather than something Windows vouches for.
+    ///
+    /// So the figure is recorded to be *weighed* against the next finding in this family rather
+    /// than implemented, and is not licence to narrow the range back to what one guest happens to
+    /// contain. Two findings have already landed on these two rules -- rounds eight and ten of
+    /// #311, which widened this range and [`Ace::callback`] -- and both were right while meeting
+    /// nothing. `0x10` is the same argument from the other end: it carries an `ACCESS_MASK` at the
+    /// documented offset whether or not Windows has ever implemented alarms, so naming it is right
+    /// independently of whether it is ever met.
     pub(crate) fn mask_is_access(self) -> bool {
         match self {
             Self::Allow | Self::Deny | Self::Audit => true,
@@ -384,6 +401,10 @@ fn read_ace(ace_type: u8, flags: u8, body: &[u8]) -> Result<Ace, SdError> {
     // What stays narrow is `conditional` below, and for a reason about layout rather than about
     // kind: those five put one or two GUIDs before the SID, so the offset the application data
     // starts at is not one this computes.
+    //
+    // This run is documented rather than met: every ACE behind every device in `\Device` on the
+    // one machine swept is type `0x00`, and `AceKind::mask_is_access` carries that figure with
+    // what it does and does not bound -- which is one guest's defaults, not this function's input.
     let callback = (0x09..=0x10).contains(&ace_type);
     let kind = match ace_type {
         // ACCESS_ALLOWED and its callback variant.
@@ -648,10 +669,10 @@ pub(crate) fn label_policy(mask: u32) -> Vec<&'static str> {
 /// `(false, false)` is that outcome rather than a gap in this table.
 ///
 /// Measured rather than reasoned, across every distinct descriptor behind every device in
-/// `\Device` on that build: 41 descriptors, 149 ACEs, of which 7 carry generic bits and **all 7
-/// are `INHERIT_ONLY_ACE`** -- templates for children of types whose mappings differ, which is the
-/// one place a generic bit is supposed to survive. None of the other 141 carries one. Those 7 are
-/// already reported as granting nothing, by the separate inherit-only rule in
+/// `\Device` on that build, 2026-09-13: 41 descriptors, 149 ACEs, of which 7 carry generic bits
+/// and **all 7 are `INHERIT_ONLY_ACE`** -- templates for children of types whose mappings differ,
+/// which is the one place a generic bit is supposed to survive. None of the other 141 carries one.
+/// Those 7 are already reported as granting nothing, by the separate inherit-only rule in
 /// [`crate::device`]'s `access_entry`, so the two rules agree on the only ACEs where both apply.
 pub(crate) fn data_access(mask: u32) -> (bool, bool) {
     (mask & 0x0001 != 0, mask & 0x0002 != 0)
@@ -940,6 +961,17 @@ mod tests {
         // so it lands at 16 -- five bytes into the GUID. A GUID carrying `artx` there is
         // therefore an object ACE that a widened test would call conditional, on four bytes of
         // somebody's type identifier.
+        //
+        // **It is contrived, it stays, and those are the same fact.** Nothing swept on a real
+        // machine reaches it -- every ACE behind every device in `\Device` on the 26100 guest is
+        // type `0x00`, which `AceKind::mask_is_access` records -- and it is the only thing in this
+        // file standing under the narrow `conditional`. The widened predicate was uncaught by
+        // this suite until this construction existed (measured 2026-09-13), and the reason is
+        // visible in the fixtures above: none of the others puts `artx` where the bad arithmetic
+        // looks, so each of them passes either reading. Deleting the construction as artificial
+        // therefore restores an uncaught mutation rather than removing a fiction -- which
+        // `FOLLOWUPS.md` item 69 proposed once, one paragraph after saying an installer may put
+        // any documented ACE type in a device's DACL.
         let mut guid = [0xaau8; 16];
         guid[4..8].copy_from_slice(CONDITIONAL_ACE_SIGNATURE);
         let principal = sid(1, &[0]);

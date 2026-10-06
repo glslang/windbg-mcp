@@ -162,6 +162,7 @@ engine — it adds a target and leaves the current one alone. The entry records 
 - [Item 111](#111-windbg-mcp--dbgscope-an-image-targets-memory-reads-only-after-something-else-has-read-it-and-a-walk-counts-what-it-did-not-get-as-scanned--done-2026-10-04-the-second-half-withdrawn) — [windbg-mcp] An image target's memory does not read until its module is loaded — done (2026-10-04), with the entry's second claim withdrawn
 - [Item 84](#84-windbg-mcp-an-adrpadd-table-base-is-lost-at-the-add--done-2026-10-04) — [windbg-mcp] An `adrp`+`add` table base is lost at the `add` — done (2026-10-04)
 - [Item 52](#52-windbg-mcp-the-no-description-names-a-tool-the-client-cannot-call-invariant-does-not-cover-input-schemas--done-2026-10-05) — [windbg-mcp] The "no description names a tool the client cannot call" invariant does not cover **input schemas** — done (2026-10-05)
+- [Item 69](#69-windbg-mcp-record-what-the-ace-kind-rules-were-measured-against--done-2026-10-05) — [windbg-mcp] Record what the ACE-kind rules were measured against — done (2026-10-05)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -9251,3 +9252,85 @@ them, the argument docs of `modules`, `crash_triage`, `driver_hazards`, `ioctl_t
 `reachable_from_dispatch`, `run_to_address` and `debug_batch` — `steps`' most of all —
 `StepAction`'s variant docs in `src/batch.rs`, and the schema-channel paragraph in
 `.claude/rules/tool-surface.md`.
+## 69. [windbg-mcp] Record what the ACE-kind rules were measured against — **done** (2026-10-05)
+
+**Repo:** `windbg-mcp`.
+
+Rounds eight and ten of [#311](https://github.com/glslang/windbg-mcp/pull/311) classified ACE types
+this tool will not meet. `AceKind::mask_is_access` names `0x04`..=`0x10` and `Ace::callback` covers
+`0x09`..=`0x10`, which pulls in the object-callback types and `SYSTEM_ALARM_CALLBACK`. Both changes
+are correct, and nothing observed here exercises either: an object ACE's `ObjectType` GUID names a
+directory service property set or extended right, which is meaningless for a device, and the
+`SYSTEM_ALARM_*` family has never been implemented by Windows at all.
+
+**Unexercised is not unreachable, and the distinction is the whole of why this is a trim and not a
+removal.** A device's DACL is whatever was assigned to it, so an installer is free to put any
+documented ACE type in one, and a descriptor read off a target is bytes rather than something
+Windows vouches for. The sweep below bounds what one machine's *defaults* contain; it does not
+bound the parser's input.
+
+Measured the same day and not applied to the finding: across every distinct descriptor behind every
+device in `\Device` on a 26100 guest -- 41 descriptors, 149 ACEs -- **every ACE is type `0x00`**.
+Not one callback ACE of any kind, let alone an object-callback one.
+
+- **Why deferred:** the code is right and the tests are right, so nothing here is a fix. What is
+  left is writing the measurement down where the next reader of those rules will meet it.
+- **What would close it:** put the 149-of-149 figure in `sd.rs` beside the ACE-kind rules, with
+  the bound stated -- one machine's *defaults*, not the parser's input domain -- so the next
+  finding in this family is weighed against it rather than implemented, and so nobody reads the
+  measurement as licence to delete the handling.
+- **Two deletions were considered and both are rejected**, which is most of why this entry exists
+  rather than a commit. **The classifications stay**, `0x10` included: it carries an `ACCESS_MASK`
+  at the documented offset whether or not Windows implements alarms, so naming it is right
+  independently of whether it is ever met. **And the object-ACE GUID fixture stays**, which is a
+  reversal: this entry first proposed dropping it as the artificial part, and that contradicted
+  the paragraph above it in this same entry -- if an installer may put any documented ACE type in
+  a device's DACL, then an object ACE is valid input and the fixture covers a valid layout. It is
+  also the only thing standing under that rule: the `conditional`-widened mutation was **not**
+  caught by the suite until that construction existed, so deleting it restores an uncaught
+  mutation. A contrived fixture pinning a real rule beats no fixture.
+- **How it was found:** the maintainer, reading the round-ten commit and calling it artificial --
+  which it read as, and which turned out to be about the entry's framing rather than the test.
+
+**Where it picks up.** `AceKind::mask_is_access` and `read_ace` in `src/sd.rs`, and that test.
+
+**What landed is three notes in `src/sd.rs` and one copy of the figure**, placed at each of the two
+rules the entry names plus the fixture under them. `AceKind::mask_is_access` carries the sweep --
+41 descriptors, 149 ACEs, every one type `0x00`, on a live Windows Server 26100 guest, 2026-09-13
+-- with the bound stated as the entry asked (one machine's *defaults*, not this parser's input,
+because a device's DACL is whatever was assigned to it), and with both halves of why it is not a
+licence: weigh the next finding in this family against it rather than implement it, and `0x10`
+stays because it carries an `ACCESS_MASK` at the documented offset whether or not Windows ever
+implemented alarms. `read_ace`'s callback run gets a pointer to that note and **not** a second copy
+of the number, for the reason the handoff skill gives about any figure written into prose: a second
+copy is a second thing to keep dated, and the stale one still reads as current.
+
+**Half of the measurement was already in the file, which the entry did not say.** `data_access` has
+reported the *generic-bit* half of this same sweep -- "41 descriptors, 149 ACEs, of which 7 carry
+generic bits and **all 7** are `INHERIT_ONLY_ACE`" -- since the round that landed it on 2026-09-13,
+so what was missing was never the sweep but the **ACE-type** half of it. That is also what settles
+the two notes being one sweep rather than two readings, and it is why the close dated
+`data_access`'s note, which carried "on that build" and no day: with the date on both, a reader
+meeting either half can tell they are the same 41 descriptors.
+
+**The fixture's note is the entry's reversal written where the next reader meets it.** The object
+ACE whose `ObjectType` GUID carries `artx` at the offset the plain-callback arithmetic computes
+reads as the artificial part of that test, which is how this item started; what makes it the part
+that has to stay is that it is the only thing in the file standing under the narrow `conditional`.
+The others pass either reading, because none of them puts `artx` where the bad arithmetic looks --
+so deleting the construction restores an uncaught mutation rather than removing a fiction. That
+sentence now sits above the construction, in
+`a_callback_ace_is_conditional_only_when_it_carries_a_condition`, rather than in a follow-up file
+nobody reading the test will open.
+
+**Nothing in the code or the tests moved**, so there is no CHANGELOG entry and no new assertion:
+the deliverable is prose, and what it records is a fact about one guest's defaults rather than
+anything this server does. **And the figures are the entry's own, carried over rather than
+re-measured** -- re-deriving them wants a live kernel on that guest, which this close did not have
+(the bench's MCP endpoint was unreachable from the Mac it was written on). What *was* re-derived is
+the date: the sweep was undated in the entry ("the same day") and in `data_access` ("on that
+build"), and 2026-09-13 is the day rounds eight and ten landed, from `git log -- src/sd.rs`. The 41/149 agreeing
+across the entry and the note already in the file is the only cross-check available here, and it is
+a weaker one than a re-measurement -- a sweep of a different guest, or of a machine with a
+third-party driver's installer in it, is the thing that would actually test the bound these notes
+state.

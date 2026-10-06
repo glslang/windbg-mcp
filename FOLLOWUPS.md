@@ -74,7 +74,6 @@ line is simply open.
 - [Item 64](#64-binary-ninja-upstream-verify-the-firstsetupdialog-shutdown-fix) — [Binary Ninja upstream] Verify the FirstSetupDialog shutdown fix
 - [Item 65](#65-binja-windbg-mcp-native-ultimate-validation--deferred-due-to-cost) — [binja-windbg-mcp] Native Ultimate validation — deferred due to cost
 - [Item 68](#68-windbg-mcp-whether-a-device-can-have-no-security-descriptor-at-all) — [windbg-mcp] Whether a device can have no security descriptor at all
-- [Item 69](#69-windbg-mcp-record-what-the-ace-kind-rules-were-measured-against) — [windbg-mcp] Record what the ACE-kind rules were measured against
 - [Item 71](#71-windbg-mcp-driver_surface-does-not-say-which-control-code-reaches-which-sink) — [windbg-mcp] `driver_surface` does not say which control code reaches which sink
 - [Item 72](#72-windbg-mcp-the-driver-tools-name-a-module-refresh-they-could-run-themselves) — [windbg-mcp] The driver tools name a module refresh they could run themselves
 - [Item 73](#73-windbg-mcp-a-drivers-import-directory-can-be-in-a-section-the-loader-freed) — [windbg-mcp] A driver's import directory can be in a section the loader freed
@@ -1109,48 +1108,6 @@ nobody re-derived it afterwards.
 
 **Where it picks up.** The `Security` enum and `render` in `src/device.rs`, and the
 `security_absent` field in `src/structured.rs`.
-
-## 69. [windbg-mcp] Record what the ACE-kind rules were measured against
-
-**Repo:** `windbg-mcp`.
-
-Rounds eight and ten of [#311](https://github.com/glslang/windbg-mcp/pull/311) classified ACE types
-this tool will not meet. `AceKind::mask_is_access` names `0x04`..=`0x10` and `Ace::callback` covers
-`0x09`..=`0x10`, which pulls in the object-callback types and `SYSTEM_ALARM_CALLBACK`. Both changes
-are correct, and nothing observed here exercises either: an object ACE's `ObjectType` GUID names a
-directory service property set or extended right, which is meaningless for a device, and the
-`SYSTEM_ALARM_*` family has never been implemented by Windows at all.
-
-**Unexercised is not unreachable, and the distinction is the whole of why this is a trim and not a
-removal.** A device's DACL is whatever was assigned to it, so an installer is free to put any
-documented ACE type in one, and a descriptor read off a target is bytes rather than something
-Windows vouches for. The sweep below bounds what one machine's *defaults* contain; it does not
-bound the parser's input.
-
-Measured the same day and not applied to the finding: across every distinct descriptor behind every
-device in `\Device` on a 26100 guest -- 41 descriptors, 149 ACEs -- **every ACE is type `0x00`**.
-Not one callback ACE of any kind, let alone an object-callback one.
-
-- **Why deferred:** the code is right and the tests are right, so nothing here is a fix. What is
-  left is writing the measurement down where the next reader of those rules will meet it.
-- **What would close it:** put the 149-of-149 figure in `sd.rs` beside the ACE-kind rules, with
-  the bound stated -- one machine's *defaults*, not the parser's input domain -- so the next
-  finding in this family is weighed against it rather than implemented, and so nobody reads the
-  measurement as licence to delete the handling.
-- **Two deletions were considered and both are rejected**, which is most of why this entry exists
-  rather than a commit. **The classifications stay**, `0x10` included: it carries an `ACCESS_MASK`
-  at the documented offset whether or not Windows implements alarms, so naming it is right
-  independently of whether it is ever met. **And the object-ACE GUID fixture stays**, which is a
-  reversal: this entry first proposed dropping it as the artificial part, and that contradicted
-  the paragraph above it in this same entry -- if an installer may put any documented ACE type in
-  a device's DACL, then an object ACE is valid input and the fixture covers a valid layout. It is
-  also the only thing standing under that rule: the `conditional`-widened mutation was **not**
-  caught by the suite until that construction existed, so deleting it restores an uncaught
-  mutation. A contrived fixture pinning a real rule beats no fixture.
-- **How it was found:** the maintainer, reading the round-ten commit and calling it artificial --
-  which it read as, and which turned out to be about the entry's framing rather than the test.
-
-**Where it picks up.** `AceKind::mask_is_access` and `read_ace` in `src/sd.rs`, and that test.
 
 ## 71. [windbg-mcp] `driver_surface` does not say which control code reaches which sink
 
@@ -2439,7 +2396,8 @@ what a compiler emits — and then, from the differential oracle those rounds pr
 reporting a code down the dead edge of a branch whose condition is a constant (2026-09-12), and items
 68–69 from `device_security` ([#311](https://github.com/glslang/windbg-mcp/pull/311)), where
 eleven rounds of review on one tool ended with its own live-kernel measurement contradicting the
-item an earlier round of it had produced (2026-09-13), and item 71 from `driver_surface`, the
+item an earlier round of it had produced (2026-09-13; 69 is now in [`DONE.md`](./DONE.md)), and
+item 71 from `driver_surface`, the
 fourth driver tool, whose specification included a dispatch-to-sink traversal that did not land
 with it, and item 72 from running that tool's live-kernel tier, where a fresh attach turns out to
 leave the debugger's module inventory nearly empty and the driver tools with nothing to resolve
