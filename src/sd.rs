@@ -675,10 +675,10 @@ pub(crate) fn label_policy(mask: u32) -> Vec<&'static str> {
 /// which is the one place a generic bit is supposed to survive. None of the others carries one --
 /// left without a count, because the three figures as recorded do not close: 7 and 141 against a
 /// total of 149, in the doc comment and in the sweep's own commit alike. Which of them was mistyped
-/// wants the sweep re-taken on that guest, and what this rule rests on is the 7 and their all being
-/// inherit-only rather than the remainder. Those 7 are already reported as granting nothing, by
-/// the separate inherit-only rule in [`crate::device`]'s `access_entry`, so the two rules agree on
-/// the only ACEs where both apply.
+/// wants the sweep re-taken on that guest (`FOLLOWUPS.md` item 113), and what this rule rests on is
+/// the 7 and their all being inherit-only rather than the remainder. Those 7 are already reported
+/// as granting nothing, by the separate inherit-only rule in [`crate::device`]'s `access_entry`, so
+/// the two rules agree on the only ACEs where both apply.
 pub(crate) fn data_access(mask: u32) -> (bool, bool) {
     (mask & 0x0001 != 0, mask & 0x0002 != 0)
 }
