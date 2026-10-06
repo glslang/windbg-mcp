@@ -1155,9 +1155,12 @@ mod tests {
     /// asked, rendered as an answer, which is the worst shape this tool's answer can take.
     ///
     /// **Mutation-verified against the fold**: delete the `Ordinal` arm from `scan`'s match and
-    /// the ordinal falls into the catch-all, which fails four of these at once --
-    /// `ordinal_imports` is 0, `other_imports` is 2, `shortfall()` is `None`, and the rendered
-    /// text carries an unqualified "none on the list" with no ordinal line anywhere in it.
+    /// the ordinal falls into the catch-all. Measured -- the first assertion fails outright,
+    /// `ordinal_imports` coming back 0 against 1. A panic stops there, which is why the fold is
+    /// asserted in both halves and in the text rather than in one place: under that mutation
+    /// `other_imports` is 2, the import-side shortfall is gone (`Both` becomes `Code`, and the
+    /// code-read view `None`), and the rendered text loses the ordinal line and carries an
+    /// unqualified "none on the list".
     #[test]
     fn an_ordinal_import_is_counted_apart_from_the_imports_that_were_checked() {
         let image = image();
@@ -1190,8 +1193,17 @@ mod tests {
         let report = structured_report("vid", BASE, &found, invented);
         assert_eq!(report.ordinal_imports, 1);
         assert_eq!(report.other_imports, 1);
+        // **Both**, because this test's decoder reads nothing: the code side is short by
+        // construction here and says so. What is being asserted is the *import* side, so it is
+        // asked again with the code side made whole -- there an ordinal alone is the whole
+        // shortfall, which is what a bound library is on its own.
+        assert_eq!(report.shortfall(), Some(crate::structured::Shortfall::Both));
+        let code_read = crate::structured::DriverHazards {
+            unreadable: Vec::new(),
+            ..report.clone()
+        };
         assert_eq!(
-            report.shortfall(),
+            code_read.shortfall(),
             Some(crate::structured::Shortfall::Imports),
             "an import the list was never shown makes `sinks` a lower bound for the same reason a \
              bound library does, and the typed answer has to say so"
