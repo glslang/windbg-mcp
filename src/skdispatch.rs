@@ -147,6 +147,30 @@ impl Session {
             .read_memory(stop.epoch.clone(), address, size)
     }
 
+    pub(crate) fn continue_to_breakpoints(
+        &mut self,
+        engine: &DebugEngine,
+        epoch: &crate::skcontrol::StopEpoch,
+        breakpoints: Vec<BreakpointGuard>,
+    ) -> Result<LiveTransition> {
+        let mut dispatcher = self.dispatcher.bind(engine);
+        let epoch = self
+            .control
+            .continue_to_breakpoints(&mut dispatcher, epoch, breakpoints)?;
+        Ok(LiveTransition {
+            phase: self.control.phase(),
+            epoch,
+        })
+    }
+
+    pub(crate) fn read_stopped_registers(
+        &mut self,
+        epoch: &crate::skcontrol::StopEpoch,
+        registers: Vec<crate::skcontrol::RegisterName>,
+    ) -> Result<Vec<crate::skcontrol::RegisterValue>> {
+        self.control.read_stopped_registers(epoch, registers)
+    }
+
     pub(crate) fn close(&mut self, engine: &DebugEngine) -> Result<()> {
         let mut dispatcher = self.dispatcher.bind(engine);
         self.control.close(&mut dispatcher)
