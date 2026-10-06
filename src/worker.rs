@@ -20,9 +20,12 @@
 //!
 //! **The one call that crosses that line, and why it is not a hole in it.** `SetInterrupt` is the
 //! single DbgEng entry point Microsoft documents as safe from any thread, and it is the only one
-//! this process ever makes off the engine thread — from exactly one place, [`interrupt_running`],
-//! on the request reader. Everything else about the engine stays where it always was: it is created
-//! on the engine thread, never sent anywhere, and every other call is made there.
+//! this process ever makes off the engine thread. Ordinary workers call it from
+//! [`interrupt_running`] on the request reader. The isolated `--sk-kd-target` role calls the same
+//! narrow handle from its pipe reader only while [`crate::skdispatch::WaitActivity`] proves the
+//! engine thread is inside the owned vmwp event wait. Everything else about the engine stays where
+//! it always was: it is created on the engine thread, never sent anywhere, and every other call is
+//! made there.
 //!
 //! The exception is not optional and not an optimisation. An interrupt exists to stop an operation
 //! that is *running*, which means the engine thread is by definition busy; routed through that

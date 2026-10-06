@@ -474,9 +474,14 @@ partial output at the price of an invariant nobody could see from the type.
 **This is the approved exception to engine-thread confinement** (`AGENTS.md`), and worth being
 explicit about, because the rule is otherwise absolute and the code visibly departs from it.
 `SetInterrupt` is the one DbgEng entry point Microsoft documents as safe from any thread; it is the
-only call this server makes off the engine thread, from exactly one place (`worker::interrupt_running`
-on the request reader). The engine is still created on the engine thread, never sent anywhere, and
-every other call is made there. The exception is unavoidable rather than convenient: an interrupt
+only call this server makes off the engine thread. Ordinary MCP workers route it through
+`worker::interrupt_running` on the request reader. The native Secure Kernel KD role also uses the
+same narrow handle from its pipe reader, but only while an atomic `WaitActivity` proves the engine
+thread is inside the owned vmwp event wait. Reset, disconnect, Ctrl+Break and idle expiry therefore
+cancel that wait and enter the existing fail-closed recovery instead of leaving the VM running
+behind an unread pipe. The reader receives no engine, dispatcher or provider object. The engine is
+still created on the engine thread, never sent anywhere, and every other call is made there. The
+exception is unavoidable rather than convenient: an interrupt
 exists to stop an operation that is *running*, so the engine thread is busy by definition, and a
 request routed through it would be read only once there was nothing left to interrupt — the
 alternative is not a safer interrupt but no interrupt. It is also not new. dbgscope's two watchdogs
@@ -489,8 +494,9 @@ kind of thread and is exercised by the bounded tier; dbgscope's
 and the dump tier's `a_running_command_is_interrupted_on_request_and_frees_its_session` drives it
 through the shipped binary, with the session used again afterwards — which is what would fail if
 the cross-thread call had corrupted engine state rather than merely raising a flag. The only other
-cross-thread touch is the handle's own refcount, and the handle windbg-mcp holds lives in a
-`OnceLock` for the life of the process, so it is never released at all.
+cross-thread touch is the interrupt handle's own refcount. Ordinary workers retain theirs in a
+`OnceLock` for the life of the process; the isolated KD role retains its handle until its pipe
+runtime and one debugger session end together.
 
 **Status.** Adopted. What it deliberately does **not** do: drop a *queued* job (nothing can name one
 — a tool call names a session, so that variant belongs with `tasks/cancel`), and reach a live-kernel
