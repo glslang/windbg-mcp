@@ -22,17 +22,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   down at all — so `symsrv.dll` was being read the whole time and a single round trip to the symbol
   store had failed. Re-running the job unchanged passed. That rules out the direction the issue
   offered first, running the ARM64 symbol-half copy on x64 too: the entry's symbol half was there,
-  and copying it again prevents nothing. So the **gates** ask three times
-  (`mcp_smoke::SYMBOL_FETCH_ATTEMPTS`), and the asks in between *change the configuration* rather
-  than repeating it — `symbol_path()` appended and `.reload /f nt` forced, which is the expression
+  and copying it again prevents nothing. So `ensure_kernel_symbols` fetches up to three times
+  (`mcp_smoke::SYMBOL_FETCH_ATTEMPTS`) before either gate is asked, and the attempts after the first
+  *change the configuration* rather than repeating it — `symbol_path()` appended and `.reload /f nt` forced, which is the expression
   every other symbol-needing test on this bench already shares, `WINDBG_MCP_SMOKE_SYMBOLS` override
   included. Appending it is not ceremony: the engine's ambient default expands to a `cache*` naming
   no directory, a store element that is skipped and reads as an absent PDB, which four runs of the
   pool tier were once spent on. Only the last ask waits (`SYMBOL_FETCH_BACKOFF`), the first refetch
-  being a different configuration rather than a retry of one. **Both** gates retry, not just the
-  PDB one: they stand down for a single cause and the guard greps for their two messages alike, so
-  retrying one would have left the same blip able to fail the same check through the other, a moment
-  earlier in the same dump. What this does not soften is the regression the guard exists for — an
+  being a different configuration rather than a retry of one. It covers **both** gates, which stand
+  down for a single cause and whose two messages the guard greps for alike — fetching for one only
+  would have left the same blip able to fail the same check through the other, a moment earlier in
+  the same dump.
+
+  **It runs once per session, before anything is read, and the gates stay pure reads.** The first
+  version put the retry *inside* them, which is a predicate with a side effect: a refetch that
+  succeeds moves the target's symbol state at whatever point the predicate happens to be called.
+  `a_dump_session_opens_reads_and_closes` captures `backtrace` a hundred lines before its gates and
+  then asserts that walk frame-for-frame against a `crash_triage` taken after them, so a refetch
+  landing in between makes an unsymbolised walk disagree with a symbolised one about `symbol`,
+  `module` and `rva` -- a red required check blaming two tools for disagreeing, in precisely the
+  transient the retry exists to recover from. Raised by Codex on #460 as a P1, and the local remedy it
+  offered (re-read the stale walk) is declined for the structural one: four of the five callers ask
+  their gate on the line after opening, where both placements are equivalent, so the one caller that
+  showed it was the only one that could -- and a sixth test written later would not have known.
+  Hoisting the fetch out deletes the hazard rather than the instance. The ordering is prevented by
+  construction and not asserted, there being no way to stage a failed first fetch on a runner that can
+  reach the symbol store. **And the retry no longer prints the symbol path it appended**, only which
+  source it came from: `WINDBG_MCP_SMOKE_SYMBOLS` is an operator override and a symbol store's URL can
+  carry credentials, where `load_kernel_symbols`'s transcript reaches a log only through an assertion
+  failure and a retry prints on every run it fires on. Raised by CodeRabbit on the same PR; the branch
+  that prints a value is reachable only when nothing was set to leak. What this does not soften is the regression the guard exists for — an
   image with no `symsrv.dll` has nothing to retry with, every attempt fails, and #153 is red there
   exactly as before; a retried blip is the only cause of a stand-down that re-running ever cured.
   The two skip messages also lost their `(issue #142)`, the other half of the report: they are
