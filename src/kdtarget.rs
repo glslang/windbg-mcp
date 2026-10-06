@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use dbgscope::dbgeng::{BreakRequest, DebugEngine, InterruptHandle};
@@ -36,6 +36,7 @@ const CODE_LOOKAHEAD_BYTES: u64 = 0x80;
 const STACK_BOOKKEEPING_BYTES: u64 = 0x80;
 const KUSER_SHARED_DATA: u64 = 0xffff_f780_0000_0000;
 const TRANSPORT_QUEUE_DEPTH: usize = 64;
+const NULL_STARTUP_PROBES: [(u64, u32); 2] = [(0, 4), (4, 0x0c)];
 const KUSER_STARTUP_PROBES: [(u64, u32); 4] = [
     (KUSER_SHARED_DATA + 0x268, 1),
     (KUSER_SHARED_DATA + 0x3d8, 0x358),
@@ -87,7 +88,6 @@ impl fmt::Display for WaitWakeReason {
 
 struct ActiveWait {
     activity: crate::skdispatch::WaitActivity,
-    last_traffic: Instant,
     reason: Option<WaitWakeReason>,
 }
 
@@ -111,7 +111,6 @@ impl WaitWaker {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(ActiveWait {
             activity,
-            last_traffic: Instant::now(),
             reason: None,
         });
     }
@@ -131,7 +130,7 @@ impl WaitWaker {
             .unwrap_or_else(|error| error.into_inner())
             .as_mut()
         {
-            wait.last_traffic = Instant::now();
+            wait.activity.note_traffic();
         }
     }
 
@@ -181,7 +180,7 @@ impl WaitWaker {
         });
     }
 
-    fn start_idle_watchdog(&self, timeout: Duration, activity: crate::skdispatch::WaitActivity) {
+    fn start_idle_watchdog(&self, activity: crate::skdispatch::WaitActivity) {
         let wake = self.clone();
         tokio::spawn(async move {
             loop {
@@ -199,7 +198,7 @@ impl WaitWaker {
                     if wait.reason.is_some() {
                         return;
                     }
-                    timeout.saturating_sub(wait.last_traffic.elapsed())
+                    wait.activity.remaining_idle()
                 };
                 if remaining.is_zero() {
                     wake.request_for(Some(&activity), WaitWakeReason::Idle);
@@ -548,9 +547,9 @@ async fn run_async(
                 )?;
             }
             writer.flush().await?;
-            let activity = crate::skdispatch::WaitActivity::default();
+            let activity = crate::skdispatch::WaitActivity::new(options.idle_timeout);
             wait_waker.begin(activity.clone());
-            wait_waker.start_idle_watchdog(options.idle_timeout, activity.clone());
+            wait_waker.start_idle_watchdog(activity.clone());
             let waited = session.wait_for_stop_interruptible(engine, &activity);
             let wake = wait_waker.finish();
             stop = match (waited, wake) {
@@ -796,17 +795,30 @@ fn read_instruction_guard(
     session: &crate::skdispatch::Session,
     address: u64,
 ) -> Result<InstructionGuard> {
-    let bytes = decode_hex(&session.read_memory(address, MAX_INSTRUCTION_BYTES)?.data)?;
-    let mut decoder = InstructionDecoder::with_ip(64, &bytes, address, DecoderOptions::NONE);
-    let instruction = decoder.decode();
-    if instruction.is_invalid() || instruction.len() == 0 {
-        bail!("the stopped VTL1 bytes do not decode as one AMD64 instruction");
+    let bytes_in_page = COMPATIBILITY_PAGE_BYTES - (address & (COMPATIBILITY_PAGE_BYTES - 1));
+    let first_count = u32::try_from(bytes_in_page.min(u64::from(MAX_INSTRUCTION_BYTES))).unwrap();
+    let mut bytes = decode_hex(&session.read_memory(address, first_count)?.data)?;
+    if instruction_length(&bytes, address).is_none() && first_count < MAX_INSTRUCTION_BYTES {
+        let continuation_address = address
+            .checked_add(u64::from(first_count))
+            .context("instruction address overflowed at the page boundary")?;
+        let continuation = session
+            .read_memory(continuation_address, MAX_INSTRUCTION_BYTES - first_count)
+            .context("reading the next page for an instruction that did not decode before it")?;
+        bytes.extend(decode_hex(&continuation.data)?);
     }
-    let length = instruction.len();
+    let length = instruction_length(&bytes, address)
+        .context("the stopped VTL1 bytes do not decode as one AMD64 instruction")?;
     Ok(InstructionGuard {
         address: crate::skcontrol::HexU64(address),
         bytes: bytes[..length].to_vec(),
     })
+}
+
+fn instruction_length(bytes: &[u8], address: u64) -> Option<usize> {
+    let mut decoder = InstructionDecoder::with_ip(64, bytes, address, DecoderOptions::NONE);
+    let instruction = decoder.decode();
+    (!instruction.is_invalid() && instruction.len() != 0).then(|| instruction.len())
 }
 
 /// Build the one-instruction guard accepted by the current KD facade.
@@ -870,8 +882,8 @@ fn decode_hex(text: &str) -> Result<Vec<u8>> {
 
 /// Supplies the bounded scaffolding that WinDbg reads while treating this non-NT target as KD.
 ///
-/// The synthetic thread page is the wait-state identity. Its zero links make WinDbg inspect the
-/// null page next. Four exact, measured KUSER reads cover shared-data probes made during startup.
+/// The synthetic thread page is the wait-state identity. Its zero links make WinDbg perform two
+/// exact null-page reads. Four exact KUSER reads cover shared-data probes made during startup.
 /// WinDbg also probes the reported RSP as an NT trap frame and disassembles backwards across bytes
 /// preceding the current instruction. Neither assumption holds for this redirected Secure Kernel
 /// stop: the selected NOP follows embedded data, and the backscan changes WinDbg's current address
@@ -882,6 +894,7 @@ struct CompatibilityMemory {
     stack_bookkeeping: bool,
     code_backscan: bool,
     code_lookahead: bool,
+    null_startup_probes: [bool; NULL_STARTUP_PROBES.len()],
     kuser_startup_probes: [bool; KUSER_STARTUP_PROBES.len()],
 }
 
@@ -891,6 +904,7 @@ impl Default for CompatibilityMemory {
             stack_bookkeeping: true,
             code_backscan: true,
             code_lookahead: true,
+            null_startup_probes: [true; NULL_STARTUP_PROBES.len()],
             kuser_startup_probes: [true; KUSER_STARTUP_PROBES.len()],
         }
     }
@@ -911,7 +925,17 @@ impl CompatibilityMemory {
                 && end <= base + COMPATIBILITY_PAGE_BYTES
                 && u64::from(count) <= COMPATIBILITY_PAGE_BYTES
         };
-        if inside(crate::kdapi::SYNTHETIC_THREAD) || inside(0) {
+        if inside(crate::kdapi::SYNTHETIC_THREAD) {
+            return Some(vec![0; count as usize]);
+        }
+        if let Some((index, _)) = NULL_STARTUP_PROBES
+            .iter()
+            .enumerate()
+            .find(|(index, probe)| {
+                self.null_startup_probes[*index] && address == probe.0 && count == probe.1
+            })
+        {
+            self.null_startup_probes[index] = false;
             return Some(vec![0; count as usize]);
         }
         if let Some((index, _)) = KUSER_STARTUP_PROBES
@@ -986,7 +1010,22 @@ mod tests {
             memory.read(crate::kdapi::SYNTHETIC_THREAD + 8, 16, 0x8000, 0x9000, 5),
             Some(vec![0; 16])
         );
-        assert_eq!(memory.read(0, 16, 0x8000, 0x9000, 5), Some(vec![0; 16]));
+        for (address, count) in NULL_STARTUP_PROBES {
+            assert_eq!(
+                memory.read(address, count, 0x8000, 0x9000, 5),
+                Some(vec![0; count as usize])
+            );
+            assert_eq!(
+                memory.read(address, count, 0x8000, 0x9000, 5),
+                None,
+                "an explicit repeat must read the real null page"
+            );
+        }
+        assert_eq!(
+            memory.read(0, 16, 0x8000, 0x9000, 5),
+            None,
+            "unmeasured null-page request shapes are never synthetic"
+        );
         for (address, count) in KUSER_STARTUP_PROBES {
             assert_eq!(
                 memory.read(address, count, 0x8000, 0x9000, 5),
@@ -1047,6 +1086,13 @@ mod tests {
             let error = fallthrough_step_guard(guard(bytes)).unwrap_err();
             assert!(error.to_string().contains("control flow"), "{error:#}");
         }
+    }
+
+    #[test]
+    fn instruction_decode_accepts_a_complete_instruction_at_the_page_end() {
+        assert_eq!(instruction_length(&[0x90], 0x1fff), Some(1));
+        assert_eq!(instruction_length(&[0xe8], 0x1fff), None);
+        assert_eq!(instruction_length(&[0xe8, 0, 0, 0, 0], 0x1fff), Some(5));
     }
 
     #[test]
