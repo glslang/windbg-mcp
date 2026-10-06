@@ -127,6 +127,35 @@ test, since a regression in `walk_memory` must not be able to silence the test t
 require `nt` to have resolved to a **PDB**. Either way the test prints `SKIPPED` with the reason
 and what still holds, which is what an `ignore` keyed to an architecture could never say.
 
+**Each condition is asked three times, and the second and third ask only after the symbol path has
+been changed under them** ([#457](https://github.com/glslang/windbg-mcp/issues/457)). A stand-down is what
+`ci.yml`'s guard step reads, and that step has no `if:` — so one failed fetch turns a *required*
+check red. That is not hypothetical: on 2026-10-05 the **x64** entry, the one documented above as
+having the symbol half, printed exactly one stand-down. `nt` resolved no PDB for one checked-in dump
+while another resolved its own in the same run, and no read-gate stood down at all, so `symsrv.dll`
+was being read the whole time; re-running the job unchanged passed. It blocked a `rmcp` bump. Between
+asks the gate now appends `symbol_path()` — a `srv*` spec naming a downstream directory, where the
+engine's ambient default expands to a `cache*` that names none and is therefore skipped, reading as
+an absent PDB — and forces `.reload /f nt`. The last ask waits `SYMBOL_FETCH_BACKOFF` first, and the
+first refetch does not, not being a repeat of anything.
+
+**A green run of this tier proves nothing about any of that, which is why the schedule is asserted
+somewhere else.** Symbols resolve on the first ask on both CI entries, so the retry path is never
+entered by the run that matters — the same vacuity the `!analyze` assertions were found in. So
+`before_ask` returns the schedule as a *value*, `mcp_smoke`'s own
+`the_symbol_retry_schedule_refetches_before_every_ask_but_the_first` asserts it with no engine, dump
+or network, and that test runs in plain `cargo test` on every PR. It is mutation-verified in four
+directions, and what it deliberately cannot see is the refetch moving to *after* the ask that failed
+— a shape that spends two fetches and asks nothing again — which is prevented structurally instead:
+the ask is the last statement of the loop body, so there is nowhere later for a fetch to go.
+
+What that does **not** soften is the regression the guard was written for. An image with no
+`symsrv.dll` has nothing to retry with, so every attempt fails, the skip is printed and the check is
+red exactly as #153 was. What is retried away is the blip — the only cause of a stand-down that
+re-running the job ever cured. The skip messages lost their `(issue #142)` in the same change: they
+are printed into a CI log, where a closed issue about a stack walk read as a live tracker for the
+symbol failure in front of you.
+
 **The two conditions are separate because they fail apart, which the ARM64 CI entry demonstrated
 the hour this was written.** A first version asked only for the read. The three tests on the ARM64
 sample stood down correctly there — nothing in that dump reads on a runner with no `symsrv.dll` —

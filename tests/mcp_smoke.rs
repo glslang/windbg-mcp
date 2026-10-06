@@ -8771,7 +8771,15 @@ fn native_sample_tier() -> Option<&'static KernelSample> {
 /// be: a kernel dump's *structure* — bug check, module list, stack — comes out of its own headers
 /// and reads anywhere, while following a **pointer** needs `nt`'s symbols to translate the
 /// address, so an engine that resolved none answers `0x8007001E` here.
+///
+/// Asked up to [`SYMBOL_FETCH_ATTEMPTS`] times, because the engine resolving none is a state a
+/// refetch can move.
 fn engine_reads_target_memory(server: &mut Server, session_id: &str) -> bool {
+    asked_until_the_symbols_are_in(server, session_id, nt_base_reads)
+}
+
+/// One ask of [`engine_reads_target_memory`]'s question, with no refetch behind it.
+fn nt_base_reads(server: &mut Server, session_id: &str) -> bool {
     let Some(nt) = nt_module(server, session_id) else {
         return false;
     };
@@ -8802,7 +8810,16 @@ fn engine_reads_target_memory(server: &mut Server, session_id: &str) -> bool {
 /// them alike (`worker::with_pdb_identity`). Accepting only `pdb` would stand these tests down on a
 /// host that has everything they need, which is the failure this whole gate exists to avoid,
 /// pointed the other way.
+///
+/// **And a no is only taken after [`SYMBOL_FETCH_ATTEMPTS`] of them**, for the same reason spelled
+/// out there: one PDB that did not arrive is not a host that cannot fetch one, and this gate is
+/// read by a required CI check.
 fn engine_resolves_kernel_symbols(server: &mut Server, session_id: &str) -> bool {
+    asked_until_the_symbols_are_in(server, session_id, nt_has_a_pdb)
+}
+
+/// One ask of [`engine_resolves_kernel_symbols`]'s question, with no refetch behind it.
+fn nt_has_a_pdb(server: &mut Server, session_id: &str) -> bool {
     nt_module(server, session_id).is_some_and(|nt| nt["symbols"] == "pdb" || nt["symbols"] == "dia")
 }
 
@@ -8825,19 +8842,217 @@ fn nt_module(server: &mut Server, session_id: &str) -> Option<Value> {
         .cloned()
 }
 
+/// How many times a symbol-dependent gate asks its question before standing its test down.
+///
+/// **One failed fetch is not a host that cannot resolve**, which is what
+/// [#457](https://github.com/glslang/windbg-mcp/issues/457) was. On 2026-10-05 the x64 CI entry
+/// resolved `nt`'s PDB for one checked-in dump and had none for another **in the same run**: one
+/// `NO_KERNEL_SYMBOLS_SKIP` in the whole log, no `NO_TARGET_READS_SKIP` at all, and `symsrv.dll`
+/// demonstrably being read the entire time. A single round trip to the symbol store failed, and
+/// because a stand-down is what `ci.yml`'s guard step reads, it turned a *required* check red and
+/// blocked a dependency bump that had nothing to do with symbols. Re-running the job unchanged
+/// passed.
+///
+/// So the gates ask again rather than reporting the first answer, and three is what that costs:
+/// the host has to fail the fetch every time before a test says it cannot read a target.
+///
+/// This does not weaken the thing the guard exists for. #153 — the regression it was written
+/// against — is an image with no `symsrv.dll` anywhere, where there is nothing to retry *with*:
+/// every attempt fails, the skip is printed, and the check goes red exactly as it did before.
+/// What is retried away is the blip, which is the only cause of a skip that re-running cured.
+const SYMBOL_FETCH_ATTEMPTS: usize = 3;
+
+/// How long to wait before asking a store that has already refused twice.
+///
+/// Only the **last** ask waits, and that asymmetry is the point: the first refetch is not a repeat
+/// of anything, since it appends a path the engine did not have (see [`refetch_kernel_symbols`]),
+/// so pausing before it would buy a slower run and nothing else. The one after it is the same
+/// question asked twice, and a store that answered an error immediately will answer it immediately
+/// again.
+const SYMBOL_FETCH_BACKOFF: Duration = Duration::from_secs(3);
+
+/// What a gate does before its `attempt`-th ask of its question.
+///
+/// Spelled out as a value so the **schedule** can be asserted with no debugger, no dump and no
+/// network — see [`the_symbol_retry_schedule_refetches_before_every_ask_but_the_first`], which runs
+/// under plain `cargo test`. Being a value is also what rules out the one mistake here that would
+/// make the whole mechanism do nothing without changing how a green run reads: a refetch *after* the
+/// last ask, which spends two fetches and never asks again. There is no "after" to put one in —
+/// [`asked_until_the_symbols_are_in`] reads this before asking and nothing follows the ask.
+#[derive(Debug, PartialEq, Eq)]
+enum BeforeAsk {
+    /// Nothing. The first ask runs against whatever symbol path the engine came up with on its own.
+    Ask,
+    /// Refetch, with no pause: [`refetch_kernel_symbols`] appends a path the engine did not have,
+    /// so this is a different configuration rather than the same one tried twice.
+    RefetchThenAsk,
+    /// Wait, then refetch. The question has been answered no twice by now, and the second no was
+    /// against the appended path, so what is left is worth giving a moment.
+    WaitRefetchThenAsk,
+}
+
+/// The schedule as one expression: a plain first ask, a refetch before every later one, and the
+/// wait from the third on.
+///
+/// Written against the ask rather than against [`SYMBOL_FETCH_ATTEMPTS`] so that moving the attempt
+/// count cannot turn the only refetch into one that waits.
+fn before_ask(attempt: usize) -> BeforeAsk {
+    match attempt {
+        1 => BeforeAsk::Ask,
+        2 => BeforeAsk::RefetchThenAsk,
+        _ => BeforeAsk::WaitRefetchThenAsk,
+    }
+}
+
+/// Asks `question` until it says yes, fetching `nt`'s symbols again before each later ask.
+///
+/// Shared by both gates because they stand down for one cause — a PDB that did not arrive — and
+/// `ci.yml`'s guard treats their two messages alike. Retrying only the PDB gate would have left the
+/// same blip able to fail the same check through the other one, a moment earlier in the same dump.
+///
+/// The refetch happens **before** the ask it belongs to rather than after the one that failed, which
+/// is the same schedule said the safe way round: the loop cannot end on a fetch nothing looked at.
+fn asked_until_the_symbols_are_in(
+    server: &mut Server,
+    session_id: &str,
+    question: fn(&mut Server, &str) -> bool,
+) -> bool {
+    for attempt in 1..=SYMBOL_FETCH_ATTEMPTS {
+        match before_ask(attempt) {
+            BeforeAsk::Ask => {}
+            BeforeAsk::RefetchThenAsk => refetch_kernel_symbols(server, session_id, attempt),
+            BeforeAsk::WaitRefetchThenAsk => {
+                std::thread::sleep(SYMBOL_FETCH_BACKOFF);
+                refetch_kernel_symbols(server, session_id, attempt);
+            }
+        }
+        if question(server, session_id) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The retry schedule, asserted with nothing but the schedule: no engine, no dump, no symbol store.
+///
+/// So it runs in CI's `Build & test` job on every PR rather than only in the opt-in debugger tier —
+/// which matters because the tier *cannot* exercise this path. A green tier run means symbols
+/// resolved on the first ask, so every assertion about what the second and third do would otherwise
+/// rest on nothing having been run at all.
+///
+/// Mutation-verified on the Mac — the schedule being pure Rust, it lifts out of this
+/// Windows-only crate into a `rustc --test` of its own — and all four of these fail it: answering
+/// [`BeforeAsk::Ask`] for every attempt, answering `RefetchThenAsk` for every later one so none
+/// waits, answering `WaitRefetchThenAsk` for the second so every refetch waits, and moving
+/// [`SYMBOL_FETCH_ATTEMPTS`] to 2. The last of those is a deliberate pin rather than a bug caught:
+/// the attempt count is a decision, and this is where it is recorded.
+///
+/// **What it cannot see** is the refetch moving to *after* the ask that failed, which is the shape
+/// that spends two fetches and asks nothing again. That is why the schedule is a value the loop
+/// follows rather than control flow spread through it: in [`asked_until_the_symbols_are_in`] the
+/// ask is the last statement of the iteration, so there is no later place for a fetch to go.
+#[test]
+fn the_symbol_retry_schedule_refetches_before_every_ask_but_the_first() {
+    let schedule: Vec<BeforeAsk> = (1..=SYMBOL_FETCH_ATTEMPTS).map(before_ask).collect();
+    assert_eq!(
+        schedule,
+        vec![
+            BeforeAsk::Ask,
+            BeforeAsk::RefetchThenAsk,
+            BeforeAsk::WaitRefetchThenAsk,
+        ],
+        "three asks, two refetches, and the last ask after the last refetch"
+    );
+    assert_eq!(
+        schedule
+            .iter()
+            .filter(|step| **step != BeforeAsk::Ask)
+            .count(),
+        SYMBOL_FETCH_ATTEMPTS - 1,
+        "every ask but the first fetches again, or an attempt is a repeat of the one before it"
+    );
+    assert_eq!(
+        schedule
+            .iter()
+            .filter(|step| **step == BeforeAsk::WaitRefetchThenAsk)
+            .count(),
+        1,
+        "only the last ask waits: the first refetch changes the path rather than repeating it"
+    );
+}
+
+/// Appends this tier's own symbol store and forces `nt`'s symbols to be fetched again.
+///
+/// **The first refetch changes the configuration rather than repeating it**, which is why it is
+/// worth making at all. The gates' first ask runs against whatever symbol path the engine came up
+/// with — on the x64 CI entry that is the ambient default, with `_NT_SYMBOL_PATH` unset — and a
+/// bare `srv*` expands to `cache*;SRV*<msdl>` whose `cache*` names no directory, a store element
+/// that is skipped and reads as an absent PDB (see [`SYMBOL_CACHE`], where four runs of the pool
+/// tier were spent learning that). [`symbol_path`] names a downstream directory, so appending it
+/// gives the fetch somewhere to land that the first attempt may not have had — and it is the same
+/// expression every other symbol-needing test on this bench uses, including the
+/// `WINDBG_MCP_SMOKE_SYMBOLS` override for a host whose store is already curated.
+///
+/// `/f nt` rather than an unqualified `.reload /f`: a forced reload discards what the engine had
+/// and fetches again, which is the whole point here, and the kernel is the only module these gates
+/// ask about. The pool tier's unqualified form buys a slower run for a reason that does not apply
+/// to something a gate does up to twice, twice over, per dump.
+///
+/// A failure is printed and not asserted on. There is nothing this can do about a host with no
+/// `symsrv.dll`, and the skip that follows says so far better than a panic here would.
+fn refetch_kernel_symbols(server: &mut Server, session_id: &str, attempt: usize) {
+    // DbgHelp creates the store, but only once it has decided to use it; making it first removes
+    // one way for a symbol-server element to be quietly unusable.
+    let _ = std::fs::create_dir_all(SYMBOL_CACHE);
+    let path = symbol_path();
+    let applied = server.call_tool(
+        "set_symbol_path",
+        json!({
+            "path": path,
+            "append": true,
+            "reload": "/f nt",
+            "session_id": session_id,
+        }),
+        TARGET_STEP,
+    );
+    // Worded to carry none of the two phrases `ci.yml`'s guard step greps for: a line about
+    // *recovering* from a missing PDB must not read to that step as a stand-down over one.
+    eprintln!(
+        "RETRY: the kernel's symbols were not in hand; appended {path} and forced a reload before \
+         ask {attempt} of {SYMBOL_FETCH_ATTEMPTS}{}",
+        if is_tool_error(&applied) {
+            " [the engine reported a failure; the next ask says whether it mattered]"
+        } else {
+            ""
+        }
+    );
+}
+
 /// Why a test that reads a target stands down. Shared, so the tests cannot drift into disagreeing
 /// about what they need.
+///
+/// **Neither message carries an issue number any more**, and that is the half of
+/// [#457](https://github.com/glslang/windbg-mcp/issues/457) that is about reading rather than
+/// retrying. These strings are printed into a CI log, where `(issue #142)` read as a live tracker
+/// for the failure in front of you — and #142 is closed, and was about a stack walk rather than
+/// about symbol availability. The pointer belongs in the doc comments above, which link it as the
+/// history it is; what a log line owes its reader is what to go and look at, which is what these
+/// now say.
 const NO_TARGET_READS_SKIP: &str = "this engine could not read `nt`'s own base, so nothing behind \
-                                    a pointer in this dump can be asserted; the usual cause is \
-                                    symbols it could not resolve (issue #142), for want of a \
-                                    `symsrv.dll` beside the engine. The dump's own structure \
-                                    still reads, which is what the rest of this tier asserts.";
+                                    a pointer in this dump can be asserted. The usual cause is \
+                                    symbols it could not resolve, for want of a `symsrv.dll` \
+                                    beside the engine — and a transient is ruled out, because \
+                                    every fetch this tier makes failed, not one. The dump's own \
+                                    structure still reads, which is what the rest of this tier \
+                                    asserts.";
 
 /// Why a test that walks `nt`'s types stands down, which is a weaker condition than reading.
-const NO_KERNEL_SYMBOLS_SKIP: &str = "`nt` resolved no PDB on this host, so the `_EPROCESS` and \
-                                      the stack walk behind these fields have nothing to read \
-                                      types out of (issue #142). Reads that need no types are \
-                                      unaffected and are asserted elsewhere in this tier.";
+const NO_KERNEL_SYMBOLS_SKIP: &str = "`nt` resolved no PDB on this host, and had none after every \
+                                      fetch this tier makes — so this is a host that cannot reach \
+                                      a PDB, not one request that failed. The `_EPROCESS` and the \
+                                      stack walk behind these fields have nothing to read types \
+                                      out of. Reads that need no types are unaffected and are \
+                                      asserted elsewhere in this tier.";
 
 /// A `disassemble` whose `address` could reach the expression evaluator is refused before a
 /// session is needed — and the refusal has to be *typed*, because the tool declares an
