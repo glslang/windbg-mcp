@@ -857,7 +857,13 @@ pub fn render(report: &crate::structured::DriverHazards) -> String {
     if report.sinks.is_empty() {
         // Qualified only here, where the sentence inverts: "none on the list" over an import the
         // list was never shown is a negative this answer has not earned.
-        let unasked = if report.ordinal_imports > 0 {
+        //
+        // **Either channel, not just the new one.** A bound library's names were never read and an
+        // ordinal has no name here to read, and `shortfall` has treated the two alike from the
+        // start -- so qualifying one and not the other is worse than qualifying neither, which is
+        // what this was: a reader would learn that an unqualified negative means every import was
+        // shown, and a bound import table would then be the case that quietly breaks the lesson.
+        let unasked = if report.ordinal_imports > 0 || !report.unnamed_libraries.is_empty() {
             " (of the imports it was shown)"
         } else {
             ""
@@ -1235,6 +1241,20 @@ mod tests {
             plain.contains("Sensitive imports: none on the list\n"),
             "{plain}"
         );
+
+        // **And the qualification belongs to the channel, not to this change.** A bound library is
+        // the same fact -- names that were never read -- and `shortfall` has always treated it as
+        // one, so a negative qualified for an ordinal and bare for a bound import would teach a
+        // reader that a bare one means every import was shown. Review on #461 found that
+        // asymmetry; it was introduced here, since before this nothing was qualified at all.
+        let mut bound = named.clone();
+        bound.unnamed_libraries = vec!["FLTMGR.SYS".to_string()];
+        let bound = render(&structured_report("vid", BASE, &bound, invented));
+        assert!(
+            bound.contains("none on the list (of the imports it was shown)"),
+            "a bound library earns the same qualification an ordinal does: {bound}"
+        );
+        assert!(!bound.contains("by ordinal"), "{bound}");
     }
 
     /// A call site is matched to an import by the **slot it goes through**, never by a name.
