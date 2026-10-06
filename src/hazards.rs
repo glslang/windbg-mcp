@@ -394,7 +394,22 @@ pub struct Scan {
     pub unreadable: Vec<Scanned>,
     /// Imports this driver holds that are **not** on the list, counted rather than listed: the
     /// number is what says whether a short `sinks` means a small driver or a narrow list.
+    ///
+    /// Every one of them was **asked** the question. An import that could not be asked is in
+    /// [`Self::ordinal_imports`] instead.
     pub other_imports: usize,
+    /// Imports named by **ordinal**, which the curated list cannot be asked about at all.
+    ///
+    /// An ordinal import's name is in the *exporting* image's export table and not in this one,
+    /// so there is nothing here to match against a name-keyed list. Counted apart from
+    /// [`Self::other_imports`] because folding the two made a driver importing a sensitive export
+    /// by ordinal report as "Sensitive imports: none on the list" with that import counted among
+    /// the ones that had been checked -- a question never asked, rendered as an answer.
+    ///
+    /// Resolving the ordinal to a name would need the exporting module loaded and readable in
+    /// this session, which is a question about *that* image and may have no answer; this count is
+    /// exact either way, and `docs/limitations.md` carries the boundary.
+    pub ordinal_imports: usize,
     /// Which framework this image binds to, where one of its imports said so.
     ///
     /// Read from the same import table the sinks are, so it costs nothing and is exact whenever the
@@ -467,6 +482,7 @@ pub fn scan(
     // everything anyone actually scans.
     let mut sinks: BTreeMap<(String, String), Sink> = BTreeMap::new();
     let mut other_imports = 0usize;
+    let mut ordinal_imports = 0usize;
     for import in imports {
         match (&import.name, sink_kind(&import.name.to_string())) {
             (pe::ImportName::Named(name), Some(kind)) => {
@@ -486,6 +502,12 @@ pub fn scan(
                     sink.slots.push(import.slot);
                 }
             }
+            // **Not `other_imports`**, which would say this import was checked against the list
+            // and is not on it. An ordinal carries no name in this image, so it was never
+            // checked, and the two cases must not look alike -- the one that matters is a
+            // sensitive export imported by ordinal, which is exactly where the fold said
+            // "none on the list".
+            (pe::ImportName::Ordinal(_), _) => ordinal_imports += 1,
             _ => other_imports += 1,
         }
     }
@@ -550,6 +572,7 @@ pub fn scan(
         scanned: covered.scanned,
         unreadable: covered.unreadable,
         other_imports,
+        ordinal_imports,
         // Over the whole table, not over the sinks: the bind routine is not a sink and never will
         // be -- it is how a driver *loads*, not something it does to a caller's buffer.
         framework: crate::framework::client_of(imports),
@@ -757,6 +780,7 @@ pub fn structured_report(
         scanned: scan.scanned.iter().map(codewalk::range_report).collect(),
         unreadable: scan.unreadable.iter().map(codewalk::range_report).collect(),
         other_imports: scan.other_imports,
+        ordinal_imports: scan.ordinal_imports,
         // The import tell, and only it: this end has read no driver object and no dispatch table, so
         // it must not claim the second tell, and `Table::Unread` is what says so in the note.
         // `driver_surface` is where the two are composed, and it passes a different `Table` --
@@ -831,7 +855,14 @@ pub fn render(report: &crate::structured::DriverHazards) -> String {
     }
 
     if report.sinks.is_empty() {
-        out.push_str("  Sensitive imports: none on the list\n");
+        // Qualified only here, where the sentence inverts: "none on the list" over an import the
+        // list was never shown is a negative this answer has not earned.
+        let unasked = if report.ordinal_imports > 0 {
+            " (of the imports it was shown)"
+        } else {
+            ""
+        };
+        out.push_str(&format!("  Sensitive imports: none on the list{unasked}\n"));
     } else {
         out.push_str(&format!("  Sensitive imports ({}):\n", report.sinks.len()));
         for sink in &report.sinks {
@@ -883,6 +914,19 @@ pub fn render(report: &crate::structured::DriverHazards) -> String {
         report.scanned.len(),
         report.other_imports
     ));
+    // Beside the bound libraries because it is the same fact in the other channel -- an import
+    // this answer could not name, and therefore a sink it may be missing. **One place for the
+    // pair**: split across the rendering, the placement would say the two were different kinds of
+    // thing. What the ordinal line cannot do here is qualify the sentence above it, so the one
+    // sentence whose meaning inverts carries its own qualification where it is printed.
+    if report.ordinal_imports > 0 {
+        out.push_str(&format!(
+            "  Not nameable (imported by ordinal): {} import(s) — the name lives in the exporting\n           \
+             image's export table rather than in this one, so the list was never shown them and\n           \
+             the sinks above are a lower bound.\n",
+            report.ordinal_imports
+        ));
+    }
     if !report.unnamed_libraries.is_empty() {
         out.push_str(&format!(
             "  Not nameable (bound imports): {}\n",
@@ -1087,6 +1131,98 @@ mod tests {
 
     fn never() -> Option<Halt> {
         None
+    }
+
+    /// The `locate` a test supplies: coordinates invented, because attributing an address is an
+    /// engine call and this file has never seen an engine.
+    fn invented(address: u64) -> crate::structured::CodeLocation {
+        crate::structured::CodeLocation {
+            address: crate::structured::addr(address),
+            module: Some("vid".to_string()),
+            rva: Some("0x0".to_string()),
+            attribution_failed: false,
+        }
+    }
+
+    /// **An import named by ordinal was never shown the list, and is not an import that is not on
+    /// it.** The two must not look alike in either half of the answer.
+    ///
+    /// An ordinal import's name is in the *exporting* image's export table and not in this one,
+    /// so a name-keyed list cannot be asked about it at all. Counted into `other_imports` -- which
+    /// is where it went -- a driver importing a sensitive export by ordinal came back as
+    /// "Sensitive imports: none on the list" with that import counted among the ones that had
+    /// been checked, and with `shortfall` reporting a scan short of nothing. A question never
+    /// asked, rendered as an answer, which is the worst shape this tool's answer can take.
+    ///
+    /// **Mutation-verified against the fold**: delete the `Ordinal` arm from `scan`'s match and
+    /// the ordinal falls into the catch-all, which fails four of these at once --
+    /// `ordinal_imports` is 0, `other_imports` is 2, `shortfall()` is `None`, and the rendered
+    /// text carries an unqualified "none on the list" with no ordinal line anywhere in it.
+    #[test]
+    fn an_ordinal_import_is_counted_apart_from_the_imports_that_were_checked() {
+        let image = image();
+        let by_ordinal = pe::Import {
+            library: "ntoskrnl.exe".to_string(),
+            name: pe::ImportName::Ordinal(0x2a),
+            slot: BASE + 0x3000,
+        };
+        let found = scan(
+            &image,
+            &[
+                by_ordinal,
+                import("KeQueryPerformanceCounter", BASE + 0x3008),
+            ],
+            InstructionSet::Amd64,
+            |_, _| None,
+            never,
+        );
+        assert_eq!(found.ordinal_imports, 1);
+        assert_eq!(
+            found.other_imports, 1,
+            "the named import is the only one the list was shown"
+        );
+        assert!(
+            found.sinks.is_empty(),
+            "neither is a sensitive API: {:?}",
+            found.sinks
+        );
+
+        let report = structured_report("vid", BASE, &found, invented);
+        assert_eq!(report.ordinal_imports, 1);
+        assert_eq!(report.other_imports, 1);
+        assert_eq!(
+            report.shortfall(),
+            Some(crate::structured::Shortfall::Imports),
+            "an import the list was never shown makes `sinks` a lower bound for the same reason a \
+             bound library does, and the typed answer has to say so"
+        );
+
+        let text = render(&report);
+        assert!(
+            text.contains("Not nameable (imported by ordinal): 1 import(s)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("none on the list (of the imports it was shown)"),
+            "the one line whose meaning inverts is the one that is qualified: {text}"
+        );
+
+        // And an image with no ordinal import pays nothing for any of it: the line is absent and
+        // the negative is unqualified, which is what keeps the qualification meaningful.
+        let named = scan(
+            &image,
+            &[import("KeQueryPerformanceCounter", BASE + 0x3008)],
+            InstructionSet::Amd64,
+            |_, _| None,
+            never,
+        );
+        assert_eq!(named.ordinal_imports, 0);
+        let plain = render(&structured_report("vid", BASE, &named, invented));
+        assert!(!plain.contains("by ordinal"), "{plain}");
+        assert!(
+            plain.contains("Sensitive imports: none on the list\n"),
+            "{plain}"
+        );
     }
 
     /// A call site is matched to an import by the **slot it goes through**, never by a name.

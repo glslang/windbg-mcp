@@ -3341,8 +3341,18 @@ pub struct DriverHazards {
     /// page reports a driver with no privileged instructions and nothing says a page was missing.
     pub unreadable: Vec<ScannedRange>,
     /// Imports that are **not** on the list, counted rather than listed. The number is what says
-    /// whether a short `sinks` means a small driver or a narrow list.
+    /// whether a short `sinks` means a small driver or a narrow list. Every one of them was
+    /// **asked**; see [`Self::ordinal_imports`] for the ones that could not be.
     pub other_imports: usize,
+    /// Imports named by **ordinal**, which a name-keyed list cannot be asked about.
+    ///
+    /// The name is in the *exporting* image's export table and not in this one. Counted apart
+    /// from [`Self::other_imports`], because folded in they read as imports that were checked
+    /// against the list and are not on it -- so a driver importing a sensitive export by ordinal
+    /// answered as holding none, which is the one shape this result must not take. Like
+    /// [`Self::unnamed_libraries`] it makes `sinks` a lower bound, and [`Self::shortfall`] says
+    /// so.
+    pub ordinal_imports: usize,
     /// Libraries whose imports could not be named at all: bound imports, whose names live only in
     /// the table this deliberately never reads.
     pub unnamed_libraries: Vec<String>,
@@ -3380,11 +3390,12 @@ impl Shortfall {
     pub fn note(self) -> &'static str {
         match self {
             Self::Imports => {
-                "some of this driver's imports could not be named -- `unnamed_libraries` says \
-                 which libraries, a bound import's names living only in a table this deliberately \
-                 never reads -- so `sinks` is a lower bound: a sensitive import in one of them is \
-                 not in this list. The code was decoded in full, so `privileged` is not qualified \
-                 by this."
+                "some of this driver's imports could not be named, so `sinks` is a lower bound: \
+                 a sensitive import among them is not in this list. Its own `unnamed_libraries` \
+                 and `ordinal_imports` fields say which -- a bound import's names live only in a \
+                 table this deliberately never reads, and an ordinal import's name lives in the \
+                 exporting image's export table rather than in this one. The code was decoded in \
+                 full, so `privileged` is not qualified by this."
             }
             Self::Code => {
                 "part of this driver's code was not decoded; its own `stopped`, `cap_hit` and \
@@ -3395,9 +3406,9 @@ impl Shortfall {
             }
             Self::Both => {
                 "this scan is short on both sides, and each field says which it is about: \
-                 `unnamed_libraries` makes the set of `sinks` a lower bound, while `stopped`, \
-                 `cap_hit` and `unreadable` make `privileged` and the sinks' `call_sites` lower \
-                 bounds."
+                 `unnamed_libraries` and `ordinal_imports` make the set of `sinks` a lower bound, \
+                 while `stopped`, `cap_hit` and `unreadable` make `privileged` and the sinks' \
+                 `call_sites` lower bounds."
             }
         }
     }
@@ -3411,7 +3422,9 @@ impl DriverHazards {
     /// while this module's own renderer printed INCOMPLETE for each. [`SectionStatus::Ok`] says
     /// everything the section reports was read, and [`Self::unreadable`] is precisely the field
     /// saying some of it was not. Naming every field then turned up
-    /// [`Self::unnamed_libraries`] as well.
+    /// [`Self::unnamed_libraries`] as well, and [`Self::ordinal_imports`] when that count was
+    /// split out of [`Self::other_imports`] -- an import the list was never shown is a sink this
+    /// answer may be missing, on exactly `unnamed_libraries`' terms.
     ///
     /// And **which** field is short decides what is qualified, which one note could not say: see
     /// [`Shortfall`]. Typed where [`IoctlMap::shortfall`] is prose, because that map is read from
@@ -3435,6 +3448,7 @@ impl DriverHazards {
             privileged_count: _,
             scanned: _,
             other_imports: _,
+            ordinal_imports,
             unreadable,
             unnamed_libraries,
             stopped,
@@ -3443,7 +3457,11 @@ impl DriverHazards {
         // The import walk refuses rather than truncates, so a scan that exists at all has a whole
         // import table behind it -- a clock or a cap can only have cut the **code** short.
         let code = stopped.is_some() || *cap_hit || !unreadable.is_empty();
-        let imports = !unnamed_libraries.is_empty();
+        // **Two channels, one side.** A bound library's names were never read; an ordinal import
+        // has no name here to read. Either leaves a sensitive import outside `sinks`, so either
+        // is the import-side shortfall -- and an ordinal count folded into `other_imports`, as it
+        // was, reached this predicate as nothing at all.
+        let imports = !unnamed_libraries.is_empty() || *ordinal_imports > 0;
         match (imports, code) {
             (false, false) => None,
             (true, false) => Some(Shortfall::Imports),
@@ -5685,6 +5703,7 @@ mod tests {
             }],
             unreadable: Vec::new(),
             other_imports: 40,
+            ordinal_imports: 0,
             unnamed_libraries: Vec::new(),
             stopped: None,
             cap_hit: false,
@@ -5759,6 +5778,21 @@ mod tests {
              sink in it is one `sinks` does not have, while the code was decoded in full"
         );
 
+        // **The import side has two channels and this is the second one**, which is the whole
+        // reason it is a field rather than a number folded into `other_imports`: there it reached
+        // this predicate as nothing at all, and a driver importing a sensitive export by ordinal
+        // answered as a complete scan that found none.
+        let by_ordinal = DriverHazards {
+            ordinal_imports: 2,
+            ..whole_scan()
+        };
+        assert_eq!(
+            by_ordinal.shortfall(),
+            Some(Shortfall::Imports),
+            "an ordinal import is a name this image does not carry, so `sinks` is a lower bound \
+             for the same reason a bound library makes it one"
+        );
+
         let both = DriverHazards {
             unnamed_libraries: vec!["FLTMGR.SYS".into()],
             cap_hit: true,
@@ -5772,6 +5806,12 @@ mod tests {
         assert!(
             imports.contains("`sinks` is a lower bound") && imports.contains("`privileged` is not"),
             "the import-side note qualifies `sinks` and clears `privileged`: {imports}"
+        );
+        // And it names **both** channels, because one note serves either cause and a reader sent
+        // to `unnamed_libraries` alone would find it empty on a scan short of ordinals.
+        assert!(
+            imports.contains("`unnamed_libraries`") && imports.contains("`ordinal_imports`"),
+            "the import-side note names the two fields that say which channel it was: {imports}"
         );
         let code = Shortfall::Code.note();
         assert!(

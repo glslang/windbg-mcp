@@ -130,6 +130,36 @@
   a sensitive call is named by the import slot inside a memory operand; neither is a question about
   control flow, so on a set whose operands are unread this would report a driver with no privileged
   instructions and no call sites, which is what a clean driver looks like.
+- **What an image's import table can and cannot name, which is what decides whether a short
+  `sinks` is a small driver or a question nobody asked.** Three shapes a sensitive import can take
+  that a name-keyed list cannot be matched against, and a fourth directory that is read for none of
+  them. A **bound** library leaves its names only in the import address table, which is writable
+  and which this never dereferences, so it is named in `unnamed_libraries`. An import by **ordinal**
+  carries no name in this image at all -- the name is in the *exporting* image's export table -- so
+  it is counted in `ordinal_imports` and **not** in `other_imports`: `other_imports` means *asked,
+  and not on the list*, where an ordinal was never asked, and folding the two reported a driver
+  importing a sensitive export by ordinal as one holding none. Either channel makes `sinks` a lower
+  bound, and `driver_surface`'s section note for this scan says so when either is set. Resolving an
+  ordinal to a name would need the exporting module loaded and readable in the same session, which
+  is a question about *that* image and may have no answer, so it is not attempted and the count is
+  exact either way. A **delay-loaded** import is not read at all: the reader takes data directories
+  0 and 1 (export and import) and never looks at directory 13, the delay-load descriptor table, so
+  an API reached through a delay-load thunk is in neither `sinks` nor `other_imports` and **nothing
+  in the answer says so** -- the one silent omission of the three, and the reason this bullet
+  exists. It is rare on this tool's usual subject rather than impossible: the linker's own
+  delay-load helper calls `LoadLibrary`/`GetProcAddress`, which kernel mode does not have, so a
+  driver would have to supply a helper of its own -- but the tool scans whatever module it is
+  pointed at, and on a **user-mode** image the hole is an ordinary one. And the **export** directory
+  is located and deliberately not parsed: nothing here answers a question about what an image
+  exports, and `driver_surface` reads a dispatch table from the driver object rather than from an
+  export table. What the reader does **refuse** rather than answer is a malformed import table --
+  the whole walk returns an error instead of a short list, so a truncated or wrapped name RVA is
+  never answered with a fabricated name. That refusal is what 120 modules of
+  `docs/samples/081226-2187-01.dmp` were scanned to check during
+  [#301](https://github.com/glslang/windbg-mcp/pull/301) (116 parsed cleanly, 4 unreadable, 0
+  malformed), and it says nothing about the three above: an import by ordinal or through a delay-
+  load thunk is well-formed PE, so a clean parse is not evidence that none was there. Issue
+  [#302](https://github.com/glslang/windbg-mcp/issues/302) has the detail.
 - On a **dump**, whether a driver's code reads at all depends on whether the engine can obtain its
   image, and the dump's type does not predict it — probe rather than assume. Measured on the
   x64 kernel minidump under `docs/samples/`, with no executable image path set: every code RVA
