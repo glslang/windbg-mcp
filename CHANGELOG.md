@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`driver_hazards` counted an import by ordinal as one it had checked against the sink list**
+  (issue [#302](https://github.com/glslang/windbg-mcp/issues/302), item 2). An ordinal import's
+  name lives in the *exporting* image's export table and not in the image being scanned, so a
+  name-keyed list cannot be matched against it at all -- but `hazards::scan` put everything that
+  did not match into `other_imports`, which means *asked, and not on the list*. A driver importing
+  a sensitive export by ordinal therefore came back as `Sensitive imports: none on the list`, with
+  that import counted among the ones that had been checked and `DriverHazards::shortfall` reporting
+  a scan short of nothing: a question never asked, rendered as an answer, which is the one shape
+  this tool's answer must not take. `ordinal_imports` is now its own count on `hazards::Scan` and
+  on the `DriverHazards` result, and it is the **second channel** of the import-side shortfall
+  beside `unnamed_libraries` -- so `driver_surface`'s section note for this scan says `sinks` is a
+  lower bound when either is set, and that note now names both fields rather than sending a reader
+  to an empty one. The rendering prints it beside the bound libraries, the same fact in the other
+  channel, and the one sentence whose meaning inverts is qualified where it is printed. Resolving
+  the ordinal to a name is deliberately not attempted: it needs the exporting module loaded and
+  readable in the same session, which is a question about *that* image and may have no answer,
+  while the count is exact either way.
+  `hazards::tests::an_ordinal_import_is_counted_apart_from_the_imports_that_were_checked` is
+  mutation-verified against the fold -- delete the `Ordinal` arm and four of its assertions fail at
+  once, including the unqualified `none on the list` in the rendered text.
+- **The PE reader's remaining gaps are stated boundaries rather than silence** (issue
+  [#302](https://github.com/glslang/windbg-mcp/issues/302), items 3 and 4). `docs/limitations.md`
+  now carries what an image's import table can and cannot name in one bullet: the two channels that
+  make `sinks` a lower bound, the **delay-load** descriptor table (data directory 13) the reader
+  never looks at -- so an API reached through a delay-load thunk is in neither `sinks` nor
+  `other_imports`, the one omission of the set that nothing in the answer reports, rare on a kernel
+  driver because the linker's own helper calls `LoadLibrary`/`GetProcAddress` and ordinary on a
+  user-mode image, which this tool will scan if pointed at one -- and the export directory, which is
+  located and deliberately not parsed because nothing here answers a question about what an image
+  exports. It also separates what #301's 120-module scan of `docs/samples/081226-2187-01.dmp`
+  measured (116 clean, 4 unreadable, **0 malformed**, which is about the reader's *refusals*) from
+  what it cannot: an import by ordinal or through a delay-load thunk is well-formed PE, so a clean
+  parse is not evidence that none was there. Item 1 of the issue -- a PE32+ import name RVA
+  truncated by `as u32` instead of refused, which answers a real slot with a name read at an
+  unrelated low RVA -- travelled into `dbgscope` with the reader and is pinned there by
+  `pe::tests::test_a_name_thunk_above_the_32_bit_offset_space_is_refused` and
+  `…::test_a_name_thunk_whose_hint_overflows_is_refused`, both in the revision this tree pins, so
+  it is not repeated here.
+
 - **A single failed PDB fetch turned a required check red** (issue
   [#457](https://github.com/glslang/windbg-mcp/issues/457)). The debugger tier's four
   target-reading assertions ask the host what it can do before they assert anything, and print
