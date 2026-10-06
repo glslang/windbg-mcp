@@ -166,22 +166,6 @@ impl ManipulateRequest {
             .map(|request| (request, self.data.as_slice()))
     }
 
-    pub(crate) fn write_control_space_response(&self) -> Result<Vec<u8>, ApiError> {
-        let (request, data) = self.write_control_space().ok_or(ApiError::WrongApi {
-            expected: DBGKD_WRITE_CONTROL_SPACE_API,
-            actual: self.api_number(),
-        })?;
-        if data.len() != request.count as usize {
-            return Err(ApiError::WriteDataLength {
-                declared: request.count,
-                actual: data.len(),
-            });
-        }
-        let mut response = self.success_response();
-        response[28..32].copy_from_slice(&request.count.to_le_bytes());
-        Ok(response)
-    }
-
     fn read_memory(&self, api: u32) -> Option<ReadMemory> {
         (self.api_number() == api).then(|| ReadMemory {
             address: quad(&self.bytes, 16),
@@ -306,7 +290,7 @@ impl Amd64Context {
     }
 
     pub(crate) fn matches_prefix(&self, bytes: &[u8]) -> bool {
-        self.bytes.starts_with(bytes)
+        !bytes.is_empty() && self.bytes.starts_with(bytes)
     }
 
     fn set_u16(&mut self, at: usize, value: u16) {
@@ -404,7 +388,6 @@ pub(crate) enum ApiError {
     ContextRange { offset: u32, count: u32 },
     ContextResponseTooLong { count: u32 },
     InstructionLength { actual: usize },
-    WriteDataLength { declared: u32, actual: usize },
 }
 
 impl fmt::Display for ApiError {
@@ -440,10 +423,6 @@ impl fmt::Display for ApiError {
             Self::InstructionLength { actual } => write!(
                 out,
                 "KD instruction report has {actual} bytes; expected 1..=16"
-            ),
-            Self::WriteDataLength { declared, actual } => write!(
-                out,
-                "KD write carries {actual} bytes but declares {declared}"
             ),
         }
     }
@@ -585,6 +564,13 @@ mod tests {
             quad(&response, MANIPULATE_BYTES + 0xf8),
             0xffff_f803_9e63_32cf
         );
+    }
+
+    #[test]
+    fn an_empty_context_write_is_not_an_unchanged_prefix() {
+        let context = Amd64Context::from_values(&Amd64ContextValues::default());
+        assert!(!context.matches_prefix(&[]));
+        assert!(context.matches_prefix(&context.bytes[..1]));
     }
 
     #[test]

@@ -763,6 +763,7 @@ enum State {
 struct VpControl<P> {
     provider: P,
     target: TargetIdentity,
+    max_registers_per_request: usize,
     provider_phase: ProviderPhase,
     baseline: Option<RegisterSnapshot>,
     observed_cr3: Option<u64>,
@@ -820,6 +821,7 @@ impl<P: ControlProvider> LiveControl<P> {
             let capabilities = provider.capabilities()?;
             require_registers(&capabilities, &SNAPSHOT_REGISTERS, false)?;
             require_registers(&capabilities, &WRITTEN_REGISTERS, true)?;
+            let max_registers_per_request = usize::from(capabilities.max_registers_per_request);
             let target = provider.target().clone();
             if controls.iter().any(|control: &VpControl<P>| {
                 control.target.vm_id.eq_ignore_ascii_case(&target.vm_id)
@@ -838,6 +840,7 @@ impl<P: ControlProvider> LiveControl<P> {
             controls.push(VpControl {
                 provider,
                 target,
+                max_registers_per_request,
                 provider_phase: ProviderPhase::Running,
                 baseline: None,
                 observed_cr3: None,
@@ -896,20 +899,44 @@ impl<P: ControlProvider> LiveControl<P> {
         registers: Vec<RegisterName>,
     ) -> Result<Vec<RegisterValue>> {
         self.require_stop_epoch(epoch)?;
+        if registers.is_empty() {
+            bail!("stopped register read requires at least one register");
+        }
+        for (index, name) in registers.iter().enumerate() {
+            if registers[..index].contains(name) {
+                bail!("stopped register names must be distinct");
+            }
+        }
         let active = self
             .active_provider
             .context("the stopped session has no active VP provider")?;
-        let first = self.providers[active]
-            .provider
-            .read_registers(registers.clone())?;
-        if let Some(value) = first.iter().find(|value| value.status != 0) {
+        let max = self.providers[active].max_registers_per_request;
+        let read_all = |provider: &mut P| -> Result<Vec<RegisterValue>> {
+            let mut values = Vec::with_capacity(registers.len());
+            for batch in registers.chunks(max) {
+                values.extend(provider.read_registers(batch.to_vec())?);
+            }
+            Ok(values)
+        };
+        let first = read_all(&mut self.providers[active].provider)?;
+        let second = read_all(&mut self.providers[active].provider)?;
+        let wrong_order = |values: &[RegisterValue]| {
+            values.len() != registers.len()
+                || values
+                    .iter()
+                    .zip(&registers)
+                    .any(|(value, expected)| value.name != *expected)
+        };
+        if wrong_order(&first) || wrong_order(&second) {
+            bail!("provider returned stopped registers in the wrong order");
+        }
+        if let Some(value) = first.iter().chain(&second).find(|value| value.status != 0) {
             bail!(
                 "provider returned status {:#x} for {:?}",
                 value.status,
                 value.name
             );
         }
-        let second = self.providers[active].provider.read_registers(registers)?;
         if first != second {
             bail!("VTL1 registers changed while the dispatcher event was held");
         }
@@ -1275,6 +1302,11 @@ impl<P: ControlProvider> LiveControl<P> {
     ) -> Result<StopEpoch> {
         validate_breakpoints(&breakpoints, ArmMode::Natural)?;
         self.require_stop_epoch(epoch)?;
+        // Verification is read-only and precedes the releasing state. A stale breakpoint guard
+        // therefore leaves the exact stop and epoch available for correction.
+        for breakpoint in &breakpoints {
+            dispatcher.verify_instruction(&breakpoint.instruction)?;
+        }
         let next_epoch = self.next_epoch("running")?;
         let dispatcher_event = self
             .dispatcher_event
@@ -1924,6 +1956,7 @@ mod tests {
 
     struct FakeProvider {
         target: TargetIdentity,
+        capabilities: Capabilities,
         epoch: StopEpoch,
         serial: u64,
         phase: FakePhase,
@@ -1935,12 +1968,14 @@ mod tests {
         unstable_once: bool,
         fail_reads_while_stopped: Option<&'static str>,
         wrong_cr3_while_stopped: bool,
+        read_requests: Vec<Vec<RegisterName>>,
     }
 
     impl FakeProvider {
         fn new() -> Self {
             Self {
                 target: target(),
+                capabilities: capabilities(),
                 epoch: epoch("running", 0),
                 serial: 0,
                 phase: FakePhase::Running,
@@ -1952,6 +1987,7 @@ mod tests {
                 unstable_once: false,
                 fail_reads_while_stopped: None,
                 wrong_cr3_while_stopped: false,
+                read_requests: Vec::new(),
             }
         }
 
@@ -1982,6 +2018,23 @@ mod tests {
 
         fn with_stopped_cr3_change(mut self) -> Self {
             self.wrong_cr3_while_stopped = true;
+            self
+        }
+
+        fn with_readable_registers(mut self, registers: &[RegisterName]) -> Self {
+            for (index, name) in registers.iter().enumerate() {
+                if !self.capabilities.readable_registers.contains(name) {
+                    self.capabilities.readable_registers.push(*name);
+                }
+                if !self.registers.iter().any(|value| value.name == *name) {
+                    self.registers.push(RegisterValue {
+                        name: *name,
+                        status: 0,
+                        low: HexU64(index as u64 + 1),
+                        high: HexU64(0),
+                    });
+                }
+            }
             self
         }
 
@@ -2051,7 +2104,7 @@ mod tests {
         }
 
         fn capabilities(&mut self) -> Result<Capabilities> {
-            Ok(capabilities())
+            Ok(self.capabilities.clone())
         }
 
         fn begin_arm(&mut self) -> Result<()> {
@@ -2088,6 +2141,10 @@ mod tests {
         }
 
         fn read_registers(&mut self, registers: Vec<RegisterName>) -> Result<Vec<RegisterValue>> {
+            if registers.len() > usize::from(self.capabilities.max_registers_per_request) {
+                bail!("register request exceeds scripted provider maximum");
+            }
+            self.read_requests.push(registers.clone());
             if self.phase == FakePhase::Stopped
                 && let Some(reason) = self.fail_reads_while_stopped
             {
@@ -2466,10 +2523,107 @@ mod tests {
                 Action::BeginArm,
                 Action::FinishArm,
                 Action::Wait,
+                Action::Verify(InstructionGuard {
+                    address: HexU64(TARGET_RIP + 0x20),
+                    bytes: vec![0x90],
+                }),
                 Action::Release(ReleaseMode::ArmNextStop),
                 Action::Wait,
                 Action::Release(ReleaseMode::Resume),
             ]
+        );
+    }
+
+    #[test]
+    fn replacement_breakpoint_verification_failure_preserves_the_held_stop() {
+        let replacement = InstructionGuard {
+            address: HexU64(TARGET_RIP + 0x20),
+            bytes: vec![0x90],
+        };
+        let mut dispatcher =
+            FakeDispatcher::new([observed(StopReason::HardwareBreakpoint { slot: 0 })]);
+        let mut control = LiveControl::open(FakeProvider::new()).unwrap();
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Redirect)
+            .unwrap();
+        let stop = control.wait_for_stop(&mut dispatcher).unwrap();
+        dispatcher.fail_verify = Some("replacement bytes changed");
+
+        let error = control
+            .continue_to_breakpoints(
+                &mut dispatcher,
+                &stop.epoch,
+                vec![BreakpointGuard {
+                    slot: 2,
+                    instruction: replacement.clone(),
+                }],
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("replacement bytes changed"));
+        assert_eq!(control.phase(), LivePhase::Stopped);
+        assert_eq!(control.stopped().unwrap().epoch, stop.epoch);
+        assert_eq!(control.test_provider().phase, FakePhase::Stopped);
+        assert_eq!(
+            dispatcher.actions.last(),
+            Some(&Action::Verify(replacement))
+        );
+        assert!(
+            !dispatcher
+                .actions
+                .iter()
+                .any(|action| matches!(action, Action::Release(_)))
+        );
+    }
+
+    #[test]
+    fn stopped_register_reads_are_batched_to_the_provider_limit() {
+        let registers = [
+            RegisterName::Rax,
+            RegisterName::Rcx,
+            RegisterName::Rdx,
+            RegisterName::Rbx,
+            RegisterName::Rbp,
+            RegisterName::Rsi,
+            RegisterName::Rdi,
+            RegisterName::R8,
+            RegisterName::R9,
+            RegisterName::R10,
+            RegisterName::R11,
+            RegisterName::R12,
+            RegisterName::R13,
+            RegisterName::R14,
+            RegisterName::R15,
+            RegisterName::Ds,
+            RegisterName::Es,
+            RegisterName::Fs,
+            RegisterName::Gs,
+            RegisterName::Ss,
+        ];
+        let provider = FakeProvider::new().with_readable_registers(&registers);
+        let mut control = LiveControl::open(provider).unwrap();
+        let mut dispatcher =
+            FakeDispatcher::new([observed(StopReason::HardwareBreakpoint { slot: 0 })]);
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Redirect)
+            .unwrap();
+        let stop = control.wait_for_stop(&mut dispatcher).unwrap();
+
+        let values = control
+            .read_stopped_registers(&stop.epoch, registers.to_vec())
+            .unwrap();
+
+        assert_eq!(
+            values.iter().map(|value| value.name).collect::<Vec<_>>(),
+            registers
+        );
+        let requests = &control.test_provider().read_requests;
+        assert_eq!(
+            requests[requests.len() - 4..]
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>(),
+            [12, 8, 12, 8]
         );
     }
 

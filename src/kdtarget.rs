@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use dbgscope::dbgeng::DebugEngine;
-use iced_x86::{Decoder as InstructionDecoder, DecoderOptions};
+use iced_x86::{Decoder as InstructionDecoder, DecoderOptions, FlowControl};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::ServerOptions;
 
@@ -256,13 +256,21 @@ async fn run_async(
     eprintln!("initial KD state change sent");
 
     let mut breakpoints = BTreeMap::<u32, BreakpointGuard>::new();
+    let mut compatibility = CompatibilityMemory::default();
     loop {
         let frame = tokio::time::timeout(options.idle_timeout, read_frame(&mut pipe, &mut decoder))
             .await
             .context("WinDbg sent no KD traffic before the idle timeout")??;
         let inbound = link.receive(frame);
+        let peer_reset = inbound.peer_reset;
         for write in inbound.writes {
             pipe.write_all(&write).await?;
+        }
+        if peer_reset {
+            compatibility = CompatibilityMemory::default();
+            send_stop(&mut pipe, &mut link, &reported_instruction.bytes, &values).await?;
+            eprintln!("KD peer reset; current held stop resent");
+            continue;
         }
         let Some(packet) = inbound.packet else {
             pipe.flush().await?;
@@ -282,7 +290,7 @@ async fn run_async(
             let count = read
                 .count
                 .min((crate::kdwire::MAX_PACKET_BYTES - crate::kdapi::MANIPULATE_BYTES) as u32);
-            if let Some(bytes) = compatibility_memory(
+            if let Some(bytes) = compatibility.read(
                 read.address,
                 count,
                 values.gpr[4],
@@ -314,8 +322,12 @@ async fn run_async(
                 .count
                 .min((crate::kdwire::MAX_PACKET_BYTES - crate::kdapi::MANIPULATE_BYTES) as u32);
             request.read_control_space_response(&vec![0; count as usize])?
-        } else if request.write_control_space().is_some() {
-            request.write_control_space_response()?
+        } else if let Some((write, _)) = request.write_control_space() {
+            eprintln!(
+                "KD control-space write {:#x}+{:#x} is unsupported",
+                write.address, write.count
+            );
+            request.failure_response()
         } else if let Some(range) = request.get_context_ex() {
             eprintln!(
                 "KD GetContextEx offset {:#x}, count {:#x}",
@@ -348,14 +360,8 @@ async fn run_async(
             eprintln!("KD Continue2 trace={trace}");
             if trace {
                 let rip = stopped_low(&stop, RegisterName::Rip)?;
-                session.step(
-                    engine,
-                    &stop.epoch,
-                    StepGuard {
-                        instruction: Some(read_instruction_guard(session, rip)?),
-                        expected_rips: Vec::new(),
-                    },
-                )?;
+                let guard = fallthrough_step_guard(read_instruction_guard(session, rip)?)?;
+                session.step(engine, &stop.epoch, guard)?;
             } else {
                 if breakpoints.is_empty() {
                     bail!("WinDbg requested continue with no hardware breakpoint installed");
@@ -558,6 +564,35 @@ fn read_instruction_guard(
     })
 }
 
+/// Build the one-instruction guard accepted by the current KD facade.
+///
+/// A branch, call, return, interrupt or exception can stop anywhere other than the linear
+/// successor. Until the facade can prove that destination from the held context, refusing it here
+/// preserves the stop instead of letting a valid vector-1 event fault the session after release.
+fn fallthrough_step_guard(instruction: InstructionGuard) -> Result<StepGuard> {
+    let mut decoder = InstructionDecoder::with_ip(
+        64,
+        &instruction.bytes,
+        instruction.address.0,
+        DecoderOptions::NONE,
+    );
+    let decoded = decoder.decode();
+    if decoded.is_invalid() || decoded.len() != instruction.bytes.len() {
+        bail!("the guarded VTL1 bytes do not decode as exactly one AMD64 instruction");
+    }
+    if decoded.flow_control() != FlowControl::Next {
+        bail!(
+            "WinDbg single-step is refused for {:?} control flow at {:#x}",
+            decoded.flow_control(),
+            instruction.address.0
+        );
+    }
+    Ok(StepGuard {
+        instruction: Some(instruction),
+        expected_rips: Vec::new(),
+    })
+}
+
 fn stopped_low(stop: &StopRecord, name: RegisterName) -> Result<u64> {
     stop.registers
         .values
@@ -584,37 +619,66 @@ fn decode_hex(text: &str) -> Result<Vec<u8>> {
 /// WinDbg also probes the reported RSP as an NT trap frame and disassembles backwards across bytes
 /// preceding the current instruction. Neither assumption holds for this redirected Secure Kernel
 /// stop: the selected NOP follows embedded data, and the backscan changes WinDbg's current address
-/// to a 16-bit `CS:IP`. Only those exact bookkeeping reads are zeroed. The real register values and
-/// current instruction remain in the state packet, ordinary reads still use guest memory, and no
-/// guest byte is changed.
-fn compatibility_memory(
-    address: u64,
-    count: u32,
-    stopped_rsp: u64,
-    stopped_rip: u64,
-    instruction_bytes: usize,
-) -> Option<Vec<u8>> {
-    let end = address.checked_add(u64::from(count))?;
-    let inside = |base: u64| {
-        address >= base
-            && end <= base + COMPATIBILITY_PAGE_BYTES
-            && u64::from(count) <= COMPATIBILITY_PAGE_BYTES
-    };
-    let stack_bookkeeping =
-        address == stopped_rsp && u64::from(count) == STACK_BOOKKEEPING_BYTES && stopped_rsp != 0;
-    let code_backscan = stopped_rip.checked_sub(CODE_BACKSCAN_BYTES) == Some(address)
-        && u64::from(count) == CODE_BACKSCAN_BYTES;
-    let code_lookahead = stopped_rip
-        .checked_add(instruction_bytes as u64)
-        .is_some_and(|after| after == address)
-        && u64::from(count) == CODE_LOOKAHEAD_BYTES;
-    (inside(crate::kdapi::SYNTHETIC_THREAD)
-        || inside(0)
-        || inside(KUSER_SHARED_DATA)
-        || stack_bookkeeping
-        || code_backscan
-        || code_lookahead)
-        .then(|| vec![0; count as usize])
+/// to a 16-bit `CS:IP`. Each stop-specific startup probe is served at most once. A later explicit
+/// debugger read of the same real address therefore reaches guest memory instead of receiving
+/// fabricated bytes.
+struct CompatibilityMemory {
+    stack_bookkeeping: bool,
+    code_backscan: bool,
+    code_lookahead: bool,
+}
+
+impl Default for CompatibilityMemory {
+    fn default() -> Self {
+        Self {
+            stack_bookkeeping: true,
+            code_backscan: true,
+            code_lookahead: true,
+        }
+    }
+}
+
+impl CompatibilityMemory {
+    fn read(
+        &mut self,
+        address: u64,
+        count: u32,
+        stopped_rsp: u64,
+        stopped_rip: u64,
+        instruction_bytes: usize,
+    ) -> Option<Vec<u8>> {
+        let end = address.checked_add(u64::from(count))?;
+        let inside = |base: u64| {
+            address >= base
+                && end <= base + COMPATIBILITY_PAGE_BYTES
+                && u64::from(count) <= COMPATIBILITY_PAGE_BYTES
+        };
+        if inside(crate::kdapi::SYNTHETIC_THREAD) || inside(0) || inside(KUSER_SHARED_DATA) {
+            return Some(vec![0; count as usize]);
+        }
+        let stack_bookkeeping = self.stack_bookkeeping
+            && address == stopped_rsp
+            && u64::from(count) == STACK_BOOKKEEPING_BYTES
+            && stopped_rsp != 0;
+        let code_backscan = self.code_backscan
+            && stopped_rip.checked_sub(CODE_BACKSCAN_BYTES) == Some(address)
+            && u64::from(count) == CODE_BACKSCAN_BYTES;
+        let code_lookahead = self.code_lookahead
+            && stopped_rip
+                .checked_add(instruction_bytes as u64)
+                .is_some_and(|after| after == address)
+            && u64::from(count) == CODE_LOOKAHEAD_BYTES;
+        if stack_bookkeeping {
+            self.stack_bookkeeping = false;
+        }
+        if code_backscan {
+            self.code_backscan = false;
+        }
+        if code_lookahead {
+            self.code_lookahead = false;
+        }
+        (stack_bookkeeping || code_backscan || code_lookahead).then(|| vec![0; count as usize])
+    }
 }
 
 fn parse_word(name: &str, value: &str) -> Result<u64> {
@@ -649,20 +713,18 @@ mod tests {
 
     #[test]
     fn compatibility_memory_is_confined_to_protocol_bookkeeping() {
+        let mut memory = CompatibilityMemory::default();
         assert_eq!(
-            compatibility_memory(crate::kdapi::SYNTHETIC_THREAD + 8, 16, 0x8000, 0x9000, 5),
+            memory.read(crate::kdapi::SYNTHETIC_THREAD + 8, 16, 0x8000, 0x9000, 5),
             Some(vec![0; 16])
         );
+        assert_eq!(memory.read(0, 16, 0x8000, 0x9000, 5), Some(vec![0; 16]));
         assert_eq!(
-            compatibility_memory(0, 16, 0x8000, 0x9000, 5),
-            Some(vec![0; 16])
-        );
-        assert_eq!(
-            compatibility_memory(KUSER_SHARED_DATA + 0x268, 8, 0x8000, 0x9000, 5),
+            memory.read(KUSER_SHARED_DATA + 0x268, 8, 0x8000, 0x9000, 5),
             Some(vec![0; 8])
         );
         assert_eq!(
-            compatibility_memory(
+            memory.read(
                 crate::kdapi::SYNTHETIC_THREAD + 0xff8,
                 16,
                 0x8000,
@@ -672,21 +734,39 @@ mod tests {
             None
         );
         assert_eq!(
-            compatibility_memory(0x8000, STACK_BOOKKEEPING_BYTES as u32, 0x8000, 0x9000, 5),
+            memory.read(0x8000, STACK_BOOKKEEPING_BYTES as u32, 0x8000, 0x9000, 5),
             Some(vec![0; STACK_BOOKKEEPING_BYTES as usize])
         );
         assert_eq!(
-            compatibility_memory(0x9000 - CODE_BACKSCAN_BYTES, 0x2b, 0x8000, 0x9000, 5),
+            memory.read(0x8000, STACK_BOOKKEEPING_BYTES as u32, 0x8000, 0x9000, 5),
+            None,
+            "an explicit repeat must read the real Secure Kernel stack"
+        );
+        assert_eq!(
+            memory.read(0x9000 - CODE_BACKSCAN_BYTES, 0x2b, 0x8000, 0x9000, 5),
             Some(vec![0; CODE_BACKSCAN_BYTES as usize])
         );
         assert_eq!(
-            compatibility_memory(0x9005, CODE_LOOKAHEAD_BYTES as u32, 0x8000, 0x9000, 5),
+            memory.read(0x9005, CODE_LOOKAHEAD_BYTES as u32, 0x8000, 0x9000, 5),
             Some(vec![0; CODE_LOOKAHEAD_BYTES as usize])
         );
-        assert_eq!(compatibility_memory(0x8000, 0x7f, 0x8000, 0x9000, 5), None);
-        assert_eq!(compatibility_memory(0x8010, 0x70, 0x8000, 0x9000, 5), None);
-        assert_eq!(compatibility_memory(0x1000, 1, 0x8000, 0x9000, 5), None);
-        assert_eq!(compatibility_memory(u64::MAX, 2, 0x8000, 0x9000, 5), None);
+        assert_eq!(memory.read(0x8000, 0x7f, 0x8000, 0x9000, 5), None);
+        assert_eq!(memory.read(0x8010, 0x70, 0x8000, 0x9000, 5), None);
+        assert_eq!(memory.read(0x1000, 1, 0x8000, 0x9000, 5), None);
+        assert_eq!(memory.read(u64::MAX, 2, 0x8000, 0x9000, 5), None);
+    }
+
+    #[test]
+    fn single_step_accepts_only_linear_control_flow() {
+        let guard = |bytes: &[u8]| InstructionGuard {
+            address: crate::skcontrol::HexU64(0x1000),
+            bytes: bytes.to_vec(),
+        };
+        assert!(fallthrough_step_guard(guard(&[0x90])).is_ok());
+        for bytes in [&[0xeb, 0x05][..], &[0xe8, 0, 0, 0, 0], &[0xc3]] {
+            let error = fallthrough_step_guard(guard(bytes)).unwrap_err();
+            assert!(error.to_string().contains("control flow"), "{error:#}");
+        }
     }
 
     #[test]
