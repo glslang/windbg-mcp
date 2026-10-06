@@ -626,8 +626,18 @@ GATES = {
     # of `arm64_pc`, whose `registers` route is ungated, and false of `driver_blame`, whose only
     # fact-checking step is this one. Whether anything else grounded them is a per-task question,
     # and the run answers it per task rather than in a sentence printed for both.
+    #
+    # **No issue number in the text**, which is the half of
+    # [#457](https://github.com/glslang/windbg-mcp/issues/457) that reaches this file. It carried
+    # `(issue #142)`, and that one is closed and titled for a reading the repo has since recorded as
+    # wrong -- "an ARM64 engine cannot read virtual memory from an x64 kernel dump", where the cause
+    # was symbols and not the architecture pairing. The symptom named here *is* #142's, unlike the
+    # smoke test's own stand-down which cited it for symbol availability (#153's subject); what both
+    # shared is a parenthesised closed issue in output a reader is invited to go and open. The
+    # history belongs in `docs/smoke-test.md` with the rest of the measurement, per this table's own
+    # rule above.
     "kernel_symbols": "`nt` resolved no PDB on this host, so a stack walk has no types to read "
-                      "and gives back frames made of the bug check's own parameters (issue #142).",
+                      "and gives back frames made of the bug check's own parameters.",
 }
 
 # The whole text of a result rather than a field of it, for a tool that has no structured half.
