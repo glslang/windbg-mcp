@@ -2369,12 +2369,18 @@ which figure is.
 **It matters because the `7` is load-bearing and the other two are not.** The sentence carrying a
 rule is *all 7 are `INHERIT_ONLY_ACE`*, and what it buys is **agreement**: those 7 are already
 reported as granting nothing by the separate inherit-only rule in `device`'s `access_entry`, so the
-two rules meet on the only ACEs where both apply. If the generic-bit count is really **8**, that
-agreement has a counterexample on the guest it was measured on -- an ACE whose `GENERIC_*` bits
-`rights` names with `reads: false` beside them and nothing to explain why, which is the reading the
-note exists to prevent. It would **not** reopen the declined generic-mapping finding, which rests on
-the kernel's own behaviour rather than on any count (`nt!SeAccessCheckWithHint`, 1,192 instructions
-on 26100 with no read of a generic bit or the mapping). And if instead the total is 148, or the
+two rules meet on the only ACEs where both apply. If the generic-bit count is really **8**, what
+follows is **not** a counterexample, and an earlier draft of this entry said it was. The eighth ACE
+is *unclassified* rather than known to be anything: the record says seven were inherit-only, `7` is
+itself one of the figures in doubt, and the eighth may be inherit-only too with the claim simply
+mistyped. What an 8 establishes is that the agreement covers seven of eight and is **unverified**
+for one -- weaker than a falsified rule, and still worth settling, because if that ACE is *not*
+inherit-only then it is one whose `GENERIC_*` bits `rights` names with `reads: false` beside them
+and nothing to explain why, which is the reading the note exists to prevent. Which of the two it is
+is exactly what the fourth figure below answers and what nothing in the records can. It would
+**not** reopen the declined generic-mapping finding either way, that resting on the kernel's own
+behaviour rather than on any count (`nt!SeAccessCheckWithHint`, 1,192 instructions on 26100 with no
+read of a generic bit or the mapping). And if instead the total is 148, or the
 remainder 142, no rule moves and only the denominator item 69's bound is quoted against does.
 
 - **Why deferred:** it cannot be settled from the records, which are one measurement written three
@@ -2382,15 +2388,20 @@ remainder 142, no rule moves and only the denominator item 69's bound is quoted 
   reachable from the Mac the close was written on. Nothing is wrong in the meantime, which is why
   this is a provenance defect in prose rather than a defect in `data_access`.
 - **What would close it:** re-take the sweep and record **four** figures with what produced them --
-  descriptors, ACEs, ACEs carrying generic bits, and how many of *those* are inherit-only -- so the
-  partition is stated rather than derived, which is the shape that drifted. If the generic-bit
-  count comes back 8, `data_access`'s doc comment, the sweep note on `AceKind::mask_is_access` and
-  item 69's entry in [`DONE.md`](./DONE.md) all need the correction, and the inherit-only agreement
-  is the sentence to check first. Settling it is also what lets item 69's bound be re-stated
-  exactly, the count beside *every ACE is type `0x00`* being one the sweep printed.
-- **A committed script is not what this wants.** The figure that drifted was a *derivation*, not
-  the measurement, so what is owed is one reading recorded with its command beside it rather than
-  machinery to repeat a reading nobody needs twice.
+  descriptors, ACEs, ACEs carrying generic bits, and how many of *those* are inherit-only -- so
+  that nothing in it is arrived at by subtraction, whichever of the three turns out to have moved.
+  If the generic-bit count comes back 8, `data_access`'s doc comment, the sweep note on
+  `AceKind::mask_is_access` and item 69's entry in [`DONE.md`](./DONE.md) all need the correction,
+  and the inherit-only agreement is the sentence to check first. Settling it is also what lets item
+  69's bound be re-stated exactly, the count beside *every ACE is type `0x00`* being one the sweep
+  printed.
+- **Record what produced the figures, and leave the form of that open.** A first draft of this
+  bullet ruled out a committed sweep script because "what drifted was a derivation rather than a
+  measurement" -- which assumes 141 is the wrong number, the very thing this item exists to settle,
+  and is false if the mistyped figure is `7` or `149`. The requirement is the provenance and not
+  the vehicle: record the command or the tool calls beside the four figures, and whether that ends
+  up a transcript in this entry or a script under `tools/` is for whoever re-takes it to judge --
+  with the answer in hand, which is the opposite order from the one that draft used.
 - **How it was found:** CodeRabbit on #458, reading "the other 141" against the 149 in the same
   sentence and proposing 142. The finding was right that the arithmetic does not close and wrong
   that it is a typo to correct -- `git log -S` for the figure found the same three numbers in the
