@@ -180,7 +180,7 @@ async fn run_async(options: Options) -> Result<()> {
     let mut link = TargetLink::new();
     let mut captured = Vec::new();
     let mut resets = 0;
-    let deadline = tokio::time::Instant::now() + options.timeout;
+    let mut deadline = tokio::time::Instant::now() + options.timeout;
     let target_reset = 'outer: loop {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         if left.is_zero() {
@@ -237,6 +237,7 @@ async fn run_async(options: Options) -> Result<()> {
             .map_err(anyhow::Error::msg)?;
         pipe.write_all(&packet).await?;
         pipe.flush().await?;
+        deadline = tokio::time::Instant::now() + options.timeout;
         let mut last_activity_after_ack = None;
         let mut repeat_state_after_ack = false;
         loop {
@@ -273,8 +274,20 @@ async fn run_async(options: Options) -> Result<()> {
             decoder.push(&buffer[..read]);
             while let Some(frame) = decoder.next().context("decoding the WinDbg KD stream")? {
                 let inbound = link.receive(frame);
+                let peer_reset = inbound.peer_reset;
                 for write in inbound.writes {
                     pipe.write_all(&write).await?;
+                }
+                if peer_reset {
+                    resets += 1;
+                    deadline = tokio::time::Instant::now() + options.timeout;
+                    last_activity_after_ack = None;
+                    repeat_state_after_ack = false;
+                    let packet = link
+                        .send(crate::kdwire::PACKET_TYPE_STATE_CHANGE64, &payload)
+                        .map_err(anyhow::Error::msg)?;
+                    pipe.write_all(&packet).await?;
+                    continue;
                 }
                 if repeat_state_after_ack && !link.awaiting_acknowledgement() {
                     let packet = link
@@ -331,7 +344,7 @@ async fn run_async(options: Options) -> Result<()> {
                     Some(request.success_response())
                 } else if request.write_control_space().is_some() {
                     control_writes += 1;
-                    Some(request.write_control_space_response()?)
+                    Some(request.failure_response())
                 } else if continue_request {
                     continue_requests += 1;
                     Some(request.success_response())
