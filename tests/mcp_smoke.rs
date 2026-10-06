@@ -17229,12 +17229,23 @@ fn a_driver_survey_on_a_live_kernel_is_its_three_tools_answers() {
         // not off whether the call it came from returned. Those are two different facts sharing
         // the word `ok`: the envelope's says the *call answered*, a section's says the *answer is
         // whole*, and a scan that reached its deadline is both `Outcome::Ok` and `stopped`.
+        //
+        // **This is a mirror of that rule, and the thing that keeps `shortfall` honest does not
+        // reach it.** `DriverHazards::shortfall` destructures `Self` exhaustively, so a new field
+        // on the scan fails to compile there until somebody decides whether it shortens an
+        // answer -- and this closure reads a JSON object, where a field nobody added is simply
+        // absent and every assertion still passes. `ordinal_imports` arrived that way: the server
+        // began answering `partial` for an image importing by ordinal while this still expected
+        // `ok`, which fails only on a host whose `mountmgr` has such an import. So a field added
+        // to that struct is a field to add here, and the compiler will not say so.
         let short = |scan: &Value| {
             let listed = |field: &str| scan[field].as_array().is_some_and(|rows| !rows.is_empty());
+            let counted = |field: &str| scan[field].as_u64().unwrap_or(0) > 0;
             !scan["stopped"].is_null()
                 || scan["cap_hit"].as_bool().unwrap_or(false)
                 || listed("unreadable")
                 || listed("unnamed_libraries")
+                || counted("ordinal_imports")
         };
         if !ran.is_null() {
             assert_eq!(
