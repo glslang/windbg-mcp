@@ -127,17 +127,30 @@ test, since a regression in `walk_memory` must not be able to silence the test t
 require `nt` to have resolved to a **PDB**. Either way the test prints `SKIPPED` with the reason
 and what still holds, which is what an `ignore` keyed to an architecture could never say.
 
-**Each condition is asked three times, and the second and third ask only after the symbol path has
-been changed under them** ([#457](https://github.com/glslang/windbg-mcp/issues/457)). A stand-down is what
+**The symbols are fetched up to three times before either condition is asked at all**
+([#457](https://github.com/glslang/windbg-mcp/issues/457)). A stand-down is what
 `ci.yml`'s guard step reads, and that step has no `if:` — so one failed fetch turns a *required*
 check red. That is not hypothetical: on 2026-10-05 the **x64** entry, the one documented above as
 having the symbol half, printed exactly one stand-down. `nt` resolved no PDB for one checked-in dump
 while another resolved its own in the same run, and no read-gate stood down at all, so `symsrv.dll`
 was being read the whole time; re-running the job unchanged passed. It blocked a `rmcp` bump. Between
-asks the gate now appends `symbol_path()` — a `srv*` spec naming a downstream directory, where the
-engine's ambient default expands to a `cache*` that names none and is therefore skipped, reading as
-an absent PDB — and forces `.reload /f nt`. The last ask waits `SYMBOL_FETCH_BACKOFF` first, and the
-first refetch does not, not being a repeat of anything.
+asks `ensure_kernel_symbols` appends `symbol_path()` — a `srv*` spec naming a downstream directory,
+where the engine's ambient default expands to a `cache*` that names none and is therefore skipped,
+reading as an absent PDB — and forces `.reload /f nt`. The last ask waits `SYMBOL_FETCH_BACKOFF`
+first, and the first refetch does not, not being a repeat of anything.
+
+**It runs once per session, straight after the open, and the gates stay pure reads** — which is a
+correction to the first version of this, where the retry lived *inside* the gates. A predicate with a
+side effect moves the target's symbol state at whatever point the predicate is called, and
+`a_dump_session_opens_reads_and_closes` captures `backtrace` a hundred lines before its gates and then
+asserts that walk frame-for-frame against a `crash_triage` taken after them. A refetch landing in
+between makes an unsymbolised walk disagree with a symbolised one about `symbol`, `module` and `rva`:
+a red required check blaming two tools for disagreeing, in exactly the transient the retry exists to
+recover. Four of the five callers ask their gate on the line after opening, where the two placements
+are equivalent, so the one that mattered was the only one that showed it — and a sixth test written
+later would not have known. Raised by Codex on #460 as a P1. **The ordering is prevented by
+construction rather than asserted**, there being no way to stage a failed first fetch on a runner that
+can reach the symbol store.
 
 **A green run of this tier proves nothing about any of that, which is why the schedule is asserted
 somewhere else.** Symbols resolve on the first ask on both CI entries, so the retry path is never

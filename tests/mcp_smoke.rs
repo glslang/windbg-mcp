@@ -8772,14 +8772,11 @@ fn native_sample_tier() -> Option<&'static KernelSample> {
 /// and reads anywhere, while following a **pointer** needs `nt`'s symbols to translate the
 /// address, so an engine that resolved none answers `0x8007001E` here.
 ///
-/// Asked up to [`SYMBOL_FETCH_ATTEMPTS`] times, because the engine resolving none is a state a
-/// refetch can move.
+/// **A pure read, and that is load-bearing.** Getting `nt`'s symbols in hand is
+/// [`ensure_kernel_symbols`]'s job, done once before a test reads anything; a gate that fetched them
+/// itself would move the target's symbol state *after* earlier reads had been captured against it,
+/// which is how review on #460 found a stale `backtrace` being compared with a fresh `crash_triage`.
 fn engine_reads_target_memory(server: &mut Server, session_id: &str) -> bool {
-    asked_until_the_symbols_are_in(server, session_id, nt_base_reads)
-}
-
-/// One ask of [`engine_reads_target_memory`]'s question, with no refetch behind it.
-fn nt_base_reads(server: &mut Server, session_id: &str) -> bool {
     let Some(nt) = nt_module(server, session_id) else {
         return false;
     };
@@ -8811,14 +8808,14 @@ fn nt_base_reads(server: &mut Server, session_id: &str) -> bool {
 /// host that has everything they need, which is the failure this whole gate exists to avoid,
 /// pointed the other way.
 ///
-/// **And a no is only taken after [`SYMBOL_FETCH_ATTEMPTS`] of them**, for the same reason spelled
-/// out there: one PDB that did not arrive is not a host that cannot fetch one, and this gate is
-/// read by a required CI check.
+/// A pure read for the same reason [`engine_reads_target_memory`] is one: the fetching happens in
+/// [`ensure_kernel_symbols`], before a test has read anything this could invalidate.
 fn engine_resolves_kernel_symbols(server: &mut Server, session_id: &str) -> bool {
-    asked_until_the_symbols_are_in(server, session_id, nt_has_a_pdb)
+    nt_has_a_pdb(server, session_id)
 }
 
-/// One ask of [`engine_resolves_kernel_symbols`]'s question, with no refetch behind it.
+/// Whether `nt` has a PDB *now* — the question both the gate above and [`ensure_kernel_symbols`]
+/// ask, so the thing being waited for and the thing being gated on cannot drift apart.
 fn nt_has_a_pdb(server: &mut Server, session_id: &str) -> bool {
     nt_module(server, session_id).is_some_and(|nt| nt["symbols"] == "pdb" || nt["symbols"] == "dia")
 }
@@ -8853,8 +8850,10 @@ fn nt_module(server: &mut Server, session_id: &str) -> Option<Value> {
 /// blocked a dependency bump that had nothing to do with symbols. Re-running the job unchanged
 /// passed.
 ///
-/// So the gates ask again rather than reporting the first answer, and three is what that costs:
-/// the host has to fail the fetch every time before a test says it cannot read a target.
+/// So [`ensure_kernel_symbols`] fetches before the gates are asked at all, and three is what that
+/// costs: the host has to fail the fetch every time before a test says it cannot read a target. The
+/// count is named in the `RETRY` line each attempt prints, which is why neither stand-down message
+/// repeats it — a second copy is a second thing to drift.
 ///
 /// This does not weaken the thing the guard exists for. #153 — the regression it was written
 /// against — is an image with no `symsrv.dll` anywhere, where there is nothing to retry *with*:
@@ -8878,7 +8877,7 @@ const SYMBOL_FETCH_BACKOFF: Duration = Duration::from_secs(3);
 /// under plain `cargo test`. Being a value is also what rules out the one mistake here that would
 /// make the whole mechanism do nothing without changing how a green run reads: a refetch *after* the
 /// last ask, which spends two fetches and never asks again. There is no "after" to put one in —
-/// [`asked_until_the_symbols_are_in`] reads this before asking and nothing follows the ask.
+/// [`ensure_kernel_symbols`] reads this before asking and nothing follows the ask.
 #[derive(Debug, PartialEq, Eq)]
 enum BeforeAsk {
     /// Nothing. The first ask runs against whatever symbol path the engine came up with on its own.
@@ -8904,19 +8903,24 @@ fn before_ask(attempt: usize) -> BeforeAsk {
     }
 }
 
-/// Asks `question` until it says yes, fetching `nt`'s symbols again before each later ask.
+/// Gets `nt`'s symbols in hand before a target-reading test reads anything, retrying the fetch.
 ///
-/// Shared by both gates because they stand down for one cause — a PDB that did not arrive — and
-/// `ci.yml`'s guard treats their two messages alike. Retrying only the PDB gate would have left the
-/// same blip able to fail the same check through the other one, a moment earlier in the same dump.
+/// **Called once per session, straight after it opens, and never from a gate.** Both gates below
+/// stand down for one cause — a PDB that did not arrive — so an earlier version put the retry inside
+/// them, which is a predicate with a side effect: a refetch that succeeds changes the target's symbol
+/// state at whatever point the predicate happens to be called. Review on
+/// [#460](https://github.com/glslang/windbg-mcp/pull/460) found what that costs in
+/// [`a_dump_session_opens_reads_and_closes`], which captures `backtrace` forty lines *before* its
+/// gates and then asserts that walk frame-for-frame against a `crash_triage` taken after them: a
+/// refetch landing in between makes an unsymbolised walk disagree with a symbolised one on `symbol`,
+/// `module` and `rva` — a red required check blaming two tools for disagreeing, in precisely the
+/// transient this retry exists to recover from. Four of the five callers ask their gate on the line
+/// after opening, where the two are equivalent; the fifth is the one that matters, and a sixth
+/// written later would not know. So the fetching is hoisted out and the gates are reads again.
 ///
-/// The refetch happens **before** the ask it belongs to rather than after the one that failed, which
-/// is the same schedule said the safe way round: the loop cannot end on a fetch nothing looked at.
-fn asked_until_the_symbols_are_in(
-    server: &mut Server,
-    session_id: &str,
-    question: fn(&mut Server, &str) -> bool,
-) -> bool {
+/// Nothing is returned and nothing is asserted. Whether the symbols arrived is the gates' question,
+/// and they ask it where they stand their own test down with the reason.
+fn ensure_kernel_symbols(server: &mut Server, session_id: &str) {
     for attempt in 1..=SYMBOL_FETCH_ATTEMPTS {
         match before_ask(attempt) {
             BeforeAsk::Ask => {}
@@ -8926,11 +8930,10 @@ fn asked_until_the_symbols_are_in(
                 refetch_kernel_symbols(server, session_id, attempt);
             }
         }
-        if question(server, session_id) {
-            return true;
+        if nt_has_a_pdb(server, session_id) {
+            return;
         }
     }
-    false
 }
 
 /// The retry schedule, asserted with nothing but the schedule: no engine, no dump, no symbol store.
@@ -8949,8 +8952,8 @@ fn asked_until_the_symbols_are_in(
 ///
 /// **What it cannot see** is the refetch moving to *after* the ask that failed, which is the shape
 /// that spends two fetches and asks nothing again. That is why the schedule is a value the loop
-/// follows rather than control flow spread through it: in [`asked_until_the_symbols_are_in`] the
-/// ask is the last statement of the iteration, so there is no later place for a fetch to go.
+/// follows rather than control flow spread through it: in [`ensure_kernel_symbols`] the ask is the
+/// last statement of the iteration, so there is no later place for a fetch to go.
 #[test]
 fn the_symbol_retry_schedule_refetches_before_every_ask_but_the_first() {
     let schedule: Vec<BeforeAsk> = (1..=SYMBOL_FETCH_ATTEMPTS).map(before_ask).collect();
@@ -9015,10 +9018,25 @@ fn refetch_kernel_symbols(server: &mut Server, session_id: &str, attempt: usize)
         }),
         TARGET_STEP,
     );
+    // **The override's value is never printed**, only that it is the thing in force. A symbol store
+    // is reached over HTTP and its URL can carry credentials, so `WINDBG_MCP_SMOKE_SYMBOLS` is a
+    // secret-bearing variable as far as this line is concerned — and a retry prints on every run it
+    // fires on, where `load_kernel_symbols`'s transcript carrying the same value reaches a log only
+    // through an assertion failure. Raised by CodeRabbit on #460.
+    //
+    // Keyed on the variable being *present* rather than on what `symbol_path` did with it. The two
+    // differ only when it is set and blank — `symbol_path` falls back, this still credits the
+    // override — so the label is advisory in that one case and the safety is not: the branch that
+    // prints a value is reachable only when nothing was set to leak.
+    let named = if std::env::var_os(SYMBOLS_ENV).is_some() {
+        format!("the symbol path {SYMBOLS_ENV} names")
+    } else {
+        path
+    };
     // Worded to carry none of the two phrases `ci.yml`'s guard step greps for: a line about
     // *recovering* from a missing PDB must not read to that step as a stand-down over one.
     eprintln!(
-        "RETRY: the kernel's symbols were not in hand; appended {path} and forced a reload before \
+        "RETRY: the kernel's symbols were not in hand; appended {named} and forced a reload before \
          ask {attempt} of {SYMBOL_FETCH_ATTEMPTS}{}",
         if is_tool_error(&applied) {
             " [the engine reported a failure; the next ask says whether it mattered]"
@@ -9041,18 +9059,18 @@ fn refetch_kernel_symbols(server: &mut Server, session_id: &str, attempt: usize)
 const NO_TARGET_READS_SKIP: &str = "this engine could not read `nt`'s own base, so nothing behind \
                                     a pointer in this dump can be asserted. The usual cause is \
                                     symbols it could not resolve, for want of a `symsrv.dll` \
-                                    beside the engine — and a transient is ruled out, because \
-                                    every fetch this tier makes failed, not one. The dump's own \
-                                    structure still reads, which is what the rest of this tier \
-                                    asserts.";
+                                    beside the engine — and this tier fetched them repeatedly \
+                                    before asking, so a single failed request is not it. \
+                                    The dump's own structure still reads, which is what the rest \
+                                    of this tier asserts.";
 
 /// Why a test that walks `nt`'s types stands down, which is a weaker condition than reading.
-const NO_KERNEL_SYMBOLS_SKIP: &str = "`nt` resolved no PDB on this host, and had none after every \
-                                      fetch this tier makes — so this is a host that cannot reach \
-                                      a PDB, not one request that failed. The `_EPROCESS` and the \
-                                      stack walk behind these fields have nothing to read types \
-                                      out of. Reads that need no types are unaffected and are \
-                                      asserted elsewhere in this tier.";
+const NO_KERNEL_SYMBOLS_SKIP: &str = "`nt` resolved no PDB on this host, and had none after this \
+                                      tier had fetched repeatedly before asking — so this is a \
+                                      host that cannot reach a PDB, not one request that failed. \
+                                      The `_EPROCESS` and the stack walk behind these fields have \
+                                      nothing to read types out of. Reads that need no types are \
+                                      unaffected and are asserted elsewhere in this tier.";
 
 /// A `disassemble` whose `address` could reach the expression evaluator is refused before a
 /// session is needed — and the refusal has to be *typed*, because the tool declares an
@@ -9300,6 +9318,8 @@ fn a_dump_session_opens_reads_and_closes() {
         session_id.starts_with("sess-"),
         "session handles are minted as `sess-…`, got `{session_id}` in:\n{opened}"
     );
+    // Before anything is read: a refetch must not land between two reads this test compares.
+    ensure_kernel_symbols(&mut server, &session_id);
 
     let status = server.tool_data("session_status", json!({}), TARGET_STEP);
     let listed_session = status["sessions"]
@@ -10792,6 +10812,8 @@ fn a_walk_marks_what_it_cannot_read_and_keeps_going() {
     };
     let mut server = Server::started();
     let session_id = server.open_session("open_dump", json!({ "path": sample.path }), TARGET_STEP);
+    // Before anything is read: a refetch must not land between two reads this test compares.
+    ensure_kernel_symbols(&mut server, &session_id);
     if !engine_reads_target_memory(&mut server, &session_id) {
         skip(NO_TARGET_READS_SKIP);
         return;
@@ -10963,6 +10985,8 @@ fn a_bug_check_is_triaged_into_its_fields() {
     let response = server.call_tool("open_dump", json!({ "path": sample.path }), TARGET_STEP);
     assert_no_error(&response, "open_dump");
     let session_id = session_id_of(&response["result"]);
+    // Before anything is read: a refetch must not land between two reads this test compares.
+    ensure_kernel_symbols(&mut server, &session_id);
     if !engine_reads_target_memory(&mut server, &session_id) {
         skip(NO_TARGET_READS_SKIP);
         return;
@@ -11236,6 +11260,8 @@ fn assert_driver_crash_names_its_driver(sample: &DriverCrashSample) {
         text_of(&opened["result"])
     );
     let session_id = session_id_of(&opened["result"]);
+    // Before anything is read: a refetch must not land between two reads this test compares.
+    ensure_kernel_symbols(&mut server, &session_id);
     if !engine_reads_target_memory(&mut server, &session_id) {
         skip(NO_TARGET_READS_SKIP);
         return;
@@ -11968,6 +11994,8 @@ fn a_batch_commits_or_fails_and_its_rollback_runs_either_way() {
     let session_id = session_id_of(&response["result"]);
     // The batch disassembles at the captured `@$ip`, which is a read like any other — and needs
     // no symbol, which is why this asks only for the read.
+    // Before anything is read: a refetch must not land between two reads this test compares.
+    ensure_kernel_symbols(&mut server, &session_id);
     if !engine_reads_target_memory(&mut server, &session_id) {
         skip(NO_TARGET_READS_SKIP);
         return;
