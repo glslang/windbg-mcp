@@ -151,7 +151,8 @@ impl AceKind {
     /// miniature as leaving the object-callback types out of [`Ace::callback`].
     ///
     /// **Nothing measured on a real machine exercises that range, and what the measurement bounds
-    /// is one machine's *defaults* rather than this parser's input** (`FOLLOWUPS.md` item 69).
+    /// is one machine's *defaults* rather than this parser's input** (`FOLLOWUPS.md` item 69, in
+    /// `DONE.md`).
     /// Across every distinct descriptor behind every device in `\Device` on a live Windows Server
     /// 26100 guest -- 41 descriptors, 149 ACEs, 2026-09-13, the sweep whose generic-bit half
     /// [`data_access`] reports -- **every ACE is type `0x00`**: not one callback ACE of any kind,
@@ -671,9 +672,13 @@ pub(crate) fn label_policy(mask: u32) -> Vec<&'static str> {
 /// Measured rather than reasoned, across every distinct descriptor behind every device in
 /// `\Device` on that build, 2026-09-13: 41 descriptors, 149 ACEs, of which 7 carry generic bits
 /// and **all 7 are `INHERIT_ONLY_ACE`** -- templates for children of types whose mappings differ,
-/// which is the one place a generic bit is supposed to survive. None of the other 141 carries one.
-/// Those 7 are already reported as granting nothing, by the separate inherit-only rule in
-/// [`crate::device`]'s `access_entry`, so the two rules agree on the only ACEs where both apply.
+/// which is the one place a generic bit is supposed to survive. None of the others carries one --
+/// left without a count, because the three figures as recorded do not close: 7 and 141 against a
+/// total of 149, in the doc comment and in the sweep's own commit alike. Which of them was mistyped
+/// wants the sweep re-taken on that guest, and what this rule rests on is the 7 and their all being
+/// inherit-only rather than the remainder. Those 7 are already reported as granting nothing, by
+/// the separate inherit-only rule in [`crate::device`]'s `access_entry`, so the two rules agree on
+/// the only ACEs where both apply.
 pub(crate) fn data_access(mask: u32) -> (bool, bool) {
     (mask & 0x0001 != 0, mask & 0x0002 != 0)
 }
@@ -970,8 +975,8 @@ mod tests {
         // visible in the fixtures above: none of the others puts `artx` where the bad arithmetic
         // looks, so each of them passes either reading. Deleting the construction as artificial
         // therefore restores an uncaught mutation rather than removing a fiction -- which
-        // `FOLLOWUPS.md` item 69 proposed once, one paragraph after saying an installer may put
-        // any documented ACE type in a device's DACL.
+        // `FOLLOWUPS.md` item 69 (in `DONE.md`) proposed once, one paragraph after saying an
+        // installer may put any documented ACE type in a device's DACL.
         let mut guid = [0xaau8; 16];
         guid[4..8].copy_from_slice(CONDITIONAL_ACE_SIGNATURE);
         let principal = sid(1, &[0]);
