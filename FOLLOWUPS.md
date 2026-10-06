@@ -2369,8 +2369,9 @@ which figure is.
 **It matters because the `7` is load-bearing and the other two are not.** The sentence carrying a
 rule is *all 7 are `INHERIT_ONLY_ACE`*, and what it buys is **agreement**: those 7 are already
 reported as granting nothing by the separate inherit-only rule in `device`'s `access_entry`, so the
-two rules meet on the only ACEs where both apply. If the generic-bit count is really **8**, what
-follows is **not** a counterexample, and an earlier draft of this entry said it was. The eighth ACE
+two rules meet on the only ACEs where both apply. If the generic-bit count on that guest was
+really **8**, what follows is **not** a counterexample, and an earlier draft of this entry said it
+was. The eighth ACE
 is *unclassified* rather than known to be anything: the record says seven were inherit-only, `7` is
 itself one of the figures in doubt, and the eighth may be inherit-only too with the claim simply
 mistyped. What an 8 establishes is that the agreement covers seven of eight and is **unverified**
@@ -2387,14 +2388,24 @@ remainder 142, no rule moves and only the denominator item 69's bound is quoted 
   times, and re-taking it wants a live kernel on that guest -- the half of this bench that was not
   reachable from the Mac the close was written on. Nothing is wrong in the meantime, which is why
   this is a provenance defect in prose rather than a defect in `data_access`.
-- **What would close it:** re-take the sweep and record **four** figures with what produced them --
-  descriptors, ACEs, ACEs carrying generic bits, and how many of *those* are inherit-only -- so
-  that nothing in it is arrived at by subtraction, whichever of the three turns out to have moved.
-  If the generic-bit count comes back 8, `data_access`'s doc comment, the sweep note on
-  `AceKind::mask_is_access` and item 69's entry in [`DONE.md`](./DONE.md) all need the correction,
-  and the inherit-only agreement is the sentence to check first. Settling it is also what lets item
-  69's bound be re-stated exactly, the count beside *every ACE is type `0x00`* being one the sweep
-  printed.
+- **What would close it, by superseding the record rather than repairing it:** re-take the sweep
+  and record **four** figures with what produced them -- descriptors, ACEs, ACEs carrying generic
+  bits, and how many of *those* are inherit-only -- so nothing in it is reached by subtraction,
+  whichever of the three moved. What it will **not** do is say which figure was mistyped, and this
+  entry's own first paragraph is why: a DACL is whatever was assigned to it, so one driver
+  installed or removed on that guest since 2026-09-13 moves the counts legitimately, and a fresh
+  sweep is then a *new sample* rather than a second reading of the old one. Nor can the original be
+  reproduced -- nothing recorded that guest's state beyond "26100", not even a revision. So the
+  archaeology stays open for good, and what closing this buys is an inconsistent record replaced by
+  a consistent, dated one that carries what produced it.
+- **The *rule* is what a new sample settles, and it is the half worth having.** Whether every
+  generic-bit ACE is `INHERIT_ONLY_ACE` is a claim about what installers assign, testable on
+  whatever inventory is in front of you: a count with one of them *not* inherit-only is a finding
+  about `data_access`'s agreement sentence on its own terms, rather than evidence about what was
+  there in September. The correction then lands where the rule is read -- that doc comment and the
+  sweep note on `AceKind::mask_is_access`, where item 69's bound can also be re-stated against a
+  count the sweep printed. Item 69's entry in [`DONE.md`](./DONE.md) is the record of what was
+  known at its close and is not rewritten, which is how this repo treats its other records.
 - **Record what produced the figures, and leave the form of that open.** A first draft of this
   bullet ruled out a committed sweep script because "what drifted was a derivation rather than a
   measurement" -- which assumes 141 is the wrong number, the very thing this item exists to settle,
