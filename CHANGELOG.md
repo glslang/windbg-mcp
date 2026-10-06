@@ -11,8 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`driver_hazards` counted an import by ordinal as one it had checked against the sink list**
   (issue [#302](https://github.com/glslang/windbg-mcp/issues/302), item 2). An ordinal import's
-  name lives in the *exporting* image's export table and not in the image being scanned, so a
-  name-keyed list cannot be matched against it at all -- but `hazards::scan` put everything that
+  slot is named with a number and no name in the image being scanned -- and need not have a name
+  anywhere, an export declared `NONAME` being in no export-name table -- so a name-keyed list
+  cannot be matched against it at all -- but `hazards::scan` put everything that
   did not match into `other_imports`, which means *asked, and not on the list*. A driver importing
   a sensitive export by ordinal therefore came back as `Sensitive imports: none on the list`, with
   that import counted among the ones that had been checked and `DriverHazards::shortfall` reporting
@@ -23,9 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lower bound when either is set, and that note now names both fields rather than sending a reader
   to an empty one. The rendering prints it beside the bound libraries, the same fact in the other
   channel, and the one sentence whose meaning inverts is qualified where it is printed. Resolving
-  the ordinal to a name is deliberately not attempted: it needs the exporting module loaded and
-  readable in the same session, which is a question about *that* image and may have no answer,
-  while the count is exact either way.
+  the ordinal is deliberately not attempted, and would not always succeed if it were: it needs the
+  exporting module loaded and readable in the same session, and then a name to find, which a
+  `NONAME` export does not have. The count is exact either way.
   `hazards::tests::an_ordinal_import_is_counted_apart_from_the_imports_that_were_checked` is
   mutation-verified against the fold -- delete the `Ordinal` arm and four of its assertions fail at
   once, including the unqualified `none on the list` in the rendered text.

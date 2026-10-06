@@ -400,15 +400,17 @@ pub struct Scan {
     pub other_imports: usize,
     /// Imports named by **ordinal**, which the curated list cannot be asked about at all.
     ///
-    /// An ordinal import's name is in the *exporting* image's export table and not in this one,
-    /// so there is nothing here to match against a name-keyed list. Counted apart from
+    /// This image carries the ordinal and no name for it, so there is nothing here to match
+    /// against a name-keyed list. **Nor need a name exist anywhere**: an export declared `NONAME`
+    /// is in no export-name table, so for those the question is unanswerable rather than answered
+    /// in another image. Counted apart from
     /// [`Self::other_imports`] because folding the two made a driver importing a sensitive export
     /// by ordinal report as "Sensitive imports: none on the list" with that import counted among
     /// the ones that had been checked -- a question never asked, rendered as an answer.
     ///
-    /// Resolving the ordinal to a name would need the exporting module loaded and readable in
-    /// this session, which is a question about *that* image and may have no answer; this count is
-    /// exact either way, and `docs/limitations.md` carries the boundary.
+    /// Resolving the ordinal is not attempted, and would not always succeed if it were: it needs
+    /// the exporting module loaded and readable in this session, and then a name to find. This
+    /// count is exact either way, and `docs/limitations.md` carries the boundary.
     pub ordinal_imports: usize,
     /// Which framework this image binds to, where one of its imports said so.
     ///
@@ -927,9 +929,10 @@ pub fn render(report: &crate::structured::DriverHazards) -> String {
     // sentence whose meaning inverts carries its own qualification where it is printed.
     if report.ordinal_imports > 0 {
         out.push_str(&format!(
-            "  Not nameable (imported by ordinal): {} import(s) — the name lives in the exporting\n           \
-             image's export table rather than in this one, so the list was never shown them and\n           \
-             the sinks above are a lower bound.\n",
+            "  Not nameable (imported by ordinal): {} import(s) — this image carries the ordinal\n           \
+             and no name, and the exporting image need not associate one with it either (an export\n           \
+             declared NONAME has none at all). So the list was never shown them, and the sinks\n           \
+             above are a lower bound.\n",
             report.ordinal_imports
         ));
     }
@@ -1153,8 +1156,9 @@ mod tests {
     /// **An import named by ordinal was never shown the list, and is not an import that is not on
     /// it.** The two must not look alike in either half of the answer.
     ///
-    /// An ordinal import's name is in the *exporting* image's export table and not in this one,
-    /// so a name-keyed list cannot be asked about it at all. Counted into `other_imports` -- which
+    /// An ordinal import is a slot this image names with a number and no name, so a name-keyed
+    /// list cannot be asked about it at all -- and the name need not exist anywhere, an export
+    /// declared `NONAME` being in no export-name table. Counted into `other_imports` -- which
     /// is where it went -- a driver importing a sensitive export by ordinal came back as
     /// "Sensitive imports: none on the list" with that import counted among the ones that had
     /// been checked, and with `shortfall` reporting a scan short of nothing. A question never

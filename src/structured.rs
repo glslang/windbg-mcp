@@ -3346,7 +3346,9 @@ pub struct DriverHazards {
     pub other_imports: usize,
     /// Imports named by **ordinal**, which a name-keyed list cannot be asked about.
     ///
-    /// The name is in the *exporting* image's export table and not in this one. Counted apart
+    /// This image carries the ordinal and no name for it, and the *exporting* image need not
+    /// associate one with that ordinal either -- an export declared `NONAME` is in no export-name
+    /// table, so for those a name exists nowhere rather than elsewhere. Counted apart
     /// from [`Self::other_imports`], because folded in they read as imports that were checked
     /// against the list and are not on it -- so a driver importing a sensitive export by ordinal
     /// answered as holding none, which is the one shape this result must not take. Like
@@ -3394,7 +3396,8 @@ impl Shortfall {
                  a sensitive import among them is not in this list. Its own `unnamed_libraries` \
                  and `ordinal_imports` fields say which -- a bound import's names live only in a \
                  table this deliberately never reads, and an ordinal import's name lives in the \
-                 exporting image's export table rather than in this one. The code was decoded in \
+                 ordinal and no name in this image, the exporting image not being obliged to \
+                 associate one with it either. The code was decoded in \
                  full, so `privileged` is not qualified by this."
             }
             Self::Code => {

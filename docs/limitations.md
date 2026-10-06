@@ -135,14 +135,15 @@
   that a name-keyed list cannot be matched against, and a fourth directory that is read for none of
   them. A **bound** library leaves its names only in the import address table, which is writable
   and which this never dereferences, so it is named in `unnamed_libraries`. An import by **ordinal**
-  carries no name in this image at all -- the name is in the *exporting* image's export table -- so
-  it is counted in `ordinal_imports` and **not** in `other_imports`: `other_imports` means *asked,
+  carries no name in this image at all, only the number -- so it is counted in `ordinal_imports`
+  and **not** in `other_imports`: `other_imports` means *asked,
   and not on the list*, where an ordinal was never asked, and folding the two reported a driver
   importing a sensitive export by ordinal as one holding none. Either channel makes `sinks` a lower
   bound, and `driver_surface`'s section note for this scan says so when either is set. Resolving an
-  ordinal to a name would need the exporting module loaded and readable in the same session, which
-  is a question about *that* image and may have no answer, so it is not attempted and the count is
-  exact either way. A **delay-loaded** import is not read at all: the reader takes data directories
+  ordinal is not attempted, and would not always succeed if it were: it needs the exporting module
+  loaded and readable in the same session, and then a name to find -- **an export declared
+  `NONAME` is in no export-name table**, so for those a name exists nowhere rather than in another
+  image, and the count is the whole of the answer there is. It is exact either way. A **delay-loaded** import is not read at all: the reader takes data directories
   0 and 1 (export and import) and never looks at directory 13, the delay-load descriptor table, so
   an API reached through a delay-load thunk is in neither `sinks` nor `other_imports` and **nothing
   in the answer says so** -- the one silent omission of the three, and the reason this bullet
