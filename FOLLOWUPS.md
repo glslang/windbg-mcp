@@ -91,6 +91,7 @@ line is simply open.
 - [Item 108](#108-windbg-mcp-a-kmdf-drivers-real-callbacks--step-1-landed-the-frameworks-per-device-config-is-what-is-left) — [windbg-mcp] A KMDF driver's real callbacks — step 1 landed, the framework's per-device config is what is left
 - [Item 110](#110-windbg-mcp-initialized-secure-kernel-stopstep--hardening-remains) — [windbg-mcp] Initialized Secure Kernel stop/step — hardening remains
 - [Item 112](#112-windbg-mcp-the-ioctl-fixtures-writes_flags-is-architecture-blind) — [windbg-mcp] The IOCTL fixture's `writes_flags` is architecture-blind
+- [Item 113](#113-windbg-mcp-the-device-descriptor-sweeps-own-figures-do-not-add-up) — [windbg-mcp] The `\Device` descriptor sweep's own figures do not add up
 
 ## 2. [dbgscope] Typed write primitives
 
@@ -2347,6 +2348,57 @@ honest answer and sets `writes_flags` on it by hand rather than teaching `insn` 
 `Layout::static_outcome_hides_flag_write`, which is the production side of the same distinction and
 is already exact.
 
+## 113. [windbg-mcp] The `\Device` descriptor sweep's own figures do not add up
+
+**Repo:** `windbg-mcp`.
+
+`data_access` in `src/sd.rs` rests on a sweep of 2026-09-13: across every distinct descriptor
+behind every device in `\Device` on a live Windows Server 26100 guest, **41 descriptors** and
+**149 ACEs**, of which **7** carry generic bits and **all 7 are `INHERIT_ONLY_ACE`**. Those figures
+cannot all be right -- 7 and the "other 141" the note carried come to 148 -- and the one-off is in
+the **record** rather than in any later reading of it: `4630c7c`'s commit message, `data_access`'s
+doc comment and item 69's entry state the same three numbers, because all three were written from
+the one run.
+
+**The remainder was dropped rather than corrected** when item 69 closed on
+[#458](https://github.com/glslang/windbg-mcp/pull/458): it is the only one of the three that is
+pure arithmetic, the other side of a partition needs no count, and writing 142 would have been a
+guess about which number was mistyped. So nothing in the tree is wrong today; what is unsettled is
+which figure is.
+
+**It matters because the `7` is load-bearing and the other two are not.** The sentence carrying a
+rule is *all 7 are `INHERIT_ONLY_ACE`*, and what it buys is **agreement**: those 7 are already
+reported as granting nothing by the separate inherit-only rule in `device`'s `access_entry`, so the
+two rules meet on the only ACEs where both apply. If the generic-bit count is really **8**, that
+agreement has a counterexample on the guest it was measured on -- an ACE whose `GENERIC_*` bits
+`rights` names with `reads: false` beside them and nothing to explain why, which is the reading the
+note exists to prevent. It would **not** reopen the declined generic-mapping finding, which rests on
+the kernel's own behaviour rather than on any count (`nt!SeAccessCheckWithHint`, 1,192 instructions
+on 26100 with no read of a generic bit or the mapping). And if instead the total is 148, or the
+remainder 142, no rule moves and only the denominator item 69's bound is quoted against does.
+
+- **Why deferred:** it cannot be settled from the records, which are one measurement written three
+  times, and re-taking it wants a live kernel on that guest -- the half of this bench that was not
+  reachable from the Mac the close was written on. Nothing is wrong in the meantime, which is why
+  this is a provenance defect in prose rather than a defect in `data_access`.
+- **What would close it:** re-take the sweep and record **four** figures with what produced them --
+  descriptors, ACEs, ACEs carrying generic bits, and how many of *those* are inherit-only -- so the
+  partition is stated rather than derived, which is the shape that drifted. If the generic-bit
+  count comes back 8, `data_access`'s doc comment, the sweep note on `AceKind::mask_is_access` and
+  item 69's entry in [`DONE.md`](./DONE.md) all need the correction, and the inherit-only agreement
+  is the sentence to check first. Settling it is also what lets item 69's bound be re-stated
+  exactly, the count beside *every ACE is type `0x00`* being one the sweep printed.
+- **A committed script is not what this wants.** The figure that drifted was a *derivation*, not
+  the measurement, so what is owed is one reading recorded with its command beside it rather than
+  machinery to repeat a reading nobody needs twice.
+- **How it was found:** CodeRabbit on #458, reading "the other 141" against the 149 in the same
+  sentence and proposing 142. The finding was right that the arithmetic does not close and wrong
+  that it is a typo to correct -- `git log -S` for the figure found the same three numbers in the
+  commit that first recorded them (2026-10-06).
+
+**Where it picks up.** `data_access` and the sweep note on `AceKind::mask_is_access` in
+`src/sd.rs`, and item 69 in [`DONE.md`](./DONE.md).
+
 ## Where these items came from
 
 Each cluster above, and what filing it measured. Items named here as *"now in `DONE.md`"* have
@@ -2473,5 +2525,10 @@ mechanism on a VM Hyper-V manages — so the realistic route is to own the boot,
 Its last two arms are declined on that ground rather than left open, each with the condition that
 reverses it, and exactly one moved to 110. Two drafts of that entry's status got the close wrong in
 opposite directions and both are recorded in it.
+And item 113 from closing item 69 on
+[#458](https://github.com/glslang/windbg-mcp/pull/458), where a review finding read the sweep's
+"other 141" as a typo for 142 and reading the commit that first recorded the figures showed all
+three written that way on the day — so what the close could record was the gap, and what it could
+not do from a Mac was settle which of the three is wrong (2026-10-06).
 `DECISIONS.md`'s 2026-08-02 entries are the bounded-command coverage review that produced
 item 13, now in [`DONE.md`](./DONE.md).
