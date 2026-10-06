@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A single failed PDB fetch turned a required check red** (issue
+  [#457](https://github.com/glslang/windbg-mcp/issues/457)). The debugger tier's four
+  target-reading assertions ask the host what it can do before they assert anything, and print
+  `SKIPPED` where they cannot; `ci.yml`'s guard step then fails the job if any of those messages is
+  in the log, because a skip otherwise passes and a broken symbol copy reads exactly like a green
+  run. That step carries no `if:`, and the unsuffixed **x64** entry it judges is a *required status
+  check* in the repository ruleset — so on 2026-10-05 it blocked a `rmcp` 3.4.1 -> 3.5.0 bump with
+  `137 passed; 0 failed`. Measuring the job rather than taking the report is what moved the fix:
+  the log holds **one** stand-down, not four, from the driver-crash test, while
+  `a_dump_session_opens_reads_and_closes` resolved `nt`'s PDB in the same run and no read gate stood
+  down at all — so `symsrv.dll` was being read the whole time and a single round trip to the symbol
+  store had failed. Re-running the job unchanged passed. That rules out the direction the issue
+  offered first, running the ARM64 symbol-half copy on x64 too: the entry's symbol half was there,
+  and copying it again prevents nothing. So the **gates** ask three times
+  (`mcp_smoke::SYMBOL_FETCH_ATTEMPTS`), and the asks in between *change the configuration* rather
+  than repeating it — `symbol_path()` appended and `.reload /f nt` forced, which is the expression
+  every other symbol-needing test on this bench already shares, `WINDBG_MCP_SMOKE_SYMBOLS` override
+  included. Appending it is not ceremony: the engine's ambient default expands to a `cache*` naming
+  no directory, a store element that is skipped and reads as an absent PDB, which four runs of the
+  pool tier were once spent on. Only the last ask waits (`SYMBOL_FETCH_BACKOFF`), the first refetch
+  being a different configuration rather than a retry of one. **Both** gates retry, not just the
+  PDB one: they stand down for a single cause and the guard greps for their two messages alike, so
+  retrying one would have left the same blip able to fail the same check through the other, a moment
+  earlier in the same dump. What this does not soften is the regression the guard exists for — an
+  image with no `symsrv.dll` has nothing to retry with, every attempt fails, and #153 is red there
+  exactly as before; a retried blip is the only cause of a stand-down that re-running ever cured.
+  The two skip messages also lost their `(issue #142)`, the other half of the report: they are
+  printed into a CI log, where a parenthesised closed issue about a *stack walk* reads as a live
+  tracker for the *symbol* failure in front of you. The pointer stays in the doc comments above
+  them, which link it as the history it is. **And the retry is asserted somewhere a green tier run
+  can reach**, because the tier itself cannot: symbols resolve on the first ask on both CI entries,
+  so every claim about the second and third would have rested on nothing having run — the same
+  vacuity the `!analyze` assertions were found in. `before_ask` returns the schedule as a value, and
+  `the_symbol_retry_schedule_refetches_before_every_ask_but_the_first` asserts it with no engine,
+  dump or network, under plain `cargo test`. Mutation-verified in four directions, on the Mac — pure
+  Rust lifts out of this Windows-only crate into a `rustc --test` of its own. The one shape it
+  cannot see is the refetch moving to *after* the ask that failed, which spends two fetches and asks
+  nothing again; that is prevented structurally, the ask being the last statement of the loop body.
+
 - **`ioctl_map` recovered control codes from blocks execution never enters** (`FOLLOWUPS.md`
   item 67, in `DONE.md`). The walk swept both edges of every conditional branch, which is right
   wherever the condition depends on anything and wrong where it is a constant: `xor ecx,ecx` before

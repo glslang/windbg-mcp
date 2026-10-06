@@ -289,6 +289,15 @@ jobs:
 
       # The copy above is the only thing standing between this entry and four silent `SKIPPED`s,
       # and a skip passes. Without this check a broken copy reads exactly like a green run.
+      #
+      # **What this step may no longer be read as catching is a failed symbol *fetch* (issue
+      # #457).** On 2026-10-05 the x64 entry printed one stand-down — `nt` resolved no PDB for one
+      # checked-in dump while another resolved its own in the same run — and this step turned a
+      # required check red over a single round trip to the symbol store, blocking a `rmcp` bump
+      # that had nothing to do with symbols. Re-running the job unchanged passed. So the *gates*
+      # retry now (`mcp_smoke::SYMBOL_FETCH_ATTEMPTS`), and a message reaching this step means
+      # every attempt failed. The regression this step was written for is unaffected: an image with
+      # no `symsrv.dll` has nothing to retry with, so #153 is still red here.
       - name: The target-reading assertions must have run
         shell: pwsh
         run: |
