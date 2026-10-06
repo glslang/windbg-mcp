@@ -528,8 +528,8 @@
       "inputSchema": 343,
       "modelVisible": 491,
       "name": "sk_live_registers",
-      "outputSchema": 3967,
-      "wire": 4621
+      "outputSchema": 4080,
+      "wire": 4734
     },
     {
       "annotations": 123,
@@ -546,8 +546,8 @@
       "inputSchema": 343,
       "modelVisible": 569,
       "name": "sk_live_wait",
-      "outputSchema": 3967,
-      "wire": 4699
+      "outputSchema": 4080,
+      "wire": 4812
     },
     {
       "annotations": 126,
@@ -682,10 +682,10 @@
     "inputSchema": 67948,
     "instructions": 2022,
     "modelVisible": 116318,
-    "outputSchema": 200980,
-    "payload": 327653,
+    "outputSchema": 201206,
+    "payload": 327879,
     "tools": 75,
-    "wire": 327567,
+    "wire": 327793,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10308
   }

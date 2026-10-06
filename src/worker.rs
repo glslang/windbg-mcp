@@ -95,6 +95,15 @@ pub(crate) fn run_sk_live_control(args: &[String]) -> anyhow::Result<()> {
     crate::skdispatch::run_acceptance(args, &engine)
 }
 
+/// Runs the native KD facade with the same one-engine, one-thread ownership as live control.
+pub(crate) fn run_sk_kd_target(args: &[String]) -> anyhow::Result<()> {
+    let (engine, limitation) = build_engine(None).map_err(anyhow::Error::msg)?;
+    if let Some(limitation) = limitation {
+        anyhow::bail!("the selected debugger engine cannot run Secure Kernel KD: {limitation}");
+    }
+    crate::kdtarget::run(args, &engine)
+}
+
 /// The flags carrying this worker's two ends of the protocol channel, as raw handle values:
 /// requests to read, messages to write ([`crate::proto`]).
 ///

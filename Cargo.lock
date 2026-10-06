@@ -1081,6 +1081,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "iced-x86",
  "rmcp",
  "schemars",
  "serde",

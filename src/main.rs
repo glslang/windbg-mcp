@@ -34,7 +34,11 @@ mod fault;
 mod framework;
 mod hazards;
 mod ioctl;
+mod kdapi;
 mod kdconn;
+mod kdprobe;
+mod kdtarget;
+mod kdwire;
 mod listen;
 mod livesrc;
 mod logbridge;
@@ -122,12 +126,13 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let is_worker = args.iter().any(|arg| arg == worker::WORKER_FLAG);
     let is_live_control = args.iter().any(|arg| arg == skdispatch::LIVE_CONTROL_FLAG);
+    let is_sk_kd_target = args.iter().any(|arg| arg == kdtarget::TARGET_FLAG);
     // A service has no console, so its stderr goes nowhere at all — and the failure most worth
     // seeing is a listener that refuses to start, which happens before `server_log` can be asked
     // anything. Decided here because logging is initialised before the role is acted on.
     let to_file =
         matches!(service::requested(&args), Some(service::Role::Run)).then(service::log_path);
-    init_logging(is_worker || is_live_control, to_file);
+    init_logging(is_worker || is_live_control || is_sk_kd_target, to_file);
     if is_worker {
         // The rest of the command line is the worker's half of the protocol channel — two
         // inherited pipe handles, which is why a worker started by hand cannot get anywhere.
@@ -141,9 +146,19 @@ fn main() -> Result<()> {
         // thread. It speaks no MCP and accepts no debugger command text.
         return worker::run_sk_live_control(&args[at + 1..]);
     }
+    if let Some(at) = args.iter().position(|arg| arg == kdtarget::TARGET_FLAG) {
+        // Native KD facade over the same guarded VTL1 controller. Engine construction stays in
+        // the worker module, and every call remains on this synchronous role's one thread.
+        return worker::run_sk_kd_target(&args[at + 1..]);
+    }
     if let Some(at) = args.iter().position(|arg| arg == cast::RENDER_FLAG) {
         // Before the runtime: this reads a file and writes a file, and neither wants one.
         return render_cast(&args[at + 1..]);
+    }
+    if let Some(at) = args.iter().position(|arg| arg == kdprobe::WIRE_PROBE_FLAG) {
+        // A transport-only compatibility gate: one local named pipe, no DbgEng, no target and no
+        // MCP. It answers WinDbg's reset and exits before either normal process role starts.
+        return kdprobe::run(&args[at + 1..]);
     }
     if let Some(at) = args.iter().position(|arg| arg == livesrc::LIVE_FLAG) {
         // The same shape as `--sk-inspect` and the same reason, with the byte source being a

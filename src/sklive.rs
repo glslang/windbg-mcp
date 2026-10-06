@@ -885,6 +885,37 @@ impl<P: ControlProvider> LiveControl<P> {
         }
     }
 
+    /// Read additional architectural state while the exact published event remains held.
+    ///
+    /// The stop snapshot contains the registers needed to prove control ownership. Debugger
+    /// clients also need the general-purpose registers, so those are fetched on demand and must
+    /// agree across two complete reads before they are exposed.
+    pub(crate) fn read_stopped_registers(
+        &mut self,
+        epoch: &StopEpoch,
+        registers: Vec<RegisterName>,
+    ) -> Result<Vec<RegisterValue>> {
+        self.require_stop_epoch(epoch)?;
+        let active = self
+            .active_provider
+            .context("the stopped session has no active VP provider")?;
+        let first = self.providers[active]
+            .provider
+            .read_registers(registers.clone())?;
+        if let Some(value) = first.iter().find(|value| value.status != 0) {
+            bail!(
+                "provider returned status {:#x} for {:?}",
+                value.status,
+                value.name
+            );
+        }
+        let second = self.providers[active].provider.read_registers(registers)?;
+        if first != second {
+            bail!("VTL1 registers changed while the dispatcher event was held");
+        }
+        Ok(first)
+    }
+
     #[cfg(test)]
     fn test_provider(&self) -> &P {
         &self.providers[0].provider
@@ -1225,6 +1256,85 @@ impl<P: ControlProvider> LiveControl<P> {
         self.arm_mode = None;
         self.dispatcher_event = None;
         self.expected_stop = None;
+        self.state = State::Running;
+        Ok(self.commit_epoch(next_epoch))
+    }
+
+    /// Resume an owned stop with a replacement set of execute breakpoints already installed.
+    ///
+    /// This is the debugger-loop transition: restoring the prior arm and releasing the event before
+    /// installing its successor creates a race in which the guest can pass the requested address.
+    /// The held event keeps the VP quiesced while the old owned state is restored and the new set is
+    /// written, then the dispatcher begins waiting for the next vector-1 event as it releases this
+    /// one.
+    pub(crate) fn continue_to_breakpoints(
+        &mut self,
+        dispatcher: &mut impl EventDispatcher,
+        epoch: &StopEpoch,
+        breakpoints: Vec<BreakpointGuard>,
+    ) -> Result<StopEpoch> {
+        validate_breakpoints(&breakpoints, ArmMode::Natural)?;
+        self.require_stop_epoch(epoch)?;
+        let next_epoch = self.next_epoch("running")?;
+        let dispatcher_event = self
+            .dispatcher_event
+            .clone()
+            .context("the stopped session has no dispatcher event")?;
+        let active = self
+            .active_provider
+            .context("the stopped session has no active VP provider")?;
+        self.state = State::Releasing;
+        let result = (|| {
+            self.restore_owned_state(active)?;
+            let baseline = self.providers[active]
+                .baseline
+                .clone()
+                .context("the stopped session has no saved baseline")?;
+            let flags = baseline.low(RegisterName::Rflags)?;
+            if flags & (TF | RF) != 0 {
+                bail!("continuing to breakpoints requires the saved TF and RF to be clear");
+            }
+            let original_dr7 = baseline.low(RegisterName::Dr7)?;
+            let owned_enable_mask = breakpoints
+                .iter()
+                .fold(0, |mask, breakpoint| mask | breakpoint.enable_mask());
+            let owned_kind_mask = breakpoints
+                .iter()
+                .fold(0, |mask, breakpoint| mask | breakpoint.kind_mask());
+            for breakpoint in &breakpoints {
+                let register = breakpoint.register();
+                self.write_one(
+                    active,
+                    register,
+                    baseline.low(register)?,
+                    breakpoint.instruction.address.0,
+                )?;
+            }
+            self.write_one(
+                active,
+                RegisterName::Dr6,
+                baseline.low(RegisterName::Dr6)?,
+                baseline.low(RegisterName::Dr6)? & !DR6_CAUSE_MASK,
+            )?;
+            self.write_one(
+                active,
+                RegisterName::Dr7,
+                original_dr7,
+                (original_dr7 & !(DR7_ENABLE_MASK | owned_kind_mask)) | owned_enable_mask,
+            )?;
+            self.providers[active].provider.release()?;
+            self.providers[active].provider_phase = ProviderPhase::Running;
+            dispatcher.release_event(&dispatcher_event, ReleaseMode::ArmNextStop)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            return Err(self.enter_fault(dispatcher, error, Some(dispatcher_event)));
+        }
+        self.active_provider = None;
+        self.breakpoints = breakpoints;
+        self.arm_mode = Some(ArmMode::Natural);
+        self.dispatcher_event = None;
+        self.expected_stop = Some(ExpectedStop::Hardware);
         self.state = State::Running;
         Ok(self.commit_epoch(next_epoch))
     }
@@ -2285,6 +2395,80 @@ mod tests {
                 Action::BeginArm,
                 Action::FinishArm,
                 Action::Wait,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_held_stop_installs_replacement_breakpoints_before_release() {
+        let replacement = InstructionGuard {
+            address: HexU64(TARGET_RIP + 0x20),
+            bytes: vec![0x90],
+        };
+        let mut dispatcher = FakeDispatcher::new([
+            observed(StopReason::HardwareBreakpoint { slot: 0 }),
+            ObservedStop {
+                event: event(StopReason::DebugException),
+                instructions: vec![replacement.clone()],
+            },
+        ]);
+        let mut control = LiveControl::open(FakeProvider::new()).unwrap();
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Redirect)
+            .unwrap();
+        let first = control.wait_for_stop(&mut dispatcher).unwrap();
+
+        control
+            .continue_to_breakpoints(
+                &mut dispatcher,
+                &first.epoch,
+                vec![BreakpointGuard {
+                    slot: 2,
+                    instruction: replacement,
+                }],
+            )
+            .unwrap();
+        assert_eq!(control.phase(), LivePhase::Running);
+        let provider = control.test_provider();
+        assert_eq!(
+            provider
+                .registers
+                .iter()
+                .find(|value| value.name == RegisterName::Dr2)
+                .unwrap()
+                .low,
+            HexU64(TARGET_RIP + 0x20)
+        );
+        assert_ne!(
+            provider
+                .registers
+                .iter()
+                .find(|value| value.name == RegisterName::Dr7)
+                .unwrap()
+                .low
+                .0
+                & (1 << 4),
+            0
+        );
+
+        let second = control.wait_for_stop(&mut dispatcher).unwrap();
+        assert_eq!(
+            second.event.reason,
+            StopReason::HardwareBreakpoint { slot: 2 }
+        );
+        assert_eq!(second.arm_mode, ArmMode::Natural);
+        control
+            .continue_from(&mut dispatcher, &second.epoch)
+            .unwrap();
+        assert_eq!(
+            dispatcher.actions,
+            vec![
+                Action::BeginArm,
+                Action::FinishArm,
+                Action::Wait,
+                Action::Release(ReleaseMode::ArmNextStop),
+                Action::Wait,
+                Action::Release(ReleaseMode::Resume),
             ]
         );
     }
@@ -3447,6 +3631,7 @@ mod tests {
                     RegisterName::Dr6 => dr6,
                     RegisterName::Dr7 => dr7,
                     RegisterName::VsmVpStatus => 0x0003_0010,
+                    _ => 0,
                 }),
                 high: HexU64(if *name == RegisterName::Cs {
                     0x209b_0010_0000_0000
