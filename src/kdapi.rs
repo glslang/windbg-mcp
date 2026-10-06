@@ -247,8 +247,9 @@ impl Amd64Context {
         let mut context = Self {
             bytes: [0; AMD64_CONTEXT_BYTES],
         };
-        context.set_u32(0x30, 0x0010_001f);
-        context.set_u32(0x34, 0x1f80);
+        // The live provider supplies control, integer, segment and debug registers. Do not claim
+        // floating-point/XMM state for the zero-filled remainder of this CONTEXT.
+        context.set_u32(0x30, 0x0010_0017);
         for (offset, value) in [0x38, 0x3a, 0x3c, 0x3e, 0x40, 0x42]
             .into_iter()
             .zip(values.segments)
@@ -559,6 +560,8 @@ mod tests {
         let response = request.get_context_ex_response(&context).unwrap();
         assert_eq!(response.len(), MANIPULATE_BYTES + 0x3d0);
         assert_eq!(word(&response, 24), 0x3d0);
+        assert_eq!(word(&response, MANIPULATE_BYTES + 0x30), 0x0010_0017);
+        assert_eq!(word(&response, MANIPULATE_BYTES + 0x34), 0);
         assert_eq!(word(&response, MANIPULATE_BYTES + 0x44), 0x202);
         assert_eq!(
             quad(&response, MANIPULATE_BYTES + 0xf8),
