@@ -5221,6 +5221,23 @@ header at all, so only they can have it mislocated.
 from the engine's side — a walk that loses a tag loses the allocation from every query made under
 that tag, so its own output could never have shown this.
 
+**Addendum, 2026-10-07 ([dbgscope#191](https://github.com/glslang/dbgscope/pull/191)).** The
+class had a second half that this oracle could only reach once a boot put such an entry among the
+first it samples: a big-pool allocation on a page the memory manager had **trimmed**. The table
+was consulted correctly — the hash landed on each entry's own slot, zero probes — and the walk
+then never asked it for a span it could not read. A named segment range was read anyway, only to
+run a decoder the name makes unnecessary, and filed as an untagged gap when the read failed; a VS
+chunk whose tail ran into the trimmed page was dropped by the past-the-extent rule before the
+containment match this entry added could run. `Gcac` at `0xffffa4b05e1b5000` (29671 lab guest,
+8 KB, segment) and `CIcr` at `0xffffa9099c86f000` (`ctf-vm`, 0x12a0 bytes, 0x20 into a
+0x12c0-byte VS chunk with a resident header), both named by `!pool`, both `....`/`unreadable`
+from `pool_chunk` — identically on the code this entry closed with, and on `v0.21.0`; the tiers
+had been green on those guests' previous boots. A named range is now answered without reading
+its pages, which were also 111 MB and 89 MB of discarded reads per walk on the two guests, and a
+VS chunk is matched before the extent check. Same guest, same sequence, old build against new on
+`ctf-vm`: a walk 82.8s → 61.9s and `pool_find_tag CIcr` 40 → 104 matches. The one sampled entry
+that run left uncovered is item 114.
+
 
 ## 98. [dbgscope] Uncommitted memory is an unreadable gap, so a live heap walk is not `Complete` — **done** (2026-09-24, dbgscope#183)
 

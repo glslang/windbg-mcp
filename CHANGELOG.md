@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`pool_chunk` and `pool_find_tag` name a big-pool allocation whose page the memory manager has
+  trimmed** ([dbgscope#191](https://github.com/glslang/dbgscope/pull/191)). Both lab guests' live
+  pool tiers failed on one such allocation each — `Gcac` at `0xffffa4b05e1b5000` on the 29671
+  guest, `CIcr` at `0xffffa9099c86f000` on `ctf-vm` — answered `....`, `unreadable`, where `!pool`
+  named them from `nt!PoolBigPageTable`. The table lookup was right; the walk never asked it for
+  a span it could not read, in either of the two places a big-pool allocation lives. Not a
+  regression: `v0.21.0` answers the same, and the tiers were green on those guests' previous
+  boots — the oracle samples the table's first live entries, and which of those sit on a trimmed
+  page is a property of the boot. A named page range is now answered without reading its pages,
+  and a VS chunk is matched against the table before the extent check. The measurements are in the
+  addendum under item 99 in `DONE.md`; the one sampled entry still uncovered is item 114.
+
 - **`driver_hazards` counted an import by ordinal as one it had checked against the sink list**
   (issue [#302](https://github.com/glslang/windbg-mcp/issues/302), item 2). An ordinal import's
   slot is named with a number and no name in the image being scanned -- and need not have a name
@@ -324,6 +336,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   variants already carried being 426 B of it.
 
 ### Changed
+
+- **Pool queries reuse a walk that reached the end of the pool, even a `partial` one**
+  ([dbgscope#191](https://github.com/glslang/dbgscope/pull/191)). dbgscope kept only a `complete`
+  snapshot, and on a live kernel no walk is complete — the pages the memory manager has trimmed do
+  not read over KD — so every `pool_find_tag`, `pool_chunk` and `pool_census` walked the whole
+  pool again: ~80s a question on `ctf-vm`, 136s on the 29671 lab guest, and the live pool tier's
+  twenty-odd questions 2,665s. A walk cut short by its budget or by `stop_after_matches` is still
+  not kept, so the shape of the rule a caller sees is unchanged — `refresh: true` walks again, and
+  a result's `walk.coverage` says what the walk it came from reached — and the second question on
+  a halted target is now a lookup: the same tier 1,032s, a repeated `pool_chunk` 79.8s → 0s. The
+  tier's reuse assertion, gated until now on a `complete` walk and so never run against a live
+  kernel, now runs on any walk that was not cut short.
 
 - **The IOCTL switch resolver matches what a compiler emits instead of refusing what it trips
   over** (`FOLLOWUPS.md` item 66, in `DONE.md`). `ioctl::follow_table` walked **backwards** from an

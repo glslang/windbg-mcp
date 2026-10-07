@@ -274,10 +274,11 @@ fn watchdog_budget_ms(patience: Duration, queued: Duration) -> u32 {
 /// miniature: with `WINDBG_MCP_CALL_TIMEOUT_SECS=10`, a floored 15s walk outlives *every* call.
 ///
 /// **And it really does buy nothing**, which is the part worth writing down, because the first cut
-/// of this reasoned the other way: a walk cut short by its budget clears `complete`, and
-/// dbgscope caches only complete snapshots — an incomplete one invalidates the entry instead. So a
-/// floored walk for a caller who has gone does 15s of work that is then *discarded*, and the next
-/// query walks from scratch anyway. There is no cache to warm.
+/// of this reasoned the other way: a walk cut short by its budget sets `budget_expired`, and
+/// dbgscope does not cache one — since dbgscope#191 it keeps a walk that reached the end of the
+/// pool, partial or not, but never one its budget stopped. So a floored walk for a caller who has
+/// gone does 15s of work that is then *discarded*, and the next query walks from scratch anyway.
+/// There is no cache to warm.
 fn walk_budget(patience: Duration, queued: Duration) -> Option<Duration> {
     let left = patience
         .saturating_sub(queued)
@@ -7158,9 +7159,9 @@ fn render_walk_report(report: &query::PoolSnapshotReport) -> String {
 /// is coverage, not an error.
 fn pool(e: &DebugEngine, args: PoolOp, within: Duration) -> Result<Output, Failed> {
     // Every answer below carries `answer.walk` — the state of the walk it was *itself* drawn
-    // from, handed back by the query. Asking separately would be a second call, and an incomplete
-    // walk is deliberately not cached, so that call could walk again and report the coverage of a
-    // different walk as this one's (dbgscope's `PoolAnswer`).
+    // from, handed back by the query. Asking separately would be a second call, and a walk cut
+    // short by its budget is deliberately not cached, so that call could walk again and report
+    // the coverage of a different walk as this one's (dbgscope's `PoolAnswer`).
     let walk = |refresh: bool| PoolWalk::from(refresh).within(within);
     match args {
         PoolOp::FindTag {
@@ -17338,8 +17339,8 @@ mod tests {
     ///
     /// Two ways in, and both are real: a server configured with a call timeout at or under the
     /// headroom, and a query dequeued after its caller has given up. Neither can be answered, and
-    /// the work would not even leave a cache behind — dbgscope caches complete snapshots only, so a
-    /// budget-truncated walk is discarded and the next query walks again regardless.
+    /// the work would not even leave a cache behind — dbgscope does not cache a walk its budget cut
+    /// short, so a budget-truncated walk is discarded and the next query walks again regardless.
     #[test]
     fn a_pool_walk_with_no_time_left_is_not_run_at_all() {
         assert_eq!(

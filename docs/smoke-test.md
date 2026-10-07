@@ -1619,17 +1619,24 @@ about. This is the other half — an attach that lands:
   same fault, and the exemption would have been how this tier went on passing over the thing it
   was written for.
 
-  **It costs about half an hour, and the reason is worth knowing before adding queries here.**
-  Measured **1,667s** on 2026-09-24 — 1,532s of it before the big-page samples were added, against
-  the **626s** this said until then. A walk that ends `partial` is not cached, and on a live kernel
-  it always does — uncommitted space alone emitted 183 diagnostics on that run — so each
-  `pool_find_tag` and `pool_chunk` the helper makes pays a fresh walk of the whole pool, measured
-  at 45–46s where it was ~20s. Any multi-query test of this shape is therefore quadratic in the
-  questions it asks, **and the constant moves with the target**: that figure more than doubled
-  without a query being added, because the guest had been up fourteen hours and its pool had grown
-  to 781,331 chunks. Re-measure it rather than trusting this sentence. The four disagreements the
-  original run found were all on **one** page, so the page spread is the part that must not shrink;
-  the per-page count is the part that can, and `POOL_ORACLE_BIG_PAGE_SAMPLES` is the other dial.
+  **It costs a quarter of an hour, and the reason is worth knowing before adding queries here.**
+  Measured **1,032s** on 2026-10-07 against the 29671 lab guest (941,412 chunks), windbg-mcp
+  `e92b4b8` on dbgscope `0287238`; the same test took **2,665s** against the same guest the day
+  before on dbgscope `401fde3`, and **1,667s** on 2026-09-24 (1,532s of it before the big-page
+  samples were added, against the **626s** this said until then). What changed between the last
+  two is which walks are paid for. A walk that ends `partial` was not cached, and on a live kernel
+  it always does — 3,442 extents on that guest are paged pool the memory manager had trimmed — so
+  every `pool_find_tag` and `pool_chunk` the helper made paid a fresh walk of the whole pool, 136s
+  each there, making a multi-query test quadratic in the questions it asks. Since dbgscope#191 a
+  walk that reached the end of the pool is kept even where some of it would not read, and only one
+  cut short — by its budget or by a match threshold — walks again, so the queries that still pay
+  are the forced ones and the ones this test deliberately bounds. **The constant still moves with
+  the target**, and with the build: on `ctf-vm` a walk was 45–46s on 2026-09-24 where it had been
+  ~20s, 77–83s on 2026-10-07 against the old build, and 58–62s against the new one — the big-pool
+  page ranges it no longer reads were 89 MB of each walk there and 111 MB on the lab guest.
+  Re-measure it rather than trusting this sentence. The four disagreements the original run found
+  were all on **one** page, so the page spread is the part that must not shrink; the per-page
+  count is the part that can, and `POOL_ORACLE_BIG_PAGE_SAMPLES` is the other dial.
 
 - **`device_security` is checked against the debugger's own view of the same device.** Three
   oracles, none of them this server's code. `!devobj` -- somebody else's extension -- names the
