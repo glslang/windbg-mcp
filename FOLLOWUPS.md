@@ -2525,8 +2525,11 @@ that several fields it keys on are invented permanently:
   connection; the null-page, `KUSER_SHARED_DATA`, stack and code probes read as zeros once each,
   and their window resets on a KD peer reset rather than at every stop, so WinDbg's bookkeeping
   reads reach real memory after the first stop and not before it.
-- `StateChange64` reports `Processor = 0` whatever `--vp` was, and `NumberProcessors = 1`. The
-  exception code is **not** on this list, and the first draft of this entry had it there: a
+- `StateChange64` reports `NumberProcessors = 1` and `Processor = 0` whatever `--vp` was. That
+  pair is consistent rather than invented — under a count of one the only valid index is zero,
+  and the KD field is a `u16` where `--vp` is a `u32` (Codex, round 3) — so what is missing is
+  any statement, on the wire or to the operator, of which guest VP that index stands for. The
+  exception code is **not** on this list either, and the first draft of this entry had it there: a
   debug-register execute hit raises `#DB`, vector 1, exactly as a trap-flag step does, NT
   reports both as `STATUS_SINGLE_STEP`, and which slot fired travels in the control report's
   DR6, which the facade sends as read. Reporting `STATUS_BREAKPOINT` instead would make WinDbg
@@ -2546,8 +2549,11 @@ that several fields it keys on are invented permanently:
   `securekernel.exe+0x1335C0`, and it needs no symbols: `SkdInitDebuggerDataBlock` links the
   two both ways, so the block's own `List.Flink` names it
   (`docs/samples/secure-kernel-debugger-investigation/26100.9457.txt`). Then measure that `lm`
-  and `x securekernel!*` resolve; carry `--vp` into `Processor`; verify `--kernel-base` against
-  the PE header the way `sk::pe_identity` does for a capture; either reset the compatibility
+  and `x securekernel!*` resolve; keep processor 0 and print its mapping to `--vp` where the pipe
+  name is printed, or report the guest's VP count in `NumberProcessors` *together with* the
+  index in `Processor` and answer `SwitchProcessor` coherently — never the index alone; verify
+  `--kernel-base` against the PE header the way `sk::pe_identity` does for a capture; either
+  reset the compatibility
   window per stop or drop the stack/code shapes, since a transport-only run with control-space
   reads refused still produced `Continue2`; and log every fabricated answer at `info` with its
   shape, so a transcript shows what was invented.
