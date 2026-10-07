@@ -62,8 +62,9 @@ Two conventions hold across all of them:
 For `pool_find_tag`, `stop_after_matches` and `limit` answer different questions. The first bounds
 a newly started walk and therefore makes its result intentionally partial; the second only caps
 the `chunks` rendered after the walk and never changes `matches` or `total_bytes`. If the session
-already holds a complete cached snapshot, it is reused and the answer remains exhaustive even when
-`stop_after_matches` was supplied.
+already holds a cached snapshot — a walk that reached the end of the pool, `complete` or
+`partial` — it is reused even when `stop_after_matches` was supplied, and the counts are
+everything that walk reached.
 
 One caveat about "also", measured rather than assumed: a client that understands
 `structuredContent` generally forwards **it** to the model and drops the text block, rather than

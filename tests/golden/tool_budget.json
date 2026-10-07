@@ -398,12 +398,12 @@
     },
     {
       "annotations": 122,
-      "description": 680,
+      "description": 705,
       "inputSchema": 1837,
-      "modelVisible": 2571,
+      "modelVisible": 2596,
       "name": "pool_find_tag",
       "outputSchema": 5796,
-      "wire": 8520
+      "wire": 8545
     },
     {
       "annotations": 90,
@@ -678,14 +678,14 @@
   ],
   "totals": {
     "annotations": 8184,
-    "description": 44397,
+    "description": 44422,
     "inputSchema": 67961,
     "instructions": 2022,
-    "modelVisible": 116331,
+    "modelVisible": 116356,
     "outputSchema": 201206,
-    "payload": 327892,
+    "payload": 327917,
     "tools": 75,
-    "wire": 327806,
+    "wire": 327831,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10308
   }

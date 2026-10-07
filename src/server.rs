@@ -3189,7 +3189,8 @@ impl WindbgServer {
 
     /// Find **allocated** kernel pool chunks carrying a tag, with their size, allocator and
     /// backend. Needs a broken-in x64 or ARM64 kernel target. `stop_after_matches` can make a
-    /// new walk return deliberately early; a complete cached snapshot remains exhaustive.
+    /// new walk return deliberately early; a cached snapshot is reused instead, with the counts
+    /// its walk reached.
     /// This walks the pool's own descriptors rather than shelling out to `!poolused`, so the
     /// result is structured.
     /// Only allocated chunks are indexed by tag — a freed chunk's tag is not reliably

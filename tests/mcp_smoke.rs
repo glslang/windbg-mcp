@@ -14217,9 +14217,9 @@ fn a_pool_walk_takes_this_servers_deadline_not_the_walkers_default() {
 /// The budget borrowed the bounded command's floor at first, which is right *there* — zero disables
 /// that watchdog, so an unbounded command is the worse outcome — and wrong here, where zero merely
 /// stops the walk at its first check. Floored, a 10s call budget bought a 15s walk: #75's own
-/// complaint at the small end. And it bought nothing for it, since dbgscope caches complete
-/// snapshots only, so the truncated result is discarded and the next query walks from scratch
-/// regardless.
+/// complaint at the small end. And it bought nothing for it, since dbgscope does not cache a
+/// walk its budget cut short, so the truncated result is discarded and the next query walks from
+/// scratch regardless.
 ///
 /// A 10s call budget is entirely reply headroom, so this needs no queue wait to stage — which is
 /// what keeps it in the tier that runs on a push. The open has to land inside that budget too; if
