@@ -92,6 +92,7 @@ line is simply open.
 - [Item 110](#110-windbg-mcp-initialized-secure-kernel-stopstep--hardening-remains) — [windbg-mcp] Initialized Secure Kernel stop/step — hardening remains
 - [Item 112](#112-windbg-mcp-the-ioctl-fixtures-writes_flags-is-architecture-blind) — [windbg-mcp] The IOCTL fixture's `writes_flags` is architecture-blind
 - [Item 113](#113-windbg-mcp-the-device-descriptor-sweeps-own-figures-do-not-add-up) — [windbg-mcp] The `\Device` descriptor sweep's own figures do not add up
+- [Item 114](#114-dbgscope-a-big-pool-entry-in-no-region-the-walk-discovers) — [dbgscope] A big-pool entry in no region the walk discovers
 
 ## 2. [dbgscope] Typed write primitives
 
@@ -2420,6 +2421,35 @@ remainder 142, no rule moves and only the denominator item 69's bound is quoted 
 
 **Where it picks up.** `data_access` and the sweep note on `AceKind::mask_is_access` in
 `src/sd.rs`, and item 69 in [`DONE.md`](./DONE.md).
+
+## 114. [dbgscope] A big-pool entry in no region the walk discovers
+
+**Repo:** `dbgscope`, surfaced by `windbg-mcp`'s live pool tier.
+
+Found on 2026-10-07 while closing the trimmed-page half of item 99's class
+([dbgscope#191](https://github.com/glslang/dbgscope/pull/191); the addendum under item 99 in
+[`DONE.md`](./DONE.md)). The tier's `BigPageOracle` takes the first live entries of
+`nt!PoolBigPageTable` and puts each to `pool_chunk`. On the 29671 lab guest four of the five came
+back carrying the table's tag and one came back `covered: false`: `Key` `smCB` at
+`0xffffe67bde598000`, `NumberOfBytes` 0x1000, flags dword `0x00004000` — `PoolFlags` 0x40, which
+the public `POOL_FLAGS` numbers as `POOL_FLAG_NON_PAGED` — in the same `0xffffe67b…` range as
+the table itself (`0xffffe67bdf2b0000`). `pool_find_tag smCB` finds nothing, on the fixed build as
+on the one before it. So it is not the trimmed-page case: the walk has **no region containing
+that address at all**, which is a question about discovery rather than about decoding.
+
+- **Why deferred:** the tier reports an uncovered sample rather than asserting on it, and the
+  class is one entry in five on one guest — so what it is (a heap discovery does not enumerate, a
+  nonpaged allocation served from outside the segment heap, a region `walk_region` refused) needs
+  a live read before anything is built, and building from the name of a flag would be the mistake
+  item 99 was filed on.
+- **What would close it:** against that guest, which heap and segment, if any, hold
+  `0xffffe67bde598000` — `!pool` names the region, and `ExPoolState`'s heaps say whether discovery
+  should have reached it — and then the same question of every uncovered big-page entry rather
+  than of one, since the oracle samples the first few and one in five is a rate rather than a
+  count.
+- **Where it picks up:** `discover_pool_regions` and `discover_segment_context` in dbgscope's
+  `src/pool/snapshot.rs`; the tier prints the addresses under `big-pool allocation(s) the walk has
+  no span for`.
 
 ## Where these items came from
 

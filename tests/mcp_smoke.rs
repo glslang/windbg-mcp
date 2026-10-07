@@ -15772,9 +15772,12 @@ const POOL_ORACLE_PER_PAGE: usize = 4;
 
 /// How many big-pool allocations to take out of `nt!PoolBigPageTable` and put to the walk.
 ///
-/// Each costs a `pool_chunk`, and a `partial` walk is not cached, so each is a fresh walk of the
-/// whole pool — 46s measured. Four is what a class of allocation that had **every** tag wrong
-/// until `FOLLOWUPS.md` item 99 is worth, against a tier already running twenty-five minutes.
+/// Each costs a `pool_chunk`. Until dbgscope#191 a `partial` walk was not cached — and on a live
+/// kernel every walk is partial — so each was a fresh walk of the whole pool, 46s measured; a walk
+/// that reached the end of the pool is kept now, so these read the walk already made unless its
+/// budget cut it short. Four is what a class of allocation that had **every** tag wrong until
+/// `FOLLOWUPS.md` item 99 is worth, against a tier that already runs a quarter of an hour
+/// (1,032s on 2026-10-07).
 const POOL_ORACLE_BIG_PAGE_SAMPLES: usize = 4;
 
 /// How many of the census's tags to try before giving up on finding an LFH-backed anchor.
@@ -16753,10 +16756,12 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
         }
 
         match heaviest_census_tag(&totals) {
-            // What one tool saw, the other has to find. Only meaningful when the walk completed:
-            // an incomplete snapshot is deliberately not cached, so these would be two separate
-            // walks of a moving target and could honestly disagree.
-            HeaviestTag::Queryable(tag) if complete => {
+            // What one tool saw, the other has to find. Only meaningful when the walk was kept: a
+            // walk its budget cut short is deliberately not cached, so these would be two separate
+            // walks of a moving target and could honestly disagree. A `partial` walk is kept since
+            // dbgscope#191 — and on a live kernel every walk is partial, so until then this arm
+            // never ran live and the two ceilings below had been asserted against nothing.
+            HeaviestTag::Queryable(tag) if coverage != "deadline_truncated" => {
                 // The census had to come off the cached snapshot too, or the reuse below is
                 // measured against a snapshot *it* took rather than the walk's.
                 //
@@ -16801,14 +16806,14 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
                 assert!(
                     reuse < CACHED_QUERY_CEILING,
                     "a second query took {reuse:?}, past the {CACHED_QUERY_CEILING:?} a cached \
-                     lookup should need — a complete snapshot is meant to be reused, not walked \
-                     again (the first walk, for scale, took {walked_for:?})"
+                     lookup should need — a walk that reached the end of the pool is meant to be \
+                     reused, not walked again (the first walk, for scale, took {walked_for:?})"
                 );
                 println!("`{tag}` found again from the cached snapshot in {reuse:?}");
             }
             HeaviestTag::Queryable(tag) => eprintln!(
-                "NOTE: the walk was incomplete, so the census/find_tag cross-check on `{tag}` was \
-                 skipped — those would be two different walks"
+                "NOTE: the walk was cut short by its budget, so the census/find_tag cross-check on \
+                 `{tag}` was skipped — those would be two different walks"
             ),
             HeaviestTag::NothingListed => assert!(
                 !complete,
