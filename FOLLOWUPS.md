@@ -2540,10 +2540,14 @@ that several fields it keys on are invented permanently:
   end, and the one bench that can run it is the disposable K3 VM behind the private provider.
   Changing the fabricated answers without a run is how the `-c "r;t;t;r;q"` mistake and the
   five-second reconnect window were found.
-- **What would close it:** point `DebuggerDataList` at the real block (or a `KdVersionBlock`-shaped
-  record naming it) and measure that `lm` and `x securekernel!*` resolve; carry `--vp` into
-  `Processor`; verify `--kernel-base` against the PE header the way `sk::pe_identity` does for a
-  capture; either reset the compatibility
+- **What would close it:** point `DebuggerDataList` at `KdpDebuggerDataListHead` — the
+  `LIST_ENTRY` whose `Flink` is the block, not the block itself, which WinDbg would otherwise
+  read as a head and walk the real head as a record (Codex, round 2). On 26100.9457 it is
+  `securekernel.exe+0x1335C0`, and it needs no symbols: `SkdInitDebuggerDataBlock` links the
+  two both ways, so the block's own `List.Flink` names it
+  (`docs/samples/secure-kernel-debugger-investigation/26100.9457.txt`). Then measure that `lm`
+  and `x securekernel!*` resolve; carry `--vp` into `Processor`; verify `--kernel-base` against
+  the PE header the way `sk::pe_identity` does for a capture; either reset the compatibility
   window per stop or drop the stack/code shapes, since a transport-only run with control-space
   reads refused still produced `Continue2`; and log every fabricated answer at `info` with its
   shape, so a transcript shows what was invented.
@@ -2654,8 +2658,10 @@ surface:
 - the inputs a user must produce before `open_sk_live_control` will accept the call:
   `dispatcher_vnd` comes from a cdb breakpoint at a hard-coded `vmwp` RVA during a pause/resume,
   `partition_id` from hijacking a `vmwp` thread to call `vid!VidGetHvPartitionId`, and
-  `kernel_base` and the VTL1 CR3 from the memory transport's own probe — all in the private
-  runner, none in a tool or a doc.
+  `expected_cr3` from the memory transport's own probe — all in the private runner, none in a
+  tool or a doc. The KD facade's `--sk-kd-target` role takes `--kernel-base` on top, from the
+  same probe; that is the facade's input and not the MCP tool's, which this entry first
+  conflated (Codex, round 2).
 
 - **Why deferred:** these are rungs, not a defect, and each has a guard it must not loosen; the
   review's ladder orders them (symbols and control space first, then break-in, then bounded
