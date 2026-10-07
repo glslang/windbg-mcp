@@ -2525,8 +2525,13 @@ that several fields it keys on are invented permanently:
   connection; the null-page, `KUSER_SHARED_DATA`, stack and code probes read as zeros once each,
   and their window resets on a KD peer reset rather than at every stop, so WinDbg's bookkeeping
   reads reach real memory after the first stop and not before it.
-- `StateChange64` reports `Processor = 0` whatever `--vp` was, `NumberProcessors = 1`, and
-  exception code `0x80000004` for a hardware-breakpoint hit as well as for a single step.
+- `StateChange64` reports `Processor = 0` whatever `--vp` was, and `NumberProcessors = 1`. The
+  exception code is **not** on this list, and the first draft of this entry had it there: a
+  debug-register execute hit raises `#DB`, vector 1, exactly as a trap-flag step does, NT
+  reports both as `STATUS_SINGLE_STEP`, and which slot fired travels in the control report's
+  DR6, which the facade sends as read. Reporting `STATUS_BREAKPOINT` instead would make WinDbg
+  apply its one-byte `int 3` RIP adjustment (`kdapi.rs`, the state-change builder's comment).
+  Codex caught that on review of this entry.
 - `ReadControlSpace` is refused, so `r` ends in "Unable to get program counter" and `k` has no
   KPRCB to start from; the stop record already carries CR3, and the bench provider's register map
   names the rest of `KSPECIAL_REGISTERS`.
@@ -2536,9 +2541,9 @@ that several fields it keys on are invented permanently:
   Changing the fabricated answers without a run is how the `-c "r;t;t;r;q"` mistake and the
   five-second reconnect window were found.
 - **What would close it:** point `DebuggerDataList` at the real block (or a `KdVersionBlock`-shaped
-  record naming it) and measure that `lm` and `x securekernel!*` resolve; report `0x80000003` with
-  the DR slot for a hardware stop; carry `--vp` into `Processor`; verify `--kernel-base` against
-  the PE header the way `sk::pe_identity` does for a capture; either reset the compatibility
+  record naming it) and measure that `lm` and `x securekernel!*` resolve; carry `--vp` into
+  `Processor`; verify `--kernel-base` against the PE header the way `sk::pe_identity` does for a
+  capture; either reset the compatibility
   window per stop or drop the stack/code shapes, since a transport-only run with control-space
   reads refused still produced `Continue2`; and log every fabricated answer at `info` with its
   shape, so a transcript shows what was invented.
