@@ -83,8 +83,9 @@ item 119 records that no tool derives them.
 
 ## Known product limits
 
-The private bench plan's seven limits, re-derived against `src/kdtarget.rs`, `src/kdapi.rs` and
-`src/sklive.rs` on 2026-10-07 rather than copied:
+The private bench plan's limits, re-derived against `src/kdtarget.rs`, `src/kdapi.rs` and
+`src/sklive.rs` on 2026-10-07 rather than copied, plus two the code states and the plan did not —
+which single steps are refused, and what every other request is answered with:
 
 - **Named-pipe serial KD only.** No KDNET network transport.
 - **One selected VTL1 VP, and four hardware execute breakpoints.** A `bp` arrives as
@@ -134,7 +135,7 @@ instruction — and that once-only window resets on a KD peer reset, not per sto
 only in the KD view. Every other read goes to guarded VTL1 memory through the live source, clamped
 to 3,944 bytes a request. The facade's stderr says which happened for every read, `served by
 compatibility memory` against `served by Secure Kernel memory`, and that log is the only place the
-two are told apart: item 116 is about WinDbg having no way to.
+two are told apart: item 116 is about WinDbg having no way to tell them apart.
 
 ## Pipe and host safety
 
