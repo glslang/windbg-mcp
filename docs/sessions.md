@@ -156,6 +156,12 @@ capacity reclamation, lease expiry, shutdown and supervisor loss. The unresolved
 further control work and cannot be treated as released. Inspect or discard the disposable VM out of
 band before allowing another controller to own it.
 
+The same controller can be driven by an installed WinDbg instead of these tools, through the
+`--sk-kd-target` command-line role: a serial KD facade over a local named pipe that is **not** a
+session — it speaks no MCP, appears nowhere in `session_status`, and ends when the debugger
+disconnects or quits, running the controller's normal close.
+[`docs/secure-kernel/kd-facade.md`](secure-kernel/kd-facade.md) has what it can and cannot do.
+
 ## Running a target asynchronously
 
 `go` and the stepping tools wait for the next stop and answer with it, which is what almost every

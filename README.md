@@ -50,8 +50,10 @@ Operator and reference material: [remote listener](docs/remote-listener.md),
 **Secure Kernel (VTL1)** has three routes. The shipped `securekernel` group contains four tools for
 a fixed **capture** and seven tools for selected-VP **live control**; both session contracts are in
 [`docs/sessions.md`](docs/sessions.md). The separate `--sk-live` command-line role decodes a running
-guest without controlling it. Live decode and control require operator-supplied transports this
-repository does not ship. The evidence, controls and dead ends are
+guest without controlling it, and the `--sk-kd-target` role puts an installed WinDbg in front of the
+live-control session over a local named pipe, within the limits
+[`docs/secure-kernel/kd-facade.md`](docs/secure-kernel/kd-facade.md) records. Live decode, live
+control and the facade require operator-supplied transports this repository does not ship. The evidence, controls and dead ends are
 [recorded gate by gate](docs/secure-kernel/README.md).
 
 ## Quick start

@@ -134,8 +134,10 @@ sk_symbol { "session_id": "sess-…", "name": "SkLoadedModuleList" }   // or "ad
 
 Exactly one of `name` or `address`. A name is **unqualified** — the module name is the engine's and
 is applied for you, so pass `SkLoadedModuleList` and not `securekernel!SkLoadedModuleList`. A
-qualified one is not refused: a lenient engine resolves it and the answer comes back rendered
-`securekernel!securekernel!Sym`, the right address under a doubled name. A lookup by address answers with the nearest preceding name and how far past it
+qualified one is **refused** as an invalid argument rather than stripped: `skci!Foo` names a module
+the capture does not hold, and a lenient engine would otherwise answer
+`securekernel!securekernel!Foo` — the right address under a doubled name — so the refusal is the
+one answer that cannot mislead. A lookup by address answers with the nearest preceding name and how far past it
 the address is, so **a displacement of zero is the only answer that says the address *is* the
 symbol**. Every answer carries the guest address, the RVA and the engine's own address, so a figure
 from here joins a disassembler loaded at either base.
@@ -286,9 +288,11 @@ Things to know besides the numbers and the grammar:
   transport**, that variant also covering an unparseable `OK`, which the client deliberately will
   not try to tell apart by reading the detail. On a guest that refuses per access, that ends the
   run at the first refusal instead of counting every one of them.
-- **Nothing in this role has a read deadline.** A transport that starts and then never emits a
-  newline blocks it until the operator interrupts — acceptable in a foreground command run by the
-  person who wrote the transport, and one of the reasons it is not reachable from the server.
+- **Every exchange has a deadline, and it is per response rather than per byte.** A transport that
+  starts and then never emits a newline is refused after 60 seconds (`EXCHANGE_WAIT`), and the
+  bound covers a whole banner, shape or read response, so one byte a minute does not keep the role
+  alive either. It still runs in the foreground, where the person who wrote the transport sees the
+  refusal.
 
 ## Live execution control: a separate MCP session
 
@@ -336,12 +340,19 @@ a checkpoint can be read on a different machine from the one that made it. For a
 a *running* guest, use `--sk-live`: the transport is theirs to supply, the server ships none, and the
 role runs on the debugger host outside MCP. For a controlled stop, stopped-state inspection, step or
 resume at a chosen address, use `open_sk_live_control` and the epoch-bound MCP sequence above, after
-the operator supplies the exact disposable target and both providers.
+the operator supplies the exact disposable target and both providers. If they want **WinDbg itself**
+on that stop, the `--sk-kd-target` role serves the serial KD protocol over a local named pipe to a
+`kd -k com:pipe,port=\\.\pipe\<name>,resets=0`; it is a foreground role rather than a tool, and what
+has been measured through it is one `t`, an `r` after it and `q` — the limits are in
+[`docs/secure-kernel/kd-facade.md`](../../docs/secure-kernel/kd-facade.md).
 
 ## Where the rest of it is
 
 - [`docs/sessions.md`](../../docs/sessions.md) — the caller's half: what capture and live-control
   sessions are, and what ending one does.
+- [`docs/secure-kernel/kd-facade.md`](../../docs/secure-kernel/kd-facade.md) — WinDbg in front of
+  the live controller: the connection string, what it can do today, and what it is told that the
+  guest never held.
 - [`docs/secure-kernel/README.md`](../../docs/secure-kernel/README.md) — the research record behind
   all of it: what is reachable from where, which landmarks survive a reboot and which do not, and
   what the lab needs. Several sections record what did **not** work, which is most of the value.

@@ -138,7 +138,9 @@ read 2026-09-25). So depth of nesting is not the objection to either layout.
 
 **Neither layout supplies a transport, and that is the whole of what is missing.** Both give a
 guest with `securekernel` running and its NT side reachable over KDNET; neither exposes a gdbstub,
-and the native KD route into SK is dead for the reasons at the top of this document. That write-up
+and the native KD route into SK is dead for the reasons at the top of this document — Secure
+Kernel's own transport, that is; the host-side facade in [`kd-facade.md`](kd-facade.md) is not that
+route and reaches the guest through the root-driven controller instead. That write-up
 does not close the gap either: its setup section is explicitly deferred to a later post, and the
 commands it shows are ordinary kernel-debugger commands against `nt`. Treat it as evidence about
 topology, not about reaching VTL1.

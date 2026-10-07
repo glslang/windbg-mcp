@@ -26,12 +26,14 @@
 //!   [`crate::skinspect`] or this module — so every engine call is on the thread that made it, which
 //!   is the other half of the rule.
 //!
-//! **What the remedy would cost is the thing S3 is deferred to decide.** There is no worker to route
-//! to here: a worker is spawned by `crate::engine::Sessions`, which lives in the supervisor. Routing
-//! would mean building a session registry and a `crate::proto` channel inside a command-line report
-//! writer — and it would pre-decide, for a research CLI, where the *tool surface*'s engine lives,
-//! which item 103's S3 lists as one of its three open questions. So the decision is recorded as a
-//! test instead of as prose:
+//! **What the remedy would cost is what gate S3 then decided, the other way.** There is no worker
+//! to route to here: a worker is spawned by `crate::engine::Sessions`, which lives in the
+//! supervisor, and routing would mean building a session registry and a `crate::proto` channel
+//! inside a command-line report writer. S3 placed the *tool surface*'s engine in an ordinary
+//! worker (`crate::sksession`; `AGENTS.md` records why — the SDK provider those tools load
+//! fast-fails on an input a caller supplies, so it must not run beside the session registry),
+//! which leaves this role as it was: a research CLI with one image target and no server behind
+//! it. The decision is recorded as a test rather than as prose:
 //! [`tests::only_the_worker_and_this_module_build_an_engine`] fails if a third file constructs one,
 //! which is where a future `DebugEngine` in the supervisor stops rather than in a review round.
 //!
@@ -1024,7 +1026,7 @@ mod tests {
             "a `DebugEngine` is constructed outside the engine worker and `sksym`. That decides \
              which process owns a debuggee session, so it is a design change rather than a local \
              one: see `AGENTS.md`, this module's docs, and `FOLLOWUPS.md` item 103 gate S3, which \
-             is where the tool surface's engine is still to be placed."
+             put the tool surface's engine in a worker."
         );
     }
 
@@ -1034,7 +1036,10 @@ mod tests {
     /// instead of restating it: a fixture and a parser reading one constant are blind to it. The
     /// preferred base and `SizeOfImage` are what the engine reported for
     /// `C:\Windows\System32\securekernel.exe` 10.0.26100.9457 on 2026-09-27, and the guest base is
-    /// the one gate S1's decode found in the `H1 pinned 26200.9457 VBS+HVCI` capture.
+    /// the one gate S1's decode found in the `H1 pinned 26200.9457 VBS+HVCI` capture. That is the
+    /// checkpoint's **name** as Hyper-V lists it on the bench (`Get-VMSnapshot`, 2026-10-07),
+    /// quoted so the capture can be found again; the `26200` in it is not the build of the image
+    /// inside, which the decode identified against the 26100.9457 file above.
     const PREFERRED: u64 = 0x1_4000_0000;
     const GUEST: u64 = 0xFFFF_F807_0EDA_9000;
     const SIZE: u32 = 0x175000;

@@ -93,7 +93,6 @@ line is simply open.
 - [Item 112](#112-windbg-mcp-the-ioctl-fixtures-writes_flags-is-architecture-blind) — [windbg-mcp] The IOCTL fixture's `writes_flags` is architecture-blind
 - [Item 113](#113-windbg-mcp-the-device-descriptor-sweeps-own-figures-do-not-add-up) — [windbg-mcp] The `\Device` descriptor sweep's own figures do not add up
 - [Item 114](#114-dbgscope-a-big-pool-entry-in-no-region-the-walk-discovers) — [dbgscope] A big-pool entry in no region the walk discovers
-- [Item 115](#115-windbg-mcp-the-secure-kernel-kd-facade-shipped-unrecorded) — [windbg-mcp] The Secure Kernel KD facade shipped unrecorded
 - [Item 116](#116-windbg-mcp-the-kd-facade-answers-windbg-with-fabricated-state-it-cannot-tell-apart-from-guest-state) — [windbg-mcp] The KD facade answers WinDbg with fabricated state it cannot tell apart from guest state
 - [Item 117](#117-windbg-mcp-the-kd-facade-pipe-has-only-the-default-acl-no-client-authentication-and-no-break-in) — [windbg-mcp] The KD facade pipe has only the default ACL, no client authentication and no break-in
 - [Item 118](#118-windbg-mcp-live-control-is-on-by-default-runs-client-supplied-programs-and-has-no-bound-on-a-paused-guest) — [windbg-mcp] Live control is on by default, runs client-supplied programs, and has no bound on a paused guest
@@ -2455,59 +2454,6 @@ that address at all**, which is a question about discovery rather than about dec
 - **Where it picks up:** `discover_pool_regions` and `discover_segment_context` in dbgscope's
   `src/pool/snapshot.rs`; the tier prints the addresses under `big-pool allocation(s) the walk has
   no span for`.
-
-## 115. [windbg-mcp] The Secure Kernel KD facade shipped unrecorded
-
-**Repo:** `windbg-mcp`. **Origin:** the 2026-10-07 review of the VTL1 work
-(`target/private/vtl1-secure-kernel-review-2026-10-07.md`, private), reading
-[#463](https://github.com/glslang/windbg-mcp/pull/463) against the tree it merged into.
-
-#463 (merged 2026-10-06, in 0.22.0) added a serial KD packet facade over a local named pipe —
-`src/kdwire.rs`, `src/kdapi.rs`, `src/kdtarget.rs`, `src/kdprobe.rs`, the `--sk-kd-target` and
-`--sk-kd-wire-probe` roles — and nothing tracked says so. There is no `CHANGELOG.md` entry under
-0.22.0 or Unreleased, no page under `docs/secure-kernel/`, no row in `README.md`'s tool table, no
-line in `skills/windbg-debugging/secure-kernel.md` or `docs/sessions.md`, no `docs/smoke-test.md`
-section, and the WinDbg connection string (`-k com:pipe,port=\\.\pipe\<name>,resets=0`) exists only
-in a private runner. The source describes the role to a reader of the code — the four modules'
-own docs, the role dispatch in `main.rs`, `worker::run_sk_kd_target`, and `skdispatch.rs` where
-it names the facade — and outside `src/` the only tracked mentions are the `SetInterrupt`
-exception notes in `AGENTS.md` and `DECISIONS.md`; the first draft of this inventory claimed the
-whole tree (Codex, round 6). `CHANGELOG.md`'s 0.21.0 entry still says "the native KD route into
-SK is dead", which is true of Secure Kernel's own transport and now reads as if no KD route exists.
-The PR body names "WinDbg 10.0.26100"; the live log names kd 10.0.29617.1000 connected to a 26100
-*target*.
-
-The same review found six statements that the code no longer matches, listed here so the sweep
-that records the facade corrects them in the same pass rather than one review round each:
-
-- `skills/windbg-debugging/secure-kernel.md`, the `sk_symbol` paragraph: "A qualified one is not
-  refused". It is — `server.rs` refuses a module-qualified `name` with `invalid_argument`;
-  `docs/tool-surface.md` has it right.
-- The same skill, the live-route section: "Nothing in this role has a read deadline." `livesrc.rs`
-  has a 60-second `EXCHANGE_WAIT` per response, and a test pins it.
-- `src/sk.rs`, the `ReadFailure::Refused` doc comment and its `#[allow(dead_code)]`: "Constructed
-  by no source in this build." `livesrc.rs` constructs it on a `REFUSED` line.
-- `src/sksym.rs`, the module docs and the test comment near its gated test: gate S3 described as
-  deferred and undecided. S3 shipped; `AGENTS.md` records where the engine lives and why.
-- `src/sksym.rs`, the rebase fixture: labelled `26200.9457` for a capture of a 26100.9457 image.
-- `docs/secure-kernel/live-control-provider.md`, the multi-VP paragraph: "the adapter's VM-wide
-  pause kept both VPs stable." `Suspend-VM` covers arming, disarming and recovery; `sk_live_wait`
-  resumes the VM and clears `vm_paused` at the stop. What holds the stop is the retained
-  intercept plus `vmwp` being debugger-stopped (`skdispatch.rs`), and whether the other VP
-  executes during it is not determined.
-
-- **Why deferred:** the facade's behaviour is still moving (items 116 and 117), and a page written
-  now would describe the fabricated answers as the design. What is not deferred is the changelog
-  line and the connection string, which cost nothing to be wrong about.
-- **What would close it:** a `CHANGELOG.md` entry under Unreleased naming the transport and the
-  measured subset; a `docs/secure-kernel/kd-facade.md` carrying the private plan's "Known product
-  limits" as they stand (named-pipe serial KD only; one VP and four hardware execute breakpoints;
-  `NOMM`; `t` must precede `r`; `SetContext` accepts only an unchanged write; no break-in); the
-  connection string; the six corrections above; and a `docs/smoke-test.md` line saying there is
-  no gate, until there is one.
-- **Where it picks up:** `src/kdtarget.rs`'s module docs are the accurate description of the role;
-  `target/private/securekernel-windbg-kd-plan.md` (private) holds the limits and the host-reset
-  mitigations the tracked runbook needs.
 
 ## 116. [windbg-mcp] The KD facade answers WinDbg with fabricated state it cannot tell apart from guest state
 

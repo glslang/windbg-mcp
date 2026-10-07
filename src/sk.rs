@@ -279,16 +279,13 @@ pub(crate) enum ReadFailure {
     /// later source calls the same thing. Bytes may well have been written into the buffer; they
     /// are not an answer.
     ///
-    /// **Constructed by no source in this build**, and that is the point rather than an oversight: a
-    /// capture has nothing to refuse with, and the route that does — the hypercall H4 measured,
-    /// which answers `HV_STATUS_SUCCESS` with a per-access `ReadIntercept` and zeros — is not built
-    /// here. The fixtures construct it, so the decode's behaviour on a refusal is pinned before the
-    /// source that produces one exists. Mapping a provider `HRESULT` onto it to satisfy the
-    /// compiler would be inventing a measurement.
-    #[allow(
-        dead_code,
-        reason = "the live hypercall source is what constructs this; fixtures cover it"
-    )]
+    /// **Constructed by one source, `crate::livesrc`**, which maps a transport's `REFUSED` status
+    /// line onto it (gate S5w): the operator-supplied live transport is the route that can be told
+    /// no, and a capture has nothing to refuse with. The fixtures constructed it first, so the
+    /// decode's behaviour on a refusal was pinned before any source produced one. Mapping a
+    /// provider `HRESULT` onto it to satisfy the compiler would have been inventing a measurement,
+    /// and the hypercall H4 measured — `HV_STATUS_SUCCESS` with a per-access `ReadIntercept` and
+    /// zeros — is still not built here.
     Refused { detail: String },
     /// A physical address this source does not cover at all.
     NotPresent,

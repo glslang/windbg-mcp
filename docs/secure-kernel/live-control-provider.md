@@ -233,8 +233,11 @@ restoring the saved debug registers and TF/RF bits. The independent 60-second au
 
 The multi-VP gate ran the same session on VP1 of a two-vCPU K3 boot. The exact-build profile reads
 the native vector-event VP field, and the dispatcher ignored any event that did not report the
-selected VP. VP1 stopped and stepped over the guarded Secure Kernel NOP while the adapter's VM-wide
-pause kept both VPs stable. The independent audit found VP0's debug registers unchanged, VP1's
+selected VP. VP1 stopped and stepped over the guarded Secure Kernel NOP. The VM-wide pause did not
+hold that stop: `Suspend-VM` covers arming, disarming and recovery, and `sk_live_wait` resumes the
+VM before the owned event arrives (`src/skdispatch.rs`, `vm_paused`), so what held it was the
+retained intercept with `vmwp` debugger-stopped — and whether VP0 executed while it was held is not
+something the audit determined. The independent audit found VP0's debug registers unchanged, VP1's
 baseline restored, TF/RF clear on both VPs, unchanged guest text, the same healthy `vmwp`, and no
 scoped crash record. A preceding natural-flow VP1 attempt timed out because that interrupt was not
 scheduled there; bounded recovery restored the baseline and resumed the VM before faulting the
