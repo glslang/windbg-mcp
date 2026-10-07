@@ -2610,9 +2610,14 @@ path and `LoadLibraryExW`'d in the worker (`savedstate.rs`), with no canonicalis
 signature check, under a tool annotated non-destructive. The always-served `launch` tool already
 grants a client the same power, so this is a statement about which clients a listener admits
 rather than a new class — but the live tools are the ones that pause a VM and forge a descriptor
-in its worker process. Nothing bounds how long that lasts: after arm the VM is paused and `vmwp`
-is debugger-stopped, after a step `vmwp` stays stopped, and no timer covers either (stdio has no
-idle release at all; `--listen` has the 30-minute one, settable to 0). Between `sk_live_continue`
+in its worker process. No pause budget bounds how long that lasts: after arm the VM is paused and
+`vmwp` is debugger-stopped, and after a step `vmwp` stays stopped. Under stdio no timer covers
+either. Under `--listen` the 30-minute idle release does cover a session nobody is calling:
+`release_idle` submits `EndSession`, and a teardown that proves out resumes the VM (`engine.rs`,
+`skdispatch.rs`'s `finish_teardown`; the first draft of this entry said no timer covered it, which
+Codex corrected in round 4). What remains is that any admitted request restamps the clock, the
+interval is settable to 0, and a client that keeps calling holds the guest as long as it likes.
+Between `sk_live_continue`
 and the next arm or close the temporary handler stays registered in `vmwp` with the adapter's
 breakpoints removed, and what `vmwp` does with a vector-1 event in that window is not measured.
 The session reservation does not stop a plain `attach_process` to the same `vmwp`, and the KD
@@ -2620,8 +2625,12 @@ role takes no reservation. Redirect mode is the default and its restore covers R
 and the debug registers, so the GPR and memory effects of a stepped instruction persist;
 `sk_live_step` has none of the `rep`/`mov ss`/`lss` refusals the facade applies to `t`. The three
 control modules emit no tracing, so a forged descriptor, a `.dvalloc`, an `eq` and a provider
-write leave no record unless `WINDBG_MCP_TRANSCRIPT` is set. And the live smoke's
-`target_left_running == true` assertion reads a constant (`worker.rs`, the released `Output`).
+write leave no record unless `WINDBG_MCP_TRANSCRIPT` is set. The live smoke's
+`target_left_running == true` assertion reads a literal in the released `Output` (`worker.rs`),
+and the first draft of this entry called that a constant; it is not vacuous, because that path is
+reached only after `Session::close` proved restoration and detach, every failure returning
+`recovery_required` first (Codex, round 4). What the assertion still does not check is VM
+health, the `vmwp` PID, debug-register state or guest text; the external wrapper does.
 
 - **Why deferred:** the group being default-on is item 106's decision and is blocked there; the
   transport allow-list changes the operator contract in `live-control-provider.md`; the pause
@@ -2632,8 +2641,7 @@ write leave no record unless `WINDBG_MCP_TRANSCRIPT` is set. And the live smoke'
   kit paths carried in the profile the operator already supplies; a pause budget on the session
   whose expiry is the existing recovery path; natural mode as the default arm; the facade's
   instruction-class guard shared with `sk_live_step`; `tracing` at `info` on every mutation in
-  `skdispatch.rs`, `sklive.rs` and `skcontrol.rs`; and the smoke test reading
-  `target_left_running` from the dispatcher rather than from a literal.
+  `skdispatch.rs`, `sklive.rs` and `skcontrol.rs`.
 - **Where it picks up:** `server.rs`'s `open_sk_live_control` handler; `skdispatch::Session::open`
   and `release`; `sklive::LiveControl::restore`; `toolset.rs`'s group table.
 
