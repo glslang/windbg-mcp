@@ -1782,7 +1782,7 @@ impl From<dbgscope::pool::query::WalkCoverage> for AllocatorCoverage {
 pub struct WalkInfo {
     pub coverage: AllocatorCoverage,
     /// The requested match threshold that intentionally stopped this walk. Absent when the
-    /// threshold was not reached or a complete cached snapshot answered the query.
+    /// threshold was not reached or a cached snapshot answered the query.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_after_matches: Option<usize>,
     /// Chunks the walk indexed, allocated and free.

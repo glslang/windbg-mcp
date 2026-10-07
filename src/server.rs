@@ -1511,8 +1511,9 @@ pub struct PoolFindTagArgs {
     #[serde(default)]
     pub refresh: Option<bool>,
     /// Stop a newly started pool walk as soon as this many matching allocated chunks have been
-    /// decoded. Must be nonzero. A complete cached snapshot is still reused, so `matches` and
-    /// `total_bytes` remain exhaustive; `limit` below controls only how many rows are printed.
+    /// decoded. Must be nonzero. A cached snapshot is still reused, and `matches` and
+    /// `total_bytes` are then everything that walk reached; `limit` below controls only how many
+    /// rows are printed.
     #[serde(default)]
     pub stop_after_matches: Option<NonZeroU32>,
     /// Maximum rows to print (default 64).
