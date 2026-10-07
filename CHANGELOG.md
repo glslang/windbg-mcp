@@ -20,9 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   page is a property of the boot. A named page range is now answered without reading its pages,
   and a VS chunk is matched against the table before the extent check. The measurements are in the
   addendum under item 99 in `DONE.md`; the one sampled entry still uncovered is item 114. The
-  `stop_after_matches` description on `pool_find_tag` said a *complete* cached snapshot is reused
-  and the counts stay exhaustive; it now says a cached snapshot is, with the counts being what
-  that walk reached — the model-visible surface moves 116,318 → **116,331 B**.
+  `stop_after_matches` description on `pool_find_tag`, and the tool's own, said a *complete* cached
+  snapshot is reused and the counts stay exhaustive; both now say a cached snapshot is, with the
+  counts being what that walk reached, and so do `docs/structured-results.md`,
+  `docs/limitations.md` and the shipped skill's `heap-walking.md` — the model-visible surface
+  moves 116,318 → **116,356 B**.
 
 - **`driver_hazards` counted an import by ordinal as one it had checked against the sink list**
   (issue [#302](https://github.com/glslang/windbg-mcp/issues/302), item 2). An ordinal import's
