@@ -16733,28 +16733,6 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
             assert_diagnostic_total_covers_its_categories(&diagnostics);
         }
 
-        // ---- The decoding, against an oracle that is not the decoder. ----
-        //
-        // Deliberately *outside* the completeness gate below and before it. This needs chunks,
-        // not a complete walk, and the first live run of it proved why that distinction matters:
-        // sitting inside the `if complete` arm it was skipped on a `partial` walk — taking its
-        // own `POOL_ORACLE_MINIMUM` guard with it — and the test passed having compared nothing.
-        // A guard inside the branch it is guarding against is not a guard.
-        //
-        // Every other cross-check here compares two readings of one walk, which is a consistency
-        // check: they share every decoder and cannot see one be wrong. That is how both defects
-        // in `FOLLOWUPS.md` item 96 lasted — including against fixtures built by calling the code
-        // under test. `!pool` is the engine's own extension reading the same bytes.
-        let census_tags: Vec<String> = totals["tags"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| entry["raw_tag"].as_str().map(str::to_owned))
-            .collect();
-        if !census_tags.is_empty() {
-            compare_pool_decoding_against_the_engine(&mut server, &session, &census_tags);
-        }
-
         // What one tool saw, the other has to find. Only meaningful when the walk was kept: a walk
         // its budget cut short is deliberately not cached, so these would be two separate walks of
         // a moving target and could honestly disagree. A `partial` walk is kept since dbgscope#191
@@ -16828,6 +16806,34 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
                 "a walk reporting itself complete on a live kernel, with no allocated chunk at \
                  all, is not credible:\n{census}"
             ),
+        }
+
+        // ---- The decoding, against an oracle that is not the decoder. ----
+        //
+        // Deliberately *outside* the reuse gate above, and **after** it. Outside, because this
+        // needs chunks and not a kept walk, and the first live run of it proved why that
+        // distinction matters: sitting inside the `if complete` arm it was skipped on a `partial`
+        // walk — taking its own `POOL_ORACLE_MINIMUM` guard with it — and the test passed having
+        // compared nothing. A guard inside the branch it is guarding against is not a guard.
+        // After, because every raw `!pool` and `dq` this oracle issues drops the cached snapshot
+        // (`raw_command` invalidates unconditionally, since a raw command may move the target),
+        // and only the oracle's own `pool_chunk` calls put one back — so the reuse ceiling above,
+        // run after it, would measure a full walk whenever the oracle's last sample was skipped,
+        // and pass only when the last sample happened to walk. Run first, it measures the lookup
+        // it is about.
+        //
+        // Every other cross-check here compares two readings of one walk, which is a consistency
+        // check: they share every decoder and cannot see one be wrong. That is how both defects
+        // in `FOLLOWUPS.md` item 96 lasted — including against fixtures built by calling the code
+        // under test. `!pool` is the engine's own extension reading the same bytes.
+        let census_tags: Vec<String> = totals["tags"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry["raw_tag"].as_str().map(str::to_owned))
+            .collect();
+        if !census_tags.is_empty() {
+            compare_pool_decoding_against_the_engine(&mut server, &session, &census_tags);
         }
     }));
 
