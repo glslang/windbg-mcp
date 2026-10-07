@@ -31,10 +31,13 @@ package-lock.json
 *.obj
 *.exe
 
-# Local Claude Code config. `rules/` and `skills/` are the working guidance that used to live in
-# `CLAUDE.md` and are shared like it; everything else here is this machine's — `settings.local.json`
-# carries absolute server paths, and the lock file is a running session's.
+# Local Claude Code config. `CLAUDE.md` itself lives here rather than at the repository root,
+# because the root is also the plugin root (`marketplace.json` names `"."`) and a `CLAUDE.md` there
+# draws a `claude plugin validate` warning; `rules/` and `skills/` are the working guidance that
+# used to live in it and are shared like it. Everything else here is this machine's —
+# `settings.local.json` carries absolute server paths, and the lock file is a running session's.
 .claude/*
+!.claude/CLAUDE.md
 !.claude/rules/
 !.claude/skills/
 

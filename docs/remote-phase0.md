@@ -198,7 +198,7 @@ claude mcp add windbg-vm --scope local -- ssh -T windbg-vm '<path>\windbg-mcp.ex
 ```
 
 **`--scope local`, not `--scope project`.** The `project` scope writes `.mcp.json` into the
-repository, and this wiring is machine-specific in exactly the way [`CLAUDE.md`](../CLAUDE.md) says
+repository, and this wiring is machine-specific in exactly the way [`CLAUDE.md`](../.claude/CLAUDE.md) says
 to keep out of version control — an address, a user name and an absolute path that are true for one
 host.
 
@@ -249,7 +249,7 @@ up a problem that measurement does not support.
 
 ## See also
 
-- [`CLAUDE.md`](../CLAUDE.md) — the supervisor/worker split, and why a worker's stdout is not the
+- [`CLAUDE.md`](../.claude/CLAUDE.md) — the supervisor/worker split, and why a worker's stdout is not the
   protocol
 - [`smoke-test.md`](./smoke-test.md) — the tiers, including the live-kernel one this setup does not
   change

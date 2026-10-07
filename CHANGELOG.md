@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`CLAUDE.md` lives in `.claude/`, so strict plugin validation passes.** The plugin root is the
+  repository root (`marketplace.json` names `"."`), and a `CLAUDE.md` at a plugin root is never
+  loaded as plugin context — so `claude plugin validate` warns when it finds one, and `--strict`,
+  which the release checklist runs, fails on it. Measured 2026-10-07 on Claude Code 2.1.292 while
+  cutting 0.22.0, on that tree and on `v0.21.0`'s alike. Claude Code reads `./.claude/CLAUDE.md`
+  as project instructions exactly as it reads `./CLAUDE.md` (checked with a codeword in a scratch
+  repository), and `.claude/CLAUDE.md` counts against `AGENTS.md` the same way, so nothing a
+  session loads changes. The alternative — moving the plugin into a subdirectory — would move
+  every installed copy's binary, and was not taken.
+
 ## [0.22.0] - 2026-10-07
 
 ### Fixed
