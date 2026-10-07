@@ -201,6 +201,16 @@ the epoch to single-step, consumes the next epoch to restore and continue, then 
 to report both release and a running target. Run it alone through the bench's independent VM
 heartbeat/crash/unchanged-text wrapper. The repository stores none of the config or evidence.
 
+**The Secure Kernel KD facade has no gate, and that is a statement rather than an omission.**
+`--sk-kd-target` — WinDbg as the protocol client of that same live controller over a named pipe,
+[`secure-kernel/kd-facade.md`](secure-kernel/kd-facade.md) — is covered by the four KD modules'
+unit tests over inline packet vectors (23 of them on 2026-10-07) and by nothing that connects a
+debugger: no `WINDBG_MCP_SMOKE_SK_KD` variable exists, no test drives the pipe loop, the wait waker
+or the `Continue2` path, and the only live run is a private bench record from 2026-10-05. A green
+run therefore says nothing about kd still connecting. The tier it would need is the live Secure
+Kernel one above with an installed `kd` and a `-cf` script beside it, and until that exists the
+facade is re-verified by hand or not at all.
+
 **The sample they open follows the host.** Four dumps are checked in (below), and the two crashes
 a *memory* read is asserted against are paired with the architecture the tests are running on — so
 an ARM64 run reads an ARM64 target, which is coverage this suite has nowhere else

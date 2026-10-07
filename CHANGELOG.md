@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The Secure Kernel KD facade of 0.22.0 is recorded** (`FOLLOWUPS.md` item 115, now in
+  `DONE.md`). [#463](https://github.com/glslang/windbg-mcp/pull/463) shipped
+  `windbg-mcp --sk-kd-target` with no entry here and no page anywhere: a serial KD packet facade
+  over a local named pipe, so that an installed WinDbg —
+  `kd -k com:pipe,port=\\.\pipe\<name>,resets=0` — can receive a held VTL1 stop from the live
+  Secure Kernel controller, read its real context and memory, install up to four hardware
+  breakpoints, single-step the linear successor and quit with the baseline restored. Measured once,
+  2026-10-05, with kd 10.0.29617.1000 against a 26100 guest: `t`, `r`, `q`. It is not KDNET — no
+  network envelope — and not a KD transport inside the guest, which Secure Kernel still does not
+  ship, so the 0.21.0 line below about the native route stays true of the guest's own transport
+  and now says which transport it means. The limits as they stand, the connection string and the
+  host-reset mitigations are in `docs/secure-kernel/kd-facade.md`; what WinDbg is told that the
+  guest never held is item 116, and what the pipe does not check is item 117. The same sweep
+  corrected six statements the code had moved past: the shipped skill said `sk_symbol` does not
+  refuse a qualified name (it does) and that `--sk-live` has no read deadline (60 s per exchange,
+  pinned); `sk.rs` said nothing constructs `ReadFailure::Refused` (`livesrc.rs` does, and the
+  variant's `dead_code` allowance is gone); `sksym.rs` described gate S3 as undecided (it placed
+  the engine in a worker); its rebase fixture quoted the bench checkpoint
+  `H1 pinned 26200.9457 VBS+HVCI` as if the number were the image's build (it is the checkpoint's
+  name, as `Get-VMSnapshot` lists it, around a 26100.9457 image, and the comment now says so); and
+  `live-control-provider.md` credited a VM-wide pause with holding the multi-VP stop, where
+  `Suspend-VM` covers arming, disarming and recovery and the stop is held by the retained
+  intercept with `vmwp` debugger-stopped.
+
 ### Changed
 
 - **`CLAUDE.md` lives in `.claude/`, so strict plugin validation passes.** The plugin root is the
@@ -2463,7 +2489,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runs that shape, a Hyper-V guest as debugger passing Hyper-V through to a Windows 11 25H2 target
   inside it, so nesting depth is not the objection to either layout. **What neither supplies is a
   transport**, which is the whole of the gap: both give `securekernel` running with its NT side
-  reachable over KDNET, neither exposes a gdbstub, and the native KD route into SK is dead. That
+  reachable over KDNET, neither exposes a gdbstub, and the native KD route into SK is dead —
+  Secure Kernel's own transport, that is; the host-side KD facade 0.22.0 added over the root-driven
+  controller (`docs/secure-kernel/kd-facade.md`) is not that route and did not exist here. That
   write-up does not close it either — its setup section is deferred to a later post and its
   commands are ordinary kernel-debugger commands against `nt`.
 

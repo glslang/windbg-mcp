@@ -163,6 +163,7 @@ engine — it adds a target and leaves the current one alone. The entry records 
 - [Item 84](#84-windbg-mcp-an-adrpadd-table-base-is-lost-at-the-add--done-2026-10-04) — [windbg-mcp] An `adrp`+`add` table base is lost at the `add` — done (2026-10-04)
 - [Item 52](#52-windbg-mcp-the-no-description-names-a-tool-the-client-cannot-call-invariant-does-not-cover-input-schemas--done-2026-10-05) — [windbg-mcp] The "no description names a tool the client cannot call" invariant does not cover **input schemas** — done (2026-10-05)
 - [Item 69](#69-windbg-mcp-record-what-the-ace-kind-rules-were-measured-against--done-2026-10-05) — [windbg-mcp] Record what the ACE-kind rules were measured against — done (2026-10-05)
+- [Item 115](#115-windbg-mcp-the-secure-kernel-kd-facade-shipped-unrecorded--done-2026-10-07) — [windbg-mcp] The Secure Kernel KD facade shipped unrecorded — done (2026-10-07)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -9362,3 +9363,95 @@ corroborated only by this entry, written from the same sweep. So the remainder i
 instead -- the other side of a partition needs no count, and dropping it leaves no third figure to
 keep in step -- with the gap recorded beside it. Settling it wants the sweep re-taken on that guest,
 which is the same measurement the bound above wants anyway.
+
+## 115. [windbg-mcp] The Secure Kernel KD facade shipped unrecorded — **done** (2026-10-07)
+
+**Repo:** `windbg-mcp`. **Origin:** the 2026-10-07 review of the VTL1 work
+(`target/private/vtl1-secure-kernel-review-2026-10-07.md`, private), reading
+[#463](https://github.com/glslang/windbg-mcp/pull/463) against the tree it merged into.
+
+#463 (merged 2026-10-06, in 0.22.0) added a serial KD packet facade over a local named pipe —
+`src/kdwire.rs`, `src/kdapi.rs`, `src/kdtarget.rs`, `src/kdprobe.rs`, the `--sk-kd-target` and
+`--sk-kd-wire-probe` roles — and nothing tracked says so. There is no `CHANGELOG.md` entry under
+0.22.0 or Unreleased, no page under `docs/secure-kernel/`, no row in `README.md`'s tool table, no
+line in `skills/windbg-debugging/secure-kernel.md` or `docs/sessions.md`, no `docs/smoke-test.md`
+section, and the WinDbg connection string (`-k com:pipe,port=\\.\pipe\<name>,resets=0`) exists only
+in a private runner. The source describes the role to a reader of the code — the four modules'
+own docs, the role dispatch in `main.rs`, `worker::run_sk_kd_target`, and `skdispatch.rs` where
+it names the facade — and outside `src/` the only tracked mentions are the `SetInterrupt`
+exception notes in `AGENTS.md` and `DECISIONS.md`; the first draft of this inventory claimed the
+whole tree (Codex, round 6). `CHANGELOG.md`'s 0.21.0 entry still says "the native KD route into
+SK is dead", which is true of Secure Kernel's own transport and now reads as if no KD route exists.
+The PR body names "WinDbg 10.0.26100"; the live log names kd 10.0.29617.1000 connected to a 26100
+*target*.
+
+The same review found six statements that the code no longer matches, listed here so the sweep
+that records the facade corrects them in the same pass rather than one review round each:
+
+- `skills/windbg-debugging/secure-kernel.md`, the `sk_symbol` paragraph: "A qualified one is not
+  refused". It is — `server.rs` refuses a module-qualified `name` with `invalid_argument`;
+  `docs/tool-surface.md` has it right.
+- The same skill, the live-route section: "Nothing in this role has a read deadline." `livesrc.rs`
+  has a 60-second `EXCHANGE_WAIT` per response, and a test pins it.
+- `src/sk.rs`, the `ReadFailure::Refused` doc comment and its `#[allow(dead_code)]`: "Constructed
+  by no source in this build." `livesrc.rs` constructs it on a `REFUSED` line.
+- `src/sksym.rs`, the module docs and the test comment near its gated test: gate S3 described as
+  deferred and undecided. S3 shipped; `AGENTS.md` records where the engine lives and why.
+- `src/sksym.rs`, the rebase fixture: labelled `26200.9457` for a capture of a 26100.9457 image.
+- `docs/secure-kernel/live-control-provider.md`, the multi-VP paragraph: "the adapter's VM-wide
+  pause kept both VPs stable." `Suspend-VM` covers arming, disarming and recovery; `sk_live_wait`
+  resumes the VM and clears `vm_paused` at the stop. What holds the stop is the retained
+  intercept plus `vmwp` being debugger-stopped (`skdispatch.rs`), and whether the other VP
+  executes during it is not determined.
+
+- **Why deferred:** the facade's behaviour is still moving (items 116 and 117), and a page written
+  now would describe the fabricated answers as the design. What is not deferred is the changelog
+  line and the connection string, which cost nothing to be wrong about.
+- **What would close it:** a `CHANGELOG.md` entry under Unreleased naming the transport and the
+  measured subset; a `docs/secure-kernel/kd-facade.md` carrying the private plan's "Known product
+  limits" as they stand (named-pipe serial KD only; one VP and four hardware execute breakpoints;
+  `NOMM`; `t` must precede `r`; `SetContext` accepts only an unchanged write; no break-in); the
+  connection string; the six corrections above; and a `docs/smoke-test.md` line saying there is
+  no gate, until there is one.
+- **Where it picks up:** `src/kdtarget.rs`'s module docs are the accurate description of the role;
+  `target/private/securekernel-windbg-kd-plan.md` (private) holds the limits and the host-reset
+  mitigations the tracked runbook needs.
+
+**What landed, 2026-10-07.** Every line of the close list, in one sweep: the `CHANGELOG.md` entry
+under Unreleased, with a one-clause qualifier on the 0.21.0 line it had made misleading;
+`docs/secure-kernel/kd-facade.md`, carrying the private plan's limits re-derived against
+`kdtarget.rs`, `kdapi.rs` and `sklive.rs` rather than copied, the connection string, the `-cf`
+lesson, the host-reset mitigations, the wire probe, and the fabricated answers named as
+fabrications with items 116 and 117 beside them — which is how the *why deferred* above was met
+without waiting on those items: the page says what the code does today and which parts are
+provisional, rather than describing the invented state as the design; a pointer from `README.md`'s
+routes paragraph, `docs/secure-kernel/README.md`'s introduction and documents table,
+`docs/sessions.md`'s live-control section and the shipped skill; the `docs/smoke-test.md` paragraph
+saying there is no gate; and the six corrections.
+
+**What the sweep found that the entry had wrong or had not said.**
+
+- **The `26200.9457` label is the checkpoint's name, not a mislabelled build.** `Get-VMSnapshot` on
+  the bench lists `Lab Guest Hyper-V`'s checkpoint as `H1 pinned 26200.9457 VBS+HVCI` and its
+  control as `H1 control 26200.9457 VBS off`, both created 2026-09-25, and the same string appears
+  in nine tracked places — `CHANGELOG.md` twice, the feasibility record twice, `DONE.md` three
+  times, `sksym.rs` once — every one quoting the name. Renaming the fixture's label to 26100 would
+  have named a checkpoint that does not exist. What landed is an annotation: the name stays so the
+  capture can be found, and the comment now says the number in it is not the build of the image
+  inside, which gate S1's decode identified against the host's 10.0.26100.9457 file. The other
+  eight copies are left as the name they are.
+- **The `#[allow(dead_code)]` on `ReadFailure::Refused` suppressed nothing.** `livesrc::parse_status`
+  constructs the variant in production code, so the allowance was dead weight beside a stale
+  sentence; it is removed, and the crate compiles and passes clippy without it, which is the check
+  that the sentence was wrong.
+- **"No row in `README.md`'s tool table" asked for nothing.** The facade is a command-line role, not
+  a tool, and a row in a table of tools would have described something no client can call. The
+  routes paragraph above that table carries the pointer instead.
+- **The review counted eleven arguments; `usage()` requires twelve** — `--pipe`, `--kernel-base`,
+  `--profile`, `--control-transport`, `--live-transport`, `--vmwp-pid`, `--dispatcher-vnd`,
+  `--vm-id`, `--partition-id`, `--expected-cr3`, `--instruction-address`, `--instruction-bytes` —
+  and takes five more. The page lists them rather than counting them.
+- **Items 116, 117 and 119 are unchanged by this close**, and the page says so where it describes
+  the fabricated answers, the default descriptor and the out-of-band inputs: nothing in the facade
+  moved. The 2026-10-05 run stays the only live measurement, and the review that produced this
+  entry did not run the facade either.

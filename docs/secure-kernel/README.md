@@ -39,6 +39,15 @@ and its state machine are documented in
 dedicated worker session: `open_sk_live_control`, `sk_live_arm`, `sk_live_wait`,
 `sk_live_registers`, `sk_live_read_memory`, `sk_live_step` and `sk_live_continue`.
 
+**And since 0.22.0 an installed WinDbg can sit in front of that controller.**
+`windbg-mcp --sk-kd-target` serves the serial KD packet stream over a local named pipe and
+translates the requests it understands — context, virtual reads, hardware breakpoints, a
+fall-through single step, continue to a breakpoint, quit — into the same guarded operations the
+seven tools make ([#463](https://github.com/glslang/windbg-mcp/pull/463)). It is a facade for the
+debugger over the root-driven controller, not a KD transport inside the guest: Secure Kernel still
+ships none, which is gate S5a below. What it can do, what WinDbg is told that the guest never held,
+and the one live run it rests on are in [`kd-facade.md`](kd-facade.md).
+
 ## The answer so far
 
 **Yes, from the root partition of the hypervisor that runs the guest — and it takes two primitives
@@ -183,6 +192,7 @@ Read them in this order; each assumes the one before it.
 | 7 | [Inbox device initialization probe](vdev-initialization-probe.md) | K1.1's guarded six-device contract and live result: guest emulation, BIOS, RTC, IOAPIC, VMBus, and SynthStor independently initialize and tear down outside `vmwp`; the build-bound JSON records every dependency and minimum configuration. |
 | 8 | [Inbox device graph probe](vdev-graph-probe.md) | K1.2's result: the six devices share one owned partition and the measured two-span 4 GiB Windows RAM map for three clean initialization, RAM-complete, reverse-teardown, memory-destruction, and partition-deletion cycles. Firmware and VP start remain open. |
 | 9 | [Diskless inbox firmware preflight](vdev-firmware-probe.md) | K1.3's result: the inbox BIOS builds five exact-readback UEFI memory regions and 19 VP0 state records, five diskless devices cold-power successfully, and the state applies cleanly in three fresh partitions. The boot-memory callback uses byte ranges; a private execution check reaches DXE. VP0 remains outside the tracked acceptance run; storage and the owner-side completion dispatcher remain open. |
+| 10 | [The Secure Kernel KD facade](kd-facade.md) | `--sk-kd-target`: WinDbg as the protocol client of the live controller over a local named pipe. The one measured run (`t`, `r`, `q` on 2026-10-05), the connection string, the limits as they stand — `NOMM` with null module and debugger-data lists, `t` before `r`, four hardware breakpoints, no break-in, no writes — the host-reset mitigations, and the fact that nothing but unit tests covers it. |
 
 Two older side-investigations, kept because they are about the same binary:
 
