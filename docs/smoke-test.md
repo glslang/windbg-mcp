@@ -1573,8 +1573,10 @@ about. This is the other half — an attach that lands:
   says nothing about how much the walk complained. The header total is the walk's own count
   (#77) — before that fix it was the length of the sample, which understated a real run by two
   orders of magnitude.
-  Where the walk *does* complete it also checks the snapshot was cached rather than
-  re-walked, and that `pool_census` and `pool_find_tag` agree about the heaviest tag in it. That
+  Where the forced walk was not cut short by its budget — which on a live kernel is a `partial`
+  walk, kept since dbgscope#191, so this now runs on every healthy live run rather than never —
+  it also checks the snapshot was cached rather than re-walked, and that `pool_census` and
+  `pool_find_tag` agree about the heaviest tag in it. That
   last comparison additionally needs the census to expose a tag that renders unambiguously: pool
   tags are four raw bytes, unprintable ones render as `.` — and so does a literal `.` — so a tag
   containing one cannot be turned back into the bytes it came from. That is a fact about rendering
