@@ -16755,13 +16755,21 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
             compare_pool_decoding_against_the_engine(&mut server, &session, &census_tags);
         }
 
+        // What one tool saw, the other has to find. Only meaningful when the walk was kept: a walk
+        // its budget cut short is deliberately not cached, so these would be two separate walks of
+        // a moving target and could honestly disagree. A `partial` walk is kept since dbgscope#191
+        // — and on a live kernel every walk is partial, so until then this arm never ran live and
+        // the two ceilings below had been asserted against nothing.
+        //
+        // **The walk that could have been kept is the forced one above, so its coverage is the
+        // gate — not the census's.** A forced walk the budget cut short leaves nothing behind; the
+        // census then walks for itself, and a fresh walk that reaches the end reports `partial`
+        // exactly as a reused one would. Gated on the census's own coverage, the first ceiling
+        // below would then require a whole walk to fit inside a cache lookup, and the tier would
+        // fail at the budget boundary with the cache behaving correctly.
+        let kept = empty["walk"]["coverage"] != "deadline_truncated";
         match heaviest_census_tag(&totals) {
-            // What one tool saw, the other has to find. Only meaningful when the walk was kept: a
-            // walk its budget cut short is deliberately not cached, so these would be two separate
-            // walks of a moving target and could honestly disagree. A `partial` walk is kept since
-            // dbgscope#191 — and on a live kernel every walk is partial, so until then this arm
-            // never ran live and the two ceilings below had been asserted against nothing.
-            HeaviestTag::Queryable(tag) if coverage != "deadline_truncated" => {
+            HeaviestTag::Queryable(tag) if kept => {
                 // The census had to come off the cached snapshot too, or the reuse below is
                 // measured against a snapshot *it* took rather than the walk's.
                 //
