@@ -19,7 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   boots — the oracle samples the table's first live entries, and which of those sit on a trimmed
   page is a property of the boot. A named page range is now answered without reading its pages,
   and a VS chunk is matched against the table before the extent check. The measurements are in the
-  addendum under item 99 in `DONE.md`; the one sampled entry still uncovered is item 114.
+  addendum under item 99 in `DONE.md`; the one sampled entry still uncovered is item 114. The
+  `stop_after_matches` description on `pool_find_tag` said a *complete* cached snapshot is reused
+  and the counts stay exhaustive; it now says a cached snapshot is, with the counts being what
+  that walk reached — the model-visible surface moves 116,318 → **116,331 B**.
 
 - **`driver_hazards` counted an import by ordinal as one it had checked against the sink list**
   (issue [#302](https://github.com/glslang/windbg-mcp/issues/302), item 2). An ordinal import's

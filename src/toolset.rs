@@ -20,7 +20,7 @@
 //!
 //! ```text
 //!   group        tools   bytes   what it is for
-//!   allocator       10   16,868  pool and heap walks, and `walk_memory`
+//!   allocator       10   16,881  pool and heap walks, and `walk_memory`
 //!   inspect         10   13,485  registers, stacks, memory, modules, symbols, location, raw commands
 //!   session         10   14,013  opening a target, ending it, and watching this server
 //!   exec            10   15,087  breakpoints and execution control
@@ -34,7 +34,7 @@
 //! ```
 //!
 //! Those bytes are a measurement of **2026-10-05** and move with any edit to a description — the
-//! whole surface they are shares of is 75 tools and 116,318 B, which is what the rows above sum to.
+//! whole surface they are shares of is 75 tools and 116,331 B, which is what the rows above sum to.
 //! Re-derive rather than quoting them.
 //!
 //! **Those are shares of the whole surface, and they do not sum to a narrowed one.** `crash` reads
