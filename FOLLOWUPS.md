@@ -2523,7 +2523,11 @@ that several fields it keys on are invented permanently:
   "Module List address is NULL" and "KdDebuggerDataBlock not available!" and `.reload` fails —
   while the capture decode in `src/sk.rs` already locates the real `KdDebuggerDataBlock` at
   `securekernel.exe+0x1335E0` on this build and the loader list it names.
-- `KernBase` is whatever `--kernel-base` said; nothing reads the guest to check it.
+- `KernBase` is whatever `--kernel-base` said and `MinorVersion` whatever `--build` said, which
+  defaults to 26100; nothing reads the guest to check either. Enumerated once rather than found
+  one per round: those two are the only operator-supplied fields in `Version64` — the rest are
+  fixed constants (NT major 15, protocol 6, x64, the three maxima) or the two zeros above. The
+  first draft of this inventory listed one of the two (Codex, round 7).
 - The synthetic thread page at `0xfffffffefffe0000` reads as zeros for the life of the
   connection; the null-page, `KUSER_SHARED_DATA`, stack and code probes read as zeros once each,
   and their window resets on a KD peer reset rather than at every stop, so WinDbg's bookkeeping
@@ -2555,7 +2559,9 @@ that several fields it keys on are invented permanently:
   and `x securekernel!*` resolve; keep processor 0 and print its mapping to `--vp` where the pipe
   name is printed, or report the guest's VP count in `NumberProcessors` *together with* the
   index in `Processor` and answer `SwitchProcessor` coherently — never the index alone; verify
-  `--kernel-base` against the PE header the way `sk::pe_identity` does for a capture; either
+  both operator-supplied fields against the image at that base — `--kernel-base` by parsing the
+  PE header the way `sk::pe_identity` does for a capture, `--build` by reading the image's
+  version resource or matching its PDB identity to the on-disk `securekernel.exe`; either
   reset the compatibility
   window per stop or drop the stack/code shapes, since a transport-only run with control-space
   reads refused still produced `Continue2`; and log every fabricated answer at `info` with its
