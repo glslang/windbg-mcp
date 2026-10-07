@@ -88,10 +88,16 @@ protection" if you stop there.
 
    Dry-run the lint too, with CI's own globs:
    `npx markdownlint-cli2@0.23.2 README.md CHANGELOG.md "docs/**/*.md" "skills/**/*.md"`.
-4. **`claude plugin validate . --strict`** — worth running, but know what it answers. In this repo
-   it validates `.claude-plugin/marketplace.json` and says so in its output; it is **not** a check
-   that the version bump is consistent, and it passes just as happily before the bump as after.
-   The version agreement is release.yml's guard and nothing else's.
+4. **`claude plugin validate . --strict`** — worth running, but know what it answers. It validates
+   the marketplace manifest and the plugin's layout; it is **not** a check that the version bump
+   is consistent, and it passes just as happily before the bump as after. The version agreement
+   is release.yml's guard and nothing else's. **What `--strict` does guard is the plugin root**,
+   which is the repository root here (`marketplace.json` names `"."`): a `CLAUDE.md` at a plugin
+   root is never loaded as plugin context, the validator warns when it finds one, and `--strict`
+   turns that warning into a failure — which is why this repo's `CLAUDE.md` lives in `.claude/`,
+   where Claude Code loads it as project instructions all the same. Measured 2026-10-07 on
+   Claude Code 2.1.292, cutting 0.22.0, with the file still at the root: `--strict` failed on
+   that tree and on `v0.21.0`'s alike, and passed once the file moved.
 5. **Commit, push, and wait for `main`'s CI to go green *before* tagging.** Then tag annotated —
    `git tag -a vX.Y.Z -m "Release X.Y.Z"` — and push the tag.
 

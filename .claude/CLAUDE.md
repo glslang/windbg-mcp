@@ -116,12 +116,16 @@ them — read it to pick the one you want.
 | `/eval-bench` | running `tools/local_model_eval.py`, adding or re-grading a task, or writing up a benchmark result |
 | `/handoff` | updating the handoff docs, closing a `FOLLOWUPS.md` item, or writing prose that states a rule about how this code behaves |
 
-Two things about this layout that are easy to get wrong. **`skills/` at the repo root is not
+Three things about this layout that are easy to get wrong. **`skills/` at the repo root is not
 `.claude/skills/`**: the first is the *shipped* plugin skill (`windbg-debugging`, published through
 `.claude-plugin/plugin.json` to whoever installs this server), the second is this repo's own working
-guidance and ships nowhere. Put nothing about editing this codebase in `skills/`. And **a rule's
-prose is not linted** — CI's markdownlint globs cover `docs/**` and `skills/**`, and `.claude/**` is
-in neither.
+guidance and ships nowhere. Put nothing about editing this codebase in `skills/`. **A rule's prose
+is not linted** — CI's markdownlint globs cover `docs/**` and `skills/**`, and `.claude/**` is in
+neither. And **this file lives in `.claude/`, not at the repository root**, because the root is
+also the plugin root (`marketplace.json` names `"."`) and a `CLAUDE.md` there draws a
+`claude plugin validate` warning that the release checklist's `--strict` run fails on; Claude Code
+loads `./.claude/CLAUDE.md` as project instructions exactly as it loads `./CLAUDE.md`, and
+`.gitignore` excepts it from `.claude/*`. Moving it back is how a release gate goes red.
 
 ## Updating the running windbg MCP after code changes
 

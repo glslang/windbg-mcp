@@ -16,7 +16,7 @@ $env:WINDBG_MCP_SMOKE_SK_LIVE = "<private config.json>"; cargo test --test mcp_s
 ```
 
 It builds and runs against `target/debug`, so it never touches the `target/release` exe a
-connected MCP client holds a lock on (see [`CLAUDE.md`](../CLAUDE.md)). The protocol tier is ~2s;
+connected MCP client holds a lock on (see [`CLAUDE.md`](../.claude/CLAUDE.md)). The protocol tier is ~2s;
 adding the debugger tier takes it to ~60s, most of it two tests waiting out real timers — a lease
 grace, and a call staying silent long enough to have to report that it is still running.
 
