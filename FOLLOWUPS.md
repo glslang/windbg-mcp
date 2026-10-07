@@ -2564,10 +2564,13 @@ that several fields it keys on are invented permanently:
 
 **Repo:** `windbg-mcp`. **Origin:** the 2026-10-07 review (item 115's origin).
 
-The pipe is `ServerOptions::new().first_pipe_instance(true).create()` with a null security
-descriptor, in the target and in the wire probe. This repository measured what that grants on its
-own bench when it audited the old cdb pipe (`DONE.md`, the cdb-pipe DACL table under item 49):
-SYSTEM and Administrators full access, Everyone and Anonymous read. The name is operator-chosen and
+The pipe is `ServerOptions::new().first_pipe_instance(true).create()` with no explicit security
+attributes, in the target and in the wire probe, so Windows assigns the default descriptor derived
+from the process token — not a null DACL, which would grant everyone everything; the first draft
+of this entry said "null security descriptor" (Codex, round 5). This repository measured what
+that default grants on its own bench when it audited the old cdb pipe (`DONE.md`, the control
+row of the cdb-pipe DACL table under item 49): SYSTEM and Administrators full access, Everyone
+and Anonymous read. The name is operator-chosen and
 checked for charset and length only; the first client to send a KD reset is served; a read-only
 client can take the single instance, after which the reset wait times out and the session closes.
 Three input shapes end the session rather than answering a KD status: a manipulate packet shorter
@@ -2636,10 +2639,15 @@ health, the `vmwp` PID, debug-register state or guest text; the external wrapper
   transport allow-list changes the operator contract in `live-control-provider.md`; the pause
   budget needs a live run to pick a number. None of the three is one afternoon alone, and all
   three are smaller than the review that found them.
-- **What would close it:** a `disposable: true` gate at `open_sk_live_control` (the smoke test
-  already demands it in its config) or the group opt-in; an allow-list of transport programs and
-  kit paths carried in the profile the operator already supplies; a pause budget on the session
-  whose expiry is the existing recovery path; natural mode as the default arm; the facade's
+- **What would close it:** a policy the operator fixes server-side at startup and no request can
+  choose — the group opt-in, the disposable VM ids a controller may bind, the executables a
+  transport may name, the roots a profile and a kit may come from — because `SkLiveOpenArgs`
+  lets the request pick the profile and both transports, and the smoke test's
+  `disposable: true` lives in its private config and is never forwarded to the opener, so a
+  gate or allow-list carried in the request or in a client-chosen profile is the client's to
+  satisfy (the first draft of this remedy proposed exactly that; Codex, round 5); a pause
+  budget on the session whose expiry is the existing recovery path; natural mode as the default
+  arm; the facade's
   instruction-class guard shared with `sk_live_step`; `tracing` at `info` on every mutation in
   `skdispatch.rs`, `sklive.rs` and `skcontrol.rs`.
 - **Where it picks up:** `server.rs`'s `open_sk_live_control` handler; `skdispatch::Session::open`
