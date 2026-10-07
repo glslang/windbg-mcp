@@ -11,7 +11,7 @@
 - `cargo test`: run the unit tests, including parser and tool-schema coverage in `src/server.rs` and `src/ttd.rs`.
 - `cargo build --release`: build the Windows release binary at `target/release/windbg-mcp.exe`.
 
-For local iteration while an MCP client may have the release executable locked, prefer `cargo test` or debug builds. See `CLAUDE.md` before replacing a running release binary.
+For local iteration while an MCP client may have the release executable locked, prefer `cargo test` or debug builds. See `.claude/CLAUDE.md` before replacing a running release binary.
 
 ## Coding Style & Naming Conventions
 

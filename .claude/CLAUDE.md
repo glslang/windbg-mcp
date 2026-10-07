@@ -376,7 +376,7 @@ is a snapshot of the last *published* release and does **not** track working-tre
 `claude mcp list` does.** It has now been wrong twice by asserting one: it claimed a local build,
 then an HTTP service on a forwarded loopback port, and on the bench that wrote this sentence it is a
 **stdio** command. All three are ordinary. The plugin's own manifest
-([`.claude-plugin/plugin.json`](.claude-plugin/plugin.json)) declares **stdio**, running
+([`.claude-plugin/plugin.json`](../.claude-plugin/plugin.json)) declares **stdio**, running
 `${CLAUDE_PLUGIN_ROOT}/target/release/windbg-mcp.exe` — but the same binary serves HTTP under
 `--listen`, as a foreground listener or a service, reached directly or through a forward, and a host
 may register it that way instead of or beside the plugin. Read the registration, match it to the
