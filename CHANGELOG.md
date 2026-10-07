@@ -348,11 +348,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not read over KD — so every `pool_find_tag`, `pool_chunk` and `pool_census` walked the whole
   pool again: ~80s a question on `ctf-vm`, 136s on the 29671 lab guest, and the live pool tier's
   twenty-odd questions 2,665s. A walk cut short by its budget or by `stop_after_matches` is still
-  not kept, so the shape of the rule a caller sees is unchanged — `refresh: true` walks again, and
-  a result's `walk.coverage` says what the walk it came from reached — and the second question on
-  a halted target is now a lookup: the same tier 1,032s, a repeated `pool_chunk` 79.8s → 0s. The
-  tier's reuse assertion, gated until now on a `complete` walk and so never run against a live
-  kernel, now runs on any walk that was not cut short.
+  not kept; `refresh: true` still walks again, and a result's `walk.coverage` still says what the
+  walk it came from reached. **One caller-visible rule does change**: a `stop_after_matches`
+  supplied while the session holds a kept `partial` snapshot is answered from that snapshot, the
+  threshold is not applied, and `matches` is everything that walk reached — before this pin the
+  partial snapshot had been discarded, so the same call started a bounded walk. A caller that
+  needs the bound honoured passes `refresh: true` beside it. The second question on a halted
+  target is now a lookup: the same tier 1,032s, a repeated `pool_chunk` 79.8s → 0s. The tier's
+  reuse assertion, gated until now on a `complete` walk and so never run against a live kernel,
+  now runs on any walk that was not cut short.
 
 - **The IOCTL switch resolver matches what a compiler emits instead of refusing what it trips
   over** (`FOLLOWUPS.md` item 66, in `DONE.md`). `ioctl::follow_table` walked **backwards** from an
