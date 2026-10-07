@@ -95,7 +95,7 @@ line is simply open.
 - [Item 114](#114-dbgscope-a-big-pool-entry-in-no-region-the-walk-discovers) — [dbgscope] A big-pool entry in no region the walk discovers
 - [Item 115](#115-windbg-mcp-the-secure-kernel-kd-facade-shipped-unrecorded) — [windbg-mcp] The Secure Kernel KD facade shipped unrecorded
 - [Item 116](#116-windbg-mcp-the-kd-facade-answers-windbg-with-fabricated-state-it-cannot-tell-apart-from-guest-state) — [windbg-mcp] The KD facade answers WinDbg with fabricated state it cannot tell apart from guest state
-- [Item 117](#117-windbg-mcp-the-kd-facade-pipe-has-no-acl-no-client-authentication-and-no-break-in) — [windbg-mcp] The KD facade pipe has no ACL, no client authentication and no break-in
+- [Item 117](#117-windbg-mcp-the-kd-facade-pipe-has-only-the-default-acl-no-client-authentication-and-no-break-in) — [windbg-mcp] The KD facade pipe has only the default ACL, no client authentication and no break-in
 - [Item 118](#118-windbg-mcp-live-control-is-on-by-default-runs-client-supplied-programs-and-has-no-bound-on-a-paused-guest) — [windbg-mcp] Live control is on by default, runs client-supplied programs, and has no bound on a paused guest
 - [Item 119](#119-windbg-mcp-what-a-vtl1-debugger-still-cannot-do) — [windbg-mcp] What a VTL1 debugger still cannot do
 
@@ -2468,8 +2468,11 @@ that address at all**, which is a question about discovery rather than about dec
 0.22.0 or Unreleased, no page under `docs/secure-kernel/`, no row in `README.md`'s tool table, no
 line in `skills/windbg-debugging/secure-kernel.md` or `docs/sessions.md`, no `docs/smoke-test.md`
 section, and the WinDbg connection string (`-k com:pipe,port=\\.\pipe\<name>,resets=0`) exists only
-in a private runner. The only tracked mentions are the `SetInterrupt` exception notes in
-`AGENTS.md` and `DECISIONS.md`. `CHANGELOG.md`'s 0.21.0 entry still says "the native KD route into
+in a private runner. The source describes the role to a reader of the code — the four modules'
+own docs, the role dispatch in `main.rs`, `worker::run_sk_kd_target`, and `skdispatch.rs` where
+it names the facade — and outside `src/` the only tracked mentions are the `SetInterrupt`
+exception notes in `AGENTS.md` and `DECISIONS.md`; the first draft of this inventory claimed the
+whole tree (Codex, round 6). `CHANGELOG.md`'s 0.21.0 entry still says "the native KD route into
 SK is dead", which is true of Secure Kernel's own transport and now reads as if no KD route exists.
 The PR body names "WinDbg 10.0.26100"; the live log names kd 10.0.29617.1000 connected to a 26100
 *target*.
@@ -2560,7 +2563,7 @@ that several fields it keys on are invented permanently:
 - **Where it picks up:** `kdtarget.rs`'s `CompatibilityMemory` and `send_stop`; `kdapi.rs`'s
   `Version64::encode` and the `StateChange64` builder; the register bank in `skcontrol.rs`.
 
-## 117. [windbg-mcp] The KD facade pipe has no ACL, no client authentication and no break-in
+## 117. [windbg-mcp] The KD facade pipe has only the default ACL, no client authentication and no break-in
 
 **Repo:** `windbg-mcp`. **Origin:** the 2026-10-07 review (item 115's origin).
 
@@ -2832,7 +2835,7 @@ not do from a Mac was settle which of the three is wrong (2026-10-06).
 And items 115–119 from the 2026-10-07 review of the whole VTL1 surface — capture decode, live
 control, and the KD facade [#463](https://github.com/glslang/windbg-mcp/pull/463) had merged the
 day before — read against `main` with the private bench runs beside it: a facade that shipped with
-no tracked record of itself and six statements the code had moved past (115); the answers it
+no operator-facing record of itself and six statements the code had moved past (115); the answers it
 invents for WinDbg and cannot mark as invented (116); a pipe any local account can open, three
 inputs that end the session instead of being refused, and a break-in that only faults (117); the
 live-control tools being default-on, running client-supplied programs, and holding a guest paused
