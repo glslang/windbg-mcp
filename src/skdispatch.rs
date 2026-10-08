@@ -53,6 +53,28 @@ const CLEANUP_SETTLE: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(20);
 const EVENT_TYPE_VECTOR_1: u64 = 0x0100_0002;
 
+fn completion_wait_deadline(outer: Option<Instant>) -> Instant {
+    outer.unwrap_or_else(|| {
+        let now = Instant::now();
+        now.checked_add(Duration::from_millis(u64::from(DEBUG_WAIT)))
+            .unwrap_or(now)
+    })
+}
+
+fn require_completion_deadline(deadline: Option<Instant>) -> Result<()> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        bail!("the absolute Secure Kernel pause bound expired during dispatcher completion");
+    }
+    Ok(())
+}
+
+fn debug_wait_remaining(deadline: Instant, activity: Option<&WaitActivity>) -> Duration {
+    let deadline_remaining = deadline.saturating_duration_since(Instant::now());
+    activity
+        .map(|activity| activity.remaining_idle().min(deadline_remaining))
+        .unwrap_or(deadline_remaining)
+}
+
 /// One complete live-control session. Both halves remain on the worker engine thread; each method
 /// creates only a short-lived borrow tying the dispatcher state to that thread's engine.
 pub(crate) struct Session {
@@ -1790,7 +1812,7 @@ impl EventDispatcher for VmwpDispatcher<'_> {
         // Stop vmwp with the ordinary watchdog, remove the exact owned breakpoint, and detach
         // before asking Hyper-V to pause. Reattach only after that pause proves provider-write
         // quiescence; teardown still owns the registered callback and scratch allocation.
-        self.settle_native_completion()?;
+        self.settle_native_completion(None)?;
         self.pause_armed_without_event(targets)
     }
 
@@ -1958,7 +1980,25 @@ impl EventDispatcher for VmwpDispatcher<'_> {
         if retained != event {
             bail!("release does not name the event held by the dispatcher");
         }
-        self.complete_event(mode)
+        self.complete_event(mode, None)
+    }
+
+    fn release_event_until(
+        &mut self,
+        event: &HeldEvent,
+        mode: ReleaseMode,
+        deadline: Instant,
+    ) -> Result<()> {
+        let retained = self
+            .state
+            .retained_event
+            .as_ref()
+            .map(|retained| &retained.event)
+            .context("the dispatcher owns no event to release")?;
+        if retained != event {
+            bail!("release does not name the event held by the dispatcher");
+        }
+        self.complete_event(mode, Some(deadline))
     }
 
     fn recover(&mut self, safe_to_resume: bool, event: Option<&HeldEvent>) -> Result<()> {
@@ -2743,14 +2783,16 @@ impl VmwpDispatcher<'_> {
         Ok(())
     }
 
-    fn complete_event(&mut self, mode: ReleaseMode) -> Result<()> {
+    fn complete_event(&mut self, mode: ReleaseMode, deadline: Option<Instant>) -> Result<()> {
+        require_completion_deadline(deadline)?;
         let event = self
             .state
             .retained_event
             .as_ref()
             .map(|retained| retained.event.clone())
             .context("the dispatcher owns no retained event to complete")?;
-        self.complete_retained_event(&event)?;
+        self.complete_retained_event(&event, deadline)?;
+        require_completion_deadline(deadline)?;
 
         match mode {
             ReleaseMode::ArmNextStop => {
@@ -2759,7 +2801,7 @@ impl VmwpDispatcher<'_> {
                 self.state.phase = DispatcherPhase::ReadyForStop;
             }
             ReleaseMode::Resume => {
-                self.settle_native_completion()?;
+                self.settle_native_completion(deadline)?;
                 self.detach_handled()?;
                 self.state.finish_completion_kick()?;
                 if self.state.vm_paused {
@@ -2773,19 +2815,33 @@ impl VmwpDispatcher<'_> {
         Ok(())
     }
 
-    fn settle_native_completion(&self) -> Result<()> {
+    fn settle_native_completion(&self, deadline: Option<Instant>) -> Result<()> {
         // The native return proves success before vmwp has executed past the call. Let the existing
         // DbgEng watchdog interrupt that ordinary execution, then detach before joining the Hyper-V
         // helper whose pause request is blocked while the callback remains debugger-stopped.
+        let remaining = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        if remaining.is_some_and(|remaining| remaining.is_zero()) {
+            bail!("the absolute Secure Kernel pause bound expired during dispatcher completion");
+        }
+        let wait = remaining
+            .map(|remaining| remaining.min(Duration::from_millis(u64::from(NATIVE_SETTLE_WAIT))))
+            .unwrap_or_else(|| Duration::from_millis(u64::from(NATIVE_SETTLE_WAIT)));
+        let timeout = wait.as_millis().clamp(1, u128::from(u32::MAX)) as u32;
+        let outer_limited = remaining.is_some_and(|remaining| {
+            remaining <= Duration::from_millis(u64::from(NATIVE_SETTLE_WAIT))
+        });
         let run = self
             .engine
-            .execute_and_wait("g", NATIVE_SETTLE_WAIT)
+            .execute_and_wait("g", timeout)
             .map_err(debugger)?;
         if run.target_gone {
             bail!("vmwp left the debugger while settling native event completion");
         }
         match run.cut_short {
-            Some(Interruption::Deadline { .. }) => Ok(()),
+            Some(Interruption::Deadline { .. }) if !outer_limited => Ok(()),
+            Some(Interruption::Deadline { .. }) => {
+                bail!("the absolute Secure Kernel pause bound expired during dispatcher completion")
+            }
             Some(Interruption::OnRequest) => {
                 bail!("native event completion was interrupted on request")
             }
@@ -2793,12 +2849,16 @@ impl VmwpDispatcher<'_> {
         }
     }
 
-    fn complete_retained_event(&mut self, event: &HeldEvent) -> Result<()> {
+    fn complete_retained_event(
+        &mut self,
+        event: &HeldEvent,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
         let phase_event = self.state.phase.held_event();
         if phase_event != Some(event) || matches!(self.state.phase, DispatcherPhase::Holding(_)) {
             self.restore_retained_event(event)?;
         }
-        self.complete_event_to_native_return()?;
+        self.complete_event_to_native_return(deadline)?;
         if !matches!(&self.state.phase, DispatcherPhase::NativeReturn(held) if held == event) {
             bail!("dispatcher completion did not reach the named native return");
         }
@@ -2815,7 +2875,8 @@ impl VmwpDispatcher<'_> {
         Ok(())
     }
 
-    fn complete_event_to_native_return(&mut self) -> Result<()> {
+    fn complete_event_to_native_return(&mut self, deadline: Option<Instant>) -> Result<()> {
+        require_completion_deadline(deadline)?;
         let held = match &self.state.phase {
             DispatcherPhase::Holding(event) => event.clone(),
             DispatcherPhase::ReturningCallback(event)
@@ -2828,18 +2889,18 @@ impl VmwpDispatcher<'_> {
         };
 
         if matches!(self.state.phase, DispatcherPhase::Holding(_)) {
+            require_completion_deadline(deadline)?;
             let site = self.state.profile.callback_entry.clone();
             self.set_site_breakpoint(&site)?;
             self.state.phase = DispatcherPhase::ReturningCallback(held.clone());
         }
 
         if matches!(self.state.phase, DispatcherPhase::ReturningCallback(_)) {
+            require_completion_deadline(deadline)?;
             let site = self.state.profile.callback_entry.clone();
             let target = self.require_owned_site_breakpoint(&site)?;
             if self.engine.instruction_pointer().map_err(debugger)? != target {
-                self.run_to_current_breakpoint(
-                    Instant::now() + Duration::from_millis(u64::from(DEBUG_WAIT)),
-                )?;
+                self.run_to_current_breakpoint(completion_wait_deadline(deadline))?;
             }
             self.require_site(&site)?;
             let message = self.register("rcx")?;
@@ -2860,6 +2921,7 @@ impl VmwpDispatcher<'_> {
         }
 
         if matches!(self.state.phase, DispatcherPhase::CallbackEntry(_)) {
+            require_completion_deadline(deadline)?;
             let site = self.state.profile.handle_return.clone();
             self.set_site_breakpoint(&site)?;
             // From here recovery owns the installed handle-return breakpoint. Record that before
@@ -2868,6 +2930,7 @@ impl VmwpDispatcher<'_> {
         }
 
         if matches!(self.state.phase, DispatcherPhase::ReturningHandle(_)) {
+            require_completion_deadline(deadline)?;
             let entry = self.site_address(&self.state.profile.callback_entry)?;
             let site = self.state.profile.handle_return.clone();
             let target = self.require_owned_site_breakpoint(&site)?;
@@ -2876,9 +2939,7 @@ impl VmwpDispatcher<'_> {
                 self.write_register("rip", self.image(self.state.profile.callback_resume_rva.0)?)?;
             }
             if rip != target {
-                self.run_to_current_breakpoint(
-                    Instant::now() + Duration::from_millis(u64::from(DEBUG_WAIT)),
-                )?;
+                self.run_to_current_breakpoint(completion_wait_deadline(deadline))?;
             }
             self.require_site(&site)?;
             if self.register("rax")? != 1 {
@@ -2889,6 +2950,7 @@ impl VmwpDispatcher<'_> {
         }
 
         if matches!(self.state.phase, DispatcherPhase::HandleReturn(_)) {
+            require_completion_deadline(deadline)?;
             let site = self.state.profile.native_return.clone();
             self.set_site_breakpoint(&site)?;
             // The retained breakpoint is recoverable before even resolving the VM coordinate for
@@ -2897,6 +2959,7 @@ impl VmwpDispatcher<'_> {
         }
 
         if matches!(self.state.phase, DispatcherPhase::ReturningNative(_)) {
+            require_completion_deadline(deadline)?;
             let site = self.state.profile.native_return.clone();
             let target = self.require_owned_site_breakpoint(&site)?;
             if self.state.completion_kick.is_none() {
@@ -2906,9 +2969,7 @@ impl VmwpDispatcher<'_> {
                 ));
             }
             if self.engine.instruction_pointer().map_err(debugger)? != target {
-                self.run_to_current_breakpoint(
-                    Instant::now() + Duration::from_millis(u64::from(DEBUG_WAIT)),
-                )?;
+                self.run_to_current_breakpoint(completion_wait_deadline(deadline))?;
             }
             self.require_site(&site)?;
             if self.register("rax")? != 1 {
@@ -2917,6 +2978,7 @@ impl VmwpDispatcher<'_> {
             self.remove_owned_breakpoint()?;
             self.state.phase = DispatcherPhase::NativeReturn(held.clone());
         }
+        require_completion_deadline(deadline)?;
         Ok(())
     }
 
@@ -3150,19 +3212,14 @@ impl VmwpDispatcher<'_> {
             .context("no owned breakpoint is armed")?
             .address;
         loop {
-            let remaining = self
-                .state
-                .wait_activity
-                .as_ref()
-                .map(WaitActivity::remaining_idle)
-                .unwrap_or_else(|| deadline.saturating_duration_since(Instant::now()));
+            let remaining = debug_wait_remaining(deadline, self.state.wait_activity.as_ref());
             if remaining.is_zero() {
                 if matches!(self.state.phase, DispatcherPhase::ReadyForStop) {
                     self.state.phase = DispatcherPhase::ReadyForStopInterrupted;
                 }
                 bail!("the debugger did not reach the owned breakpoint before its deadline");
             }
-            let timeout = remaining.as_millis().min(u128::from(u32::MAX)) as u32;
+            let timeout = remaining.as_millis().clamp(1, u128::from(u32::MAX)) as u32;
             let run = self
                 .engine
                 .execute_and_wait("g", timeout)
@@ -3184,11 +3241,9 @@ impl VmwpDispatcher<'_> {
                         return Ok(());
                     }
                     Interruption::Deadline { .. }
-                        if self
-                            .state
-                            .wait_activity
-                            .as_ref()
-                            .is_some_and(|activity| !activity.remaining_idle().is_zero()) =>
+                        if self.state.wait_activity.as_ref().is_some_and(|activity| {
+                            !debug_wait_remaining(deadline, Some(activity)).is_zero()
+                        }) =>
                     {
                         continue;
                     }
@@ -3961,6 +4016,22 @@ mod tests {
         assert!(retained >= before);
         assert_eq!(deadline, retained + Duration::from_secs(10));
         assert_eq!(activity.mark_stop_retained(), Some(deadline));
+    }
+
+    #[test]
+    fn dispatcher_completion_reuses_the_absolute_pause_deadline() {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        assert_eq!(completion_wait_deadline(Some(deadline)), deadline);
+        assert!(require_completion_deadline(Some(deadline)).is_ok());
+
+        let activity = WaitActivity::new(Duration::from_secs(60));
+        assert!(debug_wait_remaining(Instant::now(), Some(&activity)).is_zero());
+        assert!(
+            require_completion_deadline(Some(Instant::now()))
+                .unwrap_err()
+                .to_string()
+                .contains("absolute Secure Kernel pause bound")
+        );
     }
 
     #[test]

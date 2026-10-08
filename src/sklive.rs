@@ -224,6 +224,14 @@ pub(crate) trait EventDispatcher {
         self.bind_stop_cr3(cr3)
     }
     fn release_event(&mut self, event: &HeldEvent, mode: ReleaseMode) -> Result<()>;
+    fn release_event_until(
+        &mut self,
+        event: &HeldEvent,
+        mode: ReleaseMode,
+        _deadline: Instant,
+    ) -> Result<()> {
+        self.release_event(event, mode)
+    }
     fn recover(&mut self, safe_to_resume: bool, event: Option<&HeldEvent>) -> Result<()>;
     fn teardown(&mut self) -> Result<()>;
 }
@@ -1484,7 +1492,14 @@ impl<P: ControlProvider> LiveControl<P> {
             self.write_one(active, RegisterName::Rflags, rflags, (rflags | TF) & !RF)?;
             self.providers[active].provider.release()?;
             self.providers[active].provider_phase = ProviderPhase::Running;
-            dispatcher.release_event(&dispatcher_event, ReleaseMode::ArmNextStop)?;
+            match deadline {
+                Some(deadline) => dispatcher.release_event_until(
+                    &dispatcher_event,
+                    ReleaseMode::ArmNextStop,
+                    deadline,
+                )?,
+                None => dispatcher.release_event(&dispatcher_event, ReleaseMode::ArmNextStop)?,
+            }
             Ok(())
         })();
         self.providers[active].provider.set_outer_deadline(None);
@@ -1634,7 +1649,14 @@ impl<P: ControlProvider> LiveControl<P> {
             )?;
             self.providers[active].provider.release()?;
             self.providers[active].provider_phase = ProviderPhase::Running;
-            dispatcher.release_event(&dispatcher_event, ReleaseMode::ArmNextStop)?;
+            match deadline {
+                Some(deadline) => dispatcher.release_event_until(
+                    &dispatcher_event,
+                    ReleaseMode::ArmNextStop,
+                    deadline,
+                )?,
+                None => dispatcher.release_event(&dispatcher_event, ReleaseMode::ArmNextStop)?,
+            }
             Ok(())
         })();
         self.providers[active].provider.set_outer_deadline(None);
@@ -2528,6 +2550,7 @@ mod tests {
         fail_recover: Option<&'static str>,
         fail_teardown: Option<&'static str>,
         fail_verify: Option<&'static str>,
+        release_deadlines: Vec<Option<Instant>>,
     }
 
     impl FakeDispatcher {
@@ -2548,6 +2571,7 @@ mod tests {
                 fail_recover: None,
                 fail_teardown: None,
                 fail_verify: None,
+                release_deadlines: Vec::new(),
             }
         }
     }
@@ -2626,6 +2650,24 @@ mod tests {
         }
 
         fn release_event(&mut self, _event: &HeldEvent, mode: ReleaseMode) -> Result<()> {
+            self.release_deadlines.push(None);
+            self.actions.push(Action::Release(mode));
+            if self.fail_release {
+                bail!("scripted native completion failure");
+            }
+            if mode == ReleaseMode::Resume {
+                self.provider_writes_quiesced = false;
+            }
+            Ok(())
+        }
+
+        fn release_event_until(
+            &mut self,
+            _event: &HeldEvent,
+            mode: ReleaseMode,
+            deadline: Instant,
+        ) -> Result<()> {
+            self.release_deadlines.push(Some(deadline));
             self.actions.push(Action::Release(mode));
             if self.fail_release {
                 bail!("scripted native completion failure");
@@ -2750,6 +2792,7 @@ mod tests {
             [Some(step_deadline)]
         );
         assert_eq!(provider.outer_deadline, None);
+        assert_eq!(dispatcher.release_deadlines, [Some(step_deadline)]);
 
         let stepped = control.wait_for_stop(&mut dispatcher).unwrap();
         let continue_writes = control.test_provider().write_deadlines.len();
@@ -2778,6 +2821,10 @@ mod tests {
         );
         assert_eq!(provider.outer_deadline, None);
         assert_eq!(provider.deadline_updates.last(), Some(&None));
+        assert_eq!(
+            dispatcher.release_deadlines,
+            [Some(step_deadline), Some(continue_deadline)]
+        );
     }
 
     #[test]
