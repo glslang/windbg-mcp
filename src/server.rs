@@ -4228,7 +4228,7 @@ impl WindbgServer {
         annotations(
             title = "Open Secure Kernel KD",
             read_only_hint = false,
-            destructive_hint = false,
+            destructive_hint = true,
             idempotent_hint = false,
             open_world_hint = true
         ),
@@ -7860,6 +7860,7 @@ mod tests {
             "end_session",
             "go",
             "debug_batch",
+            "open_sk_kd",
         ] {
             assert_eq!(
                 ann(name).read_only_hint,
