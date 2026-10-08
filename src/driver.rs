@@ -296,6 +296,7 @@ pub(crate) fn in_listing_order(
                 // Nothing decoded, so nothing is claimed — the same "not asked" the flow says,
                 // and the same answer every field the decoder fills gives here.
                 privileged: false,
+                privilege: None,
                 effect: Effect::Other,
                 condition: None,
                 writes_flags: false,
@@ -1700,6 +1701,7 @@ mod tests {
             flow,
             // The walk asks nothing about privilege; `crate::hazards` is where that is read.
             privileged: false,
+            privilege: None,
             // Nor about what the instruction does to its operands: it reads the flow and the text.
             effect: Effect::Other,
             condition: None,

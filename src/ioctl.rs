@@ -5022,6 +5022,7 @@ mod tests {
             operands,
             flow,
             privileged: false,
+            privilege: None,
             effect,
             condition,
             writes,

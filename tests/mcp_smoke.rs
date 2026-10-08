@@ -11655,9 +11655,14 @@ fn a_hazard_scan_of_an_arm64_image_answers_with_a64_instructions() {
         .iter()
         .filter_map(|row| row["mnemonic"].as_str())
         .collect();
-    // **The A64 families fire on real code**, rather than everything landing in `other`.
+    // **The A64 families fire on real code**, rather than everything landing in `other`. Any of
+    // the three the decoder reads off a system-register or system-operation encoding will do,
+    // since which ones reach the listed sample depends on where its cap falls.
     assert!(
-        kinds.contains(&"interrupt_flag") || kinds.contains(&"machine_state"),
+        kinds.iter().any(|kind| matches!(
+            *kind,
+            "interrupt_flag" | "control_register" | "cache_or_tlb"
+        )),
         "the A64 families are read off real instructions: {kinds:?}"
     );
     assert!(
