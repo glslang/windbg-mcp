@@ -95,12 +95,11 @@ impl Policy {
 
         let profile = canonical_profile(profile)?;
         let normalized_profile = normalized_path(&profile);
-        if !self.profile_roots.iter().any(|root| {
-            normalized_profile == *root
-                || normalized_profile
-                    .strip_prefix(root)
-                    .is_some_and(|rest| rest.starts_with('\\') || rest.starts_with('/'))
-        }) {
+        if !self
+            .profile_roots
+            .iter()
+            .any(|root| Path::new(&normalized_profile).starts_with(Path::new(root)))
+        {
             bail!(
                 "Secure Kernel profile {} is outside every startup-policy profile root",
                 profile.display()
@@ -304,6 +303,45 @@ mod tests {
             )
             .unwrap();
         assert!(authorized.profile.is_dir());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn policy_authorizes_a_profile_beneath_a_volume_root() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "windbg-mcp-policy-volume-root-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let profile = directory.join("build.json");
+        std::fs::write(&profile, b"{}").unwrap();
+        let canonical_directory = directory.canonicalize().unwrap();
+        let volume_root = canonical_directory
+            .ancestors()
+            .last()
+            .expect("an absolute Windows path has a volume root");
+        let executable = std::env::current_exe().unwrap();
+        let command = format!("\"{}\" --fixture", executable.display());
+        let allowed = normalize_transport("fixture", &command).unwrap();
+        let policy = Policy {
+            disposable_vm_ids: BTreeSet::from(["51749a1f-f939-44f5-b251-1251ef5b64a3".to_string()]),
+            transport_commands: BTreeSet::from([allowed]),
+            profile_roots: vec![normalized_path(volume_root)],
+        };
+
+        let authorized = policy
+            .authorize(
+                "51749A1F-F939-44F5-B251-1251EF5B64A3",
+                &profile,
+                &command,
+                &command,
+            )
+            .unwrap();
+        assert!(authorized.profile.is_file());
         std::fs::remove_dir_all(directory).unwrap();
     }
 }
