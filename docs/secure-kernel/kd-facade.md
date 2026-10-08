@@ -103,8 +103,11 @@ enters a bounded reconnect window. `end_session` cancels a connect or active wai
 ordinary proved controller teardown. Expiry of the connect, idle or absolute-pause bound also runs
 that teardown immediately; `released` means it completed. The worker is preserved only if it
 cannot prove restoration and release. The absolute pause bound defaults to 600 seconds, independent
-of KD traffic and covers response writes as well as reads, so a peer that stops consuming output
-cannot retain the stop. Connect and idle bounds default to 30 and 300 seconds.
+of KD traffic, and includes response I/O plus controller restoration and native-event release. Each
+stop reserves the smaller of 30 seconds or half of that bound for deadline-aware cleanup; the KD
+service stops accepting work at the start of that reserve. A peer that stops consuming output
+therefore cannot consume the time needed to restore and release the stop. Connect and idle bounds
+default to 30 and 300 seconds.
 
 ## Standalone compatibility role
 

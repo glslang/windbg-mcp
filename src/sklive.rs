@@ -200,6 +200,13 @@ pub(crate) trait EventDispatcher {
     fn provider_writes_quiesced(&self) -> bool;
     /// Finish any pending transition and prove provider-write quiescence for fault recovery.
     fn establish_recovery_pause(&mut self, targets: &[TargetIdentity]) -> Result<()>;
+    fn establish_recovery_pause_until(
+        &mut self,
+        targets: &[TargetIdentity],
+        _deadline: Instant,
+    ) -> Result<()> {
+        self.establish_recovery_pause(targets)
+    }
     /// Re-read a proposed current instruction while the owned event remains held.
     fn verify_instruction(&mut self, instruction: &InstructionGuard) -> Result<()>;
     fn verify_instruction_until(
@@ -211,6 +218,9 @@ pub(crate) trait EventDispatcher {
     }
     fn retained_pause_deadline(&self) -> Option<Instant> {
         None
+    }
+    fn retained_recovery_deadline(&self) -> Option<Instant> {
+        self.retained_pause_deadline()
     }
     /// Return an owned event only after every provider whose registers may be accessed is quiesced.
     fn wait_for_stop(
@@ -233,6 +243,14 @@ pub(crate) trait EventDispatcher {
         self.release_event(event, mode)
     }
     fn recover(&mut self, safe_to_resume: bool, event: Option<&HeldEvent>) -> Result<()>;
+    fn recover_until(
+        &mut self,
+        safe_to_resume: bool,
+        event: Option<&HeldEvent>,
+        _deadline: Instant,
+    ) -> Result<()> {
+        self.recover(safe_to_resume, event)
+    }
     fn teardown(&mut self) -> Result<()>;
 }
 
@@ -1460,6 +1478,7 @@ impl<P: ControlProvider> LiveControl<P> {
         let active = self
             .active_provider
             .context("the stopped session has no active VP provider")?;
+        let recovery_deadline = dispatcher.retained_recovery_deadline().or(deadline);
         self.providers[active].provider.set_outer_deadline(deadline);
         self.state = State::Releasing;
         let result = (|| {
@@ -1504,7 +1523,12 @@ impl<P: ControlProvider> LiveControl<P> {
         })();
         self.providers[active].provider.set_outer_deadline(None);
         if let Err(error) = result {
-            return Err(self.enter_fault(dispatcher, error, Some(dispatcher_event)));
+            return Err(self.enter_fault_inner(
+                dispatcher,
+                error,
+                Some(dispatcher_event),
+                recovery_deadline,
+            ));
         }
         self.dispatcher_event = None;
         self.expected_stop = Some(ExpectedStop::SingleStep {
@@ -1522,6 +1546,24 @@ impl<P: ControlProvider> LiveControl<P> {
         dispatcher: &mut impl EventDispatcher,
         epoch: &StopEpoch,
     ) -> Result<StopEpoch> {
+        self.continue_from_inner(dispatcher, epoch, None)
+    }
+
+    pub(crate) fn continue_from_until(
+        &mut self,
+        dispatcher: &mut impl EventDispatcher,
+        epoch: &StopEpoch,
+        deadline: Instant,
+    ) -> Result<StopEpoch> {
+        self.continue_from_inner(dispatcher, epoch, Some(deadline))
+    }
+
+    fn continue_from_inner(
+        &mut self,
+        dispatcher: &mut impl EventDispatcher,
+        epoch: &StopEpoch,
+        deadline: Option<Instant>,
+    ) -> Result<StopEpoch> {
         self.require_stop_epoch(epoch)?;
         let next_epoch = self.next_epoch("running")?;
         let dispatcher_event = self
@@ -1531,17 +1573,34 @@ impl<P: ControlProvider> LiveControl<P> {
         let active = self
             .active_provider
             .context("the stopped session has no active VP provider")?;
+        let recovery_deadline = dispatcher.retained_recovery_deadline().or(deadline);
+        self.providers[active].provider.set_outer_deadline(deadline);
         self.state = State::Releasing;
         let result = (|| {
             self.restore_owned_state(active)?;
             self.providers[active].provider.release()?;
             self.providers[active].provider_phase = ProviderPhase::Running;
-            dispatcher.release_event(&dispatcher_event, ReleaseMode::Resume)?;
+            match deadline {
+                Some(deadline) => dispatcher.release_event_until(
+                    &dispatcher_event,
+                    ReleaseMode::Resume,
+                    deadline,
+                )?,
+                None => dispatcher.release_event(&dispatcher_event, ReleaseMode::Resume)?,
+            }
             Ok(())
         })();
         if let Err(error) = result {
-            return Err(self.enter_fault(dispatcher, error, Some(dispatcher_event)));
+            let error = self.enter_fault_inner(
+                dispatcher,
+                error,
+                Some(dispatcher_event),
+                recovery_deadline,
+            );
+            self.providers[active].provider.set_outer_deadline(None);
+            return Err(error);
         }
+        self.providers[active].provider.set_outer_deadline(None);
         self.providers[active].baseline = None;
         self.providers[active].observed_cr3 = None;
         self.active_provider = None;
@@ -1607,6 +1666,7 @@ impl<P: ControlProvider> LiveControl<P> {
         let active = self
             .active_provider
             .context("the stopped session has no active VP provider")?;
+        let recovery_deadline = dispatcher.retained_recovery_deadline().or(deadline);
         self.providers[active].provider.set_outer_deadline(deadline);
         self.state = State::Releasing;
         let result = (|| {
@@ -1661,7 +1721,12 @@ impl<P: ControlProvider> LiveControl<P> {
         })();
         self.providers[active].provider.set_outer_deadline(None);
         if let Err(error) = result {
-            return Err(self.enter_fault(dispatcher, error, Some(dispatcher_event)));
+            return Err(self.enter_fault_inner(
+                dispatcher,
+                error,
+                Some(dispatcher_event),
+                recovery_deadline,
+            ));
         }
         self.active_provider = None;
         self.breakpoints = breakpoints;
@@ -1674,6 +1739,22 @@ impl<P: ControlProvider> LiveControl<P> {
 
     /// Restore or release anything this session still owns, then remove the handler and detach.
     pub(crate) fn close(&mut self, dispatcher: &mut impl EventDispatcher) -> Result<()> {
+        self.close_inner(dispatcher, None)
+    }
+
+    pub(crate) fn close_until(
+        &mut self,
+        dispatcher: &mut impl EventDispatcher,
+        deadline: Instant,
+    ) -> Result<()> {
+        self.close_inner(dispatcher, Some(deadline))
+    }
+
+    fn close_inner(
+        &mut self,
+        dispatcher: &mut impl EventDispatcher,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
         match self.state.clone() {
             State::Closed => return Ok(()),
             State::Faulted => {
@@ -1691,9 +1772,14 @@ impl<P: ControlProvider> LiveControl<P> {
                 self.state = State::Closed;
                 return Ok(());
             }
-            State::Stopped(stop) => {
-                self.continue_from(dispatcher, &stop.epoch)?;
-            }
+            State::Stopped(stop) => match deadline {
+                Some(deadline) => {
+                    self.continue_from_until(dispatcher, &stop.epoch, deadline)?;
+                }
+                None => {
+                    self.continue_from(dispatcher, &stop.epoch)?;
+                }
+            },
             State::Running
                 if self
                     .providers
@@ -2106,7 +2192,21 @@ impl<P: ControlProvider> LiveControl<P> {
         cause: anyhow::Error,
         event: Option<HeldEvent>,
     ) -> anyhow::Error {
+        let deadline = dispatcher.retained_recovery_deadline();
+        self.enter_fault_inner(dispatcher, cause, event, deadline)
+    }
+
+    fn enter_fault_inner(
+        &mut self,
+        dispatcher: &mut impl EventDispatcher,
+        cause: anyhow::Error,
+        event: Option<HeldEvent>,
+        deadline: Option<Instant>,
+    ) -> anyhow::Error {
         let mut recovery_errors = Vec::new();
+        for provider in &mut self.providers {
+            provider.provider.set_outer_deadline(deadline);
+        }
         let owns_provider_state = self
             .providers
             .iter()
@@ -2119,7 +2219,13 @@ impl<P: ControlProvider> LiveControl<P> {
                 .filter(|provider| provider.baseline.is_some())
                 .map(|provider| provider.target.clone())
                 .collect::<Vec<_>>();
-            if let Err(error) = dispatcher.establish_recovery_pause(&recovery_targets) {
+            let recovery_pause = match deadline {
+                Some(deadline) => {
+                    dispatcher.establish_recovery_pause_until(&recovery_targets, deadline)
+                }
+                None => dispatcher.establish_recovery_pause(&recovery_targets),
+            };
+            if let Err(error) = recovery_pause {
                 recovery_errors.push(format!(
                     "establish provider-write quiescence for VTL1 recovery: {error:#}"
                 ));
@@ -2195,14 +2301,23 @@ impl<P: ControlProvider> LiveControl<P> {
             })
         });
         let dispatcher_safe = safe_to_resume && (event.is_none() || owned_event.is_some());
-        let dispatcher_recovered = if let Err(error) =
-            dispatcher.recover(dispatcher_safe, owned_event.filter(|_| dispatcher_safe))
-        {
+        let dispatcher_recovery = match deadline {
+            Some(deadline) => dispatcher.recover_until(
+                dispatcher_safe,
+                owned_event.filter(|_| dispatcher_safe),
+                deadline,
+            ),
+            None => dispatcher.recover(dispatcher_safe, owned_event.filter(|_| dispatcher_safe)),
+        };
+        let dispatcher_recovered = if let Err(error) = dispatcher_recovery {
             recovery_errors.push(format!("dispatcher recovery: {error:#}"));
             false
         } else {
             true
         };
+        for provider in &mut self.providers {
+            provider.provider.set_outer_deadline(None);
+        }
         let fault = FaultRecord {
             cause: format!("{cause:#}"),
             recovery_errors,
@@ -2551,6 +2666,8 @@ mod tests {
         fail_teardown: Option<&'static str>,
         fail_verify: Option<&'static str>,
         release_deadlines: Vec<Option<Instant>>,
+        retained_recovery_deadline: Option<Instant>,
+        recovery_deadlines: Vec<Option<Instant>>,
     }
 
     impl FakeDispatcher {
@@ -2572,6 +2689,8 @@ mod tests {
                 fail_teardown: None,
                 fail_verify: None,
                 release_deadlines: Vec::new(),
+                retained_recovery_deadline: None,
+                recovery_deadlines: Vec::new(),
             }
         }
     }
@@ -2627,6 +2746,10 @@ mod tests {
             Ok(())
         }
 
+        fn retained_recovery_deadline(&self) -> Option<Instant> {
+            self.retained_recovery_deadline
+        }
+
         fn wait_for_stop(
             &mut self,
             targets: &[TargetIdentity],
@@ -2679,19 +2802,36 @@ mod tests {
         }
 
         fn recover(&mut self, safe_to_resume: bool, event: Option<&HeldEvent>) -> Result<()> {
-            self.actions.push(Action::Recover {
-                safe: safe_to_resume,
-                owned_event: event.is_some(),
-            });
-            if let Some(reason) = self.fail_recover {
-                bail!("{reason}");
-            }
-            Ok(())
+            self.recovery_deadlines.push(None);
+            self.recover_inner(safe_to_resume, event)
+        }
+
+        fn recover_until(
+            &mut self,
+            safe_to_resume: bool,
+            event: Option<&HeldEvent>,
+            deadline: Instant,
+        ) -> Result<()> {
+            self.recovery_deadlines.push(Some(deadline));
+            self.recover_inner(safe_to_resume, event)
         }
 
         fn teardown(&mut self) -> Result<()> {
             self.actions.push(Action::Teardown);
             if let Some(reason) = self.fail_teardown {
+                bail!("{reason}");
+            }
+            Ok(())
+        }
+    }
+
+    impl FakeDispatcher {
+        fn recover_inner(&mut self, safe_to_resume: bool, event: Option<&HeldEvent>) -> Result<()> {
+            self.actions.push(Action::Recover {
+                safe: safe_to_resume,
+                owned_event: event.is_some(),
+            });
+            if let Some(reason) = self.fail_recover {
                 bail!("{reason}");
             }
             Ok(())
@@ -3579,7 +3719,7 @@ mod tests {
     }
 
     #[test]
-    fn native_completion_failure_is_terminal_after_bounded_restoration() {
+    fn native_completion_failure_uses_the_reserved_recovery_deadline() {
         let mut dispatcher =
             FakeDispatcher::new([observed(StopReason::HardwareBreakpoint { slot: 0 })]);
         dispatcher.fail_release = true;
@@ -3588,13 +3728,24 @@ mod tests {
             .arm(&mut dispatcher, breakpoints(), ArmMode::Redirect)
             .unwrap();
         let stopped = control.wait_for_stop(&mut dispatcher).unwrap();
+        let service_deadline = Instant::now() + std::time::Duration::from_secs(1);
+        let recovery_deadline = Instant::now() + std::time::Duration::from_secs(2);
+        dispatcher.retained_recovery_deadline = Some(recovery_deadline);
         let error = control
-            .continue_from(&mut dispatcher, &stopped.epoch)
+            .continue_from_until(&mut dispatcher, &stopped.epoch, service_deadline)
             .unwrap_err();
 
         assert!(error.to_string().contains("native completion failure"));
         assert_eq!(control.phase(), LivePhase::Faulted);
         assert!(!control.fault().unwrap().target_left_paused);
+        assert_eq!(dispatcher.release_deadlines, [Some(service_deadline)]);
+        assert_eq!(dispatcher.recovery_deadlines, [Some(recovery_deadline)]);
+        assert!(
+            control
+                .test_provider()
+                .deadline_updates
+                .contains(&Some(recovery_deadline))
+        );
         assert_eq!(
             dispatcher.actions.last(),
             Some(&Action::Recover {
@@ -3622,6 +3773,33 @@ mod tests {
             control.test_provider().registers,
             register_values(BASE_RIP, 0xffff_0ff0, 0x400, 0x46)
         );
+    }
+
+    #[test]
+    fn bounded_close_keeps_one_deadline_through_restoration_and_event_release() {
+        let mut dispatcher =
+            FakeDispatcher::new([observed(StopReason::HardwareBreakpoint { slot: 0 })]);
+        let mut control = LiveControl::open(FakeProvider::new()).unwrap();
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Redirect)
+            .unwrap();
+        control.wait_for_stop(&mut dispatcher).unwrap();
+        let writes = control.test_provider().write_deadlines.len();
+        let releases = control.test_provider().release_deadlines.len();
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+
+        control.close_until(&mut dispatcher, deadline).unwrap();
+
+        let provider = control.test_provider();
+        assert!(
+            provider.write_deadlines[writes..]
+                .iter()
+                .all(|observed| *observed == Some(deadline))
+        );
+        assert_eq!(provider.release_deadlines[releases..], [Some(deadline)]);
+        assert_eq!(provider.outer_deadline, None);
+        assert_eq!(dispatcher.release_deadlines, [Some(deadline)]);
+        assert_eq!(control.phase(), LivePhase::Closed);
     }
 
     #[test]
