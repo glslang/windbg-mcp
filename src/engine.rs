@@ -1906,7 +1906,7 @@ impl Sessions {
         profile: &std::path::Path,
         control_transport: &str,
         live_transport: &str,
-    ) -> Result<(), String> {
+    ) -> Result<crate::skpolicy::AuthorizedLive, String> {
         match self.secure_kernel_policy.as_ref() {
             Ok(Some(policy)) => policy
                 .authorize(vm_id, profile, control_transport, live_transport)
