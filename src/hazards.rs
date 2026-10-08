@@ -34,7 +34,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use dbgscope::dbgeng::{Effect, Flow, Instruction, InstructionSet, Operand};
+use dbgscope::dbgeng::{Effect, Flow, Instruction, InstructionSet, Operand, Privilege};
 
 use crate::codewalk;
 // Re-exported rather than aliased at every use: this module's public result still carries
@@ -176,165 +176,57 @@ fn sink_kind(name: &str) -> Option<SinkKind> {
         .map(|(_, kind)| *kind)
 }
 
-/// What a privileged instruction does, which is what a reader wants rather than its mnemonic.
+/// The family's name on the wire and in the rendering.
 ///
-/// **A family, not the membership test.** Whether an instruction belongs in the report at all is
-/// the decoder's answer; this only says which family it lands in. [`Self::Other`] is what makes
-/// that split safe: an instruction no family names is reported under its own mnemonic rather than
-/// dropped, which is the failure a hand-written list has by construction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum PrivilegeKind {
-    /// Reads or writes a model-specific register.
-    ModelSpecificRegister,
-    /// Reads or writes an I/O port.
-    PortIo,
-    /// Reads or writes a control or debug register.
-    ControlRegister,
-    /// Touches a descriptor table — the GDT, IDT, LDT or task register.
-    DescriptorTable,
-    /// Halts, invalidates caches, or otherwise reaches into the machine's state.
-    MachineState,
-    /// Sets or clears the interrupt flag.
-    InterruptFlag,
-    /// A hardware-virtualisation operation — the VMX and SVM families.
-    Virtualization,
-    /// Privileged, and in none of the families above. The mnemonic beside it is the answer.
-    Other,
-}
-
-impl PrivilegeKind {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::ModelSpecificRegister => "model_specific_register",
-            Self::PortIo => "port_io",
-            Self::ControlRegister => "control_register",
-            Self::DescriptorTable => "descriptor_table",
-            Self::MachineState => "machine_state",
-            Self::InterruptFlag => "interrupt_flag",
-            Self::Virtualization => "virtualization",
-            Self::Other => "other",
-        }
+/// **An exhaustive match over dbgscope's own families**, so a family it adds fails this build
+/// rather than reaching a client unnamed. The names are this server's rather than the type's, which
+/// is why they are spelled here and not derived from it: a rename in the library is not a change to
+/// what a client was told to expect.
+pub fn privilege_name(kind: Privilege) -> &'static str {
+    match kind {
+        Privilege::PortIo => "port_io",
+        Privilege::ModelSpecificRegister => "model_specific_register",
+        Privilege::ControlRegister => "control_register",
+        Privilege::DescriptorTable => "descriptor_table",
+        Privilege::InterruptFlag => "interrupt_flag",
+        Privilege::CacheOrTlb => "cache_or_tlb",
+        Privilege::Virtualization => "virtualization",
+        Privilege::Other => "other",
     }
 }
 
-/// The instruction's privilege: **the decoder's answer**, with the family read off its mnemonic
-/// and operands.
+/// Whether an instruction is reported, and under which family: **the decoder's answer**, plus one
+/// judgement of this module's own.
 ///
-/// Membership used to be the table below, and a table is wrong by construction — a driver holding
-/// `cli`, `clts`, `lmsw` or a VMX operation was reported as containing no privileged instructions,
-/// which is the one answer this must never arrive at through omission. `dbgscope` now carries
-/// `privileged` beside the flow, generated from the instruction set rather than remembered, so
-/// nothing here decides *whether*.
+/// Both halves of the decoder's answer used to be tables here, and a table is wrong by
+/// construction. Membership went first ([dbgscope#151]): a driver holding `cli`, `clts`, `lmsw` or
+/// a VMX operation was reported as holding no privileged instruction, which is the one answer this
+/// must never reach through omission. The family went with [dbgscope#153], for the same reason one
+/// level down -- a privileged instruction the table did not name lost its family -- and for one of
+/// its own: a family table is one architecture's vocabulary, and the namespaces collide. x86's `str`
+/// stores the task register, and A64's stores a register to memory; read in one namespace, a scan
+/// of an ARM64 `nt` called **every store** a descriptor-table access, 59,450 privileged
+/// instructions in all. [`Instruction::privilege`] is answered from the encoding on each
+/// architecture, so neither question is asked here any more.
 ///
-/// What the table still decides is *which family*, and it carries a few instructions the decoder
-/// calls **unprivileged** on purpose: `sgdt`, `sidt`, `sldt` and `str` read the descriptor tables
-/// from user mode, and a driver doing that is worth seeing. So the answer is the union of the two,
-/// and a mnemonic missing from the table now costs a family name — [`PrivilegeKind::Other`] —
-/// rather than a finding.
+/// **What is left is a judgement, and it is x86's alone.** `sgdt`, `sidt`, `sldt` and `str` read the
+/// descriptor tables, need no privilege -- the decoder says so, correctly, and gives them no family
+/// -- and are reported anyway, because a driver reading the GDT from wherever it runs is worth
+/// seeing. That is a choice about what a hazard report shows, which is why it lives here rather
+/// than in the decoder. It is asked of x86 and x64 only, which is the collision above: on A64 the
+/// same spelling is a store.
 ///
-/// `mov cr3, rax` and `mov rax, rbx` share a mnemonic, so the control-register case is decided by
-/// an operand being a control or debug register — which is a field here, not a substring of a
-/// printed line.
-fn privilege_kind(instruction: &Instruction, set: InstructionSet) -> Option<PrivilegeKind> {
-    let control_register = || {
-        instruction.operands.iter().any(|operand| match operand {
-            Operand::Register(register) => {
-                let name = register.name.as_str();
-                (name.starts_with("cr") || name.starts_with("dr"))
-                    && name[2..].chars().all(|c| c.is_ascii_digit())
-                    && name.len() > 2
-            }
-            _ => false,
-        })
-    };
-    // `DAIF`, by each of the three ways it is written: the two processor-state fields, and the
-    // system register itself -- `s3_3_c4_c2_1`, which is `op0` 3, `op1` 3, `CRn` 4, `CRm` 2,
-    // `op2` 1. The neighbouring `..._0` is `NZCV` and is EL0's own, so the last field is the whole
-    // distinction and matching it loosely would call every flag restore an interrupt mask.
-    let interrupt_mask = || {
-        instruction.operands.iter().any(|operand| match operand {
-            Operand::Other(name) => {
-                matches!(name.as_str(), "daifset" | "daifclr" | "s3_3_c4_c2_1")
-            }
-            _ => false,
-        })
-    };
-    // **A family table is one architecture's vocabulary, and the namespaces collide.** x86's
-    // `str` stores the task register and belongs to the descriptor tables; A64's `str` stores a
-    // register and is among the commonest instructions in any image. Matched on the name alone, a
-    // scan of an ARM64 `nt` reported **every store** as a descriptor-table access: 897 in the
-    // listed sample and 59,450 privileged instructions in all, which is a disassembly rather than
-    // a hazard report.
-    //
-    // Found by the debugger tier against a real ARM64 image, and nothing built from x86 fixtures
-    // could have shown it -- the two namespaces are *mostly* disjoint, which is the worst way for
-    // them to be, since it is one collision rather than a wholesale mismatch that would have been
-    // obvious. So the table is now chosen by the target rather than searched across all of them.
-    //
-    // An architecture with no table here keeps `Other` for anything the decoder calls privileged,
-    // which is what makes the split safe: it loses family names and loses no findings.
-    let family = match set {
-        InstructionSet::Arm64 => arm64_family(instruction, interrupt_mask),
-        InstructionSet::X86 | InstructionSet::Amd64 => x86_family(instruction, control_register),
-        InstructionSet::Other(_) => None,
-    };
-    match (family, instruction.privileged) {
-        (Some(kind), _) => Some(kind),
-        (None, true) => Some(PrivilegeKind::Other),
-        (None, false) => None,
-    }
-}
-
-/// The x86 and x64 families, by mnemonic and -- where a mnemonic does not settle it -- by operand.
-fn x86_family(
-    instruction: &Instruction,
-    control_register: impl Fn() -> bool,
-) -> Option<PrivilegeKind> {
-    match instruction.mnemonic.as_str() {
-        "rdmsr" | "wrmsr" => Some(PrivilegeKind::ModelSpecificRegister),
-        "in" | "out" | "insb" | "insw" | "insd" | "outsb" | "outsw" | "outsd" => {
-            Some(PrivilegeKind::PortIo)
-        }
-        "mov" if control_register() => Some(PrivilegeKind::ControlRegister),
-        // Both write CR0 without naming it in an operand.
-        "clts" | "lmsw" => Some(PrivilegeKind::ControlRegister),
-        "lgdt" | "lidt" | "lldt" | "ltr" | "sgdt" | "sidt" | "sldt" | "str" => {
-            Some(PrivilegeKind::DescriptorTable)
-        }
-        "hlt" | "invd" | "wbinvd" | "invlpg" | "invpcid" | "swapgs" | "xsetbv" | "rdpmc" => {
-            Some(PrivilegeKind::MachineState)
-        }
-        "cli" | "sti" => Some(PrivilegeKind::InterruptFlag),
-        "vmlaunch" | "vmresume" | "vmxon" | "vmxoff" | "vmread" | "vmwrite" | "vmptrld"
-        | "vmptrst" | "vmclear" | "invept" | "invvpid" | "vmrun" | "vmload" | "vmsave" | "clgi"
-        | "stgi" | "skinit" => Some(PrivilegeKind::Virtualization),
-        _ => None,
-    }
-}
-
-/// The A64 families.
-///
-/// Deliberately short. Every member is `privileged` from the decoder already, so this decides only
-/// the family *name* -- without it they were reported correctly and namelessly under
-/// [`PrivilegeKind::Other`], which is the state ARM64 was in the day dbgscope#170 landed. Adding a
-/// name is worth doing; inventing one is not, which is why the system-register space past the
-/// interrupt masks is deliberately absent.
-fn arm64_family(
-    instruction: &Instruction,
-    interrupt_mask: impl Fn() -> bool,
-) -> Option<PrivilegeKind> {
-    match instruction.mnemonic.as_str() {
-        // Cache, TLB and address-translation maintenance: the same family as `invd`/`wbinvd`/
-        // `invlpg`, and where an ARM64 driver's machine-state work lives.
-        "dc" | "ic" | "tlbi" | "at" => Some(PrivilegeKind::MachineState),
-        // `msr daifset,#2` masks interrupts and `msr daifclr,#2` unmasks them, which is `cli` and
-        // `sti` under another spelling; `DAIF` reached as a *register* is the same gate, and
-        // dbgscope spells a system register by its encoding rather than by name. The rest of that
-        // space lands in `Other` **with its register still in the operands**, which is a better
-        // answer than a family invented for it.
-        "msr" | "mrs" if interrupt_mask() => Some(PrivilegeKind::InterruptFlag),
-        _ => None,
-    }
+/// [dbgscope#151]: https://github.com/glslang/dbgscope/pull/151
+/// [dbgscope#153]: https://github.com/glslang/dbgscope/issues/153
+fn privilege_kind(instruction: &Instruction, set: InstructionSet) -> Option<Privilege> {
+    instruction.privilege.or_else(|| match set {
+        InstructionSet::X86 | InstructionSet::Amd64 => matches!(
+            instruction.mnemonic.as_str(),
+            "sgdt" | "sidt" | "sldt" | "str"
+        )
+        .then_some(Privilege::DescriptorTable),
+        InstructionSet::Arm64 | InstructionSet::Other(_) => None,
+    })
 }
 
 /// One sensitive import the driver holds, and where it is called from.
@@ -438,7 +330,7 @@ impl Standing {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Privileged {
     pub address: u64,
-    pub kind: PrivilegeKind,
+    pub kind: Privilege,
     /// The mnemonic, for a reader who wants to know which of the family it was.
     pub mnemonic: String,
     /// What the image's unwind table says about this address. See [`Standing`].
@@ -922,7 +814,7 @@ pub fn structured_report(
             .iter()
             .map(|found| structured::PrivilegedInstruction {
                 at: locate(found.address),
-                kind: found.kind.name().to_string(),
+                kind: privilege_name(found.kind).to_string(),
                 mnemonic: found.mnemonic.clone(),
                 standing: found.standing.name().to_string(),
             })
@@ -1206,12 +1098,12 @@ mod tests {
     /// be sharing whatever the code under test uses to decide — and the answer is the decoder's on
     /// a real target, so here it is data like an instruction's bytes.
     /// `privilege_kind` for an x64 target, which is what every fixture here but one is.
-    fn privilege_kind_x86(instruction: &Instruction) -> Option<PrivilegeKind> {
+    fn privilege_kind_x86(instruction: &Instruction) -> Option<Privilege> {
         privilege_kind(instruction, InstructionSet::Amd64)
     }
 
     /// And for an ARM64 one, so a call site says which vocabulary it is asking about.
-    fn privilege_kind_arm64(instruction: &Instruction) -> Option<PrivilegeKind> {
+    fn privilege_kind_arm64(instruction: &Instruction) -> Option<Privilege> {
         privilege_kind(instruction, InstructionSet::Arm64)
     }
 
@@ -1298,6 +1190,7 @@ mod tests {
             operands,
             flow,
             privileged: false,
+            privilege: None,
             // The scan reads the flow, the operands and the mnemonic, and `Formed` reads the
             // effect and the writes as well -- so a fixture about a **formed** slot has to supply
             // those two rather than take these defaults. `forming` below is that fixture.
@@ -1310,12 +1203,16 @@ mod tests {
         }
     }
 
-    /// The same, for an instruction the **decoder** reports as needing privilege.
+    /// The same, for an instruction the **decoder** reports as needing privilege, and the family
+    /// it reports with it.
     ///
     /// Separate rather than a sixth parameter on `insn`, because that is the point of the field:
     /// a fixture answers for the decoder here, so every test that means "the decoder said so" has
-    /// to say it, and every test that does not gets the honest `false`.
+    /// to say it, and every test that does not gets the honest `false`. And **both fields or
+    /// neither**: dbgscope builds `privileged` and `privilege` from one value, so a fixture that
+    /// could set one without the other would be standing in for a decoder that does not exist.
     fn privileged_insn(
+        family: Privilege,
         address: u64,
         bytes: &str,
         mnemonic: &str,
@@ -1324,6 +1221,7 @@ mod tests {
     ) -> Instruction {
         Instruction {
             privileged: true,
+            privilege: Some(family),
             ..insn(address, bytes, mnemonic, flow, operands)
         }
     }
@@ -1866,98 +1764,115 @@ mod tests {
         );
     }
 
-    /// A64's privileged instructions land in families rather than all in [`PrivilegeKind::Other`].
+    /// The family is the decoder's, on every architecture, and this module adds exactly one thing
+    /// to it: x86's descriptor-table reads, which need no privilege and are reported anyway.
     ///
-    /// Membership is the decoder's answer and always was, so these were reported correctly and
-    /// namelessly the moment dbgscope#170 made `privileged` true on ARM64 -- which is what
-    /// `Other` is for and why enabling these tools on ARM64 was safe before this. What the table
-    /// adds is the family, for the two groups where it is unambiguous.
-    ///
-    /// The system-register space is deliberately **not** family-named beyond the interrupt masks:
-    /// it is far too wide to map honestly onto x86's families, and `Other` carries the register in
-    /// the operands, which is a better answer than an invented name.
+    /// The fixture states what the decoder would -- `privileged` and the family together, as
+    /// dbgscope builds them -- so what is under test is the passing-through and the one judgement.
+    /// The classification itself is dbgscope's, and is tested there against encodings.
     #[test]
-    fn an_arm64_privileged_instruction_lands_in_a_family() {
-        let other = |mnemonic: &str, operands: Vec<Operand>| {
-            privileged_insn(
+    fn the_family_is_the_decoders_and_only_the_descriptor_reads_are_added() {
+        let unprivileged = |mnemonic: &str| {
+            insn(
                 BASE + 0x1000,
                 "00000000",
                 mnemonic,
                 Flow::Fallthrough,
-                operands,
+                Vec::new(),
             )
         };
-        // Cache, TLB and address-translation maintenance: the same family as `invd`/`invlpg`.
-        for mnemonic in ["dc", "ic", "tlbi", "at"] {
+        // Whatever the decoder names passes through, on both architectures and unchanged -- which
+        // is what deleting the two per-architecture tables has to preserve. `other` among them,
+        // since a privileged instruction nobody named is the one a table would have dropped.
+        for family in [
+            Privilege::PortIo,
+            Privilege::ModelSpecificRegister,
+            Privilege::ControlRegister,
+            Privilege::DescriptorTable,
+            Privilege::InterruptFlag,
+            Privilege::CacheOrTlb,
+            Privilege::Virtualization,
+            Privilege::Other,
+        ] {
+            let one = privileged_insn(
+                family,
+                BASE + 0x1000,
+                "00000000",
+                "op",
+                Flow::Fallthrough,
+                Vec::new(),
+            );
+            assert_eq!(privilege_kind_x86(&one), Some(family), "{family:?}");
+            assert_eq!(privilege_kind_arm64(&one), Some(family), "{family:?}");
+        }
+        // The judgement: the four descriptor-table reads, which the decoder calls unprivileged and
+        // gives no family, are reported under the one they read.
+        for mnemonic in ["sgdt", "sidt", "sldt", "str"] {
             assert_eq!(
-                privilege_kind_arm64(&other(mnemonic, Vec::new())),
-                Some(PrivilegeKind::MachineState),
+                privilege_kind_x86(&unprivileged(mnemonic)),
+                Some(Privilege::DescriptorTable),
                 "{mnemonic}"
             );
         }
-        // `msr daifset,#2` is `cli` under another spelling, and `DAIF` reached as a register is
-        // the same gate: `s3_3_c4_c2_1`.
-        for name in ["daifset", "daifclr", "s3_3_c4_c2_1"] {
-            assert_eq!(
-                privilege_kind_arm64(&other("msr", vec![Operand::Other(name.to_string())])),
-                Some(PrivilegeKind::InterruptFlag),
-                "{name}"
-            );
-        }
-        // **`NZCV` is one `op2` away and is EL0's own**, so a looser match would call every flag
-        // restore an interrupt mask. It is not privileged at all, so it is not reported.
+        // **And only on x86, which is the collision that made the old tables per-architecture.**
+        // A64's `str` stores a register and is among the commonest instructions there is; read in
+        // x86's namespace, a scan of an ARM64 `nt` called every store a descriptor-table access --
+        // 59,450 privileged instructions. Found by the debugger tier against a real image.
         assert_eq!(
-            privilege_kind_arm64(&insn(
-                BASE + 0x1000,
-                "00000000",
-                "msr",
-                Flow::Fallthrough,
-                vec![Operand::Other("s3_3_c4_c2_0".to_string())],
-            )),
-            None,
-        );
-        // Everything else privileged keeps its mnemonic under `Other` rather than being dropped.
-        assert_eq!(
-            privilege_kind_arm64(&other("eret", Vec::new())),
-            Some(PrivilegeKind::Other),
-        );
-        // **The collision that made these tables architecture-specific.** x86's `str` stores the
-        // task register and belongs to the descriptor tables; A64's stores a register and is among
-        // the commonest instructions there is. Read in one namespace, a scan of an ARM64 `nt`
-        // called **every store** a descriptor-table access -- 59,450 privileged instructions,
-        // which is a disassembly rather than a hazard report. Found by the debugger tier against a
-        // real image, and asserted in **both** directions here: the x86 reading has to survive,
-        // since that one is right.
-        let store = insn(
-            BASE + 0x1000,
-            "00000000",
-            "str",
-            Flow::Fallthrough,
-            Vec::new(),
-        );
-        assert_eq!(
-            privilege_kind_arm64(&store),
+            privilege_kind_arm64(&unprivileged("str")),
             None,
             "an A64 store is not a descriptor-table access"
         );
-        assert_eq!(
-            privilege_kind_x86(&store),
-            Some(PrivilegeKind::DescriptorTable),
-            "and an x86 `str` still is"
-        );
+        // Nothing else unprivileged is reported, including the one the old x86 table carried
+        // beyond those four: `rdpmc`, which was never named as a deliberate addition and needs no
+        // privilege by the decoder's reading.
+        for mnemonic in ["rdpmc", "rdtsc", "mov", "nop"] {
+            assert_eq!(
+                privilege_kind_x86(&unprivileged(mnemonic)),
+                None,
+                "{mnemonic}"
+            );
+        }
     }
 
-    /// A privileged instruction is decided by its **operands**, not by its mnemonic.
+    /// Every family has its own wire name, so a client can tell any two apart.
+    ///
+    /// [`privilege_name`] is an exhaustive match, which makes a family dbgscope adds a build
+    /// failure rather than an unnamed value; this is the other half, that no two of them collide.
+    #[test]
+    fn every_family_has_a_distinct_wire_name() {
+        let families = [
+            Privilege::PortIo,
+            Privilege::ModelSpecificRegister,
+            Privilege::ControlRegister,
+            Privilege::DescriptorTable,
+            Privilege::InterruptFlag,
+            Privilege::CacheOrTlb,
+            Privilege::Virtualization,
+            Privilege::Other,
+        ];
+        let names: std::collections::BTreeSet<&str> = families
+            .iter()
+            .map(|family| privilege_name(*family))
+            .collect();
+        assert_eq!(names.len(), families.len(), "{names:?}");
+    }
+
+    /// The scan reports what the decoder says about an instruction, not what its mnemonic
+    /// suggests.
     ///
     /// `mov cr3, rax` and `mov rax, rbx` are the same mnemonic, and the difference between a
-    /// driver that reprograms paging and one that copies a register is entirely in the operand. A
-    /// rule written against a rendering would have to find `cr3` in a string, where a symbol or a
-    /// variable named `cr3` reads the same.
+    /// driver that reprograms paging and one that copies a register is entirely in the operand.
+    /// That difference is the decoder's to find -- it reads `cr3` as a register it decoded, where a
+    /// rule written against a rendering would find it in a string -- so what this pins is that the
+    /// scan carries the decoder's answer through: the privileged `mov` under its family, the plain
+    /// one not at all, and `swapgs` under `other`, which is where the decoder puts it.
     #[test]
-    fn a_privileged_instruction_is_decided_by_its_operands() {
+    fn the_scan_reports_what_the_decoder_says_and_not_what_a_mnemonic_suggests() {
         let image = image();
         let block = vec![
             privileged_insn(
+                Privilege::ControlRegister,
                 BASE + 0x1000,
                 "0f20d8",
                 "mov",
@@ -1978,6 +1893,7 @@ mod tests {
                 ],
             ),
             privileged_insn(
+                Privilege::ModelSpecificRegister,
                 BASE + 0x1006,
                 "0f32",
                 "rdmsr",
@@ -1985,6 +1901,7 @@ mod tests {
                 Vec::new(),
             ),
             privileged_insn(
+                Privilege::PortIo,
                 BASE + 0x1008,
                 "ee",
                 "out",
@@ -1995,6 +1912,7 @@ mod tests {
                 ],
             ),
             privileged_insn(
+                Privilege::Other,
                 BASE + 0x1009,
                 "0f01f8",
                 "swapgs",
@@ -2012,7 +1930,7 @@ mod tests {
             in_functions,
         );
 
-        let kinds: Vec<(u64, PrivilegeKind)> = found
+        let kinds: Vec<(u64, Privilege)> = found
             .privileged
             .iter()
             .map(|p| (p.address, p.kind))
@@ -2020,41 +1938,54 @@ mod tests {
         assert_eq!(
             kinds,
             vec![
-                (BASE + 0x1000, PrivilegeKind::ControlRegister),
-                (BASE + 0x1006, PrivilegeKind::ModelSpecificRegister),
-                (BASE + 0x1008, PrivilegeKind::PortIo),
-                (BASE + 0x1009, PrivilegeKind::MachineState),
+                (BASE + 0x1000, Privilege::ControlRegister),
+                (BASE + 0x1006, Privilege::ModelSpecificRegister),
+                (BASE + 0x1008, Privilege::PortIo),
+                (BASE + 0x1009, Privilege::Other),
             ],
             "the plain `mov` is not privileged and everything else is: {:?}",
             found.privileged
         );
     }
 
-    /// Whether an instruction is privileged is the **decoder's** answer; the table only names the
-    /// family.
+    /// The report is the decoder's set, plus x86's descriptor-table reads.
     ///
-    /// The two directions that a table-as-membership gets wrong are both here, and each needs an
-    /// instruction the other rule cannot reach. `sysret` is privileged and in **no** family, so it
-    /// can arrive only through the decoder and only as [`PrivilegeKind::Other`] — a list of
-    /// mnemonics reports a driver holding it as holding none, which is what this change is about,
-    /// and the fallback family is what stops the decoder's extra findings being dropped for want
-    /// of a name. `sgdt` is the reverse: the decoder calls it unprivileged, correctly, and it is in
-    /// the report anyway because a driver reading the GDT is worth seeing.
+    /// The two directions a list of mnemonics gets wrong are both here, and each needs an
+    /// instruction the other rule cannot reach. `sysret` is privileged and in **no** named family,
+    /// so it can arrive only through the decoder, as [`Privilege::Other`] -- a list reports a driver
+    /// holding it as holding none. `sgdt` is the reverse: the decoder calls it unprivileged,
+    /// correctly, and it is in the report anyway because a driver reading the GDT is worth seeing,
+    /// which is the one judgement [`privilege_kind`] adds.
     #[test]
-    fn privilege_is_the_decoders_answer_and_the_table_only_names_the_family() {
+    fn the_report_is_the_decoders_set_plus_the_descriptor_table_reads() {
         let image = image();
         let block = vec![
             // Privileged, named by no family: the decoder is the only thing that can find it.
-            privileged_insn(BASE + 0x1000, "0f07", "sysret", Flow::Return, Vec::new()),
-            privileged_insn(BASE + 0x1002, "fa", "cli", Flow::Fallthrough, Vec::new()),
             privileged_insn(
+                Privilege::Other,
+                BASE + 0x1000,
+                "0f07",
+                "sysret",
+                Flow::Return,
+                Vec::new(),
+            ),
+            privileged_insn(
+                Privilege::InterruptFlag,
+                BASE + 0x1002,
+                "fa",
+                "cli",
+                Flow::Fallthrough,
+                Vec::new(),
+            ),
+            privileged_insn(
+                Privilege::Virtualization,
                 BASE + 0x1003,
                 "0f01c2",
                 "vmlaunch",
                 Flow::Fallthrough,
                 Vec::new(),
             ),
-            // Unprivileged, and reported: the table's own half of the union.
+            // Unprivileged, and reported: the one judgement this module adds to the decoder.
             insn(
                 BASE + 0x1006,
                 "0f0100",
@@ -2082,7 +2013,7 @@ mod tests {
             in_functions,
         );
 
-        let kinds: Vec<(&str, PrivilegeKind)> = found
+        let kinds: Vec<(&str, Privilege)> = found
             .privileged
             .iter()
             .map(|p| (p.mnemonic.as_str(), p.kind))
@@ -2090,10 +2021,10 @@ mod tests {
         assert_eq!(
             kinds,
             vec![
-                ("sysret", PrivilegeKind::Other),
-                ("cli", PrivilegeKind::InterruptFlag),
-                ("vmlaunch", PrivilegeKind::Virtualization),
-                ("sgdt", PrivilegeKind::DescriptorTable),
+                ("sysret", Privilege::Other),
+                ("cli", Privilege::InterruptFlag),
+                ("vmlaunch", Privilege::Virtualization),
+                ("sgdt", Privilege::DescriptorTable),
             ],
             "the decoder's set and the table's, and `nop` in neither: {:?}",
             found.privileged
@@ -2381,6 +2312,7 @@ mod tests {
         let image = image();
         let block = vec![
             privileged_insn(
+                Privilege::ModelSpecificRegister,
                 BASE + 0x1000,
                 "0f32",
                 "rdmsr",
@@ -2388,9 +2320,24 @@ mod tests {
                 Vec::new(),
             ),
             // The two one-byte opcodes that are `n` and `o` in a string literal.
-            privileged_insn(BASE + 0x1002, "6e", "outsb", Flow::Fallthrough, Vec::new()),
-            privileged_insn(BASE + 0x1003, "6f", "outsd", Flow::Fallthrough, Vec::new()),
             privileged_insn(
+                Privilege::PortIo,
+                BASE + 0x1002,
+                "6e",
+                "outsb",
+                Flow::Fallthrough,
+                Vec::new(),
+            ),
+            privileged_insn(
+                Privilege::PortIo,
+                BASE + 0x1003,
+                "6f",
+                "outsd",
+                Flow::Fallthrough,
+                Vec::new(),
+            ),
+            privileged_insn(
+                Privilege::ModelSpecificRegister,
                 BASE + 0x1004,
                 "0f30",
                 "wrmsr",
@@ -2570,7 +2517,14 @@ mod tests {
                 Some(
                     (at..at + want as u64)
                         .map(|address| {
-                            privileged_insn(address, "fa", "cli", Flow::Fallthrough, Vec::new())
+                            privileged_insn(
+                                Privilege::InterruptFlag,
+                                address,
+                                "fa",
+                                "cli",
+                                Flow::Fallthrough,
+                                Vec::new(),
+                            )
                         })
                         .collect(),
                 )
@@ -2629,8 +2583,22 @@ mod tests {
     fn a_finding_the_unwind_table_cannot_be_asked_about_is_not_called_data() {
         let image = image();
         let block = vec![
-            privileged_insn(BASE + 0x1000, "ee", "out", Flow::Fallthrough, Vec::new()),
-            privileged_insn(BASE + 0x1001, "fa", "cli", Flow::Fallthrough, Vec::new()),
+            privileged_insn(
+                Privilege::PortIo,
+                BASE + 0x1000,
+                "ee",
+                "out",
+                Flow::Fallthrough,
+                Vec::new(),
+            ),
+            privileged_insn(
+                Privilege::InterruptFlag,
+                BASE + 0x1001,
+                "fa",
+                "cli",
+                Flow::Fallthrough,
+                Vec::new(),
+            ),
             insn(BASE + 0x1002, "c3", "ret", Flow::Return, Vec::new()),
         ];
         let found = scan(
@@ -2704,7 +2672,14 @@ mod tests {
                 Some(
                     (at..at + want as u64)
                         .map(|address| {
-                            privileged_insn(address, "fa", "cli", Flow::Fallthrough, Vec::new())
+                            privileged_insn(
+                                Privilege::InterruptFlag,
+                                address,
+                                "fa",
+                                "cli",
+                                Flow::Fallthrough,
+                                Vec::new(),
+                            )
                         })
                         .collect(),
                 )

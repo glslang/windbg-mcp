@@ -103,6 +103,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`driver_hazards` takes a privileged instruction's family from the decoder**, as it already took
+  whether the instruction is privileged at all. `dbgscope` now answers both (glslang/dbgscope#153):
+  on x86 from iced's CPUID features, implicit registers and flags, and on ARM64 from the
+  system-register encoding. That deletes this server's two per-architecture mnemonic tables, which
+  had the same defect one level down that glslang/dbgscope#151 removed from membership — a
+  privileged instruction neither table named lost its family — and which had already collided
+  once, when x86's `str` read every A64 store as a descriptor-table access.
+
+  **`kind` changes as a result, and one value goes.** `machine_state` is replaced by
+  `cache_or_tlb` — `invd`, `wbinvd`, `invlpg`, `invpcid`, and A64's `dc`, `ic` and `tlbi`. What
+  else it used to hold moves: `hlt`, `swapgs` and A64's `at` to `other`, and `xsetbv`, which writes
+  an extended control register, to `control_register`. ARM64's system-register accesses, previously
+  `other` past the interrupt masks, are now `control_register`, or `model_specific_register` in the
+  IMPLEMENTATION DEFINED space. The full set is `port_io`, `model_specific_register`,
+  `control_register`, `descriptor_table`, `interrupt_flag`, `cache_or_tlb`, `virtualization` and
+  `other`.
+
+  **What stays here is one judgement, and it is x86's alone**: `sgdt`, `sidt`, `sldt` and `str`
+  need no privilege and are still reported as `descriptor_table`, because a driver reading the
+  descriptor tables is worth seeing. `rdpmc` is no longer reported — it rode along in the old
+  table, was never named as one of those deliberate additions, and the decoder calls it
+  unprivileged.
+
 - **`CLAUDE.md` lives in `.claude/`, so strict plugin validation passes.** The plugin root is the
   repository root (`marketplace.json` names `"."`), and a `CLAUDE.md` at a plugin root is never
   loaded as plugin context — so `claude plugin validate` warns when it finds one, and `--strict`,

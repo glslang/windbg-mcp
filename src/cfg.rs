@@ -228,6 +228,7 @@ mod tests {
             // None of the decoder's other answers shapes a graph, which is the point of the test
             // below that says so.
             privileged: false,
+            privilege: None,
             effect: Effect::Other,
             condition: None,
             writes_flags: false,

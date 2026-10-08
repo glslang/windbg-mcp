@@ -429,6 +429,7 @@ mod tests {
             operands: Vec::new(),
             flow,
             privileged: false,
+            privilege: None,
             effect: Effect::Other,
             condition: None,
             writes_flags: false,

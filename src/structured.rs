@@ -3213,9 +3213,11 @@ pub struct Xrefs {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PrivilegedInstruction {
     pub at: CodeLocation,
-    /// `model_specific_register`, `port_io`, `control_register`, `descriptor_table`,
-    /// `machine_state`, `interrupt_flag`, `virtualization`, or `other` for one no family names —
-    /// whether an instruction is here at all is the decoder's answer, and the family only names it.
+    /// `port_io`, `model_specific_register`, `control_register`, `descriptor_table`,
+    /// `interrupt_flag`, `cache_or_tlb`, `virtualization`, or `other` for a privileged instruction
+    /// no family names. Both whether an instruction is here and which family it is are the
+    /// decoder's answer, except that x86's `sgdt`, `sidt`, `sldt` and `str` need no privilege and
+    /// are listed as `descriptor_table` anyway.
     pub kind: String,
     /// The mnemonic, for a reader who wants to know which of the family it was.
     pub mnemonic: String,
