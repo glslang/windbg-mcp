@@ -55,6 +55,7 @@ mod skcontrol;
 mod skdispatch;
 mod skinspect;
 mod sklive;
+mod skpolicy;
 mod sksession;
 mod sksym;
 mod structured;

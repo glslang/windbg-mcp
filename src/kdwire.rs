@@ -31,7 +31,16 @@ pub(crate) struct DataPacket {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Frame {
     BreakIn,
-    Control { packet_type: u16, id: u32 },
+    /// A framing failure already consumed or resynchronised by the decoder. The target asks the
+    /// peer to resend; `fatal` bounds a client that keeps supplying corrupt frames.
+    Malformed {
+        why: String,
+        fatal: bool,
+    },
+    Control {
+        packet_type: u16,
+        id: u32,
+    },
     Data(DataPacket),
 }
 
@@ -178,6 +187,7 @@ pub(crate) struct Inbound {
     pub(crate) packet: Option<DataPacket>,
     pub(crate) break_in: bool,
     pub(crate) peer_reset: bool,
+    pub(crate) protocol_error: Option<String>,
 }
 
 impl Inbound {
@@ -187,6 +197,7 @@ impl Inbound {
             packet: None,
             break_in: false,
             peer_reset: false,
+            protocol_error: None,
         }
     }
 }
@@ -210,6 +221,12 @@ impl TargetLink {
         let mut inbound = Inbound::quiet();
         match frame {
             Frame::BreakIn => inbound.break_in = true,
+            Frame::Malformed { why, fatal } => {
+                inbound.writes.push(control(PACKET_TYPE_RESEND, 0));
+                if fatal {
+                    inbound.protocol_error = Some(why);
+                }
+            }
             Frame::Control {
                 packet_type: PACKET_TYPE_RESET,
                 ..
@@ -449,5 +466,23 @@ mod tests {
         });
         assert!(ack.writes.is_empty());
         link.send(PACKET_TYPE_STATE_CHANGE64, &[0x31]).unwrap();
+    }
+
+    #[test]
+    fn malformed_frame_requests_resend_and_only_the_bound_is_fatal() {
+        let mut link = TargetLink::new();
+        let retry = link.receive(Frame::Malformed {
+            why: "checksum".into(),
+            fatal: false,
+        });
+        assert_eq!(retry.writes, vec![control(PACKET_TYPE_RESEND, 0)]);
+        assert_eq!(retry.protocol_error, None);
+
+        let fatal = link.receive(Frame::Malformed {
+            why: "third checksum".into(),
+            fatal: true,
+        });
+        assert_eq!(fatal.writes, vec![control(PACKET_TYPE_RESEND, 0)]);
+        assert_eq!(fatal.protocol_error.as_deref(), Some("third checksum"));
     }
 }

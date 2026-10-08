@@ -2,7 +2,7 @@
   "schemaDialects": [
     "https://json-schema.org/draft/2020-12/schema"
   ],
-  "toolCount": 75,
+  "toolCount": 76,
   "tools": [
     {
       "hints": {
@@ -1262,6 +1262,57 @@
         "openWorld": true,
         "readOnly": false
       },
+      "name": "open_sk_kd",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/OpenedSession",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/OpenFailure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
+      "params": [
+        "arm_mode: ref(#/$defs/ArmMode)",
+        "connect_timeout_ms: integer|null/uint64",
+        "control_transport: string",
+        "dispatcher_vnd: string|null",
+        "expected_cr3: string|null",
+        "idle_timeout_ms: integer|null/uint64",
+        "live_transport: string",
+        "max_pause_ms: integer|null/uint64",
+        "partition_id: string|null",
+        "profile: string",
+        "vm_id: string",
+        "vmwp_pid: integer|null/uint32",
+        "vp: integer|null/uint32"
+      ],
+      "required": [
+        "control_transport",
+        "live_transport",
+        "profile",
+        "vm_id"
+      ],
+      "title": "Open Secure Kernel KD"
+    },
+    {
+      "hints": {
+        "destructive": false,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
       "name": "open_sk_live_control",
       "output": {
         "branches": [
@@ -1286,24 +1337,20 @@
       "params": [
         "allow_transition_cr3: boolean",
         "control_transport: string",
-        "dispatcher_vnd: string",
-        "expected_cr3: string",
+        "dispatcher_vnd: string|null",
+        "expected_cr3: string|null",
         "live_transport: string",
-        "partition_id: string",
+        "partition_id: string|null",
         "profile: string",
         "vm_id: string",
-        "vmwp_pid: integer/uint32",
+        "vmwp_pid: integer|null/uint32",
         "vp: integer|null/uint32"
       ],
       "required": [
         "control_transport",
-        "dispatcher_vnd",
-        "expected_cr3",
         "live_transport",
-        "partition_id",
         "profile",
-        "vm_id",
-        "vmwp_pid"
+        "vm_id"
       ],
       "title": "Open live Secure Kernel control"
     },

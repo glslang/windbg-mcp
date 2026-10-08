@@ -96,7 +96,6 @@ line is simply open.
 - [Item 116](#116-windbg-mcp-the-kd-facade-answers-windbg-with-fabricated-state-it-cannot-tell-apart-from-guest-state) — [windbg-mcp] The KD facade answers WinDbg with fabricated state it cannot tell apart from guest state
 - [Item 117](#117-windbg-mcp-the-kd-facade-pipe-has-only-the-default-acl-no-client-authentication-and-no-break-in) — [windbg-mcp] The KD facade pipe has only the default ACL, no client authentication and no break-in
 - [Item 118](#118-windbg-mcp-live-control-is-on-by-default-runs-client-supplied-programs-and-has-no-bound-on-a-paused-guest) — [windbg-mcp] Live control is on by default, runs client-supplied programs, and has no bound on a paused guest
-- [Item 119](#119-windbg-mcp-what-a-vtl1-debugger-still-cannot-do) — [windbg-mcp] What a VTL1 debugger still cannot do
 
 ## 2. [dbgscope] Typed write primitives
 
@@ -2515,6 +2514,18 @@ that several fields it keys on are invented permanently:
 - **Where it picks up:** `kdtarget.rs`'s `CompatibilityMemory` and `send_stop`; `kdapi.rs`'s
   `Version64::encode` and the `StateChange64` builder; the register bank in `skcontrol.rs`.
 
+**Implementation status, 2026-10-07:** the managed route no longer takes a caller-supplied base,
+build or initial address. The memory provider supplies the base, the exact-build profile supplies
+the build and guarded initial RVA, and optional standalone values are mismatch assertions. Before
+publishing the version record, the worker reads the live list head, debugger-data block and loader
+head; proves the list links, `KDBG` tag, plausible block size, matching kernel base and matching
+`PsLoadedModuleList`; and then reports those live addresses. WinDbg accepted the result and
+`lm m securekernel` enumerated `securekernel.exe` with an empty local symbol path. `GetContextEx`
+plus the bounded AMD64 `KSPECIAL_REGISTERS` control-space record also makes `r` succeed with real
+CR3 and debug registers; fields the provider cannot report are zero. The synthetic thread and
+one-shot compatibility reads remain explicit facade state, and symbol resolution and stack walking
+have not passed live, so this item remains open for those narrower claims.
+
 ## 117. [windbg-mcp] The KD facade pipe has only the default ACL, no client authentication and no break-in
 
 **Repo:** `windbg-mcp`. **Origin:** the 2026-10-07 review (item 115's origin).
@@ -2544,14 +2555,24 @@ live in the private runner, not in the facade.
 - **What would close it:** an explicit DACL (creating user and SYSTEM), a pipe name from the
   system RNG the controller already uses, the client's process identity checked before the reset
   is answered; `failure_response` for the short packet and the bad range, a resend on checksum
-  failure, a bound on consecutive failures rather than the first; a break-in that either produces
-  a stop or is refused at KD level while the session survives; the facade refusing to exit while
-  it retains an owned event and bounding the reconnect window itself; and a `cargo fuzz` target
-  over `kdwire::Decoder` and `ManipulateRequest::decode` seeded from the inline vectors in
-  `kdapi.rs`'s tests.
+  failure, a bound on consecutive failures rather than the first; a break-in that produces a real
+  stop — and, until that exists, treating the byte as unsupported without faulting the retained
+  session, with the refusal visible in the facade's log or server status rather than as an invented
+  KD reply (the serial break-in byte has no request to which an NTSTATUS can be returned); the facade
+  refusing to exit while it retains an owned event and bounding the reconnect window itself; and a
+  `cargo fuzz` target over `kdwire::Decoder` and `ManipulateRequest::decode` seeded from the inline
+  vectors in `kdapi.rs`'s tests.
 - **Where it picks up:** `kdtarget.rs`'s `run_async` (the pipe is built just before the connect
   wait) and `read_transport`; `kdwire.rs`'s `Decoder` and `TargetLink`; the mitigations list in
   `target/private/securekernel-windbg-kd-plan.md` (private).
+
+**Implementation status, 2026-10-07:** the facade now creates the pipe with a protected DACL,
+admits only the server account or LocalSystem after checking the connected process token, uses a
+server-generated random name for MCP sessions, sends resend packets for framing errors and faults
+only after three consecutive errors. Short manipulate packets and invalid context ranges receive
+failure replies without losing the retained stop. A stopped-state break-in is logged and refused,
+and the managed reconnect and absolute-pause windows are bounded. A real running-state break-in
+and the decoder fuzz target remain open, so this item is not closed.
 
 ## 118. [windbg-mcp] Live control is on by default, runs client-supplied programs, and has no bound on a paused guest
 
@@ -2608,50 +2629,12 @@ health, the `vmwp` PID, debug-register state or guest text; the external wrapper
 - **Where it picks up:** `server.rs`'s `open_sk_live_control` handler; `skdispatch::Session::open`
   and `release`; `sklive::LiveControl::restore`; `toolset.rs`'s group table.
 
-## 119. [windbg-mcp] What a VTL1 debugger still cannot do
-
-**Repo:** `windbg-mcp`. **Origin:** the 2026-10-07 review (item 115's origin), so that the
-distance between the measured workflow and a debugging session is tracked rather than implied by
-the gates that passed.
-
-The measured workflow is one `t`, one `r` and `q` against a pre-armed five-byte NOP, with eleven
-command-line arguments, two private programs and a build-locked profile. What is absent, on every
-surface:
-
-- a write to VTL1 memory, and a write to any general-purpose register — the provider's write bank
-  is `rip`, `rsp`, `rflags` and the debug registers, and `SetContext` succeeds only for an unchanged
-  prefix;
-- a software breakpoint: four debug-register slots and no `int3` path, by decision, since the
-  catch half of a patched breakpoint has no owner on a managed VM (S4, S5a);
-- a second VP, by measured decision (item 110's four multi-provider gates);
-- a break-in (item 117);
-- symbols and modules in WinDbg (item 116), and symbols for any VTL1 module but
-  `securekernel.exe`;
-- any decode past `KdDebuggerDataBlock` and the loader list: no Secure Kernel process, thread or
-  trustlet enumeration, no VTL1 stack walk, no secure pool, handle table, NAR/NTE or HVCI
-  page-tracking, no secure-call table, although the research record locates
-  `SkiSecureServiceTable` and its limit;
-- ARM64 guests and five-level paging, refused in `sk::walkable`;
-- the inputs a user must produce before `open_sk_live_control` will accept the call:
-  `dispatcher_vnd` comes from a cdb breakpoint at a hard-coded `vmwp` RVA during a pause/resume,
-  `partition_id` from hijacking a `vmwp` thread to call `vid!VidGetHvPartitionId`, and
-  `expected_cr3` from the memory transport's own probe — all in the private runner, none in a
-  tool or a doc. The KD facade's `--sk-kd-target` role takes `--kernel-base` on top, from the
-  same probe; that is the facade's input and not the MCP tool's, which this entry first
-  conflated (Codex, round 2).
-
-- **Why deferred:** these are rungs, not a defect, and each has a guard it must not loosen; the
-  review's ladder orders them (symbols and control space first, then break-in, then bounded
-  destinations for `t` on branches, then run-break-run live, then writes, then a second VP).
-  Filed as one item so the order is in one place.
-- **What would close it:** not the list — each rung closes on its own measurement. What closes the
-  *item* is a tracked capability matrix for the VTL1 routes (the one `secure-kernel-debugging-plan.md`'s
-  deliverables asked for and never got) that says which WinDbg commands work, which are refused,
-  and which answer with something invented, re-derived from a live run per release that touches
-  `kd*.rs` or `sk*.rs`.
-- **Where it picks up:** the ladder in the private review; the inputs in
-  `target/private/run_k4_stop_step.py` (private), whose `discover_dispatcher` and
-  `discover_partition` are the two reads the worker could make itself during the first attach.
+**Implementation status, 2026-10-07:** `WINDBG_MCP_SK_LIVE_POLICY` is loaded once when the
+session registry starts. Without it both live Secure Kernel openers are disabled. Its canonical
+server-side allow-lists cover disposable VM ids, exact transport command templates and profile
+roots, and the request cannot expand them. The KD session has an absolute pause bound, and the instruction-class
+guard is shared by KD stepping and `sk_live_step`. The ordinary live-control pause budget, natural
+mode default, mutation tracing, kit policy and the wider tool-group decision remain open.
 
 ## Where these items came from
 
@@ -2784,7 +2767,8 @@ And item 113 from closing item 69 on
 "other 141" as a typo for 142 and reading the commit that first recorded the figures showed all
 three written that way on the day — so what the close could record was the gap, and what it could
 not do from a Mac was settle which of the three is wrong (2026-10-06).
-And items 115–119 from the 2026-10-07 review of the whole VTL1 surface — capture decode, live
+And items 115–119 from the 2026-10-07 review of the whole VTL1 surface — items 115 and 119 are now
+in [`DONE.md`](./DONE.md) — capture decode, live
 control, and the KD facade [#463](https://github.com/glslang/windbg-mcp/pull/463) had merged the
 day before — read against `main` with the private bench runs beside it: a facade that shipped with
 no operator-facing record of itself and six statements the code had moved past (115); the answers it
@@ -2794,5 +2778,9 @@ live-control tools being default-on, running client-supplied programs, and holdi
 with no bound (118); and the distance from one guarded `t` to a debugging session, filed as one
 ordered ladder rather than a defect per rung (119). The review itself is private, under
 `target/private/`, because it cites the bench's runners and logs.
+Item 120, now in [`DONE.md`](./DONE.md), came from checking that review against the stated product
+goal the same day: the standalone KD role and the MCP live-control session were alternative owners,
+so the server could not create, observe or release the WinDbg-facing session it presented to an
+operator.
 `DECISIONS.md`'s 2026-08-02 entries are the bounded-command coverage review that produced
 item 13, now in [`DONE.md`](./DONE.md).

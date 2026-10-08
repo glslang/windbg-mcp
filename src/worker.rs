@@ -374,6 +374,16 @@ static KERNEL_SAFETY: KernelSafety = KernelSafety::new();
 /// thread. On supervisor loss this keeps the process alive if restoration cannot be proved, which
 /// preserves the adapter's fail-closed state instead of dropping an attachment beside a paused VM.
 static LIVE_CONTROL_ACTIVE: AtomicBool = AtomicBool::new(false);
+static KD_TEARDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+static KD_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn kd_teardown_requested() -> bool {
+    KD_TEARDOWN_REQUESTED.load(Ordering::SeqCst)
+}
+
+pub(crate) fn report_sk_kd_phase(phase: crate::proto::SecureKernelKdPhase) {
+    let _ = emit(&WorkerMessage::SecureKernelKdPhase { phase });
+}
 
 fn kernel_recovery_required() -> Failed {
     Failed::categorised(
@@ -578,6 +588,10 @@ struct Running {
     /// flag beside this lock, so "which job is pumping" and "which job may be interrupted" are
     /// decided together and cannot name different jobs.
     pumping: Option<u64>,
+    /// The managed KD service is inside its owned `vmwp` event wait. Unlike `pumping`, which
+    /// spans the service job so teardown can bar later work, this is the exact interval where a
+    /// cross-thread `SetInterrupt` has somewhere valid to land.
+    kd_waiting: bool,
     /// Jobs that were broken in before they reached the engine thread, and must not start.
     ///
     /// The other half of what [`Self::tearing_down`] does for a teardown, for one run rather than
@@ -688,6 +702,7 @@ static RUNNING: Mutex<Running> = Mutex::new(Running {
     job: None,
     interrupted: None,
     pumping: None,
+    kd_waiting: false,
     barred: BTreeSet::new(),
     tearing_down: false,
     uninterruptible: None,
@@ -794,6 +809,7 @@ impl Running {
     fn release(&mut self, id: u64) -> bool {
         self.job = None;
         self.pumping = None;
+        self.kd_waiting = false;
         self.uninterruptible = None;
         self.interrupted.take() == Some(id)
     }
@@ -854,7 +870,8 @@ fn sealed_as(op: &EngineOp) -> Option<Cleanup> {
         | EngineOp::SkLiveRegisters
         | EngineOp::SkLiveRead { .. }
         | EngineOp::SkLiveStep { .. }
-        | EngineOp::SkLiveContinue { .. } => Some(Cleanup::NotInterruptible),
+        | EngineOp::SkLiveContinue { .. }
+        | EngineOp::OpenSecureKernelKd(_) => Some(Cleanup::NotInterruptible),
         _ => None,
     }
 }
@@ -880,6 +897,31 @@ enum PumpRefused {
 /// [`Running::claim_pump`] on this process's one tracker.
 fn claim_pump(id: u64) -> Result<(), PumpRefused> {
     running().claim_pump(id)
+}
+
+/// A guard over the exact interval in which managed KD is waiting in DbgEng for a `vmwp` event.
+/// The request reader uses the same [`Running`] lock, so an interrupt either lands inside this
+/// interval or observes it closed and cannot leak into the next engine operation.
+pub(crate) struct KdWaitGuard {
+    id: u64,
+}
+
+impl Drop for KdWaitGuard {
+    fn drop(&mut self) {
+        let mut current = running();
+        if current.job == Some(self.id) {
+            current.kd_waiting = false;
+        }
+    }
+}
+
+pub(crate) fn begin_kd_wait(id: u64) -> Option<KdWaitGuard> {
+    let mut current = running();
+    if current.job != Some(id) || current.tearing_down {
+        return None;
+    }
+    current.kd_waiting = true;
+    Some(KdWaitGuard { id })
 }
 
 /// Closes `id` to further interrupts and consumes anything already pending on the engine.
@@ -1033,8 +1075,16 @@ pub fn run(args: &[String]) -> ! {
                 // blocked by the engine — it reads a line and hands it on — which is the whole
                 // reason the signal can arrive at all. See [`EngineOp::EndSession`].
                 if matches!(request.op, EngineOp::EndSession) {
+                    KD_TEARDOWN_REQUESTED.store(true, Ordering::SeqCst);
+                    if KD_ACTIVE.load(Ordering::SeqCst) {
+                        report_sk_kd_phase(crate::proto::SecureKernelKdPhase::Releasing);
+                    }
                     announce_teardown(request.id);
-                    stop_resuming();
+                    if KD_ACTIVE.load(Ordering::SeqCst) {
+                        stop_managed_kd();
+                    } else {
+                        stop_resuming();
+                    }
                 }
                 // The one request that is *answered* here rather than queued. Queueing it would
                 // put it behind the operation it exists to stop, so it could only ever run once
@@ -1328,9 +1378,10 @@ fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
     // `Send`/`Sync` question entirely: the provider's handles are raw pointers, every call on them
     // is made from here, and there is nowhere else in this process that could reach them.
     let mut sk: Option<crate::sksession::Session> = None;
-    // The live counterpart. It owns the provider child and the build-guarded adapter state; every
-    // method receives this thread's engine by reference, so neither can escape this thread.
-    let mut sk_live: Option<crate::skdispatch::Session> = None;
+    // The live counterpart. It owns the provider child, the build-guarded adapter state and any
+    // managed KD facade layered over them. Every method receives this thread's engine by
+    // reference, so none can escape this thread.
+    let mut sk_live = SecureKernelLiveState::default();
     emit(&WorkerMessage::Ready {
         build: crate::BUILD_VERSION.to_string(),
     });
@@ -1347,10 +1398,12 @@ fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
                     let _ = ack.send(false);
                     continue;
                 }
-                let released_live_control = if let Some(session) = sk_live.as_mut() {
+                let released_live_control = if let Some(session) = sk_live.session.as_mut() {
                     match catch_unwind(AssertUnwindSafe(|| session.close(&engine))) {
                         Ok(Ok(())) => {
-                            sk_live = None;
+                            sk_live.session = None;
+                            sk_live.kd = None;
+                            KD_ACTIVE.store(false, Ordering::SeqCst);
                             LIVE_CONTROL_ACTIVE.store(false, Ordering::SeqCst);
                             true
                         }
@@ -1631,6 +1684,39 @@ fn stop_resuming() {
     }
 }
 
+/// Ends a managed KD service without filing a stale break against its idle DbgEng engine.
+///
+/// The service job spans pipe connects and retained stops as well as target waits. Only the latter
+/// is interruptible. `KdWaitGuard` changes `kd_waiting` under this same lock, which closes both
+/// races: teardown before wait entry makes entry fail, and teardown after entry sends the break
+/// before the guard can close the interval.
+fn stop_managed_kd() {
+    let mut current = running();
+    let Some(job) = current.begin_teardown() else {
+        return;
+    };
+    if !current.kd_waiting {
+        return;
+    }
+    let Some(handle) = INTERRUPT.get() else {
+        tracing::warn!("worker: managed KD teardown found no interrupt handle");
+        return;
+    };
+    match handle.interrupt() {
+        Ok(filed) => {
+            current.interrupt_raised();
+            tracing::info!(
+                "worker: managed KD teardown interrupted owned wait for job {job}, filed as \
+                 {filed:?}"
+            );
+        }
+        Err(error) => tracing::warn!(
+            "worker: managed KD teardown could not interrupt owned wait for job {job} ({})",
+            es(error)
+        ),
+    }
+}
+
 /// Marks a result as one that was cut short by an interrupt somebody asked for.
 ///
 /// Said on *this* reply because this is the caller who cannot otherwise find out. The one who asked
@@ -1722,6 +1808,14 @@ fn interrupt_running(bound: Option<u64>) -> Result<(Interrupted, String), String
                 .to_string(),
         ));
     };
+    if KD_ACTIVE.load(Ordering::SeqCst) && !running.kd_waiting {
+        return Ok((
+            Interrupted::NothingRunning,
+            "The managed Secure Kernel KD service is not inside its owned target wait, so no \
+             interrupt was sent. Its retained stop and pipe lifecycle are unchanged."
+                .to_string(),
+        ));
+    }
     // A batch that has reached its `always` block is closed to breaks, whether or not one has been
     // raised for it before. Cleanup is the one thing an interrupt must not reach: a restore cut
     // short returns `Ok` with partial output like any other interrupted command, so it would be
@@ -1882,6 +1976,7 @@ fn refuse_when_the_target_is_gone(e: &DebugEngine, op: &EngineOp) -> Option<Fail
             | EngineOp::SkLiveRead { .. }
             | EngineOp::SkLiveStep { .. }
             | EngineOp::SkLiveContinue { .. }
+            | EngineOp::SkKdServe
         )
     {
         return None;
@@ -2310,7 +2405,8 @@ fn watch_for(op: &EngineOp) -> Watch {
         | EngineOp::SkLiveRegisters
         | EngineOp::SkLiveRead { .. }
         | EngineOp::SkLiveStep { .. }
-        | EngineOp::SkLiveContinue { .. } => Watch::Ignore,
+        | EngineOp::SkLiveContinue { .. }
+        | EngineOp::SkKdServe => Watch::Ignore,
         _ => Watch::Compare,
     }
 }
@@ -2684,6 +2780,13 @@ fn apply_symbol_path(e: &DebugEngine, setting: &SymbolPathSetting) -> Result<(),
     }
 }
 
+/// Live Secure Kernel state owned together because the KD facade borrows the same controller.
+#[derive(Default)]
+struct SecureKernelLiveState {
+    session: Option<crate::skdispatch::Session>,
+    kd: Option<crate::kdtarget::ManagedOptions>,
+}
+
 /// Runs one op against this worker's engine. `queued` is how long it waited its turn here, which
 /// only the bounded paths care about.
 fn execute(
@@ -2693,7 +2796,7 @@ fn execute(
     queued: Duration,
     handle_bound: bool,
     sk: &mut Option<crate::sksession::Session>,
-    sk_live: &mut Option<crate::skdispatch::Session>,
+    sk_live: &mut SecureKernelLiveState,
 ) -> Result<Output, Failed> {
     // **How much of the caller's patience is gone by the time a bound is armed** — the queue wait
     // *plus* whatever this op has already spent getting to the point of arming one. Every budget
@@ -2887,7 +2990,43 @@ fn execute(
 
         EngineOp::OpenSecureKernel(request) => open_secure_kernel(e, id, &request, sk),
 
-        EngineOp::OpenSecureKernelLive(request) => open_secure_kernel_live(id, &request, sk_live),
+        EngineOp::OpenSecureKernelLive(request) => {
+            open_secure_kernel_live(id, &request, &mut sk_live.session)
+        }
+
+        EngineOp::OpenSecureKernelKd(request) => {
+            open_secure_kernel_kd(id, &request, &mut sk_live.session, &mut sk_live.kd)
+        }
+
+        EngineOp::SkKdServe => {
+            let options = sk_live.kd.as_ref().ok_or_else(|| {
+                Failed::from("this worker holds no managed Secure Kernel KD facade")
+            })?;
+            if let Err(why) = claim_pump(id) {
+                return Err(match why {
+                    PumpRefused::TearingDown => Failed::categorised(
+                        structured::ErrorCategory::StaleSession,
+                        "The KD service was not started because this session is ending.",
+                    ),
+                    PumpRefused::BrokenIn => Failed::categorised(
+                        structured::ErrorCategory::Interrupted,
+                        "The KD service was interrupted before it started.",
+                    ),
+                });
+            }
+            let result = crate::kdtarget::serve_managed(
+                options,
+                e,
+                held_live_control(&mut sk_live.session)?,
+                id,
+            )
+            .map_err(|error| {
+                report_sk_kd_phase(crate::proto::SecureKernelKdPhase::RecoveryRequired);
+                failed(format!("{error:#}"))
+            });
+            pumping(None);
+            result.map(|()| Output::text("Secure Kernel KD peer disconnected"))
+        }
 
         EngineOp::SkModules => {
             let modules = held_capture(sk)?.modules().map_err(Failed::from)?;
@@ -2915,7 +3054,7 @@ fn execute(
         }
 
         EngineOp::SkLiveArm { breakpoints, mode } => {
-            let transition = held_live_control(sk_live)?
+            let transition = held_live_control(&mut sk_live.session)?
                 .arm(e, breakpoints, mode)
                 .map_err(failed)?;
             Ok(Output::typed(
@@ -2925,14 +3064,14 @@ fn execute(
         }
 
         EngineOp::SkLiveWait => {
-            let stop = held_live_control(sk_live)?
+            let stop = held_live_control(&mut sk_live.session)?
                 .wait_for_stop(e)
                 .map_err(failed)?;
             Ok(Output::typed(crate::skdispatch::render_stop(&stop), stop))
         }
 
         EngineOp::SkLiveRegisters => {
-            let stop = held_live_control(sk_live)?
+            let stop = held_live_control(&mut sk_live.session)?
                 .stopped()
                 .cloned()
                 .ok_or_else(|| Failed::from("live VTL1 registers are available only at a stop"))?;
@@ -2940,14 +3079,14 @@ fn execute(
         }
 
         EngineOp::SkLiveRead { address, size } => {
-            let read = held_live_control(sk_live)?
+            let read = held_live_control(&mut sk_live.session)?
                 .read_memory(address, size)
                 .map_err(failed)?;
             Ok(Output::typed(crate::skdispatch::render_read(&read), read))
         }
 
         EngineOp::SkLiveStep { epoch, guard } => {
-            let transition = held_live_control(sk_live)?
+            let transition = held_live_control(&mut sk_live.session)?
                 .step(e, &epoch, guard)
                 .map_err(failed)?;
             Ok(Output::typed(
@@ -2957,7 +3096,7 @@ fn execute(
         }
 
         EngineOp::SkLiveContinue { epoch } => {
-            let transition = held_live_control(sk_live)?
+            let transition = held_live_control(&mut sk_live.session)?
                 .continue_from(e, &epoch)
                 .map_err(failed)?;
             Ok(Output::typed(
@@ -3411,8 +3550,8 @@ fn execute(
         // Reaching here means any batch has already been told to stop and has finished unwinding —
         // the reader saw this request go past and said so, and this thread runs one job at a time.
         EngineOp::EndSession => {
-            let live_control = sk_live.is_some();
-            if let Some(session) = sk_live.as_mut()
+            let live_control = sk_live.session.is_some();
+            if let Some(session) = sk_live.session.as_mut()
                 && let Err(error) = session.close(e)
             {
                 return Err(Failed::categorised(
@@ -3426,7 +3565,9 @@ fn execute(
                 ));
             }
             if live_control {
-                *sk_live = None;
+                sk_live.session = None;
+                sk_live.kd = None;
+                KD_ACTIVE.store(false, Ordering::SeqCst);
                 LIVE_CONTROL_ACTIVE.store(false, Ordering::SeqCst);
 
                 // `Session::close` above is the live-control release boundary: it proves the
@@ -8156,9 +8297,9 @@ fn open_secure_kernel(
     Ok(Output::opened_capture(text, summary, report))
 }
 
-/// Bind a live Secure Kernel provider and retain its adapter in this worker. The opener itself is
-/// non-mutating: it validates the exact target identity and provider capabilities. `SkLiveArm` is
-/// the first operation allowed to pause or attach to `vmwp`.
+/// Reserve a live Secure Kernel target and retain its adapter in this worker. The opener itself is
+/// non-mutating. `SkLiveArm` performs build-guarded discovery, starts and validates the providers,
+/// then becomes the first operation allowed to mutate guest execution.
 fn open_secure_kernel_live(
     id: u64,
     request: &crate::skdispatch::OpenRequest,
@@ -8169,18 +8310,15 @@ fn open_secure_kernel_live(
             "this worker already holds a live Secure Kernel controller",
         ));
     }
-    let (session, skipped) = crate::skdispatch::Session::open(request).map_err(failed)?;
+    let (session, _skipped) = crate::skdispatch::Session::open(request).map_err(failed)?;
     emit(&WorkerMessage::Committed { id });
     emit(&WorkerMessage::Opened { id });
     let target = &request.target;
     let text = format!(
-        "Bound live Secure Kernel control to VM {} partition {:#x}, VP {}, VTL1, expected CR3 \
-         {:#x}. The provider ignored {} startup banner line(s). No execution breakpoint is armed.",
-        target.vm_id,
-        target.partition_id.0,
-        target.vp,
-        target.expected_cr3.0,
-        skipped.len(),
+        "Reserved live Secure Kernel control for VM {} VP {}, VTL1. The first arm discovers and \
+         validates the partition, provider CR3 and Secure Kernel memory source before changing \
+         debug registers. No execution breakpoint is armed.",
+        target.vm_id, target.vp,
     );
     let summary = structured::TargetSummary {
         kernel_mode: Some(true),
@@ -8194,6 +8332,49 @@ fn open_secure_kernel_live(
         ..Default::default()
     };
     *slot = Some(session);
+    LIVE_CONTROL_ACTIVE.store(true, Ordering::SeqCst);
+    Ok(Output::opened(text, summary))
+}
+
+fn open_secure_kernel_kd(
+    id: u64,
+    request: &crate::kdtarget::ManagedRequest,
+    live_slot: &mut Option<crate::skdispatch::Session>,
+    kd_slot: &mut Option<crate::kdtarget::ManagedOptions>,
+) -> Result<Output, Failed> {
+    if live_slot.is_some() || kd_slot.is_some() {
+        return Err(Failed::from(
+            "this worker already holds a live Secure Kernel controller",
+        ));
+    }
+    let (session, options, skipped) = crate::kdtarget::open_managed(request).map_err(failed)?;
+    KD_TEARDOWN_REQUESTED.store(false, Ordering::SeqCst);
+    KD_ACTIVE.store(true, Ordering::SeqCst);
+    emit(&WorkerMessage::Committed { id });
+    emit(&WorkerMessage::Opened { id });
+    let path = format!(r"\\.\pipe\{}", request.pipe);
+    let connection = format!(r"com:pipe,port={path},resets=0");
+    let text = format!(
+        "Reserved Secure Kernel KD for VM {} VP {}. KD processor 0 maps to guest VP {}. The server \
+         will hold the guarded initial stop and serve {path}. Connect WinDbg with `-k {connection}`. \
+         The provider ignored {} startup banner line(s).",
+        request.open.target.vm_id,
+        request.open.target.vp,
+        request.open.target.vp,
+        skipped.len(),
+    );
+    let summary = structured::TargetSummary {
+        kernel_mode: Some(true),
+        kernel_target: Some(structured::KernelTarget::Windows),
+        limitation: Some(
+            "WinDbg owns execution for this Secure Kernel KD session. MCP may inspect session \
+             status and logs, interrupt the active wait, or end the session."
+                .to_string(),
+        ),
+        ..Default::default()
+    };
+    *live_slot = Some(session);
+    *kd_slot = Some(options);
     LIVE_CONTROL_ACTIVE.store(true, Ordering::SeqCst);
     Ok(Output::opened(text, summary))
 }
@@ -11708,13 +11889,12 @@ mod tests {
             control_transport: "control-provider".into(),
             live_transport: "live-memory-provider".into(),
             vmwp_pid: 4242,
-            dispatcher_vnd: 0xfffff80000001000,
-            target: crate::skcontrol::TargetIdentity {
+            dispatcher_vnd: Some(0xfffff80000001000),
+            target: crate::skdispatch::TargetRequest {
                 vm_id: "00000000-0000-0000-0000-000000000001".into(),
-                partition_id: crate::skcontrol::HexU64(1),
+                partition_id: Some(crate::skcontrol::HexU64(1)),
                 vp: 0,
-                vtl: 1,
-                expected_cr3: crate::skcontrol::HexU64(0x1000),
+                expected_cr3: Some(crate::skcontrol::HexU64(0x1000)),
             },
             allow_transition_cr3: false,
             additional_vps: Vec::new(),
@@ -12045,6 +12225,12 @@ mod tests {
 
         assert_eq!(watch_for(&EngineOp::EndSession), Watch::Ignore);
         assert_eq!(watch_for(&EngineOp::Interrupt { job: None }), Watch::Ignore);
+        assert_eq!(
+            watch_for(&EngineOp::SkKdServe),
+            Watch::Ignore,
+            "the KD service controls vmwp behind the adapter and must not fingerprint its \
+             temporary engine target"
+        );
 
         // Everything else is measured, which is the default rather than a list — so an op added
         // later is watched without anyone remembering to add it.
@@ -15510,6 +15696,7 @@ mod tests {
             tearing_down: false,
             interrupted: None,
             pumping: None,
+            kd_waiting: false,
             uninterruptible: None,
         }
     }
@@ -15537,11 +15724,16 @@ mod tests {
 
         // And the backstop, for an op that panicked between the two.
         running.pump(Some(7));
+        running.kd_waiting = true;
         running.release(7);
         assert_eq!(
             running.pumping, None,
             "a claim given back must take the pump with it, or a later teardown breaks in on a \
              job that is not running a target"
+        );
+        assert!(
+            !running.kd_waiting,
+            "a service claim given back must close its interrupt interval"
         );
     }
 

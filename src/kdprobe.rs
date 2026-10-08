@@ -6,7 +6,6 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::windows::named_pipe::ServerOptions;
 
 use crate::kdwire::{Decoder, Frame, PACKET_TYPE_RESET, TargetLink};
 
@@ -166,15 +165,15 @@ async fn run_async(options: Options) -> Result<()> {
         );
     }
     let path = format!(r"\\.\pipe\{}", options.pipe);
-    let mut pipe = ServerOptions::new()
-        .first_pipe_instance(true)
-        .create(&path)
+    let mut pipe = crate::kdtarget::create_kd_pipe(&path)
         .with_context(|| format!("creating KD wire-probe pipe {path}"))?;
     eprintln!("waiting for WinDbg on {path}");
     tokio::time::timeout(options.timeout, pipe.connect())
         .await
         .context("waiting for WinDbg to connect timed out")?
         .with_context(|| format!("accepting WinDbg on {path}"))?;
+    let (client_pid, client_sid) = crate::kdtarget::pipe_client_identity(&pipe)?;
+    eprintln!("accepted WinDbg PID {client_pid} as {client_sid}");
 
     let mut decoder = Decoder::default();
     let mut link = TargetLink::new();

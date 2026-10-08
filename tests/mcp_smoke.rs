@@ -10,7 +10,7 @@
 //! * **The MCP spec revved.** New revision, new required field, a capability the SDK now
 //!   advertises on our behalf that this server does not actually implement.
 //!
-//! Seven tiers, so the cheap one can ride `cargo test` everywhere:
+//! Eight tiers, so the cheap one can ride `cargo test` everywhere:
 //!
 //! * **Protocol** (default) — spawns the server, speaks JSON-RPC. No debugger target, no
 //!   symbols, no network. This tier also drives the **listener** (`--listen`) over real HTTP on a
@@ -47,6 +47,11 @@
 //!   drives the complete typed MCP lifecycle through a worker: bind, guarded DR0 stop, inspect,
 //!   trap-flag step, restore, continue and teardown. The profile and privileged provider stay
 //!   outside the repository. Run it alone under the bench health wrapper.
+//! * **Secure Kernel KD** (`#[ignore]`d and
+//!   `WINDBG_MCP_SMOKE_SK_KD=<private JSON config>`) â€” opens the same disposable VM through the
+//!   MCP-managed KD session, connects an installed `kd.exe`, performs `t`, `r`, `q`, observes the
+//!   server phases, then releases through MCP. Boot-specific VND, partition, CR3, kernel base and
+//!   vmwp PID values are deliberately absent from the call.
 //! * **MessageManager CTF** (`#[ignore]`d, `WINDBG_MCP_SMOKE_CTF=1`, and the live-kernel gate)
 //!   — deploys a benign allocation fixture over WinRM, then verifies that the real driver and its
 //!   pool objects are visible through the structured MCP tools. The PowerShell orchestrator owns
@@ -2092,11 +2097,16 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// it is fixed at the open. 146 B back, and worth recording because the clause was added for the
 /// right reason on a reading that did not survive its own re-run.
 ///
-/// [`WIRE_CEILING`] is **not** raised with it: the payload is 327,543 and has 2,457 B left, and a
-/// ceiling raised before something needs it absorbs the next regression in silence. The
-/// model-visible ceiling leaves 1,626 B (1.4%), which is the headroom the last raise left and for
-/// the same reason.
-const MODEL_VISIBLE_CEILING: usize = 118_000;
+/// [`WIRE_CEILING`] is **not** raised with it: the current payload is 337,358 and has 7,642 B left,
+/// and a ceiling raised before something needs it absorbs the next regression in silence.
+///
+/// **118,000 -> 123,000 for the managed Secure Kernel KD opener** (2026-10-07, item 120). The
+/// surface moves 116,356 -> 119,631 B across 75 -> 76 tools. `open_sk_kd` is 2,772 B; the other
+/// 503 B are the startup-policy and deferred-discovery contract added to `open_sk_live_control`.
+/// The new opener names the exact-build profile, provider templates and three independent
+/// lifecycle bounds because the server now owns the facade rather than asking an external runner
+/// to own them. The current ceiling leaves 3,369 B (2.7%).
+const MODEL_VISIBLE_CEILING: usize = 123_000;
 
 /// Ceiling on the whole `tools/list` payload — the serialized result, not the sum of its tools, so
 /// the array's own punctuation and every result-level field are inside it. 216,839 bytes as of
@@ -2241,7 +2251,13 @@ const MODEL_VISIBLE_CEILING: usize = 118_000;
 /// machine-readable proof that a stop belongs to the configured VTL1 target. The new ceiling
 /// first left 11,145 B. Natural mode, bounded repeated-step inputs and the stop's mode/destination
 /// evidence move it another 1,827 B to 320,682 B, leaving 9,318 B (2.8%).
-const WIRE_CEILING: usize = 330_000;
+///
+/// **330,000 -> 345,000 for `open_sk_kd`** (2026-10-07). The payload moves 327,917 ->
+/// 337,132 B. The new tool is 7,986 B; the Secure Kernel policy/discovery description and
+/// state/output types add 1,228 B across `open_sk_live_control`, `session_status` and the seven
+/// existing opener closures, and one byte is the array comma. The new ceiling leaves 7,868 B
+/// (2.3%).
+const WIRE_CEILING: usize = 345_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,308
 /// bytes (2026-10-05), because its `inputSchema` pulls the whole `StepAction`/`Check` vocabulary
@@ -3256,6 +3272,18 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
                 "vm_id": "00000000-0000-0000-0000-000000000001",
                 "partition_id": "0x1",
                 "expected_cr3": "0x1000"
+            }),
+            "error",
+        ),
+        // The managed KD opener is likewise refused by the startup policy before discovery,
+        // providers, or a named pipe can be created on an unconfigured test host.
+        (
+            "open_sk_kd",
+            json!({
+                "profile": "Z:\\no\\such-profile.json",
+                "control_transport": "provider-that-must-not-start",
+                "live_transport": "memory-provider-that-must-not-start",
+                "vm_id": "00000000-0000-0000-0000-000000000001",
             }),
             "error",
         ),
@@ -4492,7 +4520,7 @@ fn a_listener_serves_the_narrowed_surface_it_was_started_with() {
     // was typed — `session` is added whatever it said.
     let log = listener.stderr();
     assert!(
-        log.contains("serving 13 of 75 tools (session, crash)"),
+        log.contains("serving 13 of 76 tools (session, crash)"),
         "the listener does not report the surface it ended up with: {log}"
     );
 }
@@ -4524,7 +4552,7 @@ fn two_clients_on_one_listener_are_served_two_surfaces() {
     let local_token = server.token.clone();
     assert!(
         server.wait_for_stderr(
-            "serving 20 of 75 tools (session, inspect) — except bench serves 13 of 75 tools \
+            "serving 20 of 76 tools (session, inspect) — except bench serves 13 of 76 tools \
              (session, crash)",
             Duration::from_secs(30)
         ),
@@ -19945,6 +19973,39 @@ fn secure_kernel_live_tier() -> Option<Value> {
     Some(config)
 }
 
+fn secure_kernel_kd_tier() -> Option<Value> {
+    let Some(path) = std::env::var_os("WINDBG_MCP_SMOKE_SK_KD") else {
+        skip(
+            "set WINDBG_MCP_SMOKE_SK_KD=<private JSON config> to run the MCP-managed Secure \
+             Kernel KD tier",
+        );
+        return None;
+    };
+    assert!(
+        std::env::var_os("WINDBG_MCP_SK_LIVE_POLICY").is_some(),
+        "the Secure Kernel KD tier requires the server-side WINDBG_MCP_SK_LIVE_POLICY"
+    );
+    let path = std::path::PathBuf::from(path);
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+        panic!(
+            "cannot read Secure Kernel KD config {}: {error}",
+            path.display()
+        )
+    });
+    let config: Value = serde_json::from_str(&text).unwrap_or_else(|error| {
+        panic!(
+            "invalid Secure Kernel KD config {}: {error}",
+            path.display()
+        )
+    });
+    assert_eq!(
+        config["disposable"],
+        json!(true),
+        "the Secure Kernel KD tier requires an explicit `disposable: true` guard"
+    );
+    Some(config)
+}
+
 /// The typed MCP form of the narrow live gate: one guarded hardware stop, one instruction step,
 /// full stopped-state inspection, restoration, continue and proved teardown.
 ///
@@ -20126,6 +20187,319 @@ fn a_live_secure_kernel_session_stops_steps_inspects_resumes_and_closes() {
         resume_unwind(panic);
     }
     ran("live Secure Kernel MCP stop/step/resume lifecycle");
+}
+
+/// The server-managed facade gate: MCP owns lifecycle and recovery while WinDbg owns the execution
+/// lease. The request intentionally carries no cdb-derived boot coordinates.
+#[test]
+#[ignore = "controls one explicitly disposable VBS VM; set WINDBG_MCP_SMOKE_SK_KD and the startup policy, then run alone"]
+fn a_managed_secure_kernel_kd_session_steps_in_windbg_and_releases_through_mcp() {
+    let Some(config) = secure_kernel_kd_tier() else {
+        return;
+    };
+    let required = |name: &str| {
+        config
+            .get(name)
+            .unwrap_or_else(|| panic!("Secure Kernel KD config omits `{name}`"))
+            .clone()
+    };
+    for forbidden in [
+        "vmwp_pid",
+        "dispatcher_vnd",
+        "partition_id",
+        "expected_cr3",
+        "kernel_base",
+    ] {
+        assert!(
+            config.get(forbidden).is_none(),
+            "the managed gate must discover `{forbidden}`, not accept it from its config"
+        );
+    }
+
+    let kd = required("kd")
+        .as_str()
+        .expect("`kd` is a path string")
+        .to_string();
+    assert!(std::path::Path::new(&kd).is_file(), "no kd.exe at {kd}");
+    let commands = marker_path("sk-kd-commands").with_extension("txt");
+    let log = marker_path("sk-kd-windbg").with_extension("log");
+    let symbols = marker_path("sk-kd-empty-symbols");
+    std::fs::create_dir(&symbols).expect("create the empty KD symbol directory");
+    std::fs::write(&commands, b"lm m securekernel\nt\nr\nq\n").expect("write the KD command file");
+    let _ = std::fs::remove_file(&log);
+
+    let open = json!({
+        "profile": required("profile"),
+        "control_transport": required("control_transport"),
+        "live_transport": required("live_transport"),
+        "vm_id": required("vm_id"),
+        "vp": config.get("vp").cloned().unwrap_or(json!(0)),
+        "arm_mode": config.get("arm_mode").cloned().unwrap_or(json!("redirect")),
+        "connect_timeout_ms": 60000,
+        "idle_timeout_ms": 60000,
+        "max_pause_ms": 180000
+    });
+    let mut server = Server::started();
+    let opened = server.tool_data("open_sk_kd", open, TARGET_STEP);
+    let id = opened["session_id"]
+        .as_str()
+        .expect("the KD opener mints a session handle")
+        .to_string();
+    let target = opened["target"]
+        .as_str()
+        .expect("the KD opener reports its generated pipe");
+    let pipe = target
+        .rsplit_once(" KD pipe ")
+        .map(|(_, pipe)| pipe)
+        .unwrap_or_else(|| panic!("the KD target omitted its generated pipe: {target}"));
+    let connection = format!(r"com:pipe,port=\\.\pipe\{pipe},resets=0");
+
+    let state = |server: &mut Server| -> String {
+        let status = server.tool_data("session_status", json!({ "session_id": id }), TARGET_STEP);
+        let state = &status["sessions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|session| session["session_id"] == id)
+            .unwrap_or_else(|| panic!("session status omitted {id}: {status}"))["state"];
+        if state["state"] == "secure_kernel_kd" {
+            state["phase"]
+                .as_str()
+                .unwrap_or_else(|| panic!("managed KD state omitted its phase: {status}"))
+                .to_string()
+        } else {
+            state["state"]
+                .as_str()
+                .unwrap_or_else(|| panic!("session status omitted its state: {status}"))
+                .to_string()
+        }
+    };
+    let mut kd_process: Option<Child> = None;
+    let run = catch_unwind(AssertUnwindSafe(|| {
+        let deadline = Instant::now() + TARGET_STEP;
+        loop {
+            let phase = state(&mut server);
+            if matches!(phase.as_str(), "waiting_for_peer" | "stopped") {
+                break;
+            }
+            assert!(
+                !matches!(
+                    phase.as_str(),
+                    "recovery_required" | "live_control_unresolved" | "failed" | "closed"
+                ),
+                "managed KD failed before WinDbg connected: {phase}\n--- stderr ---\n{}",
+                server.stderr()
+            );
+            assert!(
+                Instant::now() < deadline,
+                "managed KD never published its pipe; last phase was {phase}\n--- stderr ---\n{}",
+                server.stderr()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let child = Command::new(&kd)
+            .args(["-k", &connection, "-cf"])
+            .arg(&commands)
+            .arg("-y")
+            .arg(&symbols)
+            .arg("-logo")
+            .arg(&log)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap_or_else(|error| panic!("launching {kd}: {error}"));
+        kd_process = Some(child);
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            let status = kd_process
+                .as_mut()
+                .expect("KD was stored")
+                .try_wait()
+                .expect("query kd.exe");
+            if let Some(status) = status {
+                assert!(status.success(), "kd.exe exited {status}");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "kd.exe did not finish the t/r/q script"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let phase = state(&mut server);
+            if phase == "reconnecting" {
+                break;
+            }
+            assert!(
+                phase != "recovery_required",
+                "KD disconnect faulted the session"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "the managed session did not enter reconnecting; last phase was {phase}\n--- stderr ---\n{}\n--- WinDbg ---\n{}",
+                server.stderr(),
+                std::fs::read_to_string(&log).unwrap_or_else(|error| error.to_string())
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let transcript = std::fs::read_to_string(&log).expect("WinDbg wrote its KD log");
+        assert!(
+            transcript.contains("rax="),
+            "registers were not visible:\n{transcript}\n--- server stderr ---\n{}",
+            server.stderr()
+        );
+        let profile: Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                required("profile")
+                    .as_str()
+                    .expect("profile is a path string"),
+            )
+            .expect("read the managed KD profile"),
+        )
+        .expect("parse the managed KD profile");
+        let rva_text = profile["secure_kernel_kd"]["initial"]["rva"]
+            .as_str()
+            .expect("the profile has a Secure Kernel initial RVA");
+        let rva = u64::from_str_radix(rva_text.trim_start_matches("0x"), 16)
+            .expect("the initial RVA is hexadecimal");
+        let instruction_len = profile["secure_kernel_kd"]["initial"]["original"]
+            .as_array()
+            .expect("the profile has initial instruction bytes")
+            .len() as u64;
+        let base_marker = "Kernel base = 0x";
+        let base_start = transcript
+            .find(base_marker)
+            .map(|at| at + base_marker.len())
+            .expect("WinDbg reported the Secure Kernel base");
+        let base_text = transcript[base_start..]
+            .split_whitespace()
+            .next()
+            .expect("the base has a value")
+            .replace('`', "");
+        let base = u64::from_str_radix(&base_text, 16).expect("the base is hexadecimal");
+        let expected_rip = base + rva + instruction_len;
+        assert!(
+            transcript
+                .to_ascii_lowercase()
+                .contains(&format!("rip={expected_rip:016x}")),
+            "WinDbg did not report the single-step destination {expected_rip:#x}:\n{transcript}"
+        );
+        assert!(
+            !transcript.contains("Module List address is NULL")
+                && !transcript.contains("KdDebuggerDataBlock not available"),
+            "WinDbg did not accept the validated Secure Kernel debugger metadata:\n{transcript}"
+        );
+        assert!(
+            transcript.to_ascii_lowercase().contains("securekernel"),
+            "WinDbg did not enumerate securekernel.exe:\n{transcript}"
+        );
+    }));
+
+    if let Some(child) = kd_process.as_mut()
+        && child.try_wait().ok().flatten().is_none()
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let ended = server.call_tool("end_session", json!({ "session_id": id }), TARGET_STEP);
+    if run.is_ok() {
+        assert_no_error(&ended, "tools/call end_session");
+        let ended = &ended["result"]["structuredContent"];
+        assert_eq!(ended["status"], "ok", "{ended}");
+        assert_eq!(ended["released"], true, "{ended}");
+        assert_eq!(ended["target_left_running"], true, "{ended}");
+
+        let audit_command = required("post_release_audit");
+        let audit_command = audit_command
+            .as_array()
+            .expect("post_release_audit is a command array");
+        let program = audit_command
+            .first()
+            .and_then(Value::as_str)
+            .expect("post_release_audit names a program");
+        let mut audit = Command::new(program)
+            .args(
+                audit_command[1..]
+                    .iter()
+                    .map(|argument| argument.as_str().expect("audit arguments are strings")),
+            )
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|error| panic!("launching post-release audit: {error}"));
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            if audit
+                .try_wait()
+                .expect("query post-release audit")
+                .is_some()
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = audit.kill();
+                let _ = audit.wait();
+                panic!("post-release audit exceeded 120 seconds");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let audit = audit
+            .wait_with_output()
+            .expect("collect post-release audit output");
+        assert!(
+            audit.status.success(),
+            "post-release audit exited {}:\n{}",
+            audit.status,
+            String::from_utf8_lossy(&audit.stderr)
+        );
+        let audit_stdout = String::from_utf8(audit.stdout).expect("audit output is UTF-8");
+        let audit_json = audit_stdout
+            .find('{')
+            .map(|at| &audit_stdout[at..])
+            .unwrap_or_else(|| panic!("post-release audit omitted JSON: {audit_stdout}"));
+        let audit: Value = serde_json::from_str(audit_json).unwrap_or_else(|error| {
+            panic!("invalid post-release audit JSON: {error}\n{audit_json}")
+        });
+        assert_eq!(audit["result"], "pass", "{audit}");
+        assert_eq!(
+            audit["survival"]
+                .as_array()
+                .expect("audit reports survival samples")
+                .len(),
+            3,
+            "{audit}"
+        );
+        assert_eq!(audit["target_after"]["valid"], true, "{audit}");
+        let dr7 = audit["debug_registers"]["dr7"]["low"]
+            .as_str()
+            .and_then(|value| value.strip_prefix("0x"))
+            .and_then(|value| u64::from_str_radix(value, 16).ok())
+            .expect("audit reports DR7");
+        assert_eq!(
+            dr7 & 0xff,
+            0,
+            "a hardware breakpoint remained armed: {audit}"
+        );
+    } else if is_tool_error(&ended) {
+        eprintln!(
+            "managed KD cleanup retained its fail-closed worker: {}",
+            text_of(&ended["result"])
+        );
+    }
+    let _ = std::fs::remove_file(commands);
+    let _ = std::fs::remove_file(log);
+    let _ = std::fs::remove_dir(symbols);
+    if let Err(panic) = run {
+        resume_unwind(panic);
+    }
+    ran("MCP-managed Secure Kernel KD t/r/q and release lifecycle");
 }
 
 /// **A capture opens as a session, and answers about the guest rather than about the image.**

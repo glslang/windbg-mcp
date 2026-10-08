@@ -53,6 +53,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # one-shot calls against pseudo-handles, which is why this pulls in no crypto crate.
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Security_Cryptography",
     # `GetConsoleProcessList`, which is how `engine::attached_to_a_console` answers whether a
     # child this server spawns has a console to inherit — and therefore whether it would open a
@@ -71,6 +73,9 @@ windows-sys = { version = "0.61", features = [
     # (`0x80670015`, `0x80073d54`), which is what makes that decoder a typed host call rather than
     # a scrape of an extension's output.
     "Win32_System_Diagnostics_Debug",
+    # `GetThreadContext`/`SetThreadContext` preserve the exact stopped vmwp thread around the
+    # profiled VidGetHvPartitionId call used by Secure Kernel target discovery.
+    "Win32_System_Kernel",
     # `CreateFileW` + `GetFileInformationByHandle`, which is how `src/skinspect.rs` answers whether
     # two paths are the same file before it writes a report over one of them. A **hard link** is one
     # file under two names and `canonicalize` keeps both, so every path-shaped comparison says

@@ -178,17 +178,19 @@ The `securekernel` tool group exposes one selected VP through a worker-owned liv
 adapter uses an initial VM pause and the held native event to keep provider state stable while it
 changes that VP:
 
-1. `open_sk_live_control` records the requested VM, partition, selected VP, CR3, `vmwp` PID,
-   dispatcher pointer, profile and provider commands. It validates their shape, loads the profile,
-   and validates the register provider's declared identity and capabilities. Its MCP schema exposes
-   one VP; multi-provider coordination remains a separate gate. Opening does not pause, attach to or
-   inspect the VM. `allow_transition_cr3` defaults to false and is accepted only with natural
-   arming; the paused baseline must still match `expected_cr3` exactly.
-2. The first `sk_live_arm` pauses the VM, verifies its `vmwp` binding, opens and checks live memory
-   against the requested CR3, verifies each guarded instruction, attaches to `vmwp`, and checks its
-   exact build and dispatcher sites. Only then does it save the selected VP's writable baseline and
-   install one to four explicitly slotted execution breakpoints. Redirect mode requires one VP and
-   one breakpoint. Natural mode arms the full VP and breakpoint set.
+1. `open_sk_live_control` applies the startup policy, records the VM, selected VP, profile and exact
+   provider command templates, resolves the current `vmwp` PID, loads the profile, and reserves the
+   VM. PID, dispatcher VND, partition id and CR3 are optional mismatch assertions. Its MCP schema
+   exposes one VP; multi-provider coordination remains a separate gate. Opening does not pause,
+   attach to or inspect the VM, and starts no provider. `allow_transition_cr3` defaults to false and
+   is accepted only with natural arming.
+2. The first `sk_live_arm` pauses the VM, verifies its `vmwp` binding and exact build, discovers the
+   dispatcher VND and VID partition id on the worker engine thread, then starts the register
+   provider and validates its reported CR3. It opens live memory against that identity, validates
+   the provider-reported Secure Kernel base and guarded instructions, and checks every profiled
+   dispatcher site. Only then does it save the selected VP's writable baseline and install one to
+   four explicitly slotted execution breakpoints. Redirect mode requires one VP and one breakpoint.
+   Natural mode arms the full VP and breakpoint set.
 3. `sk_live_wait` pumps `vmwp` until the selected VP reaches any armed address. It retains that exact
    callback thread. In transition mode it validates two identical register snapshots, binds the
    observed CR3, and rechecks the guarded instruction bytes through that root before returning the
@@ -215,9 +217,11 @@ admits another teardown attempt only. If the supervisor disappears, the worker p
 cleanup itself and remains resident if it cannot prove it. Once adapter cleanup succeeds, a later
 failure ending the worker's idle image target cannot relabel the proved VTL1 release as unresolved.
 
-The opt-in smoke test reads all machine-specific inputs from `WINDBG_MCP_SMOKE_SK_LIVE`, whose JSON
+The opt-in smoke test reads its private inputs from `WINDBG_MCP_SMOKE_SK_LIVE`, whose JSON
 must explicitly say `"disposable": true`. It drives the seven calls above through the built MCP
-binary. The profile, privileged provider and bench evidence remain outside version control.
+binary. `WINDBG_MCP_SK_LIVE_POLICY` must admit the VM, exact provider command templates and profile
+root before the server starts. The profile, privileged provider and bench evidence remain outside
+version control.
 
 On 2026-10-03 that MCP test completed the full bind, arm, stop, inspect, step, second-stop,
 continue and close lifecycle against the allowlisted disposable K3 VM. An independent wrapper then

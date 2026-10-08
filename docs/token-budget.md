@@ -341,23 +341,23 @@ None of these is a bug. They are recorded because they were invisible, and
    and, since item 41, for the sentences the tools it keeps used to spend on pointing at them.
    Where the bytes sit, and what each profile costs:
 
-   Both tables are measurements of **2026-10-05** and move with any edit to a description.
+   Both tables are measurements of **2026-10-07** and move with any edit to a description.
 
    | group | tools | bytes | share |
    |---|---:|---:|---:|
-   | `allocator` | 10 | 16,906 | 14.5% |
-   | `ioctl` | 11 | 16,088 | 13.8% |
-   | `securekernel` | 11 | 15,906 | 13.7% |
-   | `exec` | 10 | 15,087 | 13% |
-   | `session` | 10 | 14,013 | 12% |
-   | `inspect` | 10 | 13,485 | 11.6% |
-   | `batch` | 1 | 10,308 | 8.9% |
-   | `crash` | 3 | 7,473 | 6.4% |
-   | `ttd` | 9 | 7,090 | 6.1% |
+   | `allocator` | 10 | 16,906 | 14.1% |
+   | `ioctl` | 11 | 16,088 | 13.4% |
+   | `securekernel` | 12 | 19,181 | 16.0% |
+   | `exec` | 10 | 15,087 | 12.6% |
+   | `session` | 10 | 14,013 | 11.7% |
+   | `inspect` | 10 | 13,485 | 11.3% |
+   | `batch` | 1 | 10,308 | 8.6% |
+   | `crash` | 3 | 7,473 | 6.2% |
+   | `ttd` | 9 | 7,090 | 5.9% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 75 | 116,356 |
+   | *(absent)* | 76 | 119,631 |
    | `session,inspect,exec,crash` | 33 | 49,137 |
    | `session,inspect,crash` | 23 | 33,897 |
    | `crash` | 13 | 20,320 |

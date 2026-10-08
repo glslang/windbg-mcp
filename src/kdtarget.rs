@@ -6,18 +6,30 @@
 //! here; [`crate::worker`] lends this role its one engine on the same thread.
 
 use std::collections::BTreeMap;
+use std::ffi::c_void;
 use std::fmt;
+use std::os::windows::io::AsRawHandle;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use dbgscope::dbgeng::{BreakRequest, DebugEngine, InterruptHandle};
-use iced_x86::{
-    Decoder as InstructionDecoder, DecoderOptions, FlowControl, Mnemonic, OpKind, Register,
-};
+use iced_x86::{Decoder as InstructionDecoder, DecoderOptions, FlowControl};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::windows::named_pipe::ServerOptions;
 use tokio::sync::mpsc;
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
+use windows_sys::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+};
+use windows_sys::Win32::Security::{
+    GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+    TokenUser,
+};
+use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 
 use crate::kdapi::{Amd64Context, Amd64ContextValues, ManipulateRequest, Version64};
 use crate::kdwire::{Decoder, Frame, TargetLink};
@@ -28,6 +40,7 @@ pub(crate) const TARGET_FLAG: &str = "--sk-kd-target";
 
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_MAX_PAUSE: Duration = Duration::from_secs(600);
 const MAX_PIPE_NAME: usize = 128;
 const MAX_INSTRUCTION_BYTES: u32 = 15;
 const COMPATIBILITY_PAGE_BYTES: u64 = 0x1000;
@@ -54,6 +67,17 @@ impl fmt::Display for Disconnected {
 }
 
 impl std::error::Error for Disconnected {}
+
+#[derive(Debug)]
+struct ManagedTeardown;
+
+impl fmt::Display for ManagedTeardown {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        out.write_str("the MCP supervisor requested Secure Kernel KD teardown")
+    }
+}
+
+impl std::error::Error for ManagedTeardown {}
 
 enum TransportMessage {
     Frame(Frame),
@@ -210,19 +234,34 @@ impl WaitWaker {
     }
 }
 
-#[derive(Debug)]
-struct Options {
-    open: crate::skdispatch::OpenRequest,
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManagedRequest {
+    pub(crate) open: crate::skdispatch::OpenRequest,
+    pub(crate) pipe: String,
+    pub(crate) kernel_base: Option<u64>,
+    pub(crate) build: Option<u16>,
+    /// Optional standalone assertion for the profile-derived first stop.
+    pub(crate) initial: Option<InstructionGuard>,
+    pub(crate) arm_mode: ArmMode,
+    pub(crate) connect_timeout_ms: u64,
+    pub(crate) idle_timeout_ms: u64,
+    pub(crate) max_pause_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ManagedOptions {
     pipe: String,
-    kernel_base: u64,
-    build: u16,
-    initial: InstructionGuard,
+    kernel_base: Option<u64>,
+    build: Option<u16>,
+    initial: Option<InstructionGuard>,
     arm_mode: ArmMode,
     connect_timeout: Duration,
     idle_timeout: Duration,
+    max_pause: Duration,
 }
 
-impl Options {
+impl ManagedRequest {
     fn parse(args: &[String]) -> Result<Self> {
         let mut profile = None;
         let mut control_transport = None;
@@ -235,12 +274,13 @@ impl Options {
         let mut expected_cr3 = None;
         let mut pipe = None;
         let mut kernel_base = None;
-        let mut build = 26_100;
+        let mut build = None;
         let mut instruction_address = None;
         let mut instruction_bytes = None;
         let mut arm_mode = ArmMode::Redirect;
         let mut connect_timeout = DEFAULT_CONNECT_TIMEOUT;
         let mut idle_timeout = DEFAULT_IDLE_TIMEOUT;
+        let mut max_pause = DEFAULT_MAX_PAUSE;
         let mut at = 0;
         while at < args.len() {
             let value = |at: &mut usize| -> Result<&String> {
@@ -268,7 +308,7 @@ impl Options {
                 }
                 "--pipe" => pipe = Some(value(&mut at)?.clone()),
                 "--kernel-base" => kernel_base = Some(parse_word("kernel-base", value(&mut at)?)?),
-                "--build" => build = value(&mut at)?.parse().context("invalid --build")?,
+                "--build" => build = Some(value(&mut at)?.parse().context("invalid --build")?),
                 "--instruction-address" => {
                     instruction_address = Some(parse_word("instruction-address", value(&mut at)?)?)
                 }
@@ -302,6 +342,14 @@ impl Options {
                     }
                     idle_timeout = Duration::from_millis(milliseconds);
                 }
+                "--max-pause-ms" => {
+                    let milliseconds: u64 =
+                        value(&mut at)?.parse().context("invalid --max-pause-ms")?;
+                    if milliseconds == 0 || milliseconds > 3_600_000 {
+                        bail!("--max-pause-ms must be in 1..=3600000");
+                    }
+                    max_pause = Duration::from_millis(milliseconds);
+                }
                 other => bail!("unknown Secure Kernel KD argument {other:?}\n\n{}", usage()),
             }
             at += 1;
@@ -317,12 +365,16 @@ impl Options {
                 "--pipe must contain 1..={MAX_PIPE_NAME} ASCII letters, digits, dots, dashes or underscores"
             );
         }
-        let target = crate::skcontrol::TargetIdentity {
-            vm_id: vm_id.context(usage())?,
-            partition_id: crate::skcontrol::HexU64(partition_id.context(usage())?),
+        let vm_id = vm_id.context(usage())?;
+        let vmwp_pid = match vmwp_pid {
+            Some(pid) => pid,
+            None => crate::skdispatch::resolve_vmwp_pid(&vm_id, None)?,
+        };
+        let target = crate::skdispatch::TargetRequest {
+            vm_id,
+            partition_id: partition_id.map(crate::skcontrol::HexU64),
             vp,
-            vtl: 1,
-            expected_cr3: crate::skcontrol::HexU64(expected_cr3.context(usage())?),
+            expected_cr3: expected_cr3.map(crate::skcontrol::HexU64),
         };
         target.validate()?;
         Ok(Self {
@@ -330,29 +382,36 @@ impl Options {
                 profile: profile.context(usage())?,
                 control_transport: control_transport.context(usage())?,
                 live_transport: live_transport.context(usage())?,
-                vmwp_pid: vmwp_pid.context(usage())?,
-                dispatcher_vnd: dispatcher_vnd.context(usage())?,
+                vmwp_pid,
+                dispatcher_vnd,
                 target,
                 allow_transition_cr3: false,
                 additional_vps: Vec::new(),
             },
             pipe,
-            kernel_base: kernel_base.context(usage())?,
+            kernel_base,
             build,
-            initial: InstructionGuard {
-                address: crate::skcontrol::HexU64(instruction_address.context(usage())?),
-                bytes: instruction_bytes.context(usage())?,
+            initial: match (instruction_address, instruction_bytes) {
+                (Some(address), Some(bytes)) => Some(InstructionGuard {
+                    address: crate::skcontrol::HexU64(address),
+                    bytes,
+                }),
+                (None, None) => None,
+                _ => {
+                    bail!("--instruction-address and --instruction-bytes must be supplied together")
+                }
             },
             arm_mode,
-            connect_timeout,
-            idle_timeout,
+            connect_timeout_ms: connect_timeout.as_millis() as u64,
+            idle_timeout_ms: idle_timeout.as_millis() as u64,
+            max_pause_ms: max_pause.as_millis() as u64,
         })
     }
 }
 
 pub(crate) fn run(args: &[String], engine: &DebugEngine) -> Result<()> {
-    let options = Options::parse(args)?;
-    let (mut session, skipped) = crate::skdispatch::Session::open(&options.open)?;
+    let request = ManagedRequest::parse(args)?;
+    let (mut session, options, skipped) = open_managed(&request)?;
     for line in skipped {
         eprintln!("control provider: {line}");
     }
@@ -362,7 +421,7 @@ pub(crate) fn run(args: &[String], engine: &DebugEngine) -> Result<()> {
         .worker_threads(2)
         .enable_all()
         .build()?
-        .block_on(run_async(&options, engine, &mut session));
+        .block_on(run_async(&options, engine, &mut session, false, None));
     if result
         .as_ref()
         .is_err_and(|error| error.downcast_ref::<Disconnected>().is_some())
@@ -378,222 +437,677 @@ pub(crate) fn run(args: &[String], engine: &DebugEngine) -> Result<()> {
     }
 }
 
-async fn run_async(
-    options: &Options,
+pub(crate) fn open_managed(
+    request: &ManagedRequest,
+) -> Result<(crate::skdispatch::Session, ManagedOptions, Vec<String>)> {
+    validate_pipe_name(&request.pipe)?;
+    if request.connect_timeout_ms == 0 || request.connect_timeout_ms > 3_600_000 {
+        bail!("Secure Kernel KD connect_timeout_ms must be in 1..=3600000");
+    }
+    if request.idle_timeout_ms == 0 || request.idle_timeout_ms > 3_600_000 {
+        bail!("Secure Kernel KD idle_timeout_ms must be in 1..=3600000");
+    }
+    if request.max_pause_ms == 0 || request.max_pause_ms > 3_600_000 {
+        bail!("Secure Kernel KD max_pause_ms must be in 1..=3600000");
+    }
+    if let Some(initial) = &request.initial {
+        initial.validate()?;
+    }
+    let (session, skipped) = crate::skdispatch::Session::open(&request.open)?;
+    Ok((
+        session,
+        ManagedOptions {
+            pipe: request.pipe.clone(),
+            kernel_base: request.kernel_base,
+            build: request.build,
+            initial: request.initial.clone(),
+            arm_mode: request.arm_mode,
+            connect_timeout: Duration::from_millis(request.connect_timeout_ms),
+            idle_timeout: Duration::from_millis(request.idle_timeout_ms),
+            max_pause: Duration::from_millis(request.max_pause_ms),
+        },
+        skipped,
+    ))
+}
+
+pub(crate) fn serve_managed(
+    options: &ManagedOptions,
     engine: &DebugEngine,
     session: &mut crate::skdispatch::Session,
+    job: u64,
 ) -> Result<()> {
+    let result = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?
+        .block_on(run_async(options, engine, session, true, Some(job)));
+    match result {
+        Err(error)
+            if error.downcast_ref::<ManagedTeardown>().is_some()
+                || crate::worker::kd_teardown_requested() =>
+        {
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+fn validate_pipe_name(pipe: &str) -> Result<()> {
+    if pipe.is_empty()
+        || pipe.len() > MAX_PIPE_NAME
+        || !pipe
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        bail!(
+            "KD pipe must contain 1..={MAX_PIPE_NAME} ASCII letters, digits, dots, dashes or \
+             underscores"
+        );
+    }
+    Ok(())
+}
+
+struct OwnedHandle(HANDLE);
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: this owns the handle returned by OpenProcess or OpenProcessToken.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+}
+
+struct LocalAllocation(*mut c_void);
+
+impl Drop for LocalAllocation {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: both conversion APIs document their output as LocalFree-owned.
+            unsafe { LocalFree(self.0) };
+        }
+    }
+}
+
+pub(crate) fn create_kd_pipe(
+    path: &str,
+) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: the current-process pseudo-handle is valid, and `token` is writable.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let token = OwnedHandle(token);
+    let mut required = 0u32;
+    // The first call intentionally supplies no buffer to obtain the required size.
+    unsafe { GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut required) };
+    if required == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let words = usize::try_from(required)
+        .unwrap_or(usize::MAX)
+        .div_ceil(std::mem::size_of::<usize>());
+    let mut storage = vec![0usize; words];
+    // SAFETY: `storage` is aligned for TOKEN_USER and has the byte length Windows requested.
+    if unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenUser,
+            storage.as_mut_ptr().cast(),
+            required,
+            &mut required,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a successful TokenUser query begins with a TOKEN_USER.
+    let user = unsafe { &*storage.as_ptr().cast::<TOKEN_USER>() };
+    let mut sid_text = std::ptr::null_mut();
+    // SAFETY: the SID pointer belongs to the token-information buffer and remains live here.
+    if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut sid_text) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let sid_text_guard = LocalAllocation(sid_text.cast());
+    let mut sid_length = 0usize;
+    // SAFETY: ConvertSidToStringSidW returned a NUL-terminated UTF-16 allocation.
+    while unsafe { *sid_text.add(sid_length) } != 0 {
+        sid_length += 1;
+    }
+    // SAFETY: the loop found the terminator inside the API-owned string.
+    let sid = String::from_utf16(unsafe { std::slice::from_raw_parts(sid_text, sid_length) })
+        .map_err(|_| std::io::Error::other("the current token SID was not valid UTF-16"))?;
+    drop(sid_text_guard);
+
+    // Protected DACL: the exact server account, LocalSystem and builtin Administrators only.
+    let mut sddl = format!("D:P(A;;GA;;;{sid})(A;;GA;;;SY)(A;;GA;;;BA)")
+        .encode_utf16()
+        .collect::<Vec<_>>();
+    sddl.push(0);
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: `sddl` is NUL-terminated and `descriptor` is a writable output pointer.
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let descriptor = LocalAllocation(descriptor);
+    let mut attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: 0,
+    };
+    // SAFETY: `attributes` and its descriptor stay live until CreateNamedPipeW returns. Windows
+    // captures the descriptor into the new object, so freeing it after this call is valid.
+    unsafe {
+        ServerOptions::new()
+            .first_pipe_instance(true)
+            .reject_remote_clients(true)
+            .create_with_security_attributes_raw(
+                path,
+                std::ptr::from_mut(&mut attributes).cast::<c_void>(),
+            )
+    }
+}
+
+pub(crate) fn pipe_client_identity(
+    pipe: &tokio::net::windows::named_pipe::NamedPipeServer,
+) -> Result<(u32, String)> {
+    let mut pid = 0;
+    // SAFETY: the Tokio pipe owns a connected server handle and `pid` is a writable out pointer.
+    if unsafe { GetNamedPipeClientProcessId(pipe.as_raw_handle() as HANDLE, &mut pid) } == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("reading the Secure Kernel KD pipe client PID");
+    }
+    if pid == 0 {
+        bail!("the Secure Kernel KD pipe reported client PID zero");
+    }
+    // SAFETY: the returned process handle is owned here and closed by `OwnedHandle`.
+    let process = OwnedHandle(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) });
+    if process.0.is_null() {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("opening Secure Kernel KD pipe client PID {pid}"));
+    }
+    let sid = process_user_sid(process.0)
+        .with_context(|| format!("reading Secure Kernel KD pipe client PID {pid} token"))?;
+    let owner = process_user_sid(unsafe { GetCurrentProcess() })?;
+    if sid != owner && sid != "S-1-5-18" {
+        bail!(
+            "Secure Kernel KD pipe client PID {pid} runs as {sid}, not the server account {owner} \
+             or LocalSystem"
+        );
+    }
+    Ok((pid, sid))
+}
+
+fn process_user_sid(process: HANDLE) -> Result<String> {
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: `process` is a valid process or pseudo-handle and `token` is writable.
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
+        return Err(std::io::Error::last_os_error()).context("opening process token");
+    }
+    let token = OwnedHandle(token);
+    let mut required = 0;
+    // SAFETY: a null buffer with size zero is the documented size query.
+    unsafe { GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut required) };
+    if required == 0 {
+        return Err(std::io::Error::last_os_error()).context("sizing token user information");
+    }
+    let words = (required as usize).div_ceil(std::mem::size_of::<usize>());
+    let mut storage = vec![0usize; words];
+    // SAFETY: `storage` is aligned for TOKEN_USER and has the byte length Windows requested.
+    if unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenUser,
+            storage.as_mut_ptr().cast(),
+            required,
+            &mut required,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error()).context("reading token user information");
+    }
+    // SAFETY: a successful TokenUser query begins with a TOKEN_USER.
+    let user = unsafe { &*storage.as_ptr().cast::<TOKEN_USER>() };
+    let mut sid_text = std::ptr::null_mut();
+    // SAFETY: the SID pointer belongs to the token-information buffer and remains live here.
+    if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut sid_text) } == 0 {
+        return Err(std::io::Error::last_os_error()).context("formatting token user SID");
+    }
+    let sid_text_guard = LocalAllocation(sid_text.cast());
+    let mut length = 0;
+    // SAFETY: ConvertSidToStringSidW returned a NUL-terminated UTF-16 allocation.
+    while unsafe { *sid_text.add(length) } != 0 {
+        length += 1;
+    }
+    // SAFETY: the loop found the terminator inside the API-owned string.
+    let text = String::from_utf16(unsafe { std::slice::from_raw_parts(sid_text, length) })
+        .context("token user SID is not valid UTF-16")?;
+    drop(sid_text_guard);
+    Ok(text)
+}
+
+async fn run_async(
+    options: &ManagedOptions,
+    engine: &DebugEngine,
+    session: &mut crate::skdispatch::Session,
+    reconnect: bool,
+    managed_job: Option<u64>,
+) -> Result<()> {
+    refuse_managed_teardown()?;
+    crate::worker::report_sk_kd_phase(crate::proto::SecureKernelKdPhase::Discovering);
+    for line in session.prepare_for_kd(engine)? {
+        eprintln!("control provider: {line}");
+    }
+    let provider_kernel_base = session
+        .kernel_base()
+        .context("the live-memory provider did not report the Secure Kernel base")?;
+    if let Some(asserted) = options.kernel_base
+        && asserted != provider_kernel_base
+    {
+        bail!(
+            "provider-reported Secure Kernel base {provider_kernel_base:#x} does not match assertion {asserted:#x}"
+        );
+    }
+    let profile = session
+        .secure_kernel_kd()
+        .context("the dispatcher profile has no secure_kernel_kd section")?;
+    if let Some(asserted) = options.build
+        && asserted != profile.build
+    {
+        bail!(
+            "profiled Secure Kernel build {} does not match standalone assertion {asserted}",
+            profile.build
+        );
+    }
+    let initial_rva = profile.initial.rva.0;
+    let initial = InstructionGuard {
+        address: crate::skcontrol::HexU64(
+            provider_kernel_base
+                .checked_add(initial_rva)
+                .context("profiled Secure Kernel initial address overflowed")?,
+        ),
+        bytes: profile.initial.original.clone(),
+    };
+    initial.validate()?;
+    if let Some(asserted) = &options.initial
+        && asserted != &initial
+    {
+        bail!(
+            "profile-derived Secure Kernel initial stop {:#x} does not match the standalone assertion",
+            initial.address.0
+        );
+    }
     // WinDbg gives a serial target only a few seconds after reset before it reconnects. Capture the
     // initial event first, so accepting the pipe promises that a state-change packet is ready now.
     eprintln!(
         "arming initial Secure Kernel stop at {:#x}",
-        options.initial.address.0
+        initial.address.0
     );
+    crate::worker::report_sk_kd_phase(crate::proto::SecureKernelKdPhase::Arming);
     session.arm(
         engine,
         vec![BreakpointGuard {
             slot: 0,
-            instruction: options.initial.clone(),
+            instruction: initial,
         }],
         options.arm_mode,
     )?;
-    let mut stop = session.wait_for_stop(engine)?;
+    crate::worker::report_sk_kd_phase(crate::proto::SecureKernelKdPhase::Running);
+    let initial_activity = wait_activity(options.idle_timeout, managed_job);
+    let mut stop = session.wait_for_stop_interruptible(engine, &initial_activity)?;
+    let mut stopped_since = Instant::now();
+    refuse_managed_teardown()?;
+    crate::worker::report_sk_kd_phase(crate::proto::SecureKernelKdPhase::Stopped);
+    let kernel_base = provider_kernel_base;
+    let metadata = validate_debugger_metadata(session, kernel_base, &profile.debugger_data)?;
     let (mut values, mut context) = read_context(session, &stop)?;
     let mut reported_instruction = read_instruction_guard(session, values.rip)?;
 
     let path = format!(r"\\.\pipe\{}", options.pipe);
-    let pipe = ServerOptions::new()
-        .first_pipe_instance(true)
-        .create(&path)
-        .with_context(|| format!("creating Secure Kernel KD pipe {path}"))?;
-    eprintln!(
-        "Secure Kernel stop held at {:#x}; waiting for WinDbg on {path}",
-        values.rip
-    );
-    tokio::time::timeout(options.connect_timeout, pipe.connect())
+    let mut reconnecting = false;
+    'connections: loop {
+        let connect_wait = options
+            .connect_timeout
+            .min(remaining_pause(stopped_since, options.max_pause)?);
+        let pipe = create_kd_pipe(&path)
+            .with_context(|| format!("creating Secure Kernel KD pipe {path}"))?;
+        eprintln!(
+            "Secure Kernel stop held at {:#x}; waiting for WinDbg on {path}",
+            values.rip
+        );
+        crate::worker::report_sk_kd_phase(if reconnecting {
+            crate::proto::SecureKernelKdPhase::Reconnecting
+        } else {
+            crate::proto::SecureKernelKdPhase::WaitingForPeer
+        });
+        tokio::select! {
+            connected = tokio::time::timeout(connect_wait, pipe.connect()) => {
+                connected
+                    .with_context(|| {
+                        if stopped_since.elapsed() >= options.max_pause {
+                            "the absolute Secure Kernel pause bound expired while waiting for WinDbg"
+                        } else {
+                            "waiting for WinDbg to connect timed out"
+                        }
+                    })??;
+            }
+            () = wait_for_managed_teardown() => return Err(ManagedTeardown.into()),
+        }
+        let (client_pid, client_sid) = pipe_client_identity(&pipe)?;
+        eprintln!("accepted Secure Kernel KD client PID {client_pid} as {client_sid}");
+        crate::worker::report_sk_kd_phase(crate::proto::SecureKernelKdPhase::Stopped);
+
+        let (reader, mut writer) = tokio::io::split(pipe);
+        let (transport_tx, mut transport_rx) = mpsc::channel(TRANSPORT_QUEUE_DEPTH);
+        let wait_waker = WaitWaker::new(engine.interrupt_handle());
+        let reader_waker = wait_waker.clone();
+        tokio::spawn(read_transport(reader, transport_tx, reader_waker));
+        let mut link = TargetLink::new();
+        let reset = tokio::time::timeout(
+            options.connect_timeout,
+            wait_for_reset(&mut writer, &mut transport_rx, &mut link),
+        )
         .await
-        .context("waiting for WinDbg to connect timed out")??;
+        .context("waiting for WinDbg's KD reset timed out")?;
+        if let Err(error) = reset {
+            if reconnect && error.downcast_ref::<Disconnected>().is_some() {
+                reconnecting = true;
+                continue 'connections;
+            }
+            return Err(error);
+        }
+        send_stop(&mut writer, &mut link, &reported_instruction.bytes, &values).await?;
+        eprintln!("initial KD state change sent");
 
-    let (reader, mut writer) = tokio::io::split(pipe);
-    let (transport_tx, mut transport_rx) = mpsc::channel(TRANSPORT_QUEUE_DEPTH);
-    let wait_waker = WaitWaker::new(engine.interrupt_handle());
-    let reader_waker = wait_waker.clone();
-    tokio::spawn(read_transport(reader, transport_tx, reader_waker));
-    let mut link = TargetLink::new();
-    tokio::time::timeout(
-        options.connect_timeout,
-        wait_for_reset(&mut writer, &mut transport_rx, &mut link),
-    )
-    .await
-    .context("waiting for WinDbg's KD reset timed out")??;
-    send_stop(&mut writer, &mut link, &reported_instruction.bytes, &values).await?;
-    eprintln!("initial KD state change sent");
-
-    let mut breakpoints = BTreeMap::<u32, BreakpointGuard>::new();
-    let mut compatibility = CompatibilityMemory::default();
-    loop {
-        let frame = tokio::time::timeout(options.idle_timeout, read_frame(&mut transport_rx))
-            .await
-            .context("WinDbg sent no KD traffic before the idle timeout")??;
-        let inbound = link.receive(frame);
-        let peer_reset = inbound.peer_reset;
-        for write in inbound.writes {
-            writer.write_all(&write).await?;
-        }
-        if peer_reset {
-            compatibility = CompatibilityMemory::default();
-            breakpoints.clear();
-            send_stop(&mut writer, &mut link, &reported_instruction.bytes, &values).await?;
-            eprintln!("KD peer reset; current held stop resent");
-            continue;
-        }
-        let Some(packet) = inbound.packet else {
-            writer.flush().await?;
-            continue;
-        };
-        if packet.packet_type != crate::kdwire::PACKET_TYPE_STATE_MANIPULATE {
-            writer.flush().await?;
-            continue;
-        }
-        let request = ManipulateRequest::decode(&packet.payload)?;
-        let response = if request.api_number() == crate::kdapi::DBGKD_GET_VERSION_API {
-            request.get_version_response(Version64 {
-                build: options.build,
-                kernel_base: options.kernel_base,
-            })
-        } else if let Some(read) = request.read_virtual_memory() {
-            let count = read
-                .count
-                .min((crate::kdwire::MAX_PACKET_BYTES - crate::kdapi::MANIPULATE_BYTES) as u32);
-            if let Some(bytes) = compatibility.read(
-                read.address,
-                count,
-                values.gpr[4],
-                values.rip,
-                reported_instruction.bytes.len(),
-            ) {
-                eprintln!(
-                    "KD virtual read {:#x}+{count:#x} served by compatibility memory",
-                    read.address
+        let mut breakpoints = BTreeMap::<u32, BreakpointGuard>::new();
+        let mut compatibility = CompatibilityMemory::default();
+        loop {
+            let frame_wait = options
+                .idle_timeout
+                .min(remaining_pause(stopped_since, options.max_pause)?);
+            let next = tokio::select! {
+                frame = tokio::time::timeout(frame_wait, read_frame(&mut transport_rx)) => {
+                    frame.with_context(|| {
+                        if stopped_since.elapsed() >= options.max_pause {
+                            "the absolute Secure Kernel pause bound expired while serving WinDbg"
+                        } else {
+                            "WinDbg sent no KD traffic before the idle timeout"
+                        }
+                    })?
+                }
+                () = wait_for_managed_teardown() => return Err(ManagedTeardown.into()),
+            };
+            let frame = match next {
+                Ok(frame) => frame,
+                Err(error) if reconnect && error.downcast_ref::<Disconnected>().is_some() => {
+                    reconnecting = true;
+                    continue 'connections;
+                }
+                Err(error) => return Err(error),
+            };
+            let inbound = link.receive(frame);
+            let peer_reset = inbound.peer_reset;
+            let break_in = inbound.break_in;
+            let protocol_error = inbound.protocol_error;
+            for write in inbound.writes {
+                writer.write_all(&write).await?;
+            }
+            if let Some(error) = protocol_error {
+                writer.flush().await?;
+                bail!("KD peer exceeded the consecutive framing-error bound: {error}");
+            }
+            if break_in {
+                tracing::warn!(
+                    "Secure Kernel KD break-in is unsupported while the target is already stopped; \
+                     the retained stop was left unchanged"
                 );
-                request.read_virtual_memory_response(&bytes)?
-            } else {
-                match session.read_memory(read.address, count) {
-                    Ok(read_result) => {
-                        eprintln!(
-                            "KD virtual read {:#x}+{count:#x} served by Secure Kernel memory",
-                            read.address
-                        );
-                        request.read_virtual_memory_response(&decode_hex(&read_result.data)?)?
+                writer.flush().await?;
+                continue;
+            }
+            if peer_reset {
+                compatibility = CompatibilityMemory::default();
+                breakpoints.clear();
+                send_stop(&mut writer, &mut link, &reported_instruction.bytes, &values).await?;
+                eprintln!("KD peer reset; current held stop resent");
+                continue;
+            }
+            let Some(packet) = inbound.packet else {
+                writer.flush().await?;
+                continue;
+            };
+            if packet.packet_type != crate::kdwire::PACKET_TYPE_STATE_MANIPULATE {
+                writer.flush().await?;
+                continue;
+            }
+            let request = match ManipulateRequest::decode(&packet.payload) {
+                Ok(request) => request,
+                Err(error) => {
+                    tracing::warn!("refusing malformed Secure Kernel KD request: {error}");
+                    let response = link
+                        .send(
+                            crate::kdwire::PACKET_TYPE_STATE_MANIPULATE,
+                            &ManipulateRequest::failure_for_payload(&packet.payload),
+                        )
+                        .map_err(anyhow::Error::msg)?;
+                    writer.write_all(&response).await?;
+                    writer.flush().await?;
+                    continue;
+                }
+            };
+            let response = if request.api_number() == crate::kdapi::DBGKD_GET_VERSION_API {
+                tracing::info!(
+                    build = profile.build,
+                    kernel_base = format_args!("{kernel_base:#x}"),
+                    debugger_data_list = format_args!("{:#x}", metadata.debugger_data_list),
+                    loaded_module_list = format_args!("{:#x}", metadata.loaded_module_list),
+                    "serving synthesized Secure Kernel KD version record"
+                );
+                request.get_version_response(Version64 {
+                    build: profile.build,
+                    kernel_base,
+                    loaded_module_list: metadata.loaded_module_list,
+                    debugger_data_list: metadata.debugger_data_list,
+                })
+            } else if let Some(read) = request.read_virtual_memory() {
+                let count = read
+                    .count
+                    .min((crate::kdwire::MAX_PACKET_BYTES - crate::kdapi::MANIPULATE_BYTES) as u32);
+                if let Some(bytes) = compatibility.read(
+                    read.address,
+                    count,
+                    values.gpr[4],
+                    values.rip,
+                    reported_instruction.bytes.len(),
+                ) {
+                    tracing::info!(
+                        address = format_args!("{:#x}", read.address),
+                        count,
+                        "serving synthesized Secure Kernel KD compatibility memory"
+                    );
+                    request.read_virtual_memory_response(&bytes)?
+                } else {
+                    match session.read_memory(read.address, count) {
+                        Ok(read_result) => {
+                            eprintln!(
+                                "KD virtual read {:#x}+{count:#x} served by Secure Kernel memory",
+                                read.address
+                            );
+                            request.read_virtual_memory_response(&decode_hex(&read_result.data)?)?
+                        }
+                        Err(error) => {
+                            eprintln!("KD virtual read at {:#x} failed: {error:#}", read.address);
+                            request.failure_response()
+                        }
                     }
+                }
+            } else if let Some(read) = request.read_control_space() {
+                if read.address == crate::kdapi::AMD64_DEBUG_CONTROL_SPACE_KSPECIAL
+                    && read.count as usize <= crate::kdapi::AMD64_SPECIAL_REGISTERS_BYTES
+                {
+                    let special = crate::kdapi::amd64_special_registers(
+                        &values,
+                        stopped_low(&stop, RegisterName::Cr3)?,
+                    );
+                    eprintln!(
+                        "KD AMD64 special-register read {:#x}+{:#x}",
+                        read.address, read.count
+                    );
+                    request.read_control_space_response(&special[..read.count as usize])?
+                } else {
+                    eprintln!(
+                        "KD control-space read {:#x}+{:#x} is unsupported",
+                        read.address, read.count
+                    );
+                    request.failure_response()
+                }
+            } else if let Some((write, _)) = request.write_control_space() {
+                eprintln!(
+                    "KD control-space write {:#x}+{:#x} is unsupported",
+                    write.address, write.count
+                );
+                request.failure_response()
+            } else if request.api_number() == crate::kdapi::DBGKD_GET_CONTEXT_API {
+                eprintln!("KD GetContext");
+                request.get_context_response(&context)?
+            } else if let Some(range) = request.get_context_ex() {
+                eprintln!(
+                    "KD GetContextEx offset {:#x}, count {:#x}",
+                    range.offset, range.count
+                );
+                match request.get_context_ex_response(&context) {
+                    Ok(response) => response,
                     Err(error) => {
-                        eprintln!("KD virtual read at {:#x} failed: {error:#}", read.address);
+                        tracing::warn!("refusing Secure Kernel KD context range: {error}");
                         request.failure_response()
                     }
                 }
-            }
-        } else if let Some(read) = request.read_control_space() {
-            eprintln!(
-                "KD control-space read {:#x}+{:#x} is unsupported",
-                read.address, read.count
-            );
-            request.failure_response()
-        } else if let Some((write, _)) = request.write_control_space() {
-            eprintln!(
-                "KD control-space write {:#x}+{:#x} is unsupported",
-                write.address, write.count
-            );
-            request.failure_response()
-        } else if let Some(range) = request.get_context_ex() {
-            eprintln!(
-                "KD GetContextEx offset {:#x}, count {:#x}",
-                range.offset, range.count
-            );
-            request.get_context_ex_response(&context)?
-        } else if let Some(written) = request.set_context() {
-            let matches = context.matches_prefix(written);
-            eprintln!(
-                "KD SetContext supplied {:#x} bytes, unchanged={matches}",
-                written.len()
-            );
-            if matches {
-                request.success_response()
-            } else {
-                request.failure_response()
-            }
-        } else if let Some(address) = request.write_breakpoint_address() {
-            match insert_breakpoint(session, &mut breakpoints, address) {
-                Ok(handle) => request.write_breakpoint_response(handle)?,
-                Err(error) => {
-                    eprintln!("KD breakpoint at {address:#x} was refused: {error:#}");
+            } else if let Some(written) = request.set_context() {
+                let matches = context.matches_prefix(written);
+                eprintln!(
+                    "KD SetContext supplied {:#x} bytes, unchanged={matches}",
+                    written.len()
+                );
+                if matches {
+                    request.success_response()
+                } else {
                     request.failure_response()
                 }
-            }
-        } else if let Some(handle) = request.restore_breakpoint_handle() {
-            breakpoints.remove(&handle);
-            request.success_response()
-        } else if let Some(trace) = request.continue2_trace() {
-            eprintln!("KD Continue2 trace={trace}");
-            let activity = crate::skdispatch::WaitActivity::new(options.idle_timeout);
-            wait_waker.begin(activity.clone());
-            let resume = if trace {
-                stopped_low(&stop, RegisterName::Rip).and_then(|rip| {
-                    read_instruction_guard(session, rip)
-                        .and_then(fallthrough_step_guard)
-                        .and_then(|guard| session.step(engine, &stop.epoch, guard).map(|_| ()))
-                })
-            } else {
-                if breakpoints.is_empty() {
-                    Err(anyhow!(
-                        "WinDbg requested continue with no hardware breakpoint installed"
-                    ))
+            } else if let Some(address) = request.write_breakpoint_address() {
+                match insert_breakpoint(session, &mut breakpoints, address) {
+                    Ok(handle) => request.write_breakpoint_response(handle)?,
+                    Err(error) => {
+                        eprintln!("KD breakpoint at {address:#x} was refused: {error:#}");
+                        request.failure_response()
+                    }
+                }
+            } else if let Some(handle) = request.restore_breakpoint_handle() {
+                breakpoints.remove(&handle);
+                request.success_response()
+            } else if let Some(trace) = request.continue2_trace() {
+                eprintln!("KD Continue2 trace={trace}");
+                crate::worker::report_sk_kd_phase(crate::proto::SecureKernelKdPhase::Running);
+                let activity = wait_activity(options.idle_timeout, managed_job);
+                wait_waker.begin(activity.clone());
+                let resume = if trace {
+                    stopped_low(&stop, RegisterName::Rip).and_then(|rip| {
+                        read_instruction_guard(session, rip)
+                            .and_then(fallthrough_step_guard)
+                            .and_then(|guard| session.step(engine, &stop.epoch, guard).map(|_| ()))
+                    })
                 } else {
-                    session
-                        .continue_to_breakpoints(
-                            engine,
-                            &stop.epoch,
-                            breakpoints.values().cloned().collect(),
-                        )
-                        .map(|_| ())
+                    if breakpoints.is_empty() {
+                        Err(anyhow!(
+                            "WinDbg requested continue with no hardware breakpoint installed"
+                        ))
+                    } else {
+                        session
+                            .continue_to_breakpoints(
+                                engine,
+                                &stop.epoch,
+                                breakpoints.values().cloned().collect(),
+                            )
+                            .map(|_| ())
+                    }
+                };
+                if let Err(error) = resume {
+                    activity.finish();
+                    wait_waker.finish();
+                    if session.phase() != crate::sklive::LivePhase::Stopped {
+                        return Err(error);
+                    }
+                    crate::worker::report_sk_kd_phase(crate::proto::SecureKernelKdPhase::Stopped);
+                    eprintln!("KD Continue2 refused; current held stop preserved: {error:#}");
+                    send_stop(&mut writer, &mut link, &reported_instruction.bytes, &values).await?;
+                    continue;
                 }
-            };
-            if let Err(error) = resume {
-                activity.finish();
-                wait_waker.finish();
-                if session.phase() != crate::sklive::LivePhase::Stopped {
-                    return Err(error);
+                wait_waker.start_idle_watchdog(activity.clone());
+                if let Err(error) = writer.flush().await {
+                    activity.finish();
+                    wait_waker.finish();
+                    return Err(error.into());
                 }
-                eprintln!("KD Continue2 refused; current held stop preserved: {error:#}");
+                let waited = session.wait_for_stop_interruptible(engine, &activity);
+                let wake = wait_waker.finish();
+                if crate::worker::kd_teardown_requested() {
+                    return Err(ManagedTeardown.into());
+                }
+                stop = match (waited, wake) {
+                    (Ok(stop), _) => stop,
+                    (Err(_), Some(WaitWakeReason::Disconnected)) => return Err(Disconnected.into()),
+                    (Err(error), Some(reason)) => return Err(error.context(reason.to_string())),
+                    (Err(error), None) => return Err(error),
+                };
+                crate::worker::report_sk_kd_phase(crate::proto::SecureKernelKdPhase::Stopped);
+                stopped_since = Instant::now();
+                (values, context) = read_context(session, &stop)?;
+                reported_instruction = read_instruction_guard(session, values.rip)?;
+                compatibility = CompatibilityMemory::default();
                 send_stop(&mut writer, &mut link, &reported_instruction.bytes, &values).await?;
                 continue;
-            }
-            wait_waker.start_idle_watchdog(activity.clone());
-            if let Err(error) = writer.flush().await {
-                activity.finish();
-                wait_waker.finish();
-                return Err(error.into());
-            }
-            let waited = session.wait_for_stop_interruptible(engine, &activity);
-            let wake = wait_waker.finish();
-            stop = match (waited, wake) {
-                (Ok(stop), _) => stop,
-                (Err(_), Some(WaitWakeReason::Disconnected)) => return Err(Disconnected.into()),
-                (Err(error), Some(reason)) => return Err(error.context(reason.to_string())),
-                (Err(error), None) => return Err(error),
+            } else {
+                eprintln!("KD API {:#x} is not implemented", request.api_number());
+                request.failure_response()
             };
-            (values, context) = read_context(session, &stop)?;
-            reported_instruction = read_instruction_guard(session, values.rip)?;
-            send_stop(&mut writer, &mut link, &reported_instruction.bytes, &values).await?;
-            continue;
-        } else {
-            eprintln!("KD API {:#x} is not implemented", request.api_number());
-            request.failure_response()
-        };
-        let response = link
-            .send(crate::kdwire::PACKET_TYPE_STATE_MANIPULATE, &response)
-            .map_err(anyhow::Error::msg)?;
-        writer.write_all(&response).await?;
-        writer.flush().await?;
+            let response = link
+                .send(crate::kdwire::PACKET_TYPE_STATE_MANIPULATE, &response)
+                .map_err(anyhow::Error::msg)?;
+            writer.write_all(&response).await?;
+            writer.flush().await?;
+        }
+    }
+}
+
+fn wait_activity(idle_timeout: Duration, job: Option<u64>) -> crate::skdispatch::WaitActivity {
+    match job {
+        Some(job) => crate::skdispatch::WaitActivity::for_managed_kd(idle_timeout, job),
+        None => crate::skdispatch::WaitActivity::new(idle_timeout),
+    }
+}
+
+fn refuse_managed_teardown() -> Result<()> {
+    if crate::worker::kd_teardown_requested() {
+        return Err(ManagedTeardown.into());
+    }
+    Ok(())
+}
+
+fn remaining_pause(since: Instant, bound: Duration) -> Result<Duration> {
+    bound.checked_sub(since.elapsed()).context(
+        "the absolute Secure Kernel pause bound expired; the worker will enter fail-closed recovery",
+    )
+}
+
+async fn wait_for_managed_teardown() {
+    while !crate::worker::kd_teardown_requested() {
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -604,10 +1118,14 @@ async fn wait_for_reset<W: AsyncWrite + Unpin>(
 ) -> Result<()> {
     loop {
         let inbound = link.receive(read_frame(transport).await?);
+        let protocol_error = inbound.protocol_error;
         for write in inbound.writes {
             writer.write_all(&write).await?;
         }
         writer.flush().await?;
+        if let Some(error) = protocol_error {
+            bail!("KD peer exceeded the consecutive framing-error bound: {error}");
+        }
         if inbound.peer_reset {
             return Ok(());
         }
@@ -628,6 +1146,7 @@ async fn read_transport<R: AsyncRead + Unpin>(
     wait_waker: WaitWaker,
 ) {
     let mut decoder = Decoder::default();
+    let mut consecutive_decode_failures = 0usize;
     loop {
         loop {
             let frame = match decoder.next() {
@@ -635,11 +1154,28 @@ async fn read_transport<R: AsyncRead + Unpin>(
                 Ok(None) => break,
                 Err(error) => {
                     let why = error.to_string();
-                    wait_waker.request(WaitWakeReason::Transport(why.clone()));
-                    let _ = queue_transport(&transport, TransportMessage::Failed(why), &wait_waker);
-                    return;
+                    consecutive_decode_failures += 1;
+                    let fatal = consecutive_decode_failures >= 3;
+                    if fatal {
+                        wait_waker.request(WaitWakeReason::Transport(why.clone()));
+                    }
+                    if !queue_transport(
+                        &transport,
+                        TransportMessage::Frame(Frame::Malformed {
+                            why: why.clone(),
+                            fatal,
+                        }),
+                        &wait_waker,
+                    ) {
+                        return;
+                    }
+                    if fatal {
+                        return;
+                    }
+                    continue;
                 }
             };
+            consecutive_decode_failures = 0;
             wait_waker.note_traffic();
             let wake = match &frame {
                 Frame::BreakIn => Some(WaitWakeReason::BreakIn),
@@ -697,6 +1233,13 @@ async fn send_stop<W: AsyncWrite + Unpin>(
     instruction: &[u8],
     values: &Amd64ContextValues,
 ) -> Result<()> {
+    tracing::info!(
+        processor = 0u16,
+        number_processors = 1u32,
+        synthetic_thread = format_args!("{:#x}", crate::kdapi::SYNTHETIC_THREAD),
+        rip = format_args!("{:#x}", values.rip),
+        "serving Secure Kernel KD state change; processor 0 maps to the selected guest VP"
+    );
     let state = crate::kdapi::breakpoint_state_change(values, instruction)?;
     let packet = link
         .send(crate::kdwire::PACKET_TYPE_STATE_CHANGE64, &state)
@@ -850,6 +1393,7 @@ fn instruction_length(bytes: &[u8], address: u64) -> Option<usize> {
 /// successor. Until the facade can prove that destination from the held context, refusing it here
 /// preserves the stop instead of letting a valid vector-1 event fault the session after release.
 fn fallthrough_step_guard(instruction: InstructionGuard) -> Result<StepGuard> {
+    crate::sklive::validate_step_instruction_class(&instruction)?;
     let mut decoder = InstructionDecoder::with_ip(
         64,
         &instruction.bytes,
@@ -864,27 +1408,6 @@ fn fallthrough_step_guard(instruction: InstructionGuard) -> Result<StepGuard> {
         bail!(
             "WinDbg single-step is refused for {:?} control flow at {:#x}",
             decoded.flow_control(),
-            instruction.address.0
-        );
-    }
-    let writes_ss = decoded.op0_kind() == OpKind::Register
-        && decoded.op0_register() == Register::SS
-        && matches!(decoded.mnemonic(), Mnemonic::Mov | Mnemonic::Pop);
-    let repeats = decoded.is_string_instruction()
-        && (decoded.has_rep_prefix() || decoded.has_repe_prefix() || decoded.has_repne_prefix());
-    if repeats {
-        bail!(
-            "WinDbg single-step is refused for repeated {:?} at {:#x}; the trap can stop before \
-             the linear successor",
-            decoded.mnemonic(),
-            instruction.address.0
-        );
-    }
-    if writes_ss || decoded.mnemonic() == Mnemonic::Lss {
-        bail!(
-            "WinDbg single-step is refused because {:?} can defer the trap-flag exception past \
-             the linear successor at {:#x}",
-            decoded.mnemonic(),
             instruction.address.0
         );
     }
@@ -911,6 +1434,77 @@ fn decode_hex(text: &str) -> Result<Vec<u8>> {
         .step_by(2)
         .map(|at| u8::from_str_radix(&text[at..at + 2], 16).context("invalid live-memory hex"))
         .collect()
+}
+
+#[derive(Clone, Copy, Debug)]
+struct KdMetadata {
+    loaded_module_list: u64,
+    debugger_data_list: u64,
+}
+
+fn validate_debugger_metadata(
+    session: &crate::skdispatch::Session,
+    kernel_base: u64,
+    profile: &crate::sklive::SecureKernelDebuggerDataProfile,
+) -> Result<KdMetadata> {
+    let address = |name: &str, rva: u64| {
+        kernel_base
+            .checked_add(rva)
+            .with_context(|| format!("profiled Secure Kernel {name} address overflowed"))
+    };
+    let list_head = address("debugger-data list", profile.list_head_rva.0)?;
+    let block = address("debugger-data block", profile.block_rva.0)?;
+    let loaded_module_list = address("loaded-module list", profile.loaded_module_list_rva.0)?;
+    let read = |at, size| {
+        session
+            .read_memory(at, size)
+            .and_then(|read| decode_hex(&read.data))
+    };
+    let head = read(list_head, 0x10)?;
+    let data = read(block, 0x50)?;
+    let modules = read(loaded_module_list, 0x10)?;
+    let quad = |bytes: &[u8], at: usize| -> u64 {
+        u64::from_le_bytes(
+            bytes[at..at + 8]
+                .try_into()
+                .expect("bounded metadata field"),
+        )
+    };
+    if quad(&head, 0) != block
+        || quad(&head, 8) != block
+        || quad(&data, 0) != list_head
+        || quad(&data, 8) != list_head
+    {
+        bail!("profiled Secure Kernel debugger-data list links are not initialized");
+    }
+    if &data[0x10..0x14] != b"KDBG" {
+        bail!("profiled Secure Kernel debugger-data block has no KDBG owner tag");
+    }
+    let size = u32::from_le_bytes(data[0x14..0x18].try_into().unwrap());
+    if !(0x50..=0x1000).contains(&size) {
+        bail!("Secure Kernel debugger-data size {size:#x} is implausible");
+    }
+    if quad(&data, 0x18) != kernel_base {
+        bail!("Secure Kernel debugger-data block names a different kernel base");
+    }
+    if quad(&data, 0x48) != loaded_module_list {
+        bail!("Secure Kernel debugger-data block names a different loaded-module list");
+    }
+    let canonical = |value: u64| value >> 48 == 0xffff;
+    if !canonical(quad(&modules, 0)) || !canonical(quad(&modules, 8)) {
+        bail!("Secure Kernel loaded-module list has noncanonical links");
+    }
+    tracing::info!(
+        debugger_data_list = format_args!("{list_head:#x}"),
+        debugger_data_block = format_args!("{block:#x}"),
+        loaded_module_list = format_args!("{loaded_module_list:#x}"),
+        size = format_args!("{size:#x}"),
+        "validated live Secure Kernel debugger metadata"
+    );
+    Ok(KdMetadata {
+        loaded_module_list,
+        debugger_data_list: list_head,
+    })
 }
 
 /// Supplies the bounded scaffolding that WinDbg reads while treating this non-NT target as KD.
@@ -1015,14 +1609,16 @@ fn parse_word(name: &str, value: &str) -> Result<u64> {
 }
 
 fn usage() -> &'static str {
-    "usage: windbg-mcp --sk-kd-target --pipe <name> --kernel-base <address> \
+    "usage: windbg-mcp --sk-kd-target --pipe <name> \
      --profile <json> --control-transport \"<command line>\" \
-     --live-transport \"<command line>\" --vmwp-pid <pid> \
-     --dispatcher-vnd <address> --vm-id <guid> --partition-id <number> \
-     --expected-cr3 <number> --instruction-address <number> \
-     --instruction-bytes <hex> [--arm-mode <redirect|natural>] [--vp <number>] \
+     --live-transport \"<command line>\" --vm-id <guid> \
+     [--instruction-address <assertion> --instruction-bytes <assertion>] \
+     [--arm-mode <redirect|natural>] [--vp <number>] \
+     [--vmwp-pid <assertion>] [--dispatcher-vnd <assertion>] \
+     [--partition-id <assertion>] [--expected-cr3 <assertion>] \
+     [--kernel-base <assertion>] \
      [--build <number>] [--connect-timeout-ms <milliseconds>] \
-     [--idle-timeout-ms <milliseconds>]"
+     [--idle-timeout-ms <milliseconds>] [--max-pause-ms <milliseconds>]"
 }
 
 #[cfg(test)]
@@ -1151,10 +1747,35 @@ mod tests {
     fn target_options_refuse_an_unbounded_pipe_name_before_opening_any_target() {
         let args = ["--pipe".to_string(), r"bad\pipe".to_string()];
         assert!(
-            Options::parse(&args)
+            ManagedRequest::parse(&args)
                 .unwrap_err()
                 .to_string()
                 .contains("ASCII")
         );
+    }
+
+    #[test]
+    fn target_options_do_not_require_boot_specific_identity_assertions() {
+        let args = [
+            "--pipe",
+            "windbg-mcp-test",
+            "--profile",
+            r"C:\private\profile.json",
+            "--control-transport",
+            "provider --partition {partition_id}",
+            "--live-transport",
+            "memory --partition {partition_id} --cr3 {cr3}",
+            "--vmwp-pid",
+            "4242",
+            "--vm-id",
+            "11111111-2222-3333-4444-555555555555",
+        ]
+        .map(str::to_string);
+        let request = ManagedRequest::parse(&args).unwrap();
+        assert_eq!(request.open.dispatcher_vnd, None);
+        assert_eq!(request.open.target.partition_id, None);
+        assert_eq!(request.open.target.expected_cr3, None);
+        assert_eq!(request.kernel_base, None);
+        assert_eq!(request.initial, None);
     }
 }

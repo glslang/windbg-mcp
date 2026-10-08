@@ -583,6 +583,8 @@ pub enum SessionKindName {
     /// A live, one-VP Secure Kernel controller. Its worker owns the provider and any temporary
     /// `vmwp` debugger attachment; only epoch-bound VTL1 operations are accepted.
     SecureKernelLive,
+    /// A server-managed Secure Kernel KD facade whose execution lease belongs to WinDbg.
+    SecureKernelKd,
 }
 
 impl From<SessionKind> for SessionKindName {
@@ -596,6 +598,7 @@ impl From<SessionKind> for SessionKindName {
             SessionKind::Launch => Self::Launch,
             SessionKind::SecureKernel => Self::SecureKernel,
             SessionKind::SecureKernelLive => Self::SecureKernelLive,
+            SessionKind::SecureKernelKd => Self::SecureKernelKd,
         }
     }
 }
@@ -702,6 +705,10 @@ pub enum SessionStateInfo {
     /// Live VTL1 cleanup was not confirmed. Ordinary operations are refused and the worker is
     /// retained when available so teardown can be retried without discarding adapter state.
     LiveControlUnresolved { why: String },
+    /// Current server-managed Secure Kernel KD lifecycle phase.
+    SecureKernelKd {
+        phase: crate::proto::SecureKernelKdPhase,
+    },
     /// The open has started; nothing has been created or claimed yet.
     Opening,
     /// The target has been created or claimed and the debugger is waiting for it to break in.
@@ -738,6 +745,7 @@ impl SessionStateInfo {
             SessionState::LiveControlUnresolved(why) => {
                 Self::LiveControlUnresolved { why: why.clone() }
             }
+            SessionState::SecureKernelKd(phase) => Self::SecureKernelKd { phase: *phase },
             SessionState::Opening => Self::Opening,
             SessionState::Attaching => Self::Attaching {
                 waits_indefinitely,

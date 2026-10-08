@@ -50,7 +50,7 @@
 //! <- (any number of lines the provider prints while starting)
 //! <- windbg-mcp-gpa/1
 //! -> SHAPE
-//! <- SHAPE cr3=0x1201000 vtl_enabled=1 paging=long cr0=0x80050033 cr4=0x350ef8 efer=0xd01 max_read=4096
+//! <- SHAPE cr3=0x1201000 vtl_enabled=1 paging=long cr0=0x80050033 cr4=0x350ef8 efer=0xd01 kernel_base=0xfffff8072007a000 max_read=4096
 //! -> READ 0xCD12DF 16
 //! <- OK 16
 //! <- <16 raw bytes>
@@ -141,6 +141,9 @@ pub(crate) struct Transport<R: BufRead, W: Write> {
 pub(crate) struct ShapeReply {
     pub(crate) shape: GuestShape,
     pub(crate) max_read: usize,
+    /// Secure Kernel's live virtual image base when the provider can name it. It is transport
+    /// evidence only until the caller reads and validates the PE at this address.
+    pub(crate) kernel_base: Option<u64>,
 }
 
 impl<R: BufRead, W: Write> Transport<R, W> {
@@ -486,6 +489,13 @@ pub(crate) fn parse_shape(line: &str) -> Result<ShapeReply> {
             "cr3" => reply.shape.cr3 = Some(number(key, value)?),
             "cr4" => reply.shape.cr4 = Some(number(key, value)?),
             "efer" => reply.shape.efer = Some(number(key, value)?),
+            "kernel_base" => {
+                let base = number(key, value)?;
+                if base == 0 {
+                    bail!("kernel_base must be nonzero when supplied");
+                }
+                reply.kernel_base = Some(base);
+            }
             // Kept as `u64` here and narrowed only after the bound is applied. Casting first is
             // target-width-dependent: on the shipped `i686-pc-windows-msvc` image a declaration of
             // `4294967297` truncates to `1`, passes the bound, and the decode then runs the whole
@@ -616,6 +626,7 @@ pub(crate) struct LiveSource {
     transport: std::cell::RefCell<Option<Transport<BufReader<DeadlineChildStdout>, ChildStdin>>>,
     shape: GuestShape,
     max_read: usize,
+    kernel_base: Option<u64>,
 }
 
 impl LiveSource {
@@ -674,6 +685,7 @@ impl LiveSource {
             ))),
             shape: GuestShape::default(),
             max_read: 1,
+            kernel_base: None,
         };
         source.handshake()?;
         Ok(source)
@@ -693,7 +705,13 @@ impl LiveSource {
         drop(held);
         self.shape = reply.shape;
         self.max_read = reply.max_read;
+        self.kernel_base = reply.kernel_base;
         Ok(())
+    }
+
+    /// Provider-reported Secure Kernel image base. A consumer must still validate the image.
+    pub(crate) fn kernel_base(&self) -> Option<u64> {
+        self.kernel_base
     }
 }
 
@@ -970,7 +988,7 @@ mod tests {
     fn a_shape_reply_becomes_the_shape_the_decode_takes() {
         let reply = parse_shape(
             "SHAPE cr0=0x80050033 cr3=0x1201000 cr4=0x350ef8 efer=0xd01 vtl_enabled=1 \
-             paging=long max_read=4096",
+             paging=long kernel_base=0xfffff8072007a000 max_read=4096",
         )
         .unwrap();
         assert_eq!(reply.max_read, 4096);
@@ -978,7 +996,14 @@ mod tests {
         assert_eq!(reply.shape.cr0, Some(0x8005_0033));
         assert_eq!(reply.shape.vtl_enabled, Some(true));
         assert_eq!(reply.shape.paging_mode, Some(PagingMode::Long));
+        assert_eq!(reply.kernel_base, Some(0xffff_f807_2007_a000));
         assert!(reply.shape.unreadable.is_empty());
+    }
+
+    #[test]
+    fn a_supplied_kernel_base_must_not_be_zero() {
+        let error = parse_shape("SHAPE kernel_base=0 max_read=16").unwrap_err();
+        assert!(format!("{error}").contains("kernel_base must be nonzero"));
     }
 
     #[test]
