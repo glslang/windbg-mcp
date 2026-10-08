@@ -142,7 +142,7 @@ fn canonical_transport(name: &str, command: &str) -> Result<(Vec<String>, Vec<St
     Ok((normalized, words))
 }
 
-fn render_transport(words: &[String]) -> String {
+pub(crate) fn render_transport(words: &[String]) -> String {
     words
         .iter()
         .map(|word| {
