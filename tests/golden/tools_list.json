@@ -1257,7 +1257,7 @@
     },
     {
       "hints": {
-        "destructive": false,
+        "destructive": true,
         "idempotent": false,
         "openWorld": true,
         "readOnly": false

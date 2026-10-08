@@ -855,6 +855,13 @@ impl VmwpDispatcherState {
         execute("~# u")
     }
 
+    fn finish_discovery_call_cleanup(&mut self, returned: bool) {
+        self.threads_frozen = false;
+        if returned {
+            self.phase = DispatcherPhase::Fresh;
+        }
+    }
+
     fn claim_created_breakpoint(
         &mut self,
         created: CreatedBreakpoint,
@@ -2189,6 +2196,9 @@ impl VmwpDispatcher<'_> {
     ) -> Result<u64> {
         let export = self.verify_vid_build(discovery)?;
         self.allocate_discovery_scratch()?;
+        // Capture before changing debugger freeze state. The target is already stopped, and a
+        // capture failure must not leave vmwp threads frozen while no hijack has begun.
+        let saved = HijackContext::capture(self)?;
         let engine = self.engine;
         self.state.freeze_other_threads(|command| {
             engine
@@ -2196,10 +2206,10 @@ impl VmwpDispatcher<'_> {
                 .map(|_| ())
                 .map_err(debugger)
         })?;
-        let saved = HijackContext::capture(self)?;
         self.state.phase = DispatcherPhase::Discovering;
         // From this point every exit goes through the cleanup below. The call temporarily owns
         // the selected thread's context, one dynamic breakpoint and the other threads' freeze.
+        let mut returned = false;
         let operation = (|| {
             let return_address = self.read_u64(self.register("rsp")?)?;
             self.set_dynamic_breakpoint(return_address)?;
@@ -2213,6 +2223,7 @@ impl VmwpDispatcher<'_> {
             if self.engine.instruction_pointer().map_err(debugger)? != return_address {
                 bail!("VidGetHvPartitionId stopped away from its return address");
             }
+            returned = true;
             if self.register("rax")? != 1 {
                 bail!("VidGetHvPartitionId returned failure");
             }
@@ -2230,16 +2241,19 @@ impl VmwpDispatcher<'_> {
             Ok(())
         };
         let thawed = if restored.is_ok() && breakpoint_cleanup.is_ok() {
-            self.engine
-                .execute_command("~* u")
-                .map(|_| ())
-                .map_err(debugger)
+            Some(
+                self.engine
+                    .execute_command("~* u")
+                    .map(|_| ())
+                    .map_err(debugger),
+            )
         } else {
-            Ok(())
+            None
         };
-        if restored.is_ok() && breakpoint_cleanup.is_ok() && thawed.is_ok() {
-            self.state.threads_frozen = false;
-            self.state.phase = DispatcherPhase::Fresh;
+        if matches!(thawed, Some(Ok(()))) {
+            // Even when an interrupted call did not return, record that the debugger freeze was
+            // released. Keep Discovering in that case so teardown contains vmwp.
+            self.state.finish_discovery_call_cleanup(returned);
         }
 
         let mut cleanup_errors = Vec::new();
@@ -2253,7 +2267,7 @@ impl VmwpDispatcher<'_> {
                 "removing the VidGetHvPartitionId return breakpoint: {error:#}"
             ));
         }
-        if let Err(error) = thawed {
+        if let Some(Err(error)) = thawed {
             cleanup_errors.push(format!("releasing the frozen vmwp threads: {error:#}"));
         }
         match (operation, cleanup_errors.is_empty()) {
@@ -4034,6 +4048,30 @@ mod tests {
         assert!(error.to_string().contains("current-thread thaw failed"));
         assert_eq!(commands, ["~* f", "~# u"]);
         assert!(state.threads_frozen);
+    }
+
+    #[test]
+    fn discovery_cleanup_requires_the_call_return_boundary_before_becoming_fresh() {
+        let mut state = VmwpDispatcherState::new(
+            profile(),
+            4242,
+            Some(0x2000_0000_1000),
+            "11111111-2222-3333-4444-555555555555".into(),
+        )
+        .unwrap();
+        state.phase = DispatcherPhase::Discovering;
+        state.threads_frozen = true;
+
+        state.finish_discovery_call_cleanup(false);
+
+        assert!(!state.threads_frozen);
+        assert!(matches!(state.phase, DispatcherPhase::Discovering));
+
+        state.threads_frozen = true;
+        state.finish_discovery_call_cleanup(true);
+
+        assert!(!state.threads_frozen);
+        assert!(matches!(state.phase, DispatcherPhase::Fresh));
     }
 
     #[test]
