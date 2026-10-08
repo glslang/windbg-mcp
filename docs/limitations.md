@@ -155,9 +155,11 @@
   are exactly what this tool is for. A filter would have dropped them. **`in_function` is not a guarantee the byte is an instruction**: a jump table
   embedded inside a function's own region is covered by that function's entry, so the table narrows
   the question rather than settling it. And **x86 cannot be asked at all** -- 32-bit Windows has no
-  unwind table -- so an x86 image reports exactly what it reported before this existed, with every
-  row saying `unverified`; so does a target whose entry layout this build does not decode, and an
-  engine whose query failed. The **call sites** are not exposed to any of this, which was measured
+  unwind table -- so an x86 image **keeps the whole of this problem**, and says so rather than
+  implying a coverage it has not got: measured on `docs/samples/cppthrow-fastfail-x86.dmp`, the
+  32-bit `ntdll` reports 10,623 privileged instructions with `uncovered_privileged` zero and every
+  row `unverified`, which is the answer it gave before this existed. A target whose entry layout
+  this build does not decode, and an engine whose query failed, answer the same way. The **call sites** are not exposed to any of this, which was measured
   rather than assumed: all 10,349 of them across the same dump are inside covered regions, a
   slot-relative indirect call in random data being a far rarer coincidence than a one-byte opcode.
   Issue [#303](https://github.com/glslang/windbg-mcp/issues/303) has the evidence.
