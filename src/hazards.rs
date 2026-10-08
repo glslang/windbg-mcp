@@ -1034,12 +1034,17 @@ pub fn render(report: &crate::structured::DriverHazards) -> String {
         } else {
             String::new()
         };
-        out.push_str(&format!("  Privileged instructions ({in_code}{listed}):\n"));
+        // **One sentence rather than a count and a `none` row**, which is the shape the sample
+        // dump's `tm` takes: its single finding is a `sldt` inside `tm!TmpTransactionManagerMapping`,
+        // a data table, so the group above is empty and `(0):` followed by a `none` line says the
+        // same thing twice. It parallels the "none" case above it, where there is no finding at all.
         if covered.is_empty() {
-            out.push_str("    none in bytes an unwind entry covers\n");
-        }
-        for found in &covered {
-            out.push_str(&row(found));
+            out.push_str("  Privileged instructions: none in bytes an unwind entry covers\n");
+        } else {
+            out.push_str(&format!("  Privileged instructions ({in_code}{listed}):\n"));
+            for found in &covered {
+                out.push_str(&row(found));
+            }
         }
         if report.uncovered_privileged > 0 {
             let listed = if report.uncovered_privileged > uncovered.len() {
@@ -2428,6 +2433,28 @@ mod tests {
         assert!(
             !text.contains("Not placed against an unwind table"),
             "the table answered, so nothing says it could not: {text}"
+        );
+
+        // And where **nothing** is in a covered region -- the sample dump's `tm`, whose one finding
+        // is a `sldt` inside `tm!TmpTransactionManagerMapping` -- the first heading becomes a
+        // sentence rather than a count of zero with a `none` row under it, which is the shape the
+        // line above it has had since before any of this.
+        let all_data = scan(
+            &image,
+            &[],
+            InstructionSet::Amd64,
+            |at, _| (at == BASE + 0x1000).then(|| block.clone()),
+            never,
+            |_| Standing::NoUnwindEntry,
+        );
+        let text = render(&structured_report("vid", BASE, &all_data, invented));
+        assert!(
+            text.contains("Privileged instructions: none in bytes an unwind entry covers\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("In bytes no unwind entry covers (4)"),
+            "and all four are under the data heading: {text}"
         );
     }
 
