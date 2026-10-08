@@ -16,8 +16,8 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -943,10 +943,110 @@ impl BufRead for TimedChildReader {
     }
 }
 
+struct WriteRequest {
+    bytes: Vec<u8>,
+    completed: SyncSender<io::Result<()>>,
+}
+
+/// Moves blocking request writes off the engine thread. Anonymous child stdin has no standard
+/// timeout, and a provider which stops draining it must not extend an owned VTL1 pause forever.
+struct TimedChildWriter {
+    requests: Sender<WriteRequest>,
+    pending: Vec<u8>,
+    request_grace: Duration,
+    outer_deadline: Option<Instant>,
+}
+
+impl TimedChildWriter {
+    fn spawn<W>(mut writer: W) -> Result<Self>
+    where
+        W: Write + Send + 'static,
+    {
+        let (requests, receive) = mpsc::channel::<WriteRequest>();
+        std::thread::Builder::new()
+            .name("sk-control-writer".into())
+            .spawn(move || {
+                while let Ok(request) = receive.recv() {
+                    let result = writer
+                        .write_all(&request.bytes)
+                        .and_then(|_| writer.flush());
+                    if request.completed.send(result).is_err() {
+                        break;
+                    }
+                }
+            })
+            .context("spawning the control-provider writer failed")?;
+        Ok(Self {
+            requests,
+            pending: Vec::new(),
+            request_grace: PROVIDER_REPLY_GRACE,
+            outer_deadline: None,
+        })
+    }
+
+    fn set_outer_deadline(&mut self, deadline: Option<Instant>) {
+        self.outer_deadline = deadline;
+    }
+
+    fn wait_limit(&self) -> io::Result<(Duration, bool)> {
+        let Some(deadline) = self.outer_deadline else {
+            return Ok((self.request_grace, false));
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "control-provider request write reached its outer deadline",
+            ));
+        }
+        Ok((
+            remaining.min(self.request_grace),
+            remaining <= self.request_grace,
+        ))
+    }
+}
+
+impl Write for TimedChildWriter {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        self.wait_limit()?;
+        self.pending.extend_from_slice(input);
+        Ok(input.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let (wait, outer_limited) = self.wait_limit()?;
+        let (completed, result) = mpsc::sync_channel(1);
+        let bytes = std::mem::take(&mut self.pending);
+        self.requests
+            .send(WriteRequest { bytes, completed })
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "control-provider writer stopped")
+            })?;
+        match result.recv_timeout(wait) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                if outer_limited {
+                    "control-provider request write reached its outer deadline"
+                } else {
+                    "control provider did not accept a request before its write deadline"
+                },
+            )),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "control-provider writer stopped",
+            )),
+        }
+    }
+}
+
 /// Owns one operator provider and closes its request pipe before applying the bounded child-process
 /// teardown. The live-control worker keeps this object on its engine thread beside its dispatcher.
 pub(crate) struct ControlProcess {
-    session: Option<ControlSession<TimedChildReader, ChildStdin>>,
+    session: Option<ControlSession<TimedChildReader, TimedChildWriter>>,
     child: ChildGuard,
 }
 
@@ -1000,7 +1100,7 @@ impl ControlProcess {
             .context("the provider has no stdout")?;
         let (session, skipped) = ControlSession::open_selected(
             TimedChildReader::spawn(stdout)?,
-            stdin,
+            TimedChildWriter::spawn(stdin)?,
             expected_target,
         )?;
         Ok((
@@ -1012,13 +1112,13 @@ impl ControlProcess {
         ))
     }
 
-    fn session(&self) -> &ControlSession<TimedChildReader, ChildStdin> {
+    fn session(&self) -> &ControlSession<TimedChildReader, TimedChildWriter> {
         self.session
             .as_ref()
             .expect("a live ControlProcess always owns its session")
     }
 
-    fn session_mut(&mut self) -> &mut ControlSession<TimedChildReader, ChildStdin> {
+    fn session_mut(&mut self) -> &mut ControlSession<TimedChildReader, TimedChildWriter> {
         self.session
             .as_mut()
             .expect("a live ControlProcess always owns its session")
@@ -1069,13 +1169,17 @@ impl ControlProcess {
         }
         let session = self.session_mut();
         session.reader.set_outer_deadline(Some(deadline));
+        session.writer.set_outer_deadline(Some(deadline));
         let result = session.read_registers(registers);
         session.reader.set_outer_deadline(None);
+        session.writer.set_outer_deadline(None);
         result
     }
 
     pub(crate) fn set_outer_deadline(&mut self, deadline: Option<Instant>) {
-        self.session_mut().reader.set_outer_deadline(deadline);
+        let session = self.session_mut();
+        session.reader.set_outer_deadline(deadline);
+        session.writer.set_outer_deadline(deadline);
     }
 
     pub(crate) fn write_registers(
@@ -1745,5 +1849,29 @@ mod tests {
 
         let error = read_line(&mut reader).unwrap_err();
         assert!(format!("{error:#}").contains("outer deadline"));
+    }
+
+    #[test]
+    fn an_outer_deadline_caps_a_blocked_provider_request_write() {
+        struct SlowWriter;
+
+        impl Write for SlowWriter {
+            fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+                std::thread::sleep(Duration::from_millis(250));
+                Ok(input.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut writer = TimedChildWriter::spawn(SlowWriter).unwrap();
+        writer.set_outer_deadline(Some(Instant::now() + Duration::from_millis(25)));
+        writer.write_all(b"request\n").unwrap();
+
+        let error = writer.flush().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("outer deadline"));
     }
 }
