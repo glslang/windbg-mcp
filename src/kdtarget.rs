@@ -79,6 +79,12 @@ impl fmt::Display for ManagedTeardown {
 
 impl std::error::Error for ManagedTeardown {}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManagedCompletion {
+    TeardownPending,
+    Released,
+}
+
 enum TransportMessage {
     Frame(Frame),
     Disconnected,
@@ -481,14 +487,44 @@ pub(crate) fn serve_managed(
         .enable_all()
         .build()?
         .block_on(run_async(options, engine, session, true, Some(job)));
-    match result {
-        Err(error)
-            if error.downcast_ref::<ManagedTeardown>().is_some()
-                || crate::worker::kd_teardown_requested() =>
-        {
-            Ok(())
+    let teardown_requested = result
+        .as_ref()
+        .is_err_and(|error| error.downcast_ref::<ManagedTeardown>().is_some())
+        || crate::worker::kd_teardown_requested();
+    if !teardown_requested {
+        report_managed_phase(Some(job), crate::proto::SecureKernelKdPhase::Releasing);
+        if let Err(error) = &result {
+            eprintln!(
+                "Secure Kernel KD service ended ({error:#}); restoring and releasing its controller"
+            );
         }
-        other => other,
+    }
+    let completion = finish_managed(result, teardown_requested, || session.close(engine))?;
+    if completion == ManagedCompletion::Released {
+        report_managed_phase(Some(job), crate::proto::SecureKernelKdPhase::Released);
+    }
+    Ok(())
+}
+
+fn finish_managed(
+    result: Result<()>,
+    teardown_requested: bool,
+    close: impl FnOnce() -> Result<()>,
+) -> Result<ManagedCompletion> {
+    if teardown_requested
+        || result
+            .as_ref()
+            .is_err_and(|error| error.downcast_ref::<ManagedTeardown>().is_some())
+    {
+        return Ok(ManagedCompletion::TeardownPending);
+    }
+    let cleanup = close();
+    match (result, cleanup) {
+        (Ok(()), Ok(())) | (Err(_), Ok(())) => Ok(ManagedCompletion::Released),
+        (Ok(()), Err(cleanup)) => Err(cleanup.context("closing Secure Kernel KD target")),
+        (Err(primary), Err(cleanup)) => Err(anyhow!(
+            "{primary:#}; closing Secure Kernel KD target also failed: {cleanup:#}"
+        )),
     }
 }
 
@@ -1076,7 +1112,7 @@ fn refuse_managed_teardown() -> Result<()> {
 
 fn remaining_pause(since: Instant, bound: Duration) -> Result<Duration> {
     bound.checked_sub(since.elapsed()).context(
-        "the absolute Secure Kernel pause bound expired; the worker will enter fail-closed recovery",
+        "the absolute Secure Kernel pause bound expired; the worker will close the controller",
     )
 }
 
@@ -1777,5 +1813,40 @@ mod tests {
                 .to_string()
                 .contains("absolute Secure Kernel pause bound")
         );
+    }
+
+    #[test]
+    fn a_managed_service_failure_attempts_normal_close_before_recovery() {
+        let closes = std::cell::Cell::new(0);
+
+        let completed = finish_managed(Err(anyhow!("idle bound expired")), false, || {
+            closes.set(closes.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(completed, ManagedCompletion::Released);
+        assert_eq!(closes.get(), 1);
+
+        let error = finish_managed(Err(anyhow!("idle bound expired")), false, || {
+            Err(anyhow!("restore failed"))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("idle bound expired"));
+        assert!(error.to_string().contains("restore failed"));
+    }
+
+    #[test]
+    fn a_managed_teardown_leaves_close_to_the_queued_end_session() {
+        let closes = std::cell::Cell::new(0);
+
+        let completed = finish_managed(Err(ManagedTeardown.into()), true, || {
+            closes.set(closes.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(completed, ManagedCompletion::TeardownPending);
+        assert_eq!(closes.get(), 0);
     }
 }

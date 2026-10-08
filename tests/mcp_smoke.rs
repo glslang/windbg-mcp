@@ -2098,7 +2098,7 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// right reason on a reading that did not survive its own re-run.
 ///
 /// The matching [`WIRE_CEILING`] raise and its independent wire-size arithmetic are recorded
-/// below. The current payload is 337,357 B and has 7,643 B left.
+/// below. The current payload is 337,368 B and has 7,632 B left.
 ///
 /// **118,000 -> 123,000 for the managed Secure Kernel KD opener** (2026-10-07, item 120). The
 /// surface moves 116,356 -> 119,631 B across 75 -> 76 tools. `open_sk_kd` is 2,772 B; the other
@@ -2253,9 +2253,9 @@ const MODEL_VISIBLE_CEILING: usize = 123_000;
 /// evidence move it another 1,827 B to 320,682 B, leaving 9,318 B (2.8%).
 ///
 /// **330,000 -> 345,000 for `open_sk_kd`** (2026-10-07). The payload moves 328,545 ->
-/// 337,357 B. The new tool is 7,583 B; the Secure Kernel policy/discovery description and
+/// 337,368 B. The new tool is 7,583 B; the Secure Kernel policy/discovery description and
 /// state/output types add 1,228 B across `open_sk_live_control`, `session_status` and the seven
-/// existing opener closures, and one byte is the array comma. The new ceiling leaves 7,643 B
+/// existing opener closures, and one byte is the array comma. The new ceiling leaves 7,632 B
 /// (2.2%).
 const WIRE_CEILING: usize = 345_000;
 

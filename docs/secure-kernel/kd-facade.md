@@ -97,11 +97,12 @@ kd -k com:pipe,port=\\.\pipe\<generated-name>,resets=0 -cf <commands.txt>
 ```
 
 `session_status` reports `discovering`, `arming`, `waiting_for_peer`, `stopped`, `running`,
-`reconnecting`, `releasing` or `recovery_required`. A peer disconnect while stopped enters a
-bounded reconnect window. `end_session` cancels a connect or active wait, then runs the ordinary
-proved controller teardown. The worker is preserved if it cannot prove restoration and release.
-An absolute pause bound defaults to 600 seconds, independent of KD traffic; connect and idle bounds
-default to 30 and 300 seconds.
+`reconnecting`, `releasing`, `released` or `recovery_required`. A peer disconnect while stopped
+enters a bounded reconnect window. `end_session` cancels a connect or active wait, then runs the
+ordinary proved controller teardown. Expiry of the connect, idle or absolute-pause bound also runs
+that teardown immediately; `released` means it completed. The worker is preserved only if it
+cannot prove restoration and release. The absolute pause bound defaults to 600 seconds, independent
+of KD traffic; connect and idle bounds default to 30 and 300 seconds.
 
 ## Standalone compatibility role
 

@@ -852,7 +852,20 @@ impl VmwpDispatcherState {
         // The first command changed debugger state, so cleanup owns that state even
         // when selecting the current thread fails.
         self.threads_frozen = true;
-        execute("~# u")
+        if let Err(primary) = execute("~# u") {
+            let thawed = execute("~* u");
+            if thawed.is_ok() {
+                self.threads_frozen = false;
+            }
+            return match thawed {
+                Ok(()) => Err(primary),
+                Err(cleanup) => Err(anyhow!(
+                    "{primary:#}; releasing the partially frozen vmwp threads also failed: \
+                     {cleanup:#}"
+                )),
+            };
+        }
+        Ok(())
     }
 
     fn finish_discovery_call_cleanup(&mut self, returned: bool) {
@@ -4024,7 +4037,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_current_thread_thaw_retains_all_thread_freeze_ownership() {
+    fn a_failed_current_thread_selection_releases_the_partial_freeze() {
         let mut state = VmwpDispatcherState::new(
             profile(),
             4242,
@@ -4046,7 +4059,34 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("current-thread thaw failed"));
-        assert_eq!(commands, ["~* f", "~# u"]);
+        assert_eq!(commands, ["~* f", "~# u", "~* u"]);
+        assert!(!state.threads_frozen);
+    }
+
+    #[test]
+    fn a_failed_partial_freeze_cleanup_retains_ownership_for_teardown() {
+        let mut state = VmwpDispatcherState::new(
+            profile(),
+            4242,
+            Some(0x2000_0000_1000),
+            "11111111-2222-3333-4444-555555555555".into(),
+        )
+        .unwrap();
+        let mut commands = Vec::new();
+
+        let error = state
+            .freeze_other_threads(|command| {
+                commands.push(command.to_string());
+                if command == "~* f" {
+                    Ok(())
+                } else {
+                    Err(anyhow!("{command} failed"))
+                }
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("partially frozen"));
+        assert_eq!(commands, ["~* f", "~# u", "~* u"]);
         assert!(state.threads_frozen);
     }
 

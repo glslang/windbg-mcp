@@ -2244,6 +2244,7 @@ fn describe_session(s: &SessionSnapshot) -> String {
                     "holding the stop for WinDbg reconnection"
                 }
                 crate::proto::SecureKernelKdPhase::Releasing => "releasing its controller",
+                crate::proto::SecureKernelKdPhase::Released => "released from its controller",
                 crate::proto::SecureKernelKdPhase::RecoveryRequired => {
                     "waiting for fail-closed recovery"
                 }
