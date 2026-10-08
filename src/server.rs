@@ -2743,8 +2743,12 @@ impl WindbgServer {
                 {
                     let sessions = self.sessions.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = sessions.call(&session, Call::new(op).named(true)).await
-                        {
+                        let result = if matches!(&op, EngineOp::SkKdServe) {
+                            sessions.serve_secure_kernel_kd(&session).await
+                        } else {
+                            sessions.call(&session, Call::new(op).named(true)).await
+                        };
+                        if let Err(error) = result {
                             tracing::error!(
                                 "session {}: background target service failed: {error}",
                                 session.id
