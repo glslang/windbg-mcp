@@ -20,7 +20,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use dbgscope::dbgeng::{
-    BreakpointAt, BreakpointKind, BreakpointSpec, DebugEngine, Interruption, RegisterValue,
+    BreakpointAt, BreakpointKind, BreakpointSpec, DebugEngine, Interruption, PendingTarget,
+    RegisterValue, WaitOutcome,
 };
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
 #[cfg(target_arch = "x86_64")]
@@ -80,6 +81,32 @@ fn debug_wait_remaining(deadline: Instant, activity: Option<&WaitActivity>) -> D
     activity
         .map(|activity| activity.remaining_idle().min(deadline_remaining))
         .unwrap_or(deadline_remaining)
+}
+
+fn wait_for_process_attach(
+    engine: &DebugEngine,
+    pending: PendingTarget<'_>,
+    pid: u32,
+    deadline: Option<Instant>,
+) -> Result<()> {
+    let Some(deadline) = deadline else {
+        return pending.wait().map_err(debugger);
+    };
+    loop {
+        require_completion_deadline(Some(deadline))?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let timeout = remaining.as_millis().clamp(1, u128::from(u32::MAX)) as u32;
+        match engine.wait_for_event(timeout).map_err(debugger)? {
+            WaitOutcome::Stopped {
+                process: Some((_, system_pid)),
+            } if system_pid == pid => return Ok(()),
+            WaitOutcome::Stopped { .. } => {}
+            WaitOutcome::Expired | WaitOutcome::Deadline => {
+                bail!("the absolute Secure Kernel pause bound expired while attaching to vmwp")
+            }
+            WaitOutcome::OnRequest => bail!("the vmwp attach was interrupted on request"),
+        }
+    }
 }
 
 /// One complete live-control session. Both halves remain on the worker engine thread; each method
@@ -465,12 +492,7 @@ impl Session {
     }
 
     fn close_inner(&mut self, engine: &DebugEngine, deadline: Option<Instant>) -> Result<()> {
-        let deadline = deadline.or_else(|| {
-            self.dispatcher
-                .retained_event
-                .as_ref()
-                .and_then(|retained| retained.recovery_deadline)
-        });
+        let deadline = deadline.or(self.dispatcher.recovery_deadline);
         let mut dispatcher = self.dispatcher.bind(engine);
         if let Some(control) = self.control.as_mut() {
             match deadline {
@@ -478,7 +500,10 @@ impl Session {
                 None => control.close(&mut dispatcher),
             }
         } else {
-            dispatcher.teardown()
+            match deadline {
+                Some(deadline) => dispatcher.teardown_until(deadline),
+                None => dispatcher.teardown(),
+            }
         }
     }
 }
@@ -815,7 +840,6 @@ struct RetainedEvent {
     event: HeldEvent,
     validation_complete: bool,
     release_eligible: bool,
-    recovery_deadline: Option<Instant>,
 }
 
 pub(crate) struct VmwpDispatcherState {
@@ -842,6 +866,10 @@ pub(crate) struct VmwpDispatcherState {
     provider_writes_quiesced: bool,
     /// Exact callback thread retained until this provider's debug state is restored.
     retained_event: Option<RetainedEvent>,
+    /// Absolute end of the cleanup reserve for the current stop. It outlives the retained event,
+    /// because native completion consumes that event before later detach or VM-resume work can
+    /// fail and leave teardown retryable.
+    recovery_deadline: Option<Instant>,
     completion_kick: Option<VmTransition>,
     unregister: Option<UnregisterProgress>,
     /// Present only for the KD facade's current running wait. It exposes no DbgEng object.
@@ -889,6 +917,7 @@ impl VmwpDispatcherState {
             vm_paused: false,
             provider_writes_quiesced: false,
             retained_event: None,
+            recovery_deadline: None,
             completion_kick: None,
             unregister: None,
             wait_activity: None,
@@ -1542,7 +1571,12 @@ impl RawSource for DeadlineLiveSource<'_> {
                 detail: format!("{} reached its deadline", self.operation),
             });
         }
-        let result = self.source.read_chunk_until(gpa, out, self.deadline);
+        let result = self.source.read_chunk_until_cancelled(
+            gpa,
+            out,
+            self.deadline,
+            crate::worker::kd_teardown_requested,
+        );
         if Instant::now() >= self.deadline {
             self.expired.set(true);
         }
@@ -1960,16 +1994,12 @@ impl EventDispatcher for VmwpDispatcher<'_> {
     }
 
     fn retained_recovery_deadline(&self) -> Option<Instant> {
-        self.state
-            .retained_event
-            .as_ref()
-            .and_then(|retained| retained.recovery_deadline)
-            .or_else(|| {
-                self.state
-                    .wait_activity
-                    .as_ref()
-                    .and_then(WaitActivity::recovery_deadline)
-            })
+        self.state.recovery_deadline.or_else(|| {
+            self.state
+                .wait_activity
+                .as_ref()
+                .and_then(WaitActivity::recovery_deadline)
+        })
     }
 
     fn wait_for_stop(
@@ -2102,6 +2132,17 @@ impl EventDispatcher for VmwpDispatcher<'_> {
     }
 
     fn teardown(&mut self) -> Result<()> {
+        self.teardown_inner(None)
+    }
+
+    fn teardown_until(&mut self, deadline: Instant) -> Result<()> {
+        self.teardown_inner(Some(deadline))
+    }
+}
+
+impl VmwpDispatcher<'_> {
+    fn teardown_inner(&mut self, deadline: Option<Instant>) -> Result<()> {
+        require_completion_deadline(deadline)?;
         match &self.state.phase {
             DispatcherPhase::Closed => return Ok(()),
             DispatcherPhase::Contained(why) => {
@@ -2125,27 +2166,31 @@ impl EventDispatcher for VmwpDispatcher<'_> {
         // failed, resume that recorded sequence before any generic breakpoint removal or detach;
         // neither recovery nor a retry may issue the unregister call a second time.
         if self.state.unregister.is_some() {
-            self.unregister_handler()?;
-            return self.finish_teardown();
+            self.unregister_handler_inner(deadline)?;
+            return self.finish_teardown(deadline);
         }
 
+        require_completion_deadline(deadline)?;
         if self.state.breakpoint.is_some() {
             self.remove_owned_breakpoint()?;
         }
+        require_completion_deadline(deadline)?;
         if self.state.threads_frozen {
             self.engine.execute_command("~* u").map_err(debugger)?;
             self.state.threads_frozen = false;
         }
+        require_completion_deadline(deadline)?;
         if self.state.attached {
             self.detach_handled()?;
         }
-        self.state.finish_completion_kick()?;
+        self.state.finish_completion_kick_until(deadline)?;
+        require_completion_deadline(deadline)?;
         if self.state.handler_context.is_some() {
-            self.unregister_handler()?;
+            self.unregister_handler_inner(deadline)?;
         } else if self.state.scratch_allocated {
-            self.free_unregistered_scratch()?;
+            self.free_unregistered_scratch_inner(deadline)?;
         }
-        self.finish_teardown()
+        self.finish_teardown(deadline)
     }
 }
 
@@ -2262,13 +2307,15 @@ impl VmwpDispatcher<'_> {
         Ok(())
     }
 
-    fn finish_teardown(&mut self) -> Result<()> {
+    fn finish_teardown(&mut self, deadline: Option<Instant>) -> Result<()> {
+        require_completion_deadline(deadline)?;
         if self.state.vm_paused {
             self.state.begin_vm_resume();
-            run_vm_action(self.bound_vm_id()?, VmAction::Resume, POWERSHELL_WAIT)?;
+            run_vm_action_until(self.bound_vm_id()?, VmAction::Resume, deadline)?;
             self.state.vm_paused = false;
         }
         self.state.phase = DispatcherPhase::Closed;
+        self.state.recovery_deadline = None;
         Ok(())
     }
 
@@ -2358,13 +2405,13 @@ impl VmwpDispatcher<'_> {
             .wait_activity
             .as_ref()
             .and_then(WaitActivity::recovery_deadline);
+        self.state.recovery_deadline = recovery_deadline;
         self.state.retained_event = Some(RetainedEvent {
             system_id,
             return_ip: event_site,
             event: event.clone(),
             validation_complete: false,
             release_eligible: false,
-            recovery_deadline,
         });
         let advance = self.read_u8(
             event_pointer
@@ -2442,7 +2489,7 @@ impl VmwpDispatcher<'_> {
             .attach_process_begin(self.state.vmwp_pid)
             .map_err(debugger)?;
         self.state.attached = true;
-        pending.wait().map_err(debugger)?;
+        wait_for_process_attach(self.engine, pending, self.state.vmwp_pid, deadline)?;
         require_retention_deadline(deadline)?;
         self.engine.execute_command("sxd 6ba").map_err(debugger)?;
         self.engine
@@ -3014,6 +3061,7 @@ impl VmwpDispatcher<'_> {
                 self.state.phase = DispatcherPhase::Detached;
             }
         }
+        self.state.recovery_deadline = None;
         Ok(())
     }
 
@@ -3184,24 +3232,26 @@ impl VmwpDispatcher<'_> {
         Ok(())
     }
 
-    fn unregister_handler(&mut self) -> Result<()> {
+    fn unregister_handler_inner(&mut self, deadline: Option<Instant>) -> Result<()> {
+        require_completion_deadline(deadline)?;
         let context = self.state.handler_context.context("no handler context")?;
         if self.state.unregister.is_none() {
-            self.begin_unregister_call(context)?;
+            self.begin_unregister_call(context, deadline)?;
         }
         loop {
+            require_completion_deadline(deadline)?;
             match self.state.unregister.clone() {
                 Some(UnregisterProgress::Calling) => {
                     bail!("handler unregister return was not proved")
                 }
                 Some(UnregisterProgress::WaitingCleanup) => {
-                    self.wait_for_unregister_cleanup(context)?
+                    self.wait_for_unregister_cleanup(context, deadline)?
                 }
                 Some(UnregisterProgress::ReturningCleanup { return_address }) => {
-                    self.finish_unregister_cleanup_return(return_address)?
+                    self.finish_unregister_cleanup_return(return_address, deadline)?
                 }
                 Some(UnregisterProgress::CleanupReturned) => {
-                    self.settle_unregister_cleanup(context)?
+                    self.settle_unregister_cleanup(context, deadline)?
                 }
                 Some(UnregisterProgress::ReadyToFreeScratch) => {
                     self.issue_unregister_scratch_free(context)?
@@ -3214,14 +3264,16 @@ impl VmwpDispatcher<'_> {
         }
     }
 
-    fn begin_unregister_call(&mut self, context: u64) -> Result<()> {
+    fn begin_unregister_call(&mut self, context: u64, deadline: Option<Instant>) -> Result<()> {
+        require_completion_deadline(deadline)?;
         verify_vmwp_pid(self.bound_vm_id()?, self.state.vmwp_pid)?;
         let pending = self
             .engine
             .attach_process_begin(self.state.vmwp_pid)
             .map_err(debugger)?;
         self.state.attached = true;
-        pending.wait().map_err(debugger)?;
+        wait_for_process_attach(self.engine, pending, self.state.vmwp_pid, deadline)?;
+        require_completion_deadline(deadline)?;
         self.verify_vmwp_build()?;
         self.verify_all_sites()?;
         self.engine.execute_command("sxd 6ba").map_err(debugger)?;
@@ -3254,9 +3306,7 @@ impl VmwpDispatcher<'_> {
             "rip",
             self.image(self.state.profile.unregister_handler_rva.0)?,
         )?;
-        self.run_to_current_breakpoint(
-            Instant::now() + Duration::from_millis(u64::from(DEBUG_WAIT)),
-        )?;
+        self.run_to_current_breakpoint(completion_wait_deadline(deadline))?;
         if self.engine.instruction_pointer().map_err(debugger)? != return_address {
             bail!("handler unregister stopped away from its return address");
         }
@@ -3269,7 +3319,12 @@ impl VmwpDispatcher<'_> {
         Ok(())
     }
 
-    fn wait_for_unregister_cleanup(&mut self, context: u64) -> Result<()> {
+    fn wait_for_unregister_cleanup(
+        &mut self,
+        context: u64,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        require_completion_deadline(deadline)?;
         let cleanup = self.state.profile.deferred_cleanup.clone();
         let cleanup_address = self.site_address(&cleanup)?;
         if self.state.breakpoint.is_none() {
@@ -3279,16 +3334,16 @@ impl VmwpDispatcher<'_> {
             self.engine.execute_command("~* u").map_err(debugger)?;
             self.state.threads_frozen = false;
         }
-        let deadline = Instant::now() + Duration::from_millis(u64::from(DEBUG_WAIT));
+        let wait_deadline = completion_wait_deadline(deadline);
         loop {
             if self.engine.instruction_pointer().map_err(debugger)? == cleanup_address
                 && self.register("rcx")? == context
             {
                 break;
             }
-            self.run_to_current_breakpoint(deadline)?;
+            self.run_to_current_breakpoint(wait_deadline)?;
             self.require_site(&cleanup)?;
-            if Instant::now() >= deadline {
+            if Instant::now() >= wait_deadline {
                 bail!("deferred cleanup did not reach the registered handler context");
             }
         }
@@ -3299,7 +3354,12 @@ impl VmwpDispatcher<'_> {
         Ok(())
     }
 
-    fn finish_unregister_cleanup_return(&mut self, cleanup_return: u64) -> Result<()> {
+    fn finish_unregister_cleanup_return(
+        &mut self,
+        cleanup_return: u64,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        require_completion_deadline(deadline)?;
         if let Some(owned) = &self.state.breakpoint {
             let cleanup_address = self.site_address(&self.state.profile.deferred_cleanup)?;
             if owned.address != cleanup_address && owned.address != cleanup_return {
@@ -3313,9 +3373,7 @@ impl VmwpDispatcher<'_> {
             self.set_dynamic_breakpoint(cleanup_return)?;
         }
         if self.engine.instruction_pointer().map_err(debugger)? != cleanup_return {
-            self.run_to_current_breakpoint(
-                Instant::now() + Duration::from_millis(u64::from(DEBUG_WAIT)),
-            )?;
+            self.run_to_current_breakpoint(completion_wait_deadline(deadline))?;
         }
         if self.engine.instruction_pointer().map_err(debugger)? != cleanup_return {
             bail!("deferred cleanup stopped away from its return address");
@@ -3325,18 +3383,25 @@ impl VmwpDispatcher<'_> {
         Ok(())
     }
 
-    fn settle_unregister_cleanup(&mut self, context: u64) -> Result<()> {
+    fn settle_unregister_cleanup(&mut self, context: u64, deadline: Option<Instant>) -> Result<()> {
+        require_completion_deadline(deadline)?;
         if self.state.attached {
             self.detach_handled()?;
         }
+        if deadline.is_some_and(|deadline| {
+            deadline.saturating_duration_since(Instant::now()) < CLEANUP_SETTLE
+        }) {
+            bail!("the absolute Secure Kernel pause bound has no time left for cleanup settling");
+        }
         thread::sleep(CLEANUP_SETTLE);
+        require_completion_deadline(deadline)?;
         if !self.state.attached {
             let pending = self
                 .engine
                 .attach_process_begin(self.state.vmwp_pid)
                 .map_err(debugger)?;
             self.state.attached = true;
-            pending.wait().map_err(debugger)?;
+            wait_for_process_attach(self.engine, pending, self.state.vmwp_pid, deadline)?;
         }
         let callback = self.read_u64(
             context
@@ -3697,7 +3762,8 @@ impl VmwpDispatcher<'_> {
         Ok(())
     }
 
-    fn free_unregistered_scratch(&mut self) -> Result<()> {
+    fn free_unregistered_scratch_inner(&mut self, deadline: Option<Instant>) -> Result<()> {
+        require_completion_deadline(deadline)?;
         if !self.state.attached {
             verify_vmwp_pid(self.bound_vm_id()?, self.state.vmwp_pid)?;
             let pending = self
@@ -3705,8 +3771,9 @@ impl VmwpDispatcher<'_> {
                 .attach_process_begin(self.state.vmwp_pid)
                 .map_err(debugger)?;
             self.state.attached = true;
-            pending.wait().map_err(debugger)?;
+            wait_for_process_attach(self.engine, pending, self.state.vmwp_pid, deadline)?;
         }
+        require_completion_deadline(deadline)?;
         let scratch = self.state.profile.scratch_base.0;
         self.engine
             .execute_command(&format!(".dvfree {scratch:016x} 0"))
@@ -4503,7 +4570,6 @@ mod tests {
             event,
             validation_complete: true,
             release_eligible: true,
-            recovery_deadline: None,
         });
         let mut selected = target();
         selected.vp = 1;
@@ -4516,6 +4582,40 @@ mod tests {
         assert!(state.provider_writes_quiesced);
         selected.vp = 0;
         assert!(state.confirm_retained_provider_stop(&[selected]).is_err());
+    }
+
+    #[test]
+    fn the_cleanup_deadline_outlives_the_consumed_event_record() {
+        let event = HeldEvent {
+            message_type: HexU64(EVENT_TYPE_VECTOR_1),
+            vector: 1,
+            vp: 0,
+            vtl: 1,
+            cpl: 0,
+            dispatcher_context: HexU64(0x2000_0000_2000),
+            advance_instruction_pointer: false,
+            reason: StopReason::DebugException,
+        };
+        let mut state = VmwpDispatcherState::new(
+            profile(),
+            4242,
+            Some(0x2000_0000_1000),
+            "11111111-2222-3333-4444-555555555555".into(),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        state.recovery_deadline = Some(deadline);
+        state.retained_event = Some(RetainedEvent {
+            system_id: 0x1234,
+            return_ip: 0x2000_0000_3000,
+            event,
+            validation_complete: true,
+            release_eligible: true,
+        });
+
+        state.retained_event.take().unwrap();
+
+        assert_eq!(state.recovery_deadline, Some(deadline));
     }
 
     #[test]
@@ -4544,7 +4644,6 @@ mod tests {
             event,
             validation_complete: false,
             release_eligible: false,
-            recovery_deadline: None,
         });
 
         let error = state.refuse_unsafe_recovery().unwrap_err();

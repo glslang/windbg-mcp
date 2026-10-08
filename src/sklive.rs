@@ -252,6 +252,9 @@ pub(crate) trait EventDispatcher {
         self.recover(safe_to_resume, event)
     }
     fn teardown(&mut self) -> Result<()>;
+    fn teardown_until(&mut self, _deadline: Instant) -> Result<()> {
+        self.teardown()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1764,7 +1767,11 @@ impl<P: ControlProvider> LiveControl<P> {
                     .context("the faulted session has no fault record")?
                     .cause
                     .clone();
-                if let Err(error) = dispatcher.teardown() {
+                let teardown = match deadline {
+                    Some(deadline) => dispatcher.teardown_until(deadline),
+                    None => dispatcher.teardown(),
+                };
+                if let Err(error) = teardown {
                     bail!(
                         "the terminal live-control fault remains and teardown failed: {cause}; {error:#}"
                     );
@@ -1809,7 +1816,7 @@ impl<P: ControlProvider> LiveControl<P> {
                     Ok(())
                 })();
                 if let Err(error) = result {
-                    return Err(self.enter_fault(dispatcher, error, None));
+                    return Err(self.enter_fault_inner(dispatcher, error, None, deadline));
                 }
                 for provider in &mut self.providers {
                     provider.baseline = None;
@@ -1823,15 +1830,20 @@ impl<P: ControlProvider> LiveControl<P> {
             }
             State::Running => {}
             State::Arming | State::Releasing => {
-                return Err(self.enter_fault(
+                return Err(self.enter_fault_inner(
                     dispatcher,
                     anyhow!("close observed an incomplete control transition"),
                     None,
+                    deadline,
                 ));
             }
         }
-        if let Err(error) = dispatcher.teardown() {
-            return Err(self.enter_fault(dispatcher, error, None));
+        let teardown = match deadline {
+            Some(deadline) => dispatcher.teardown_until(deadline),
+            None => dispatcher.teardown(),
+        };
+        if let Err(error) = teardown {
+            return Err(self.enter_fault_inner(dispatcher, error, None, deadline));
         }
         self.state = State::Closed;
         Ok(())
@@ -2668,6 +2680,7 @@ mod tests {
         release_deadlines: Vec<Option<Instant>>,
         retained_recovery_deadline: Option<Instant>,
         recovery_deadlines: Vec<Option<Instant>>,
+        teardown_deadlines: Vec<Option<Instant>>,
     }
 
     impl FakeDispatcher {
@@ -2691,6 +2704,7 @@ mod tests {
                 release_deadlines: Vec::new(),
                 retained_recovery_deadline: None,
                 recovery_deadlines: Vec::new(),
+                teardown_deadlines: Vec::new(),
             }
         }
     }
@@ -2817,6 +2831,18 @@ mod tests {
         }
 
         fn teardown(&mut self) -> Result<()> {
+            self.teardown_deadlines.push(None);
+            self.teardown_inner()
+        }
+
+        fn teardown_until(&mut self, deadline: Instant) -> Result<()> {
+            self.teardown_deadlines.push(Some(deadline));
+            self.teardown_inner()
+        }
+    }
+
+    impl FakeDispatcher {
+        fn teardown_inner(&mut self) -> Result<()> {
             self.actions.push(Action::Teardown);
             if let Some(reason) = self.fail_teardown {
                 bail!("{reason}");
@@ -3799,7 +3825,56 @@ mod tests {
         assert_eq!(provider.release_deadlines[releases..], [Some(deadline)]);
         assert_eq!(provider.outer_deadline, None);
         assert_eq!(dispatcher.release_deadlines, [Some(deadline)]);
+        assert_eq!(dispatcher.teardown_deadlines, [Some(deadline)]);
         assert_eq!(control.phase(), LivePhase::Closed);
+    }
+
+    #[test]
+    fn faulted_close_keeps_the_retained_deadline_through_teardown() {
+        let mut dispatcher =
+            FakeDispatcher::new([observed(StopReason::HardwareBreakpoint { slot: 0 })]);
+        dispatcher.fail_release = true;
+        let recovery_deadline = Instant::now() + std::time::Duration::from_secs(2);
+        dispatcher.retained_recovery_deadline = Some(recovery_deadline);
+        let mut control = LiveControl::open(FakeProvider::new()).unwrap();
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Redirect)
+            .unwrap();
+        let stopped = control.wait_for_stop(&mut dispatcher).unwrap();
+        control
+            .continue_from_until(
+                &mut dispatcher,
+                &stopped.epoch,
+                Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap_err();
+
+        control
+            .close_until(&mut dispatcher, recovery_deadline)
+            .unwrap();
+
+        assert_eq!(dispatcher.teardown_deadlines, [Some(recovery_deadline)]);
+        assert_eq!(control.phase(), LivePhase::Closed);
+    }
+
+    #[test]
+    fn teardown_failure_keeps_the_close_deadline_through_fault_recovery() {
+        let mut dispatcher =
+            FakeDispatcher::new([observed(StopReason::HardwareBreakpoint { slot: 0 })]);
+        dispatcher.fail_teardown = Some("handler removal failed");
+        let mut control = LiveControl::open(FakeProvider::new()).unwrap();
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Redirect)
+            .unwrap();
+        control.wait_for_stop(&mut dispatcher).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+
+        let error = control.close_until(&mut dispatcher, deadline).unwrap_err();
+
+        assert!(error.to_string().contains("handler removal failed"));
+        assert_eq!(dispatcher.teardown_deadlines, [Some(deadline)]);
+        assert_eq!(dispatcher.recovery_deadlines.last(), Some(&Some(deadline)));
+        assert_eq!(control.phase(), LivePhase::Faulted);
     }
 
     #[test]

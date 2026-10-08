@@ -106,8 +106,13 @@ cannot prove restoration and release. The absolute pause bound defaults to 600 s
 of KD traffic, and includes response I/O plus controller restoration and native-event release. Each
 stop reserves the smaller of 30 seconds or half of that bound for deadline-aware cleanup; the KD
 service stops accepting work at the start of that reserve. A peer that stops consuming output
-therefore cannot consume the time needed to restore and release the stop. Connect and idle bounds
-default to 30 and 300 seconds.
+therefore cannot consume the time needed to restore and release the stop. `end_session` is also
+observed by the live-memory pipe's engine-thread poll, so a provider that stops answering a read
+cannot occupy the worker until its 60-second exchange limit while teardown waits behind it. Once a
+stop is retained, its cleanup deadline remains with the dispatcher even after native completion has
+consumed the event record; it bounds unregister waits, cleanup settling, `vmwp` reattachment,
+Hyper-V transition joins and the final VM resume. Connect and idle bounds default to 30 and 300
+seconds.
 
 ## Standalone compatibility role
 
