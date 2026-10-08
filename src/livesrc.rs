@@ -122,6 +122,9 @@ const TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 /// would have us allocate 4 GB before a byte was read.
 const MAX_DECLARED_READ: usize = 1 << 20;
 
+type CancelCheck = fn() -> bool;
+type SetCancel<R> = fn(&mut R, Option<CancelCheck>);
+
 /// One request/response exchange with a transport, over anything readable and writable.
 ///
 /// Generic on purpose: the framing is the part that can be wrong in ways a live guest would hide,
@@ -132,6 +135,7 @@ pub(crate) struct Transport<R: BufRead, W: Write> {
     max_read: usize,
     response_wait: Option<Duration>,
     set_deadline: Option<fn(&mut R, Option<Instant>)>,
+    set_cancelled: Option<SetCancel<R>>,
     /// Set by a framing fault, after which the stream's position is unknown.
     poisoned: bool,
 }
@@ -157,6 +161,7 @@ impl<R: BufRead, W: Write> Transport<R, W> {
             max_read: 1,
             response_wait: None,
             set_deadline: None,
+            set_cancelled: None,
             poisoned: false,
         }
     }
@@ -166,6 +171,7 @@ impl<R: BufRead, W: Write> Transport<R, W> {
         writer: W,
         response_wait: Duration,
         set_deadline: fn(&mut R, Option<Instant>),
+        set_cancelled: SetCancel<R>,
     ) -> Transport<R, W> {
         Transport {
             reader,
@@ -173,6 +179,7 @@ impl<R: BufRead, W: Write> Transport<R, W> {
             max_read: 1,
             response_wait: Some(response_wait),
             set_deadline: Some(set_deadline),
+            set_cancelled: Some(set_cancelled),
             poisoned: false,
         }
     }
@@ -186,6 +193,15 @@ impl<R: BufRead, W: Write> Transport<R, W> {
         outer_deadline: Option<Instant>,
         exchange: impl FnOnce(&mut Self) -> T,
     ) -> T {
+        self.bounded_until_cancelled(outer_deadline, None, exchange)
+    }
+
+    fn bounded_until_cancelled<T>(
+        &mut self,
+        outer_deadline: Option<Instant>,
+        cancelled: Option<CancelCheck>,
+        exchange: impl FnOnce(&mut Self) -> T,
+    ) -> T {
         let exchange_deadline = self.response_wait.map(|wait| Instant::now() + wait);
         let deadline = match (exchange_deadline, outer_deadline) {
             (Some(exchange), Some(outer)) => Some(exchange.min(outer)),
@@ -195,7 +211,13 @@ impl<R: BufRead, W: Write> Transport<R, W> {
         if let Some(set_deadline) = self.set_deadline {
             set_deadline(&mut self.reader, deadline);
         }
+        if let Some(set_cancelled) = self.set_cancelled {
+            set_cancelled(&mut self.reader, cancelled);
+        }
         let result = exchange(self);
+        if let Some(set_cancelled) = self.set_cancelled {
+            set_cancelled(&mut self.reader, None);
+        }
         if let Some(set_deadline) = self.set_deadline {
             set_deadline(&mut self.reader, None);
         }
@@ -283,6 +305,7 @@ impl<R: BufRead, W: Write> Transport<R, W> {
         self.bounded(|transport| transport.read_chunk_inner(gpa, out))
     }
 
+    #[cfg(test)]
     fn read_chunk_until(
         &mut self,
         gpa: Gpa,
@@ -290,6 +313,18 @@ impl<R: BufRead, W: Write> Transport<R, W> {
         deadline: Instant,
     ) -> Result<(), ReadFailure> {
         self.bounded_until(Some(deadline), |transport| {
+            transport.read_chunk_inner(gpa, out)
+        })
+    }
+
+    fn read_chunk_until_cancelled(
+        &mut self,
+        gpa: Gpa,
+        out: &mut [u8],
+        deadline: Instant,
+        cancelled: CancelCheck,
+    ) -> Result<(), ReadFailure> {
+        self.bounded_until_cancelled(Some(deadline), Some(cancelled), |transport| {
             transport.read_chunk_inner(gpa, out)
         })
     }
@@ -403,6 +438,7 @@ impl<R: BufRead, W: Write> Transport<R, W> {
 struct DeadlineChildStdout {
     stdout: ChildStdout,
     deadline: Option<Instant>,
+    cancelled: Option<CancelCheck>,
 }
 
 impl DeadlineChildStdout {
@@ -410,11 +446,16 @@ impl DeadlineChildStdout {
         Self {
             stdout,
             deadline: None,
+            cancelled: None,
         }
     }
 
     fn set_deadline(&mut self, deadline: Option<Instant>) {
         self.deadline = deadline;
+    }
+
+    fn set_cancelled(&mut self, cancelled: Option<CancelCheck>) {
+        self.cancelled = cancelled;
     }
 
     fn available(&self) -> std::io::Result<usize> {
@@ -425,6 +466,11 @@ impl DeadlineChildStdout {
             )
         })?;
         loop {
+            if self.cancelled.is_some_and(|cancelled| cancelled()) {
+                return Err(std::io::Error::other(
+                    "the live-memory transport response was cancelled for teardown",
+                ));
+            }
             let mut available = 0u32;
             // SAFETY: `ChildStdout` owns a valid readable pipe handle for this call's duration. No
             // output buffer is supplied; `available` is a valid out-parameter.
@@ -469,6 +515,10 @@ impl Read for DeadlineChildStdout {
 
 fn set_pipe_deadline(reader: &mut BufReader<DeadlineChildStdout>, deadline: Option<Instant>) {
     reader.get_mut().set_deadline(deadline);
+}
+
+fn set_pipe_cancelled(reader: &mut BufReader<DeadlineChildStdout>, cancelled: Option<CancelCheck>) {
+    reader.get_mut().set_cancelled(cancelled);
 }
 
 /// `SHAPE cr3=0x... max_read=...` into the shape the decode takes.
@@ -682,6 +732,7 @@ impl LiveSource {
                 stdin,
                 EXCHANGE_WAIT,
                 set_pipe_deadline,
+                set_pipe_cancelled,
             ))),
             shape: GuestShape::default(),
             max_read: 1,
@@ -774,15 +825,17 @@ impl sk::RawSource for LiveSource {
 }
 
 impl LiveSource {
-    /// Read one transport-width chunk while respecting a larger operation's absolute deadline.
-    pub(crate) fn read_chunk_until(
+    /// Read one transport-width chunk while allowing the engine thread to abandon a response when
+    /// its queued teardown has already made the result unusable.
+    pub(crate) fn read_chunk_until_cancelled(
         &self,
         gpa: Gpa,
         out: &mut [u8],
         deadline: Instant,
+        cancelled: CancelCheck,
     ) -> Result<(), ReadFailure> {
         match self.transport.borrow_mut().as_mut() {
-            Some(transport) => transport.read_chunk_until(gpa, out, deadline),
+            Some(transport) => transport.read_chunk_until_cancelled(gpa, out, deadline, cancelled),
             None => Err(ReadFailure::SourceError {
                 detail: "the transport has already been closed".to_string(),
             }),
@@ -907,16 +960,23 @@ mod tests {
     struct DeadlineProbe {
         inner: Cursor<Vec<u8>>,
         changes: Vec<Option<Instant>>,
+        cancelled: Option<CancelCheck>,
     }
 
     impl std::io::Read for DeadlineProbe {
         fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.cancelled.is_some_and(|cancelled| cancelled()) {
+                return Err(std::io::Error::other("cancelled by test"));
+            }
             self.inner.read(out)
         }
     }
 
     impl BufRead for DeadlineProbe {
         fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            if self.cancelled.is_some_and(|cancelled| cancelled()) {
+                return Err(std::io::Error::other("cancelled by test"));
+            }
             self.inner.fill_buf()
         }
 
@@ -927,6 +987,14 @@ mod tests {
 
     fn record_deadline(reader: &mut DeadlineProbe, deadline: Option<Instant>) {
         reader.changes.push(deadline);
+    }
+
+    fn record_cancelled(reader: &mut DeadlineProbe, cancelled: Option<CancelCheck>) {
+        reader.cancelled = cancelled;
+    }
+
+    fn cancelled() -> bool {
+        true
     }
 
     /// A canned server: the framing is what can be wrong in ways a live guest would hide, so it is
@@ -942,9 +1010,15 @@ mod tests {
                 b"banner\nwindbg-mcp-gpa/1\nSHAPE cr3=0x1201000 max_read=4\nOK 4\nwxyz".to_vec(),
             ),
             changes: Vec::new(),
+            cancelled: None,
         };
-        let mut transport =
-            Transport::with_deadline(reader, Vec::new(), Duration::from_secs(1), record_deadline);
+        let mut transport = Transport::with_deadline(
+            reader,
+            Vec::new(),
+            Duration::from_secs(1),
+            record_deadline,
+            record_cancelled,
+        );
 
         assert_eq!(transport.await_ready().unwrap(), vec!["banner"]);
         transport.shape().unwrap();
@@ -968,9 +1042,15 @@ mod tests {
         let reader = DeadlineProbe {
             inner: Cursor::new(b"OK 4\nwxyz".to_vec()),
             changes: Vec::new(),
+            cancelled: None,
         };
-        let mut transport =
-            Transport::with_deadline(reader, Vec::new(), Duration::from_secs(60), record_deadline);
+        let mut transport = Transport::with_deadline(
+            reader,
+            Vec::new(),
+            Duration::from_secs(60),
+            record_deadline,
+            record_cancelled,
+        );
         let outer_deadline = Instant::now() + Duration::from_secs(1);
         let mut out = [0u8; 4];
 
@@ -982,6 +1062,36 @@ mod tests {
         let armed = transport.reader.changes[0].unwrap();
         assert!(armed <= outer_deadline);
         assert_eq!(transport.reader.changes[1], None);
+    }
+
+    #[test]
+    fn a_cancelled_exchange_stops_before_waiting_for_the_provider() {
+        let reader = DeadlineProbe {
+            inner: Cursor::new(Vec::new()),
+            changes: Vec::new(),
+            cancelled: None,
+        };
+        let mut transport = Transport::with_deadline(
+            reader,
+            Vec::new(),
+            Duration::from_secs(60),
+            record_deadline,
+            record_cancelled,
+        );
+        let mut out = [0u8; 4];
+
+        let error = transport
+            .read_chunk_until_cancelled(
+                Gpa(0x1000),
+                &mut out,
+                Instant::now() + Duration::from_secs(60),
+                cancelled,
+            )
+            .unwrap_err();
+
+        assert!(format!("{error:?}").contains("cancelled by test"));
+        assert!(transport.poisoned);
+        assert!(transport.reader.cancelled.is_none());
     }
 
     #[test]
