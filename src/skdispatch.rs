@@ -77,10 +77,10 @@ fn require_retention_deadline(deadline: Option<Instant>) -> Result<()> {
 }
 
 fn debug_wait_remaining(deadline: Instant, activity: Option<&WaitActivity>) -> Duration {
-    let deadline_remaining = deadline.saturating_duration_since(Instant::now());
-    activity
-        .map(|activity| activity.remaining_idle().min(deadline_remaining))
-        .unwrap_or(deadline_remaining)
+    activity.map_or_else(
+        || deadline.saturating_duration_since(Instant::now()),
+        WaitActivity::remaining_idle,
+    )
 }
 
 fn wait_for_process_attach(
@@ -4360,8 +4360,12 @@ mod tests {
         assert_eq!(completion_wait_deadline(Some(deadline)), deadline);
         assert!(require_completion_deadline(Some(deadline)).is_ok());
 
-        let activity = WaitActivity::new(Duration::from_secs(60));
-        assert!(debug_wait_remaining(Instant::now(), Some(&activity)).is_zero());
+        let activity = WaitActivity::new(Duration::from_secs(3_600));
+        assert!(
+            debug_wait_remaining(Instant::now(), Some(&activity)) > Duration::from_secs(3_500),
+            "a managed wait must use its configured idle bound instead of the legacy deadline"
+        );
+        assert!(debug_wait_remaining(Instant::now(), None).is_zero());
         assert!(
             require_completion_deadline(Some(Instant::now()))
                 .unwrap_err()

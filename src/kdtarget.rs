@@ -1483,6 +1483,9 @@ async fn read_transport<R: AsyncRead + Unpin>(
         let mut bytes = [0; 4096];
         match reader.read(&mut bytes).await {
             Ok(0) => {
+                // A reconnect may create another first pipe instance as soon as it consumes this
+                // message. Close the old read half before making that transition observable.
+                drop(reader);
                 wait_waker.request(WaitWakeReason::Disconnected);
                 let _ = queue_transport(&transport, TransportMessage::Disconnected, &wait_waker);
                 return;
@@ -1490,6 +1493,7 @@ async fn read_transport<R: AsyncRead + Unpin>(
             Ok(read) => decoder.push(&bytes[..read]),
             Err(error) => {
                 let why = error.to_string();
+                drop(reader);
                 wait_waker.request(WaitWakeReason::Transport(why.clone()));
                 let _ = queue_transport(&transport, TransportMessage::Failed(why), &wait_waker);
                 return;
