@@ -130,6 +130,37 @@
   a sensitive call is named by the import slot inside a memory operand; neither is a question about
   control flow, so on a set whose operands are unread this would report a driver with no privileged
   instructions and no call sites, which is what a clean driver looks like.
+- **An executable section is not all instructions, and `privileged` says which of its findings are
+  in code the compiler emitted.** The scan decodes each executable section from its first byte to
+  its last, and a compiler puts jump tables, string literals, import descriptors, `TraceLogging`
+  metadata and alignment padding in `.text` beside the code -- so a linear decode walks those bytes
+  and reports what they happen to spell. Four of x86's one-byte port-I/O opcodes are ASCII letters
+  (`6c`-`6f` are `l`, `m`, `n`, `o`), which is why the noise is overwhelmingly `insb`/`outsd`.
+  Measured on `docs/samples/081226-2187-01.dmp`: across the 34 modules with any findings the scan
+  finds 7,515 privileged instructions and **1,512 of them, 20%, are in bytes no unwind entry
+  covers** -- half of the 2,994 it actually lists. The concentration is what matters rather than
+  the average: `tpm` reports 638 of which 623 are inside `tpm!TraceLoggingMetadata` and its
+  neighbours, `DTrace` 880 of which 879 are data, and `nt` 5,535 of which **none** is. What
+  separates them with no symbols is the image's own
+  **unwind table**: the `RUNTIME_FUNCTION` records the x64 and ARM64 ABIs oblige a compiler to emit
+  for the code it generates, carried by a stripped third-party driver exactly as by a Microsoft one,
+  and read-only -- so present on a dump for the same reason the code is. Each row's `standing` says
+  what that table answered and `uncovered_privileged` counts the ones it does not cover. Three
+  limits on reading it. **`no_unwind_entry` is a qualification and not a verdict**, having three
+  readings this cannot choose between -- data, code nobody emitted an unwind record for, or a table
+  that would not read -- which is why those findings are listed and counted rather than dropped.
+  The second reading is what settled that, and it is measured rather than hypothetical: on
+  `docs/samples/082126-7015-01.dmp`, 240 of ARM64 `nt`'s 1,373 findings have no entry and the first
+  of them is `nt!HalpStartupStub`, hand-written assembly whose `mrs x1,DAIF` and `msr daifset,#1`
+  are exactly what this tool is for. A filter would have dropped them. **`in_function` is not a guarantee the byte is an instruction**: a jump table
+  embedded inside a function's own region is covered by that function's entry, so the table narrows
+  the question rather than settling it. And **x86 cannot be asked at all** -- 32-bit Windows has no
+  unwind table -- so an x86 image reports exactly what it reported before this existed, with every
+  row saying `unverified`; so does a target whose entry layout this build does not decode, and an
+  engine whose query failed. The **call sites** are not exposed to any of this, which was measured
+  rather than assumed: all 10,349 of them across the same dump are inside covered regions, a
+  slot-relative indirect call in random data being a far rarer coincidence than a one-byte opcode.
+  Issue [#303](https://github.com/glslang/windbg-mcp/issues/303) has the evidence.
 - **What an image's import table can and cannot name, which is what decides whether a short
   `sinks` is a small driver or a question nobody asked.** Three shapes a sensitive import can take
   that a name-keyed list cannot be matched against, and a fourth directory that is read for none of

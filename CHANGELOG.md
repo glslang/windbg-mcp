@@ -33,6 +33,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Suspend-VM` covers arming, disarming and recovery and the stop is held by the retained
   intercept with `vmwp` debugger-stopped.
 
+### Fixed
+
+- **`driver_hazards` said which of its privileged instructions are in code the compiler emitted
+  and which are bytes a linear decode read as code**
+  ([#303](https://github.com/glslang/windbg-mcp/issues/303)). An executable section is not all
+  instructions -- a compiler puts jump tables, string literals, import descriptors, `TraceLogging`
+  metadata and alignment padding in `.text` -- and the sweep decoded each section from its first
+  byte to its last, reporting what those bytes happen to spell. Four of x86's one-byte port-I/O
+  opcodes are ASCII letters (`6c`-`6f` are `l`, `m`, `n`, `o`), so a string in `.text` reads as
+  `insb`/`outsd` all day. Measured on `docs/samples/081226-2187-01.dmp`: across the 34 modules
+  with any findings the scan finds 7,515 privileged instructions and **1,512 of them, 20%**, are
+  bytes no unwind entry covers -- half of the 2,994 it lists. The concentration is the point
+  rather than the average: `tpm` reports 638 of which 623 are inside `tpm!TraceLoggingMetadata`
+  and its neighbours, `DTrace` 880 of which 879 are data, and `nt` 5,535 of which **none** is.
+  And the two read identically in the report -- `tpm+0x43fbd` is the fifth byte of a
+  `TraceLogging` blob and `kdstub+0x7fed` is a real `tdcall` inside `HcTdxVmcall`.
+
+  What tells them apart with no symbols is the image's own **unwind table** -- the
+  `RUNTIME_FUNCTION` records the x64 and ARM64 ABIs oblige a compiler to emit, which a stripped
+  third-party driver carries exactly as a Microsoft one does, and which is read-only and so is in
+  a dump for the same reason the code is. So each `privileged` row now carries a `standing`
+  (`in_function`, `no_unwind_entry`, or `unverified` where there was no table to ask), the new
+  `uncovered_privileged` counts the second kind exactly beside `privileged_count`, and the
+  rendered form prints the two under separate headings. It separates the two populations almost
+  perfectly: of the 1,434 listed findings that are `ins`/`outs`, 1,405 have no entry, while of the
+  other 1,560, 1,453 are inside one. Cross-checked against the engine's own `.fnent` over every one
+  of the 2,994 listed findings -- the two classifications agree on all 34 modules, 0 mismatches.
+  `tpm`'s report is now 15 real `in`/`out` port accesses with 623 data bytes split out and
+  labelled.
+
+  **It qualifies rather than filters.** `no_unwind_entry` has three readings and this cannot choose
+  between them -- data in an executable section, code nobody emitted an unwind record for, or an
+  unwind table that would not read -- so those findings are listed and counted rather than dropped,
+  and nothing calls them fabricated. The second reading is why, and it is measured rather than
+  hypothetical: on the ARM64 sample `docs/samples/082126-7015-01.dmp`, 240 of `nt`'s 1,373 findings
+  have no entry, and the first of them is `nt!HalpStartupStub` -- hand-written assembly whose
+  `mrs x1,DAIF` and `msr daifset,#1` are exactly what this tool is for. That dump also exercises
+  ARM64's own record shape, whose second word is unwind data packed into a word or an RVA into
+  `.xdata` rather than an end address; `nt!HalpHalt` is the `.xdata` form. The list gained a **second budget** so
+  that neither population can push the other out of it: one budget spent in address order lists
+  `DTrace`'s 879 data bytes and drops its one real finding. A target whose unwind entries are not
+  decoded here -- x86, which has no unwind table at all -- reports exactly what it reported before,
+  with every row saying `unverified` and a sentence saying the question was not answered. The scan
+  costs the same: 0.92 s against 0.82 s on `nt`'s 4 MB and 5,535 findings, because a
+  `RUNTIME_FUNCTION` region is contiguous and the walk visits addresses in order, so a routine
+  with forty `rdmsr` in it costs one query. The **call sites** are untouched, and that was measured
+  rather than assumed: all **10,349** of them across the same dump are inside covered regions,
+  which is what the issue predicted from a slot-relative indirect call being a rarer coincidence
+  than a one-byte opcode.
+
 ### Changed
 
 - **`CLAUDE.md` lives in `.claude/`, so strict plugin validation passes.** The plugin root is the
