@@ -9004,6 +9004,19 @@ fn hazards_at(
         pe_failure(module, &why, stopped_by.get(), discarded.as_deref())
     })?;
 
+    // **One predicate, read by the walk and by the classification below.** `walk_code` polls it
+    // between 64 KiB windows, which bounds the *decode*; the unwind query runs per finding and a
+    // window of one-byte privileged opcodes is tens of thousands of them, so a scan whose caller
+    // has gone would otherwise hold the session for the rest of that window. Review on #468.
+    let stop = || {
+        if matches!(e.interrupted(), Ok(true)) {
+            Some(walk::Halt::Interrupted)
+        } else if Instant::now() >= deadline {
+            Some(walk::Halt::Deadline)
+        } else {
+            None
+        }
+    };
     let mut covers = Covers::default();
     let mut scan = hazards::scan(
         &image,
@@ -9013,16 +9026,8 @@ fn hazards_at(
         // ARM64 store as a descriptor-table access.
         e.instruction_set(),
         |at, len| e.decode_range(at, len).ok(),
-        || {
-            if matches!(e.interrupted(), Ok(true)) {
-                Some(walk::Halt::Interrupted)
-            } else if Instant::now() >= deadline {
-                Some(walk::Halt::Deadline)
-            } else {
-                None
-            }
-        },
-        |at| covers.standing(e, at),
+        stop,
+        |at| covers.standing(e, at, stop),
     );
     scan.unnamed_libraries = table.unnamed_libraries;
 
@@ -9058,10 +9063,15 @@ fn hazards_at(
 /// A `RUNTIME_FUNCTION` region is contiguous and [`hazards::scan`] visits addresses in ascending
 /// order, so a routine with forty `rdmsr` in it costs **one** query rather than forty. What the
 /// cache cannot shorten is a run of findings no entry covers — there is no region to remember —
-/// which is the shape a data blob has. That is bounded by the scan's own deadline, the same budget
-/// that bounds the decode, and not by a query cap of its own: a cap would have to answer
-/// [`hazards::Standing::Unverified`] past its bound, which is a fourth outcome whose only remedy
-/// is the clock this already has.
+/// which is the shape a data blob has, and 879 of `DTrace`'s 880 findings are that shape.
+///
+/// **The cache is not the bound, and saying it was is what review on #468 corrected.**
+/// `walk_code` polls the stop predicate between 64 KiB windows, which bounds the decode; a window
+/// of one-byte privileged opcodes is tens of thousands of *queries* inside one of those gaps, so a
+/// deadline that expired at the top of a window was not observed until the bottom of it. The
+/// earlier draft of this paragraph dismissed a bound here because answering past one would need a
+/// fourth outcome — which was true when `Unverified` shared `InFunction`'s count and is not now
+/// that it has one of its own. So [`Covers::standing`] polls the same predicate and latches it.
 ///
 /// # The direction a failure goes, and it is measured rather than assumed
 ///
@@ -9088,20 +9098,60 @@ struct Covers {
     /// one; what it is, is a server fact, so it goes to the log rather than into the caller's
     /// answer.
     failed: usize,
+    /// Latched once the walk's stop predicate has fired, so the remaining findings of the window
+    /// the walk is in cost no engine call at all. Latched rather than re-polled because the
+    /// predicate itself reaches the engine, and because a stop does not un-fire.
+    stopped: bool,
 }
 
 impl Covers {
     /// What the table says about `at`, asking the engine only where the cache cannot answer.
-    fn standing(&mut self, e: &DebugEngine, at: u64) -> hazards::Standing {
-        if self.unsupported {
-            return hazards::Standing::Unverified;
+    ///
+    /// `stop` is the walk's own predicate, polled **before** a query the cache cannot serve and
+    /// latched when it fires: a finding past that point is [`hazards::Standing::Unverified`], which
+    /// needs no new outcome and is counted apart from the findings this did place. The walk then
+    /// ends at its next window boundary and reports the halt, so the answer carries both facts —
+    /// `stopped` says the scan was cut short, and `unverified_privileged` says how many findings
+    /// went unplaced because of it.
+    fn standing(
+        &mut self,
+        e: &DebugEngine,
+        at: u64,
+        stop: impl Fn() -> Option<walk::Halt>,
+    ) -> hazards::Standing {
+        match self.standing_without_engine(at, stop) {
+            Some(standing) => standing,
+            None => self.read(at, e.function_extent(at)),
         }
+    }
+
+    /// Everything [`Self::standing`] can answer without reaching the engine, and `None` where the
+    /// question has to.
+    ///
+    /// Split out so that a unit test can take it: this crate's unit tests cannot make a
+    /// `DebugEngine`, so `None` is also how a test says *this would have cost a query* — which is
+    /// the assertion the stop latch needs and a call count cannot give.
+    fn standing_without_engine(
+        &mut self,
+        at: u64,
+        stop: impl Fn() -> Option<walk::Halt>,
+    ) -> Option<hazards::Standing> {
+        if self.unsupported {
+            return Some(hazards::Standing::Unverified);
+        }
+        // **Cheap answers before the poll.** A cached region costs nothing and makes no engine
+        // call, so there is nothing to bound; polling first would put an engine call
+        // (`GetInterrupt`) in front of every finding of a routine this had already placed.
         if let Some((begin, end)) = self.region
             && (begin..end).contains(&at)
         {
-            return hazards::Standing::InFunction;
+            return Some(hazards::Standing::InFunction);
         }
-        self.read(at, e.function_extent(at))
+        if self.stopped || stop().is_some() {
+            self.stopped = true;
+            return Some(hazards::Standing::Unverified);
+        }
+        None
     }
 
     /// One answer's meaning, separated from the call that produced it so that a test can supply
@@ -13284,6 +13334,68 @@ mod tests {
             "`read` itself is the mapping; the latch is read by `standing`, which is what skips the \
              call -- so this stays a test of the mapping alone"
         );
+    }
+
+    /// **A finding past the scan's stop is unplaced, and it costs no engine call.**
+    ///
+    /// `walk_code` polls the stop between 64 KiB windows, so the *decode* is bounded there -- but
+    /// the unwind query runs per finding, and a window of one-byte privileged opcodes is tens of
+    /// thousands of them inside one of those gaps. A scan whose caller has timed out, or whose
+    /// caller asked for an interrupt, would hold the session for the rest of that window. Raised on
+    /// #468.
+    ///
+    /// So `standing` polls the same predicate and **latches** it: the remaining findings answer
+    /// `Unverified`, which is counted apart from the ones it placed, and the walk reports the halt
+    /// on its own. Checked through `standing` rather than `read`, because the poll is what is being
+    /// asserted and `read` is the half below it — `Covers::region` left `None` is what says no
+    /// query was made, there being no engine here to count calls against.
+    ///
+    /// **Mutation-verified**: drop the `stop()` arm and the *second* assertion fails, `None`
+    /// against `Some(Unverified)` — measured, rather than the first as an earlier draft of this
+    /// said. The first is the cached-region case and does not reach the stop at all, which is the
+    /// point of it: the cheap answer must come back without an engine call however the clock
+    /// stands.
+    #[test]
+    fn a_finding_past_the_scans_stop_is_unplaced_and_costs_no_query() {
+        let at = 0xffff_f800_0000_1000u64;
+        let stopped = || Some(walk::Halt::Deadline);
+        let running = || None;
+
+        // A cached region answers before the poll, so a routine already placed costs neither an
+        // unwind query nor an interrupt query however the clock stands.
+        let mut covers = Covers {
+            region: Some((at, at + 0x20)),
+            ..Covers::default()
+        };
+        assert_eq!(
+            covers.standing_without_engine(at, stopped),
+            Some(hazards::Standing::InFunction),
+            "the cache answers first, so the stop is not even consulted"
+        );
+
+        // Past the region, a fired stop answers without a query -- which is what
+        // `standing_without_engine` reporting `Some` at all asserts, it having no engine to call.
+        let mut covers = Covers::default();
+        assert_eq!(
+            covers.standing_without_engine(at, stopped),
+            Some(hazards::Standing::Unverified),
+            "a finding past the stop is unplaced rather than queried"
+        );
+        assert!(covers.stopped, "and the stop is latched");
+        assert_eq!(
+            covers.region, None,
+            "nothing was placed, so there is no region to have cached"
+        );
+        assert_eq!(
+            covers.standing_without_engine(at, running),
+            Some(hazards::Standing::Unverified),
+            "latched: a stop does not un-fire, and the predicate reaches the engine itself"
+        );
+
+        // And with the stop clear and nothing cached, this is the path that needs the engine --
+        // which is what `None` here means, and is the only arm a unit test cannot take further.
+        let mut covers = Covers::default();
+        assert_eq!(covers.standing_without_engine(at, running), None);
     }
 
     /// Once the walk is stopped, an address is **not** taken to the engine.

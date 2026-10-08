@@ -150,8 +150,8 @@
       "inputSchema": 597,
       "modelVisible": 1342,
       "name": "driver_hazards",
-      "outputSchema": 3734,
-      "wire": 5220
+      "outputSchema": 3926,
+      "wire": 5412
     },
     {
       "annotations": 74,
@@ -168,8 +168,8 @@
       "inputSchema": 652,
       "modelVisible": 1735,
       "name": "driver_surface",
-      "outputSchema": 11257,
-      "wire": 13141
+      "outputSchema": 11449,
+      "wire": 13333
     },
     {
       "annotations": 130,
@@ -682,10 +682,10 @@
     "inputSchema": 67961,
     "instructions": 2022,
     "modelVisible": 116356,
-    "outputSchema": 201450,
-    "payload": 328161,
+    "outputSchema": 201834,
+    "payload": 328545,
     "tools": 75,
-    "wire": 328075,
+    "wire": 328459,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10308
   }

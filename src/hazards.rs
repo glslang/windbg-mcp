@@ -417,9 +417,9 @@ pub enum Standing {
     ///
     /// **x86 therefore keeps the whole of issue #303**, and this says so rather than implying a
     /// coverage it has not got: measured on `docs/samples/cppthrow-fastfail-x86.dmp`, the 32-bit
-    /// `ntdll` reports 10,623 privileged instructions with `uncovered_privileged` zero and every
-    /// row `unverified`. Nothing was filtered and nothing was claimed, which is the same answer
-    /// that image got before this field existed.
+    /// `ntdll` reports 10,623 privileged instructions, every one of them counted in
+    /// [`Scan::unverified_privileged`] and none in the other two. Nothing was filtered and nothing
+    /// was claimed, which is the same answer that image got before this field existed.
     Unverified,
 }
 
@@ -452,19 +452,37 @@ pub struct Scan {
     /// The privileged instructions found, in address order.
     ///
     /// **Two budgets on one list**, [`MAX_PRIVILEGED`] and [`MAX_UNCOVERED_PRIVILEGED`], so that
-    /// neither population can push the other out of it: a module like the sample dump's `DTrace`,
-    /// whose 880 findings are 879 bytes of data an unwind entry does not cover, would otherwise
-    /// spend a single budget on noise and list none of the code.
+    /// the findings an unwind entry covers and the ones it does not cannot push each other out of
+    /// it: a module like the sample dump's `DTrace`, whose 880 findings are 879 bytes of data an
+    /// unwind entry does not cover, would otherwise spend a single budget on noise and list none
+    /// of the code. [`Standing::Unverified`] shares the first budget, because it is the standing
+    /// of a finding that is **not** known to be data — on x86 it is every finding, and a budget of
+    /// its own would have to be the full one anyway.
     pub privileged: Vec<Privileged>,
     /// How many were found, which is exact however many are listed above.
-    pub privileged_count: usize,
-    /// How many of those are in bytes **no unwind entry covers** —
-    /// [`Standing::NoUnwindEntry`] — which is exact however many of them are listed.
     ///
-    /// A count of its own rather than something to derive from the list, for the reason every
-    /// count here is one: the list is a sample. It is what says how much of
-    /// [`Self::privileged_count`] is a linear decode's reading of data rather than of code.
+    /// The sum of the three counts below, which is the same arithmetic [`crate::structured::Xrefs`]
+    /// states between `site_count` and its three kinds.
+    pub privileged_count: usize,
+    /// How many are in a region the image's unwind table covers — [`Standing::InFunction`].
+    pub in_function_privileged: usize,
+    /// How many are in bytes **no unwind entry covers** — [`Standing::NoUnwindEntry`].
+    ///
+    /// What says how much of [`Self::privileged_count`] is a linear decode's reading of data
+    /// rather than of code.
     pub uncovered_privileged: usize,
+    /// How many the unwind table could not be asked about at all — [`Standing::Unverified`].
+    ///
+    /// **A count of its own rather than folded into [`Self::in_function_privileged`]**, which is
+    /// where it was until review on #468 found what that costs. Folded, a finding whose query
+    /// failed was counted among the ones *known* to be code, and past the shared list budget its
+    /// row was dropped as well — so a renderer looking for the standing among the listed rows found
+    /// none and said nothing. An unanswered question counted as an answer, which is the one shape
+    /// this module's doc comment says the result must never take.
+    ///
+    /// It is counted for every finding, so it is exact even where the shared budget left no row to
+    /// show for it, and that is the case it exists for.
+    pub unverified_privileged: usize,
     pub scanned: Vec<Scanned>,
     /// Executable ranges that were **not** decoded, and therefore say nothing: bytes that would
     /// not read, and any part of a section whose declared span ran past the image.
@@ -563,8 +581,8 @@ pub const MAX_SLOTS_PER_SINK: usize = 16;
 /// budgets; what stays here is the per-instruction reading.
 ///
 /// `standing` answers what the image's unwind table says about one address, and is asked **once
-/// per privileged finding** — including the ones past a list budget, since
-/// [`Scan::uncovered_privileged`] is a count and a count is exact. See [`Standing`] for what it
+/// per privileged finding** — including the ones past a list budget, since the three counts
+/// [`Scan::privileged_count`] is the sum of are counts and a count is exact. See [`Standing`] for what it
 /// buys and why a caller that cannot answer returns [`Standing::Unverified`] rather than guessing.
 /// It is a closure for the reason the other two are: the worker's reaches an engine, and a test's
 /// is a fixture.
@@ -616,7 +634,13 @@ pub fn scan(
 
     let mut privileged = Vec::new();
     let mut privileged_count = 0usize;
+    // One exact count per standing, which is what keeps an unanswered query from being counted as
+    // an answer -- see `Scan::unverified_privileged`. Three counters matched exhaustively rather
+    // than an array indexed by the discriminant, so a fourth standing is a compile error here
+    // rather than a count nothing takes.
+    let mut in_function_privileged = 0usize;
     let mut uncovered_privileged = 0usize;
+    let mut unverified_privileged = 0usize;
     // The two list budgets, counted apart. One list, so it stays in address order; two counters,
     // so the uncovered findings cannot spend the covered ones' budget or be spent by them.
     let mut listed_covered = 0usize;
@@ -652,12 +676,16 @@ pub fn scan(
         }
         if let Some(kind) = privilege_kind(instruction, set) {
             privileged_count += 1;
-            // **Asked for every finding, not for every listed one.** `uncovered_privileged` is a
-            // count, and a count that stopped being taken at a list's cap would report a module
+            // **Asked for every finding, not for every listed one.** The per-standing counts are
+            // counts, and a count that stopped being taken at a list's cap would report a module
             // whose findings are all data as one whose first thousand are.
             let standing = standing(instruction.address);
+            match standing {
+                Standing::InFunction => in_function_privileged += 1,
+                Standing::NoUnwindEntry => uncovered_privileged += 1,
+                Standing::Unverified => unverified_privileged += 1,
+            }
             let (listed, cap) = if standing == Standing::NoUnwindEntry {
-                uncovered_privileged += 1;
                 (&mut listed_uncovered, MAX_UNCOVERED_PRIVILEGED)
             } else {
                 (&mut listed_covered, MAX_PRIVILEGED)
@@ -688,7 +716,9 @@ pub fn scan(
         sinks: sinks.into_values().collect(),
         privileged,
         privileged_count,
+        in_function_privileged,
         uncovered_privileged,
+        unverified_privileged,
         scanned: covered.scanned,
         unreadable: covered.unreadable,
         other_imports,
@@ -898,7 +928,9 @@ pub fn structured_report(
             })
             .collect(),
         privileged_count: scan.privileged_count,
+        in_function_privileged: scan.in_function_privileged,
         uncovered_privileged: scan.uncovered_privileged,
+        unverified_privileged: scan.unverified_privileged,
         scanned: scan.scanned.iter().map(codewalk::range_report).collect(),
         unreadable: scan.unreadable.iter().map(codewalk::range_report).collect(),
         other_imports: scan.other_imports,
@@ -917,6 +949,43 @@ pub fn structured_report(
         }),
         cap_hit: scan.cap_hit,
     }
+}
+
+/// One of this rendering's long lines, folded to the width and continuation indent every other
+/// sentence in this file is hand-wrapped to.
+///
+/// **A helper rather than more `\n           \` in a literal**, because the three group headings
+/// below are built from a count and a clause and so cannot be wrapped by hand at all — the width
+/// of the count moves the break. Breaks on whitespace only, so an over-long word runs past the
+/// margin rather than being cut; nothing here produces one, and truncating a mnemonic would be the
+/// worse failure.
+fn wrapped(line: &str) -> String {
+    // The two columns every other line of this rendering uses: where a label starts, and where a
+    // continuation of it aligns. `line` carries neither, because `split_whitespace` below would
+    // eat the first and nothing would restore it -- which it did, until `tm`'s rendering came back
+    // with its headings flush against the margin and every assertion still green.
+    const WIDTH: usize = 96;
+    const LABEL: &str = "  ";
+    const INDENT: &str = "           ";
+    let mut out = String::from(LABEL);
+    let mut at = LABEL.len();
+    for word in line.split_whitespace() {
+        if at == LABEL.len() {
+            out.push_str(word);
+        } else if at + 1 + word.chars().count() > WIDTH {
+            out.push('\n');
+            out.push_str(INDENT);
+            out.push_str(word);
+            at = INDENT.len();
+        } else {
+            out.push(' ');
+            out.push_str(word);
+            at += 1;
+        }
+        at += word.chars().count();
+    }
+    out.push('\n');
+    out
 }
 
 /// The listing a person reads, rendered **from the values beside it**.
@@ -1011,76 +1080,64 @@ pub fn render(report: &crate::structured::DriverHazards) -> String {
         }
     }
 
-    if report.privileged.is_empty() {
+    // **One group per standing, each headed with its own exact count**, which is the whole of what
+    // a text reader gets from issue #303: the groups read identically as rows -- a real `tdcall` and
+    // a `jo` that is the fifth byte of a `TraceLogging` blob -- and the only thing that tells them
+    // apart is the heading they sit under.
+    //
+    // **Headed from the counts rather than from the rows**, which is what review on #468 corrected.
+    // A single sentence appended when *any* listed row was unplaced said "none of the above is
+    // known to be code" over a list whose other rows were confirmed, and it went missing entirely
+    // when the shared list budget left no unplaced row to find. A count is exact whether or not a
+    // row survived, so it is what decides whether a heading prints and what it says.
+    let groups = [
+        (
+            Standing::InFunction,
+            report.in_function_privileged,
+            "Privileged instructions",
+            "",
+        ),
+        (
+            Standing::NoUnwindEntry,
+            report.uncovered_privileged,
+            "In bytes no unwind entry covers",
+            " — an executable section is not all instructions, and a linear decode spells a jump              table, a string or TraceLogging metadata as whatever those bytes happen to say. But              code nobody emitted an unwind record for lands here too — hand-written assembly does              — so these are listed rather than dropped. Disassemble one before quoting it",
+        ),
+        (
+            Standing::Unverified,
+            report.unverified_privileged,
+            "Not placed against an unwind table",
+            " — this target's unwind entries are not decoded here (x86 has none at all), or the              query for them failed, so these are neither known to be code nor known to be data a              linear decode read as code",
+        ),
+    ];
+    if report.privileged_count == 0 {
         out.push_str("  Privileged instructions: none\n");
     } else {
-        // **Split by standing rather than printed in one run**, which is the whole of what a text
-        // reader gets from issue #303: the two groups read identically as rows -- a real `tdcall`
-        // and a `jo` that is the fifth byte of a `TraceLogging` blob -- and the only thing that
-        // tells them apart is the heading they sit under.
-        let (covered, uncovered): (Vec<_>, Vec<_>) = report
-            .privileged
-            .iter()
-            .partition(|found| found.standing != Standing::NoUnwindEntry.name());
-        let row = |found: &crate::structured::PrivilegedInstruction| {
-            format!(
-                "    {:<16} {:<24} {}\n",
-                crate::structured::renderable(&found.mnemonic),
-                found.kind,
-                found.at.rva.as_deref().unwrap_or("?")
-            )
-        };
-        // The count of **this** group, which is the total less the uncovered one -- both exact,
-        // and neither derivable from a list that is a sample.
-        let in_code = report
-            .privileged_count
-            .saturating_sub(report.uncovered_privileged);
-        let listed = if in_code > covered.len() {
-            format!(", first {} listed", covered.len())
-        } else {
-            String::new()
-        };
-        // **One sentence rather than a count and a `none` row**, which is the shape the sample
-        // dump's `tm` takes: its single finding is a `sldt` inside `tm!TmpTransactionManagerMapping`,
-        // a data table, so the group above is empty and `(0):` followed by a `none` line says the
-        // same thing twice. It parallels the "none" case above it, where there is no finding at all.
-        if covered.is_empty() {
-            out.push_str("  Privileged instructions: none in bytes an unwind entry covers\n");
-        } else {
-            out.push_str(&format!("  Privileged instructions ({in_code}{listed}):\n"));
-            for found in &covered {
-                out.push_str(&row(found));
+        for (standing, count, heading, why) in groups {
+            if count == 0 {
+                continue;
             }
-        }
-        if report.uncovered_privileged > 0 {
-            let listed = if report.uncovered_privileged > uncovered.len() {
-                format!(", first {} listed", uncovered.len())
-            } else {
-                String::new()
+            let rows: Vec<_> = report
+                .privileged
+                .iter()
+                .filter(|found| found.standing == standing.name())
+                .collect();
+            // The count is the fact and the rows are a sample of it, so the two are printed apart
+            // -- and a group whose rows all fell to a budget still prints its count.
+            let listed = match count.saturating_sub(rows.len()) {
+                0 => String::new(),
+                _ if rows.is_empty() => ", none listed".to_string(),
+                _ => format!(", first {} listed", rows.len()),
             };
-            out.push_str(&format!(
-                "  In bytes no unwind entry covers ({}{listed}) — an executable section is not\n           \
-                 all instructions, and a linear decode spells a jump table, a string or\n           \
-                 TraceLogging metadata as whatever those bytes happen to say. But code nobody\n           \
-                 emitted an unwind record for lands here too — hand-written assembly does — so\n           \
-                 these are listed rather than dropped. Disassemble one before quoting it:\n",
-                report.uncovered_privileged
-            ));
-            for found in &uncovered {
-                out.push_str(&row(found));
+            out.push_str(&wrapped(&format!("{heading} ({count}{listed}){why}:")));
+            for found in rows {
+                out.push_str(&format!(
+                    "    {:<16} {:<24} {}\n",
+                    crate::structured::renderable(&found.mnemonic),
+                    found.kind,
+                    found.at.rva.as_deref().unwrap_or("?")
+                ));
             }
-        }
-        // Said once for the whole group rather than per row: where the table cannot be asked, it
-        // cannot be asked about any of them.
-        if covered
-            .iter()
-            .any(|found| found.standing == Standing::Unverified.name())
-        {
-            out.push_str(
-                "  Not placed against an unwind table: this target's unwind entries are not\n           \
-                 decoded here (x86 has none at all), so none of the above is known to be code\n           \
-                 rather than data a linear decode read as code.\n",
-            );
         }
     }
 
@@ -2358,8 +2415,13 @@ mod tests {
             found.privileged
         );
         assert_eq!(
-            found.uncovered_privileged, 2,
-            "and this says how many of them no unwind entry covers: {:?}",
+            (
+                found.in_function_privileged,
+                found.uncovered_privileged,
+                found.unverified_privileged
+            ),
+            (2, 2, 0),
+            "and the three counts split it by standing, summing to the total: {:?}",
             found.privileged
         );
         assert_eq!(
@@ -2378,7 +2440,16 @@ mod tests {
         );
 
         let report = structured_report("vid", BASE, &found, invented);
+        assert_eq!(report.in_function_privileged, 2);
         assert_eq!(report.uncovered_privileged, 2);
+        assert_eq!(report.unverified_privileged, 0);
+        assert_eq!(
+            report.in_function_privileged
+                + report.uncovered_privileged
+                + report.unverified_privileged,
+            report.privileged_count,
+            "the three are a partition of the total, which is what lets a reader trust a              subtraction between any two of them"
+        );
         assert_eq!(
             report
                 .privileged
@@ -2398,23 +2469,27 @@ mod tests {
         // exists -- the field is `in_function` either way once a client has parsed it.
         let wire = serde_json::to_string(&report).expect("the report serializes");
         assert_eq!(
-            wire.matches("no_unwind_entry").count(),
+            wire.matches(r#""standing":"no_unwind_entry""#).count(),
             2,
             "the interesting standing is spelled out: {wire}"
         );
+        // **The field, not the value**, which the first draft of this got wrong: `in_function`
+        // appears in the serialized form either way, because `in_function_privileged` is a field
+        // name -- so the loose match passed on a coincidence and would have gone on passing with
+        // the omission backed out. Measured by backing it out.
         assert!(
-            !wire.contains("in_function"),
-            "and the expected one is left out: {wire}"
+            !wire.contains(r#""standing":"in_function""#),
+            "and the expected one is left out of every row: {wire}"
         );
 
         let text = render(&report);
         assert!(
-            text.contains("Privileged instructions (2):"),
+            text.contains("\n  Privileged instructions (2):\n"),
             "the heading counts the findings in code rather than every finding -- it said 4 while \
              the two groups were one: {text}"
         );
         assert!(
-            text.contains("In bytes no unwind entry covers (2)"),
+            text.contains("\n  In bytes no unwind entry covers (2)"),
             "and the others get a heading of their own: {text}"
         );
         // The rows land under the right heading, which is the whole of what a text reader gets
@@ -2442,9 +2517,8 @@ mod tests {
         );
 
         // And where **nothing** is in a covered region -- the sample dump's `tm`, whose one finding
-        // is a `sldt` inside `tm!TmpTransactionManagerMapping` -- the first heading becomes a
-        // sentence rather than a count of zero with a `none` row under it, which is the shape the
-        // line above it has had since before any of this.
+        // is a `sldt` inside `tm!TmpTransactionManagerMapping` -- the first heading is absent
+        // rather than printed over a count of zero. A group prints when its count does.
         let all_data = scan(
             &image,
             &[],
@@ -2455,12 +2529,83 @@ mod tests {
         );
         let text = render(&structured_report("vid", BASE, &all_data, invented));
         assert!(
-            text.contains("Privileged instructions: none in bytes an unwind entry covers\n"),
-            "{text}"
+            !text.contains("\n  Privileged instructions ("),
+            "no finding is in code, so that heading is not printed at all: {text}"
         );
         assert!(
-            text.contains("In bytes no unwind entry covers (4)"),
+            text.contains("\n  In bytes no unwind entry covers (4)"),
             "and all four are under the data heading: {text}"
+        );
+    }
+
+    /// **A group's heading is printed from its count, not from the rows that survived the budget.**
+    ///
+    /// The case review on #468 found: [`Standing::Unverified`] shares [`MAX_PRIVILEGED`] with
+    /// [`Standing::InFunction`], so a scan that places a thousand findings and *then* has one query
+    /// fail has no unplaced row left to list. Driven from the rows, the qualification went missing
+    /// entirely and the unplaced finding was counted among the ones known to be code. The count is
+    /// taken for every finding, so it is what the heading reads -- and it says `none listed` rather
+    /// than implying a sample it does not have.
+    ///
+    /// **Mutation-verified**: counting the `Unverified` finding into `in_function_privileged` fails
+    /// the first assertion (0 against 1), and printing a heading only where a row survived fails
+    /// the last. Both measured.
+    #[test]
+    fn a_standing_with_no_row_left_still_has_a_heading_and_a_count() {
+        let mut image = image();
+        image.size_of_image = 0x40000;
+        image.sections[0].virtual_size = 0x30000;
+        // Enough findings to fill the shared budget, and one query failing well past it.
+        let unplaced = BASE + 0x1000 + 0x20000;
+        let found = scan(
+            &image,
+            &[],
+            InstructionSet::Amd64,
+            |at, want| {
+                Some(
+                    (at..at + want as u64)
+                        .map(|address| {
+                            privileged_insn(address, "fa", "cli", Flow::Fallthrough, Vec::new())
+                        })
+                        .collect(),
+                )
+            },
+            never,
+            |at| {
+                if at == unplaced {
+                    Standing::Unverified
+                } else {
+                    Standing::InFunction
+                }
+            },
+        );
+
+        assert_eq!(
+            found.unverified_privileged, 1,
+            "the one unanswered query is counted whether or not a row survived"
+        );
+        assert_eq!(
+            found.in_function_privileged,
+            found.privileged_count - 1,
+            "and it is not counted among the findings this placed in code"
+        );
+        assert!(
+            !found
+                .privileged
+                .iter()
+                .any(|found| found.standing == Standing::Unverified),
+            "the shared budget was full long before it, so no row of it is listed: {}",
+            found.privileged.len()
+        );
+
+        let text = render(&structured_report("vid", BASE, &found, invented));
+        assert!(
+            text.contains("\n  Not placed against an unwind table (1, none listed)"),
+            "the heading is printed from the count, and says it has no sample: {}",
+            text.lines()
+                .filter(|line| line.contains("Not placed") || line.contains("Privileged"))
+                .collect::<Vec<_>>()
+                .join(" / ")
         );
     }
 
@@ -2494,8 +2639,13 @@ mod tests {
 
         assert_eq!(found.privileged_count, 2);
         assert_eq!(
-            found.uncovered_privileged, 0,
-            "nothing was placed outside a function, because nothing was placed: {:?}",
+            (
+                found.in_function_privileged,
+                found.uncovered_privileged,
+                found.unverified_privileged
+            ),
+            (0, 0, 2),
+            "nothing was placed in a function or out of one, because nothing was placed: {:?}",
             found.privileged
         );
         assert!(
@@ -2509,18 +2659,18 @@ mod tests {
 
         let text = render(&structured_report("vid", BASE, &found, invented));
         assert!(
-            text.contains("Privileged instructions (2):")
+            text.contains("\n  Not placed against an unwind table (2")
                 && text.contains("out")
                 && text.contains("cli"),
-            "both are reported exactly as they were before the standing existed: {text}"
+            "both are reported, under the heading that says the question was not answered: {text}"
         );
         assert!(
             !text.contains("In bytes no unwind entry covers"),
-            "and neither is under the data heading: {text}"
+            "and neither is under the data heading, which is the one that would read as a verdict:              {text}"
         );
         assert!(
-            text.contains("Not placed against an unwind table"),
-            "what a reader is told instead is that the question was not answered: {text}"
+            !text.contains("\n  Privileged instructions ("),
+            "nor under the heading for findings this placed in code: {text}"
         );
     }
 
