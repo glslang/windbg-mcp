@@ -14,6 +14,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind, Register};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 
 use crate::skcontrol::{
     Capabilities, ControlProcess, ControlSession, HeldEvent, HexU64, RegisterName, RegisterValue,
@@ -70,6 +71,13 @@ pub(crate) trait ControlProvider {
     fn publish_stop(&mut self, event: HeldEvent) -> Result<()>;
     fn held_event(&mut self) -> Result<HeldEvent>;
     fn read_registers(&mut self, registers: Vec<RegisterName>) -> Result<Vec<RegisterValue>>;
+    fn read_registers_until(
+        &mut self,
+        registers: Vec<RegisterName>,
+        _deadline: Instant,
+    ) -> Result<Vec<RegisterValue>> {
+        self.read_registers(registers)
+    }
     fn write_registers(&mut self, writes: Vec<RegisterWrite>) -> Result<Vec<RegisterValue>>;
     fn release(&mut self) -> Result<()>;
 }
@@ -141,6 +149,14 @@ impl ControlProvider for ControlProcess {
         ControlProcess::read_registers(self, registers)
     }
 
+    fn read_registers_until(
+        &mut self,
+        registers: Vec<RegisterName>,
+        deadline: Instant,
+    ) -> Result<Vec<RegisterValue>> {
+        ControlProcess::read_registers_until(self, registers, deadline)
+    }
+
     fn write_registers(&mut self, writes: Vec<RegisterWrite>) -> Result<Vec<RegisterValue>> {
         ControlProcess::write_registers(self, writes)
     }
@@ -181,6 +197,13 @@ pub(crate) trait EventDispatcher {
     fn establish_recovery_pause(&mut self, targets: &[TargetIdentity]) -> Result<()>;
     /// Re-read a proposed current instruction while the owned event remains held.
     fn verify_instruction(&mut self, instruction: &InstructionGuard) -> Result<()>;
+    fn verify_instruction_until(
+        &mut self,
+        instruction: &InstructionGuard,
+        _deadline: Instant,
+    ) -> Result<()> {
+        self.verify_instruction(instruction)
+    }
     /// Return an owned event only after every provider whose registers may be accessed is quiesced.
     fn wait_for_stop(
         &mut self,
@@ -1032,10 +1055,29 @@ impl<P: ControlProvider> LiveControl<P> {
     /// The stop snapshot contains the registers needed to prove control ownership. Debugger
     /// clients also need the general-purpose registers, so those are fetched on demand and must
     /// agree across two complete reads before they are exposed.
+    #[cfg(test)]
     pub(crate) fn read_stopped_registers(
         &mut self,
         epoch: &StopEpoch,
         registers: Vec<RegisterName>,
+    ) -> Result<Vec<RegisterValue>> {
+        self.read_stopped_registers_inner(epoch, registers, None)
+    }
+
+    pub(crate) fn read_stopped_registers_until(
+        &mut self,
+        epoch: &StopEpoch,
+        registers: Vec<RegisterName>,
+        deadline: Instant,
+    ) -> Result<Vec<RegisterValue>> {
+        self.read_stopped_registers_inner(epoch, registers, Some(deadline))
+    }
+
+    fn read_stopped_registers_inner(
+        &mut self,
+        epoch: &StopEpoch,
+        registers: Vec<RegisterName>,
+        deadline: Option<Instant>,
     ) -> Result<Vec<RegisterValue>> {
         self.require_stop_epoch(epoch)?;
         if registers.is_empty() {
@@ -1053,7 +1095,10 @@ impl<P: ControlProvider> LiveControl<P> {
         let read_all = |provider: &mut P| -> Result<Vec<RegisterValue>> {
             let mut values = Vec::with_capacity(registers.len());
             for batch in registers.chunks(max) {
-                values.extend(provider.read_registers(batch.to_vec())?);
+                values.extend(match deadline {
+                    Some(deadline) => provider.read_registers_until(batch.to_vec(), deadline)?,
+                    None => provider.read_registers(batch.to_vec())?,
+                });
             }
             Ok(values)
         };
@@ -1329,11 +1374,34 @@ impl<P: ControlProvider> LiveControl<P> {
         epoch: &StopEpoch,
         guard: StepGuard,
     ) -> Result<StopEpoch> {
+        self.step_inner(dispatcher, epoch, guard, None)
+    }
+
+    pub(crate) fn step_until(
+        &mut self,
+        dispatcher: &mut impl EventDispatcher,
+        epoch: &StopEpoch,
+        guard: StepGuard,
+        deadline: Instant,
+    ) -> Result<StopEpoch> {
+        self.step_inner(dispatcher, epoch, guard, Some(deadline))
+    }
+
+    fn step_inner(
+        &mut self,
+        dispatcher: &mut impl EventDispatcher,
+        epoch: &StopEpoch,
+        guard: StepGuard,
+        deadline: Option<Instant>,
+    ) -> Result<StopEpoch> {
         let stop = self.require_stop_epoch(epoch)?.clone();
         let (instruction, expected_rips) = guard.resolve(&stop)?;
         // This read has no target-side effect. A bad caller guard leaves the current stop and
         // epoch intact so it can be corrected or continued safely.
-        dispatcher.verify_instruction(&instruction)?;
+        match deadline {
+            Some(deadline) => dispatcher.verify_instruction_until(&instruction, deadline)?,
+            None => dispatcher.verify_instruction(&instruction)?,
+        }
         let next_epoch = self.next_epoch("running")?;
         let dispatcher_event = self
             .dispatcher_event
@@ -1433,18 +1501,44 @@ impl<P: ControlProvider> LiveControl<P> {
     /// The held event keeps the VP quiesced while the old owned state is restored and the new set is
     /// written, then the dispatcher begins waiting for the next vector-1 event as it releases this
     /// one.
+    #[cfg(test)]
     pub(crate) fn continue_to_breakpoints(
         &mut self,
         dispatcher: &mut impl EventDispatcher,
         epoch: &StopEpoch,
         breakpoints: Vec<BreakpointGuard>,
     ) -> Result<StopEpoch> {
+        self.continue_to_breakpoints_inner(dispatcher, epoch, breakpoints, None)
+    }
+
+    pub(crate) fn continue_to_breakpoints_until(
+        &mut self,
+        dispatcher: &mut impl EventDispatcher,
+        epoch: &StopEpoch,
+        breakpoints: Vec<BreakpointGuard>,
+        deadline: Instant,
+    ) -> Result<StopEpoch> {
+        self.continue_to_breakpoints_inner(dispatcher, epoch, breakpoints, Some(deadline))
+    }
+
+    fn continue_to_breakpoints_inner(
+        &mut self,
+        dispatcher: &mut impl EventDispatcher,
+        epoch: &StopEpoch,
+        breakpoints: Vec<BreakpointGuard>,
+        deadline: Option<Instant>,
+    ) -> Result<StopEpoch> {
         validate_breakpoints(&breakpoints, ArmMode::Natural)?;
         self.require_stop_epoch(epoch)?;
         // Verification is read-only and precedes the releasing state. A stale breakpoint guard
         // therefore leaves the exact stop and epoch available for correction.
         for breakpoint in &breakpoints {
-            dispatcher.verify_instruction(&breakpoint.instruction)?;
+            match deadline {
+                Some(deadline) => {
+                    dispatcher.verify_instruction_until(&breakpoint.instruction, deadline)?
+                }
+                None => dispatcher.verify_instruction(&breakpoint.instruction)?,
+            }
         }
         let next_epoch = self.next_epoch("running")?;
         let dispatcher_event = self

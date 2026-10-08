@@ -330,6 +330,26 @@ impl Session {
         })
     }
 
+    pub(crate) fn step_until(
+        &mut self,
+        engine: &DebugEngine,
+        epoch: &crate::skcontrol::StopEpoch,
+        guard: crate::sklive::StepGuard,
+        deadline: Instant,
+    ) -> Result<LiveTransition> {
+        self.ensure_preparation_succeeded()?;
+        let control = self
+            .control
+            .as_mut()
+            .context("live Secure Kernel control has not completed target discovery")?;
+        let mut dispatcher = self.dispatcher.bind(engine);
+        let epoch = control.step_until(&mut dispatcher, epoch, guard, deadline)?;
+        Ok(LiveTransition {
+            phase: control.phase(),
+            epoch,
+        })
+    }
+
     pub(crate) fn continue_from(
         &mut self,
         engine: &DebugEngine,
@@ -349,20 +369,39 @@ impl Session {
     }
 
     pub(crate) fn read_memory(&self, address: u64, size: u32) -> Result<LiveMemoryRead> {
+        self.read_memory_inner(address, size, None)
+    }
+
+    pub(crate) fn read_memory_until(
+        &self,
+        address: u64,
+        size: u32,
+        deadline: Instant,
+    ) -> Result<LiveMemoryRead> {
+        self.read_memory_inner(address, size, Some(deadline))
+    }
+
+    fn read_memory_inner(
+        &self,
+        address: u64,
+        size: u32,
+        deadline: Option<Instant>,
+    ) -> Result<LiveMemoryRead> {
         crate::sksession::readable(address, size).map_err(anyhow::Error::msg)?;
         let stop = self
             .control()?
             .stopped()
             .context("live VTL1 memory can be read only while the session is stopped")?;
         self.dispatcher
-            .read_memory(stop.epoch.clone(), address, size)
+            .read_memory(stop.epoch.clone(), address, size, deadline)
     }
 
-    pub(crate) fn continue_to_breakpoints(
+    pub(crate) fn continue_to_breakpoints_until(
         &mut self,
         engine: &DebugEngine,
         epoch: &crate::skcontrol::StopEpoch,
         breakpoints: Vec<BreakpointGuard>,
+        deadline: Instant,
     ) -> Result<LiveTransition> {
         self.ensure_preparation_succeeded()?;
         let control = self
@@ -370,19 +409,22 @@ impl Session {
             .as_mut()
             .context("live Secure Kernel control has not completed target discovery")?;
         let mut dispatcher = self.dispatcher.bind(engine);
-        let epoch = control.continue_to_breakpoints(&mut dispatcher, epoch, breakpoints)?;
+        let epoch =
+            control.continue_to_breakpoints_until(&mut dispatcher, epoch, breakpoints, deadline)?;
         Ok(LiveTransition {
             phase: control.phase(),
             epoch,
         })
     }
 
-    pub(crate) fn read_stopped_registers(
+    pub(crate) fn read_stopped_registers_until(
         &mut self,
         epoch: &crate::skcontrol::StopEpoch,
         registers: Vec<crate::skcontrol::RegisterName>,
+        deadline: Instant,
     ) -> Result<Vec<crate::skcontrol::RegisterValue>> {
-        self.control_mut()?.read_stopped_registers(epoch, registers)
+        self.control_mut()?
+            .read_stopped_registers_until(epoch, registers, deadline)
     }
 
     pub(crate) fn close(&mut self, engine: &DebugEngine) -> Result<()> {
@@ -1045,6 +1087,7 @@ impl VmwpDispatcherState {
         epoch: crate::skcontrol::StopEpoch,
         address: u64,
         size: u32,
+        deadline: Option<Instant>,
     ) -> Result<LiveMemoryRead> {
         let memory = self
             .memory
@@ -1056,7 +1099,7 @@ impl VmwpDispatcherState {
             .translate(at)
             .with_context(|| format!("nothing in live VTL1 maps {address:#x}"))?;
         let bytes = memory
-            .read_span(at, size as usize, "stopped live VTL1 memory read")
+            .read_span_until(at, size as usize, "stopped live VTL1 memory read", deadline)
             .map_err(|why| anyhow!("reading live VTL1 at {address:#x} failed: {why:#}"))?;
         Ok(LiveMemoryRead {
             epoch,
@@ -1301,10 +1344,18 @@ struct DeadlineLiveSource<'a> {
 
 impl<'a> DeadlineLiveSource<'a> {
     fn new(source: &'a crate::livesrc::LiveSource, operation: &'a str) -> Self {
+        Self::new_until(source, operation, Instant::now() + LIVE_MEMORY_WAIT)
+    }
+
+    fn new_until(
+        source: &'a crate::livesrc::LiveSource,
+        operation: &'a str,
+        outer_deadline: Instant,
+    ) -> Self {
         Self {
             source,
             operation,
-            deadline: Instant::now() + LIVE_MEMORY_WAIT,
+            deadline: outer_deadline.min(Instant::now() + LIVE_MEMORY_WAIT),
             expired: std::cell::Cell::new(false),
         }
     }
@@ -1312,11 +1363,7 @@ impl<'a> DeadlineLiveSource<'a> {
     fn require_within_deadline(&self) -> Result<()> {
         if self.expired.get() || Instant::now() >= self.deadline {
             self.expired.set(true);
-            bail!(
-                "{} exceeded its {} second deadline",
-                self.operation,
-                LIVE_MEMORY_WAIT.as_secs()
-            );
+            bail!("{} reached its deadline", self.operation);
         }
         Ok(())
     }
@@ -1377,6 +1424,11 @@ impl LiveGuestMemory {
         Ok(())
     }
 
+    fn refresh_until(&mut self, deadline: Instant) -> Result<()> {
+        self.space = Self::walk_space_until(&self.source, self.root, "refresh", Some(deadline))?;
+        Ok(())
+    }
+
     fn bind_root(&mut self, cr3: u64) -> Result<()> {
         if cr3 == 0 || cr3 & 0xfff != 0 {
             bail!("live VTL1 stop CR3 must be nonzero and page aligned");
@@ -1392,8 +1444,20 @@ impl LiveGuestMemory {
         root: sk::Gpa,
         operation: &str,
     ) -> Result<sk::AddressSpace> {
+        Self::walk_space_until(source, root, operation, None)
+    }
+
+    fn walk_space_until(
+        source: &crate::livesrc::LiveSource,
+        root: sk::Gpa,
+        operation: &str,
+        deadline: Option<Instant>,
+    ) -> Result<sk::AddressSpace> {
         let description = format!("live VTL1 page-table {operation}");
-        let source = DeadlineLiveSource::new(source, &description);
+        let source = match deadline {
+            Some(deadline) => DeadlineLiveSource::new_until(source, &description, deadline),
+            None => DeadlineLiveSource::new(source, &description),
+        };
         let reader = sk::Reader::new(&source);
         let (leaves, stats) = sk::walk(&reader, root);
         source.require_within_deadline()?;
@@ -1404,7 +1468,20 @@ impl LiveGuestMemory {
     }
 
     fn read_span(&self, at: sk::Gva, size: usize, operation: &str) -> Result<Vec<u8>> {
-        let source = DeadlineLiveSource::new(&self.source, operation);
+        self.read_span_until(at, size, operation, None)
+    }
+
+    fn read_span_until(
+        &self,
+        at: sk::Gva,
+        size: usize,
+        operation: &str,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<u8>> {
+        let source = match deadline {
+            Some(deadline) => DeadlineLiveSource::new_until(&self.source, operation, deadline),
+            None => DeadlineLiveSource::new(&self.source, operation),
+        };
         let reader = sk::Reader::new(&source);
         let result = sk::Space::new(&reader, &self.space).read_span(at, size);
         source.require_within_deadline()?;
@@ -1412,11 +1489,20 @@ impl LiveGuestMemory {
     }
 
     fn read_guard(&self, guard: &InstructionGuard) -> Result<InstructionGuard> {
+        self.read_guard_until(guard, None)
+    }
+
+    fn read_guard_until(
+        &self,
+        guard: &InstructionGuard,
+        deadline: Option<Instant>,
+    ) -> Result<InstructionGuard> {
         let bytes = self
-            .read_span(
+            .read_span_until(
                 sk::Gva(guard.address.0),
                 guard.bytes.len(),
                 "live VTL1 instruction guard read",
+                deadline,
             )
             .map_err(|why| anyhow!("reading guarded VTL1 instruction failed: {why:?}"))?;
         Ok(InstructionGuard {
@@ -1722,6 +1808,14 @@ impl EventDispatcher for VmwpDispatcher<'_> {
 
     fn verify_instruction(&mut self, instruction: &InstructionGuard) -> Result<()> {
         VmwpDispatcher::verify_instruction(self, instruction)
+    }
+
+    fn verify_instruction_until(
+        &mut self,
+        instruction: &InstructionGuard,
+        deadline: Instant,
+    ) -> Result<()> {
+        VmwpDispatcher::verify_instruction_until(self, instruction, deadline)
     }
 
     fn wait_for_stop(
@@ -2442,13 +2536,32 @@ impl VmwpDispatcher<'_> {
     }
 
     fn verify_instruction(&mut self, instruction: &InstructionGuard) -> Result<()> {
+        self.verify_instruction_inner(instruction, None)
+    }
+
+    fn verify_instruction_until(
+        &mut self,
+        instruction: &InstructionGuard,
+        deadline: Instant,
+    ) -> Result<()> {
+        self.verify_instruction_inner(instruction, Some(deadline))
+    }
+
+    fn verify_instruction_inner(
+        &mut self,
+        instruction: &InstructionGuard,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
         let memory = self
             .state
             .memory
             .as_mut()
             .context("the live VTL1 memory source is absent")?;
-        memory.refresh()?;
-        let observed = memory.read_guard(instruction)?;
+        match deadline {
+            Some(deadline) => memory.refresh_until(deadline)?,
+            None => memory.refresh()?,
+        }
+        let observed = memory.read_guard_until(instruction, deadline)?;
         if &observed != instruction {
             bail!("the guarded VTL1 instruction does not match live memory");
         }

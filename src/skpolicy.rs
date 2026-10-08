@@ -27,6 +27,13 @@ pub(crate) struct Policy {
     profile_roots: Vec<String>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct AuthorizedLive {
+    pub(crate) profile: PathBuf,
+    pub(crate) control_transport: String,
+    pub(crate) live_transport: String,
+}
+
 impl Policy {
     pub(crate) fn load_from_env() -> Result<Option<Self>> {
         let Some(path) = std::env::var_os(POLICY_ENV) else {
@@ -80,7 +87,7 @@ impl Policy {
         profile: &Path,
         control_transport: &str,
         live_transport: &str,
-    ) -> Result<()> {
+    ) -> Result<AuthorizedLive> {
         validate_vm_id(vm_id)?;
         if !self.disposable_vm_ids.contains(&vm_id.to_ascii_lowercase()) {
             bail!("VM {vm_id} is not in the startup policy's disposable VM allow-list");
@@ -99,21 +106,29 @@ impl Policy {
                 profile.display()
             );
         }
-        self.authorize_transport("control_transport", control_transport)?;
-        self.authorize_transport("live_transport", live_transport)?;
-        Ok(())
+        let control_transport = self.authorize_transport("control_transport", control_transport)?;
+        let live_transport = self.authorize_transport("live_transport", live_transport)?;
+        Ok(AuthorizedLive {
+            profile,
+            control_transport,
+            live_transport,
+        })
     }
 
-    fn authorize_transport(&self, name: &str, command: &str) -> Result<()> {
-        let normalized = normalize_transport(name, command)?;
+    fn authorize_transport(&self, name: &str, command: &str) -> Result<String> {
+        let (normalized, launch) = canonical_transport(name, command)?;
         if !self.transport_commands.contains(&normalized) {
             bail!("{name} is not an exact transport command admitted by startup policy");
         }
-        Ok(())
+        Ok(render_transport(&launch))
     }
 }
 
 fn normalize_transport(name: &str, command: &str) -> Result<Vec<String>> {
+    canonical_transport(name, command).map(|(normalized, _)| normalized)
+}
+
+fn canonical_transport(name: &str, command: &str) -> Result<(Vec<String>, Vec<String>)> {
     let mut words = crate::livesrc::split_command(command);
     let program = words
         .first_mut()
@@ -122,8 +137,24 @@ fn normalize_transport(name: &str, command: &str) -> Result<Vec<String>> {
     if !path.is_absolute() {
         bail!("{name} must name an absolute executable fixed by startup policy");
     }
-    *program = normalized_path(&canonical_file(&path, name)?);
-    Ok(words)
+    *program = canonical_file(&path, name)?.to_string_lossy().into_owned();
+    let mut normalized = words.clone();
+    normalized[0] = normalized_path(Path::new(&normalized[0]));
+    Ok((normalized, words))
+}
+
+fn render_transport(words: &[String]) -> String {
+    words
+        .iter()
+        .map(|word| {
+            if word.chars().any(char::is_whitespace) {
+                format!("\"{word}\"")
+            } else {
+                word.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn normalized_path(path: &Path) -> String {
@@ -199,5 +230,35 @@ mod tests {
         let injected = format!("\"{}\" -c dangerous", executable.display());
         let injected = normalize_transport("fixture", &injected).expect("injection is parseable");
         assert!(!policy.transport_commands.contains(&injected));
+    }
+
+    #[test]
+    fn authorized_transport_launches_the_canonical_executable() {
+        let executable = std::env::current_exe().expect("the test executable has a path");
+        let parent = executable
+            .parent()
+            .expect("the test executable has a parent");
+        let indirect = parent.join(".").join(
+            executable
+                .file_name()
+                .expect("the test executable has a file name"),
+        );
+        let command = format!("\"{}\" --fixture value", indirect.display());
+        let allowed = normalize_transport("fixture", &command).expect("fixture command is valid");
+        let policy = Policy {
+            disposable_vm_ids: BTreeSet::new(),
+            transport_commands: BTreeSet::from([allowed]),
+            profile_roots: Vec::new(),
+        };
+
+        let launch = policy
+            .authorize_transport("fixture", &command)
+            .expect("the exact command is authorized");
+        let words = crate::livesrc::split_command(&launch);
+        assert_eq!(
+            Path::new(&words[0]),
+            canonical_file(&executable, "fixture").unwrap()
+        );
+        assert_eq!(&words[1..], ["--fixture", "value"]);
     }
 }

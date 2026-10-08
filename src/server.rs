@@ -4107,14 +4107,17 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SkLiveOpenArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(why) = self.sessions.authorize_secure_kernel_live(
+        let authorized = match self.sessions.authorize_secure_kernel_live(
             &args.vm_id,
             std::path::Path::new(&args.profile),
             &args.control_transport,
             &args.live_transport,
         ) {
-            return open_failure(ErrorCategory::InvalidArgument, why, None, TargetCreated::No);
-        }
+            Ok(authorized) => authorized,
+            Err(why) => {
+                return open_failure(ErrorCategory::InvalidArgument, why, None, TargetCreated::No);
+            }
+        };
         let parse =
             |name: &str, value: &str| parse_u64(value).map_err(|why| format!("{name}: {why}"));
         let dispatcher_vnd = match args
@@ -4203,15 +4206,14 @@ impl WindbgServer {
                 );
             }
         };
-        let control_transport = args.control_transport;
         let what = format!("VM {} VTL1 VP {}", target.vm_id, target.vp);
         self.opened(
             SessionKind::SecureKernelLive,
             what,
             EngineOp::OpenSecureKernelLive(Box::new(crate::skdispatch::OpenRequest {
-                profile: PathBuf::from(args.profile),
-                control_transport,
-                live_transport: args.live_transport,
+                profile: authorized.profile,
+                control_transport: authorized.control_transport,
+                live_transport: authorized.live_transport,
                 vmwp_pid,
                 dispatcher_vnd,
                 target,
@@ -4239,14 +4241,17 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SkKdOpenArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(why) = self.sessions.authorize_secure_kernel_live(
+        let authorized = match self.sessions.authorize_secure_kernel_live(
             &args.vm_id,
             std::path::Path::new(&args.profile),
             &args.control_transport,
             &args.live_transport,
         ) {
-            return open_failure(ErrorCategory::InvalidArgument, why, None, TargetCreated::No);
-        }
+            Ok(authorized) => authorized,
+            Err(why) => {
+                return open_failure(ErrorCategory::InvalidArgument, why, None, TargetCreated::No);
+            }
+        };
         let parse_optional = |name: &str, value: Option<&str>| {
             value
                 .map(|value| parse_u64(value).map_err(|why| format!("{name}: {why}")))
@@ -4336,9 +4341,9 @@ impl WindbgServer {
             None,
             EngineOp::OpenSecureKernelKd(Box::new(crate::kdtarget::ManagedRequest {
                 open: crate::skdispatch::OpenRequest {
-                    profile: PathBuf::from(args.profile),
-                    control_transport: args.control_transport,
-                    live_transport: args.live_transport,
+                    profile: authorized.profile,
+                    control_transport: authorized.control_transport,
+                    live_transport: authorized.live_transport,
                     vmwp_pid,
                     dispatcher_vnd,
                     target,

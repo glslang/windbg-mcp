@@ -5,7 +5,7 @@
 //! translated to its hardware-breakpoint and trap-flag transitions. No DbgEng instance is created
 //! here; [`crate::worker`] lends this role its one engine on the same thread.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
 use std::fmt;
 use std::os::windows::io::AsRawHandle;
@@ -91,7 +91,7 @@ enum TransportMessage {
     Failed(String),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum WaitWakeReason {
     BreakIn,
     Reset,
@@ -121,47 +121,118 @@ struct ActiveWait {
     reason: Option<WaitWakeReason>,
 }
 
+#[derive(Default)]
+struct WaitWakeState {
+    active: Option<ActiveWait>,
+    pending: VecDeque<WaitWakeReason>,
+}
+
+impl WaitWakeState {
+    fn begin(
+        &mut self,
+        activity: crate::skdispatch::WaitActivity,
+    ) -> Option<crate::skdispatch::WaitActivity> {
+        let reason = self.pending.pop_front();
+        let wake = reason.as_ref().map(|_| activity.clone());
+        self.active = Some(ActiveWait { activity, reason });
+        wake
+    }
+
+    fn finish(&mut self) -> Option<WaitWakeReason> {
+        self.active.take().and_then(|wait| wait.reason)
+    }
+
+    fn request(
+        &mut self,
+        expected: Option<&crate::skdispatch::WaitActivity>,
+        reason: WaitWakeReason,
+    ) -> Option<crate::skdispatch::WaitActivity> {
+        let Some(wait) = self.active.as_mut() else {
+            if expected.is_none() {
+                self.pending.push_back(reason);
+            }
+            return None;
+        };
+        if expected.is_some_and(|expected| !wait.activity.same_wait(expected))
+            || wait.reason.is_some()
+        {
+            return None;
+        }
+        wait.reason = Some(reason);
+        Some(wait.activity.clone())
+    }
+
+    fn consume_frame(&mut self, frame: &Frame) {
+        let matches = matches!(
+            (self.pending.front(), frame),
+            (Some(WaitWakeReason::BreakIn), Frame::BreakIn)
+                | (
+                    Some(WaitWakeReason::Reset),
+                    Frame::Control {
+                        packet_type: crate::kdwire::PACKET_TYPE_RESET,
+                        ..
+                    },
+                )
+                | (
+                    Some(WaitWakeReason::Transport(_)),
+                    Frame::Malformed { fatal: true, .. }
+                )
+        );
+        if matches {
+            self.pending.pop_front();
+        }
+    }
+}
+
 #[derive(Clone)]
 struct WaitWaker {
     interrupt: Arc<InterruptHandle>,
-    active: Arc<Mutex<Option<ActiveWait>>>,
+    state: Arc<Mutex<WaitWakeState>>,
 }
 
 impl WaitWaker {
     fn new(interrupt: InterruptHandle) -> Self {
         Self {
             interrupt: Arc::new(interrupt),
-            active: Arc::new(Mutex::new(None)),
+            state: Arc::new(Mutex::new(WaitWakeState::default())),
         }
     }
 
     fn begin(&self, activity: crate::skdispatch::WaitActivity) {
-        *self
-            .active
+        let wake = self
+            .state
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(ActiveWait {
-            activity,
-            reason: None,
-        });
+            .unwrap_or_else(|error| error.into_inner())
+            .begin(activity);
+        if let Some(activity) = wake {
+            self.spawn_interrupt(activity);
+        }
     }
 
     fn finish(&self) -> Option<WaitWakeReason> {
-        self.active
+        self.state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .take()
-            .and_then(|wait| wait.reason)
+            .finish()
     }
 
     fn note_traffic(&self) {
         if let Some(wait) = self
-            .active
+            .state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
+            .active
             .as_mut()
         {
             wait.activity.note_traffic();
         }
+    }
+
+    fn consume_frame(&self, frame: &Frame) {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .consume_frame(frame);
     }
 
     fn request(&self, reason: WaitWakeReason) {
@@ -173,23 +244,17 @@ impl WaitWaker {
         expected: Option<&crate::skdispatch::WaitActivity>,
         reason: WaitWakeReason,
     ) {
-        let activity = {
-            let mut active = self
-                .active
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            let Some(wait) = active.as_mut() else {
-                return;
-            };
-            if expected.is_some_and(|expected| !wait.activity.same_wait(expected)) {
-                return;
-            }
-            if wait.reason.is_some() {
-                return;
-            }
-            wait.reason = Some(reason);
-            wait.activity.clone()
-        };
+        let activity = self
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .request(expected, reason);
+        if let Some(activity) = activity {
+            self.spawn_interrupt(activity);
+        }
+    }
+
+    fn spawn_interrupt(&self, activity: crate::skdispatch::WaitActivity) {
         let interrupt = self.interrupt.clone();
         tokio::spawn(async move {
             loop {
@@ -215,11 +280,8 @@ impl WaitWaker {
         tokio::spawn(async move {
             loop {
                 let remaining = {
-                    let active = wake
-                        .active
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    let Some(wait) = active.as_ref() else {
+                    let active = wake.state.lock().unwrap_or_else(|error| error.into_inner());
+                    let Some(wait) = active.active.as_ref() else {
                         return;
                     };
                     if !wait.activity.same_wait(&activity) {
@@ -763,12 +825,18 @@ async fn run_async(
     let initial_activity = wait_activity(options.idle_timeout, managed_job);
     let mut stop = session.wait_for_stop_interruptible(engine, &initial_activity)?;
     let mut stopped_since = Instant::now();
+    let mut stopped_deadline = pause_deadline(stopped_since, options.max_pause)?;
     refuse_managed_teardown()?;
     report_managed_phase(managed_job, crate::proto::SecureKernelKdPhase::Stopped);
     let kernel_base = provider_kernel_base;
-    let metadata = validate_debugger_metadata(session, kernel_base, &profile.debugger_data)?;
-    let (mut values, mut context) = read_context(session, &stop)?;
-    let mut reported_instruction = read_instruction_guard(session, values.rip)?;
+    let metadata = validate_debugger_metadata(
+        session,
+        kernel_base,
+        &profile.debugger_data,
+        stopped_deadline,
+    )?;
+    let (mut values, mut context) = read_context(session, &stop, stopped_deadline)?;
+    let mut reported_instruction = read_instruction_guard(session, values.rip, stopped_deadline)?;
 
     let path = format!(r"\\.\pipe\{}", options.pipe);
     let mut reconnecting = false;
@@ -823,6 +891,7 @@ async fn run_async(
                     &mut link,
                     stopped_since,
                     options.max_pause,
+                    &wait_waker,
                 ),
             ) => {
                 reset.with_context(|| {
@@ -859,7 +928,7 @@ async fn run_async(
             let frame_wait =
                 bounded_pause_wait(options.idle_timeout, stopped_since, options.max_pause)?;
             let next = tokio::select! {
-                frame = tokio::time::timeout(frame_wait, read_frame(&mut transport_rx)) => {
+                frame = tokio::time::timeout(frame_wait, read_frame(&mut transport_rx, &wait_waker)) => {
                     frame.with_context(|| {
                         if stopped_since.elapsed() >= options.max_pause {
                             "the absolute Secure Kernel pause bound expired while serving WinDbg"
@@ -968,7 +1037,7 @@ async fn run_async(
                     );
                     request.read_virtual_memory_response(&bytes)?
                 } else {
-                    match session.read_memory(read.address, count) {
+                    match session.read_memory_until(read.address, count, stopped_deadline) {
                         Ok(read_result) => {
                             eprintln!(
                                 "KD virtual read {:#x}+{count:#x} served by Secure Kernel memory",
@@ -1035,7 +1104,7 @@ async fn run_async(
                     request.failure_response()
                 }
             } else if let Some(address) = request.write_breakpoint_address() {
-                match insert_breakpoint(session, &mut breakpoints, address) {
+                match insert_breakpoint(session, &mut breakpoints, address, stopped_deadline) {
                     Ok(handle) => request.write_breakpoint_response(handle)?,
                     Err(error) => {
                         eprintln!("KD breakpoint at {address:#x} was refused: {error:#}");
@@ -1052,9 +1121,13 @@ async fn run_async(
                 wait_waker.begin(activity.clone());
                 let resume = if trace {
                     stopped_low(&stop, RegisterName::Rip).and_then(|rip| {
-                        read_instruction_guard(session, rip)
+                        read_instruction_guard(session, rip, stopped_deadline)
                             .and_then(fallthrough_step_guard)
-                            .and_then(|guard| session.step(engine, &stop.epoch, guard).map(|_| ()))
+                            .and_then(|guard| {
+                                session
+                                    .step_until(engine, &stop.epoch, guard, stopped_deadline)
+                                    .map(|_| ())
+                            })
                     })
                 } else {
                     if breakpoints.is_empty() {
@@ -1063,10 +1136,11 @@ async fn run_async(
                         ))
                     } else {
                         session
-                            .continue_to_breakpoints(
+                            .continue_to_breakpoints_until(
                                 engine,
                                 &stop.epoch,
                                 breakpoints.values().cloned().collect(),
+                                stopped_deadline,
                             )
                             .map(|_| ())
                     }
@@ -1115,8 +1189,10 @@ async fn run_async(
                 };
                 report_managed_phase(managed_job, crate::proto::SecureKernelKdPhase::Stopped);
                 stopped_since = Instant::now();
-                (values, context) = read_context(session, &stop)?;
-                reported_instruction = read_instruction_guard(session, values.rip)?;
+                stopped_deadline = pause_deadline(stopped_since, options.max_pause)?;
+                (values, context) = read_context(session, &stop, stopped_deadline)?;
+                reported_instruction =
+                    read_instruction_guard(session, values.rip, stopped_deadline)?;
                 compatibility = CompatibilityMemory::default();
                 send_stop(
                     &mut writer,
@@ -1159,6 +1235,18 @@ fn remaining_pause(since: Instant, bound: Duration) -> Result<Duration> {
     bound.checked_sub(since.elapsed()).context(
         "the absolute Secure Kernel pause bound expired; the worker will close the controller",
     )
+}
+
+fn pause_deadline(since: Instant, bound: Duration) -> Result<Instant> {
+    let deadline = since
+        .checked_add(bound)
+        .context("the absolute Secure Kernel pause deadline overflowed")?;
+    if Instant::now() >= deadline {
+        bail!(
+            "the absolute Secure Kernel pause bound expired; the worker will close the controller"
+        );
+    }
+    Ok(deadline)
 }
 
 fn bounded_pause_wait(requested: Duration, since: Instant, bound: Duration) -> Result<Duration> {
@@ -1219,9 +1307,10 @@ async fn wait_for_reset<W: AsyncWrite + Unpin>(
     link: &mut TargetLink,
     stopped_since: Instant,
     max_pause: Duration,
+    wait_waker: &WaitWaker,
 ) -> Result<()> {
     loop {
-        let inbound = link.receive(read_frame(transport).await?);
+        let inbound = link.receive(read_frame(transport, wait_waker).await?);
         let protocol_error = inbound.protocol_error;
         for write in inbound.writes {
             write_stopped_pipe(writer, &write, stopped_since, max_pause).await?;
@@ -1236,9 +1325,15 @@ async fn wait_for_reset<W: AsyncWrite + Unpin>(
     }
 }
 
-async fn read_frame(transport: &mut mpsc::Receiver<TransportMessage>) -> Result<Frame> {
+async fn read_frame(
+    transport: &mut mpsc::Receiver<TransportMessage>,
+    wait_waker: &WaitWaker,
+) -> Result<Frame> {
     match transport.recv().await {
-        Some(TransportMessage::Frame(frame)) => Ok(frame),
+        Some(TransportMessage::Frame(frame)) => {
+            wait_waker.consume_frame(&frame);
+            Ok(frame)
+        }
         Some(TransportMessage::Disconnected) | None => Err(Disconnected.into()),
         Some(TransportMessage::Failed(why)) => bail!("reading the WinDbg KD stream failed: {why}"),
     }
@@ -1358,8 +1453,9 @@ async fn send_stop<W: AsyncWrite + Unpin>(
 fn read_context(
     session: &mut crate::skdispatch::Session,
     stop: &StopRecord,
+    deadline: Instant,
 ) -> Result<(Amd64ContextValues, Amd64Context)> {
-    let extra = session.read_stopped_registers(
+    let extra = session.read_stopped_registers_until(
         &stop.epoch,
         vec![
             RegisterName::Rax,
@@ -1383,6 +1479,7 @@ fn read_context(
             RegisterName::Gs,
             RegisterName::Ss,
         ],
+        deadline,
     )?;
     let values = context_values(stop, &extra)?;
     let context = Amd64Context::from_values(&values);
@@ -1442,6 +1539,7 @@ fn insert_breakpoint(
     session: &crate::skdispatch::Session,
     breakpoints: &mut BTreeMap<u32, BreakpointGuard>,
     address: u64,
+    deadline: Instant,
 ) -> Result<u32> {
     if let Some((handle, _)) = breakpoints
         .iter()
@@ -1452,7 +1550,7 @@ fn insert_breakpoint(
     let handle = (1..=4)
         .find(|handle| !breakpoints.contains_key(handle))
         .context("all four VTL1 hardware-breakpoint slots are in use")?;
-    let instruction = read_instruction_guard(session, address)?;
+    let instruction = read_instruction_guard(session, address, deadline)?;
     breakpoints.insert(
         handle,
         BreakpointGuard {
@@ -1466,16 +1564,25 @@ fn insert_breakpoint(
 fn read_instruction_guard(
     session: &crate::skdispatch::Session,
     address: u64,
+    deadline: Instant,
 ) -> Result<InstructionGuard> {
     let bytes_in_page = COMPATIBILITY_PAGE_BYTES - (address & (COMPATIBILITY_PAGE_BYTES - 1));
     let first_count = u32::try_from(bytes_in_page.min(u64::from(MAX_INSTRUCTION_BYTES))).unwrap();
-    let mut bytes = decode_hex(&session.read_memory(address, first_count)?.data)?;
+    let mut bytes = decode_hex(
+        &session
+            .read_memory_until(address, first_count, deadline)?
+            .data,
+    )?;
     if instruction_length(&bytes, address).is_none() && first_count < MAX_INSTRUCTION_BYTES {
         let continuation_address = address
             .checked_add(u64::from(first_count))
             .context("instruction address overflowed at the page boundary")?;
         let continuation = session
-            .read_memory(continuation_address, MAX_INSTRUCTION_BYTES - first_count)
+            .read_memory_until(
+                continuation_address,
+                MAX_INSTRUCTION_BYTES - first_count,
+                deadline,
+            )
             .context("reading the next page for an instruction that did not decode before it")?;
         bytes.extend(decode_hex(&continuation.data)?);
     }
@@ -1552,6 +1659,7 @@ fn validate_debugger_metadata(
     session: &crate::skdispatch::Session,
     kernel_base: u64,
     profile: &crate::sklive::SecureKernelDebuggerDataProfile,
+    deadline: Instant,
 ) -> Result<KdMetadata> {
     let address = |name: &str, rva: u64| {
         kernel_base
@@ -1563,7 +1671,7 @@ fn validate_debugger_metadata(
     let loaded_module_list = address("loaded-module list", profile.loaded_module_list_rva.0)?;
     let read = |at, size| {
         session
-            .read_memory(at, size)
+            .read_memory_until(at, size, deadline)
             .and_then(|read| decode_hex(&read.data))
     };
     let head = read(list_head, 0x10)?;
@@ -1904,6 +2012,28 @@ mod tests {
                 .to_string()
                 .contains("absolute Secure Kernel pause bound")
         );
+    }
+
+    #[test]
+    fn a_disconnect_queued_before_continue_wakes_the_new_running_wait() {
+        let mut state = WaitWakeState::default();
+        assert!(state.request(None, WaitWakeReason::Disconnected).is_none());
+
+        let activity = crate::skdispatch::WaitActivity::new(Duration::from_secs(1));
+        assert!(state.begin(activity).is_some());
+        assert_eq!(state.finish(), Some(WaitWakeReason::Disconnected));
+    }
+
+    #[test]
+    fn consuming_a_stopped_wake_frame_preserves_the_later_disconnect() {
+        let mut state = WaitWakeState::default();
+        state.request(None, WaitWakeReason::BreakIn);
+        state.request(None, WaitWakeReason::Disconnected);
+        state.consume_frame(&Frame::BreakIn);
+
+        let activity = crate::skdispatch::WaitActivity::new(Duration::from_secs(1));
+        assert!(state.begin(activity).is_some());
+        assert_eq!(state.finish(), Some(WaitWakeReason::Disconnected));
     }
 
     #[tokio::test(start_paused = true)]

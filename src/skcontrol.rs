@@ -820,6 +820,7 @@ struct TimedChildReader {
     offset: usize,
     eof: bool,
     reply_grace: Duration,
+    outer_deadline: Option<Instant>,
 }
 
 impl TimedChildReader {
@@ -859,6 +860,7 @@ impl TimedChildReader {
             offset: 0,
             eof: false,
             reply_grace: PROVIDER_REPLY_GRACE,
+            outer_deadline: None,
         })
     }
 
@@ -870,7 +872,12 @@ impl TimedChildReader {
             offset: 0,
             eof: false,
             reply_grace,
+            outer_deadline: None,
         }
+    }
+
+    fn set_outer_deadline(&mut self, deadline: Option<Instant>) {
+        self.outer_deadline = deadline;
     }
 
     fn receive(&mut self) -> io::Result<()> {
@@ -879,7 +886,19 @@ impl TimedChildReader {
         }
         self.current.clear();
         self.offset = 0;
-        match self.lines.recv_timeout(self.reply_grace) {
+        let wait = match self.outer_deadline {
+            Some(deadline) => deadline
+                .saturating_duration_since(Instant::now())
+                .min(self.reply_grace),
+            None => self.reply_grace,
+        };
+        if wait.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "control-provider operation reached its outer deadline",
+            ));
+        }
+        match self.lines.recv_timeout(wait) {
             Ok(Ok(line)) if line.is_empty() => self.eof = true,
             Ok(Ok(line)) => self.current = line,
             Ok(Err(error)) => return Err(error),
@@ -888,7 +907,7 @@ impl TimedChildReader {
                     io::ErrorKind::TimedOut,
                     format!(
                         "control provider sent no complete line within {} seconds",
-                        self.reply_grace.as_secs()
+                        wait.as_secs_f64()
                     ),
                 ));
             }
@@ -1038,6 +1057,21 @@ impl ControlProcess {
         registers: Vec<RegisterName>,
     ) -> Result<Vec<RegisterValue>> {
         self.session_mut().read_registers(registers)
+    }
+
+    pub(crate) fn read_registers_until(
+        &mut self,
+        registers: Vec<RegisterName>,
+        deadline: Instant,
+    ) -> Result<Vec<RegisterValue>> {
+        if Instant::now() >= deadline {
+            bail!("control-provider register read reached its outer deadline");
+        }
+        let session = self.session_mut();
+        session.reader.set_outer_deadline(Some(deadline));
+        let result = session.read_registers(registers);
+        session.reader.set_outer_deadline(None);
+        result
     }
 
     pub(crate) fn write_registers(
@@ -1697,5 +1731,15 @@ mod tests {
         let mut reader = TimedChildReader::from_receiver(lines, Duration::from_secs(1));
         let error = read_line(&mut reader).unwrap_err();
         assert!(format!("{error:#}").contains("reader stopped"));
+    }
+
+    #[test]
+    fn an_outer_deadline_caps_the_provider_reply_wait() {
+        let (_writer, lines) = mpsc::sync_channel(1);
+        let mut reader = TimedChildReader::from_receiver(lines, Duration::from_secs(1));
+        reader.set_outer_deadline(Some(Instant::now()));
+
+        let error = read_line(&mut reader).unwrap_err();
+        assert!(format!("{error:#}").contains("outer deadline"));
     }
 }
