@@ -488,18 +488,29 @@ pub(crate) fn run(args: &[String], engine: &DebugEngine) -> Result<()> {
     }
     // DbgEng remains on this calling thread. Tokio's worker threads service only the KD pipe and
     // may use the engine's narrow `InterruptHandle` while this thread is inside the owned wait.
+    let mut cleanup_deadline = None;
     let result = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()?
-        .block_on(run_async(&options, engine, &mut session, false, None));
+        .block_on(run_async(
+            &options,
+            engine,
+            &mut session,
+            false,
+            None,
+            &mut cleanup_deadline,
+        ));
     if result
         .as_ref()
         .is_err_and(|error| error.downcast_ref::<Disconnected>().is_some())
     {
         eprintln!("WinDbg disconnected; restoring the held Secure Kernel stop");
     }
-    match (result, session.close(engine)) {
+    match (
+        result,
+        close_session(&mut session, engine, cleanup_deadline),
+    ) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(primary), Ok(())) if primary.downcast_ref::<Disconnected>().is_some() => Ok(()),
         (Err(primary), Ok(())) => Err(primary),
@@ -548,11 +559,19 @@ pub(crate) fn serve_managed(
     session: &mut crate::skdispatch::Session,
     job: u64,
 ) -> Result<()> {
+    let mut cleanup_deadline = None;
     let result = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()?
-        .block_on(run_async(options, engine, session, true, Some(job)));
+        .block_on(run_async(
+            options,
+            engine,
+            session,
+            true,
+            Some(job),
+            &mut cleanup_deadline,
+        ));
     let teardown_requested = result
         .as_ref()
         .is_err_and(|error| error.downcast_ref::<ManagedTeardown>().is_some())
@@ -565,11 +584,24 @@ pub(crate) fn serve_managed(
             );
         }
     }
-    let completion = finish_managed(result, teardown_requested, || session.close(engine))?;
+    let completion = finish_managed(result, teardown_requested, || {
+        close_session(session, engine, cleanup_deadline)
+    })?;
     if completion == ManagedCompletion::Released {
         report_managed_phase(Some(job), crate::proto::SecureKernelKdPhase::Released);
     }
     Ok(())
+}
+
+fn close_session(
+    session: &mut crate::skdispatch::Session,
+    engine: &DebugEngine,
+    deadline: Option<Instant>,
+) -> Result<()> {
+    match deadline {
+        Some(deadline) => session.close_until(engine, deadline),
+        None => session.close(engine),
+    }
 }
 
 fn finish_managed(
@@ -765,7 +797,10 @@ async fn run_async(
     session: &mut crate::skdispatch::Session,
     reconnect: bool,
     managed_job: Option<u64>,
+    cleanup_deadline: &mut Option<Instant>,
 ) -> Result<()> {
+    *cleanup_deadline = None;
+    let service_pause = service_pause_bound(options.max_pause);
     refuse_managed_teardown()?;
     report_managed_phase(managed_job, crate::proto::SecureKernelKdPhase::Discovering);
     for line in session.prepare_for_kd(engine)? {
@@ -828,12 +863,19 @@ async fn run_async(
         options.arm_mode,
     )?;
     report_managed_phase(managed_job, crate::proto::SecureKernelKdPhase::Running);
-    let initial_activity = wait_activity(options.idle_timeout, options.max_pause, managed_job);
-    let mut stop = session.wait_for_stop_interruptible(engine, &initial_activity)?;
-    let mut stopped_since = initial_activity
-        .retained_since()
+    let initial_activity = wait_activity(
+        options.idle_timeout,
+        service_pause,
+        options.max_pause,
+        managed_job,
+    );
+    let initial_stop = session.wait_for_stop_interruptible(engine, &initial_activity);
+    let retained_since =
+        record_cleanup_deadline(&initial_activity, options.max_pause, cleanup_deadline)?;
+    let mut stop = initial_stop?;
+    let mut stopped_since = retained_since
         .context("the Secure Kernel wait did not record when it retained the stop")?;
-    let mut stopped_deadline = pause_deadline(stopped_since, options.max_pause)?;
+    let mut stopped_deadline = pause_deadline(stopped_since, service_pause)?;
     refuse_managed_teardown()?;
     report_managed_phase(managed_job, crate::proto::SecureKernelKdPhase::Stopped);
     let kernel_base = provider_kernel_base;
@@ -850,7 +892,7 @@ async fn run_async(
     let mut reconnecting = false;
     'connections: loop {
         let connect_wait =
-            bounded_pause_wait(options.connect_timeout, stopped_since, options.max_pause)?;
+            bounded_pause_wait(options.connect_timeout, stopped_since, service_pause)?;
         let pipe = create_kd_pipe(&path)
             .with_context(|| format!("creating Secure Kernel KD pipe {path}"))?;
         eprintln!(
@@ -869,8 +911,8 @@ async fn run_async(
             connected = tokio::time::timeout(connect_wait, pipe.connect()) => {
                 connected
                     .with_context(|| {
-                        if stopped_since.elapsed() >= options.max_pause {
-                            "the absolute Secure Kernel pause bound expired while waiting for WinDbg"
+                        if stopped_since.elapsed() >= service_pause {
+                            "the service portion of the absolute Secure Kernel pause bound ended while waiting for WinDbg"
                         } else {
                             "waiting for WinDbg to connect timed out"
                         }
@@ -888,8 +930,7 @@ async fn run_async(
         let reader_waker = wait_waker.clone();
         tokio::spawn(read_transport(reader, transport_tx, reader_waker));
         let mut link = TargetLink::new();
-        let reset_wait =
-            bounded_pause_wait(options.connect_timeout, stopped_since, options.max_pause)?;
+        let reset_wait = bounded_pause_wait(options.connect_timeout, stopped_since, service_pause)?;
         let reset = tokio::select! {
             reset = tokio::time::timeout(
                 reset_wait,
@@ -898,13 +939,13 @@ async fn run_async(
                     &mut transport_rx,
                     &mut link,
                     stopped_since,
-                    options.max_pause,
+                    service_pause,
                     &wait_waker,
                 ),
             ) => {
                 reset.with_context(|| {
-                    if stopped_since.elapsed() >= options.max_pause {
-                        "the absolute Secure Kernel pause bound expired while waiting for WinDbg's KD reset"
+                    if stopped_since.elapsed() >= service_pause {
+                        "the service portion of the absolute Secure Kernel pause bound ended while waiting for WinDbg's KD reset"
                     } else {
                         "waiting for WinDbg's KD reset timed out"
                     }
@@ -925,7 +966,7 @@ async fn run_async(
             &reported_instruction.bytes,
             &values,
             stopped_since,
-            options.max_pause,
+            service_pause,
         )
         .await?;
         eprintln!("initial KD state change sent");
@@ -934,12 +975,12 @@ async fn run_async(
         let mut compatibility = CompatibilityMemory::default();
         loop {
             let frame_wait =
-                bounded_pause_wait(options.idle_timeout, stopped_since, options.max_pause)?;
+                bounded_pause_wait(options.idle_timeout, stopped_since, service_pause)?;
             let next = tokio::select! {
                 frame = tokio::time::timeout(frame_wait, read_frame(&mut transport_rx, &wait_waker)) => {
                     frame.with_context(|| {
-                        if stopped_since.elapsed() >= options.max_pause {
-                            "the absolute Secure Kernel pause bound expired while serving WinDbg"
+                        if stopped_since.elapsed() >= service_pause {
+                            "the service portion of the absolute Secure Kernel pause bound ended while serving WinDbg"
                         } else {
                             "WinDbg sent no KD traffic before the idle timeout"
                         }
@@ -960,10 +1001,10 @@ async fn run_async(
             let break_in = inbound.break_in;
             let protocol_error = inbound.protocol_error;
             for write in inbound.writes {
-                write_stopped_pipe(&mut writer, &write, stopped_since, options.max_pause).await?;
+                write_stopped_pipe(&mut writer, &write, stopped_since, service_pause).await?;
             }
             if let Some(error) = protocol_error {
-                flush_stopped_pipe(&mut writer, stopped_since, options.max_pause).await?;
+                flush_stopped_pipe(&mut writer, stopped_since, service_pause).await?;
                 bail!("KD peer exceeded the consecutive framing-error bound: {error}");
             }
             if break_in {
@@ -971,7 +1012,7 @@ async fn run_async(
                     "Secure Kernel KD break-in is unsupported while the target is already stopped; \
                      the retained stop was left unchanged"
                 );
-                flush_stopped_pipe(&mut writer, stopped_since, options.max_pause).await?;
+                flush_stopped_pipe(&mut writer, stopped_since, service_pause).await?;
                 continue;
             }
             if peer_reset {
@@ -983,18 +1024,18 @@ async fn run_async(
                     &reported_instruction.bytes,
                     &values,
                     stopped_since,
-                    options.max_pause,
+                    service_pause,
                 )
                 .await?;
                 eprintln!("KD peer reset; current held stop resent");
                 continue;
             }
             let Some(packet) = inbound.packet else {
-                flush_stopped_pipe(&mut writer, stopped_since, options.max_pause).await?;
+                flush_stopped_pipe(&mut writer, stopped_since, service_pause).await?;
                 continue;
             };
             if packet.packet_type != crate::kdwire::PACKET_TYPE_STATE_MANIPULATE {
-                flush_stopped_pipe(&mut writer, stopped_since, options.max_pause).await?;
+                flush_stopped_pipe(&mut writer, stopped_since, service_pause).await?;
                 continue;
             }
             let request = match ManipulateRequest::decode(&packet.payload) {
@@ -1007,9 +1048,9 @@ async fn run_async(
                             &ManipulateRequest::failure_for_payload(&packet.payload),
                         )
                         .map_err(anyhow::Error::msg)?;
-                    write_stopped_pipe(&mut writer, &response, stopped_since, options.max_pause)
+                    write_stopped_pipe(&mut writer, &response, stopped_since, service_pause)
                         .await?;
-                    flush_stopped_pipe(&mut writer, stopped_since, options.max_pause).await?;
+                    flush_stopped_pipe(&mut writer, stopped_since, service_pause).await?;
                     continue;
                 }
             };
@@ -1125,7 +1166,12 @@ async fn run_async(
             } else if let Some(trace) = request.continue2_trace() {
                 eprintln!("KD Continue2 trace={trace}");
                 report_managed_phase(managed_job, crate::proto::SecureKernelKdPhase::Running);
-                let activity = wait_activity(options.idle_timeout, options.max_pause, managed_job);
+                let activity = wait_activity(
+                    options.idle_timeout,
+                    service_pause,
+                    options.max_pause,
+                    managed_job,
+                );
                 wait_waker.begin(activity.clone());
                 let resume = if trace {
                     stopped_low(&stop, RegisterName::Rip).and_then(|rip| {
@@ -1167,11 +1213,12 @@ async fn run_async(
                         &reported_instruction.bytes,
                         &values,
                         stopped_since,
-                        options.max_pause,
+                        service_pause,
                     )
                     .await?;
                     continue;
                 }
+                *cleanup_deadline = None;
                 wait_waker.start_idle_watchdog(activity.clone());
                 if let Err(error) = bounded_pipe_io(
                     writer.flush(),
@@ -1185,6 +1232,8 @@ async fn run_async(
                     return Err(error);
                 }
                 let waited = session.wait_for_stop_interruptible(engine, &activity);
+                let retained_since =
+                    record_cleanup_deadline(&activity, options.max_pause, cleanup_deadline)?;
                 let wake = wait_waker.finish();
                 if crate::worker::kd_teardown_requested() {
                     return Err(ManagedTeardown.into());
@@ -1196,10 +1245,9 @@ async fn run_async(
                     (Err(error), None) => return Err(error),
                 };
                 report_managed_phase(managed_job, crate::proto::SecureKernelKdPhase::Stopped);
-                stopped_since = activity
-                    .retained_since()
+                stopped_since = retained_since
                     .context("the Secure Kernel wait did not record when it retained the stop")?;
-                stopped_deadline = pause_deadline(stopped_since, options.max_pause)?;
+                stopped_deadline = pause_deadline(stopped_since, service_pause)?;
                 (values, context) = read_context(session, &stop, stopped_deadline)?;
                 reported_instruction =
                     read_instruction_guard(session, values.rip, stopped_deadline)?;
@@ -1210,7 +1258,7 @@ async fn run_async(
                     &reported_instruction.bytes,
                     &values,
                     stopped_since,
-                    options.max_pause,
+                    service_pause,
                 )
                 .await?;
                 continue;
@@ -1221,20 +1269,47 @@ async fn run_async(
             let response = link
                 .send(crate::kdwire::PACKET_TYPE_STATE_MANIPULATE, &response)
                 .map_err(anyhow::Error::msg)?;
-            write_stopped_pipe(&mut writer, &response, stopped_since, options.max_pause).await?;
-            flush_stopped_pipe(&mut writer, stopped_since, options.max_pause).await?;
+            write_stopped_pipe(&mut writer, &response, stopped_since, service_pause).await?;
+            flush_stopped_pipe(&mut writer, stopped_since, service_pause).await?;
         }
     }
 }
 
+fn service_pause_bound(max_pause: Duration) -> Duration {
+    let cleanup_reserve = (max_pause / 2).min(Duration::from_secs(30));
+    max_pause.saturating_sub(cleanup_reserve)
+}
+
+fn record_cleanup_deadline(
+    activity: &crate::skdispatch::WaitActivity,
+    max_pause: Duration,
+    cleanup_deadline: &mut Option<Instant>,
+) -> Result<Option<Instant>> {
+    let Some(retained_since) = activity.retained_since() else {
+        return Ok(None);
+    };
+    *cleanup_deadline = Some(
+        retained_since
+            .checked_add(max_pause)
+            .context("the absolute Secure Kernel cleanup deadline overflowed")?,
+    );
+    Ok(Some(retained_since))
+}
+
 fn wait_activity(
     idle_timeout: Duration,
+    service_pause: Duration,
     max_pause: Duration,
     job: Option<u64>,
 ) -> crate::skdispatch::WaitActivity {
     match job {
-        Some(job) => crate::skdispatch::WaitActivity::for_managed_kd(idle_timeout, max_pause, job),
-        None => crate::skdispatch::WaitActivity::for_kd(idle_timeout, max_pause),
+        Some(job) => crate::skdispatch::WaitActivity::for_managed_kd(
+            idle_timeout,
+            service_pause,
+            max_pause,
+            job,
+        ),
+        None => crate::skdispatch::WaitActivity::for_kd(idle_timeout, service_pause, max_pause),
     }
 }
 
@@ -1247,7 +1322,7 @@ fn refuse_managed_teardown() -> Result<()> {
 
 fn remaining_pause(since: Instant, bound: Duration) -> Result<Duration> {
     bound.checked_sub(since.elapsed()).context(
-        "the absolute Secure Kernel pause bound expired; the worker will close the controller",
+        "the service portion of the absolute Secure Kernel pause bound ended; the worker will use the cleanup reserve to close the controller",
     )
 }
 
@@ -1257,7 +1332,7 @@ fn pause_deadline(since: Instant, bound: Duration) -> Result<Instant> {
         .context("the absolute Secure Kernel pause deadline overflowed")?;
     if Instant::now() >= deadline {
         bail!(
-            "the absolute Secure Kernel pause bound expired; the worker will close the controller"
+            "the service portion of the absolute Secure Kernel pause bound ended; the worker will use the cleanup reserve to close the controller"
         );
     }
     Ok(deadline)
@@ -1290,7 +1365,7 @@ async fn write_stopped_pipe<W: AsyncWrite + Unpin>(
     bounded_pipe_io(
         writer.write_all(bytes),
         within,
-        "the absolute Secure Kernel pause bound expired while writing KD output",
+        "the service portion of the absolute Secure Kernel pause bound ended while writing KD output",
     )
     .await
 }
@@ -1304,7 +1379,7 @@ async fn flush_stopped_pipe<W: AsyncWrite + Unpin>(
     bounded_pipe_io(
         writer.flush(),
         within,
-        "the absolute Secure Kernel pause bound expired while flushing KD output",
+        "the service portion of the absolute Secure Kernel pause bound ended while flushing KD output",
     )
     .await
 }
@@ -2037,6 +2112,18 @@ mod tests {
             expired
                 .to_string()
                 .contains("absolute Secure Kernel pause bound")
+        );
+    }
+
+    #[test]
+    fn every_pause_window_reserves_time_for_bounded_controller_cleanup() {
+        assert_eq!(
+            service_pause_bound(Duration::from_secs(600)),
+            Duration::from_secs(570)
+        );
+        assert_eq!(
+            service_pause_bound(Duration::from_millis(1)),
+            Duration::from_micros(500)
         );
     }
 

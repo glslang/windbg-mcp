@@ -457,9 +457,26 @@ impl Session {
     }
 
     pub(crate) fn close(&mut self, engine: &DebugEngine) -> Result<()> {
+        self.close_inner(engine, None)
+    }
+
+    pub(crate) fn close_until(&mut self, engine: &DebugEngine, deadline: Instant) -> Result<()> {
+        self.close_inner(engine, Some(deadline))
+    }
+
+    fn close_inner(&mut self, engine: &DebugEngine, deadline: Option<Instant>) -> Result<()> {
+        let deadline = deadline.or_else(|| {
+            self.dispatcher
+                .retained_event
+                .as_ref()
+                .and_then(|retained| retained.recovery_deadline)
+        });
         let mut dispatcher = self.dispatcher.bind(engine);
         if let Some(control) = self.control.as_mut() {
-            control.close(&mut dispatcher)
+            match deadline {
+                Some(deadline) => control.close_until(&mut dispatcher, deadline),
+                None => control.close(&mut dispatcher),
+            }
         } else {
             dispatcher.teardown()
         }
@@ -798,6 +815,7 @@ struct RetainedEvent {
     event: HeldEvent,
     validation_complete: bool,
     release_eligible: bool,
+    recovery_deadline: Option<Instant>,
 }
 
 pub(crate) struct VmwpDispatcherState {
@@ -1186,6 +1204,7 @@ struct WaitActivityState {
     idle_timeout: Duration,
     managed_job: Option<u64>,
     pause_bound: Option<Duration>,
+    recovery_bound: Option<Duration>,
     retained_since: Mutex<Option<Instant>>,
 }
 
@@ -1199,22 +1218,42 @@ pub(crate) enum WaitActivityPhase {
 impl WaitActivity {
     #[cfg(test)]
     pub(crate) fn new(idle_timeout: Duration) -> Self {
-        Self::with_options(idle_timeout, None, None)
+        Self::with_options(idle_timeout, None, None, None)
     }
 
-    pub(crate) fn for_kd(idle_timeout: Duration, pause_bound: Duration) -> Self {
-        Self::with_options(idle_timeout, Some(pause_bound), None)
+    pub(crate) fn for_kd(
+        idle_timeout: Duration,
+        pause_bound: Duration,
+        recovery_bound: Duration,
+    ) -> Self {
+        Self::with_options(idle_timeout, Some(pause_bound), Some(recovery_bound), None)
     }
 
-    pub(crate) fn for_managed_kd(idle_timeout: Duration, pause_bound: Duration, job: u64) -> Self {
-        Self::with_options(idle_timeout, Some(pause_bound), Some(job))
+    pub(crate) fn for_managed_kd(
+        idle_timeout: Duration,
+        pause_bound: Duration,
+        recovery_bound: Duration,
+        job: u64,
+    ) -> Self {
+        Self::with_options(
+            idle_timeout,
+            Some(pause_bound),
+            Some(recovery_bound),
+            Some(job),
+        )
     }
 
     fn with_options(
         idle_timeout: Duration,
         pause_bound: Option<Duration>,
+        recovery_bound: Option<Duration>,
         managed_job: Option<u64>,
     ) -> Self {
+        debug_assert!(
+            pause_bound
+                .zip(recovery_bound)
+                .is_none_or(|(pause, recovery)| pause <= recovery)
+        );
         Self(Arc::new(WaitActivityState {
             phase: AtomicU8::new(WAIT_ARMED),
             scope_gate: Mutex::new(()),
@@ -1222,6 +1261,7 @@ impl WaitActivity {
             idle_timeout,
             managed_job,
             pause_bound,
+            recovery_bound,
             retained_since: Mutex::new(None),
         }))
     }
@@ -1248,6 +1288,11 @@ impl WaitActivity {
     fn pause_deadline(&self) -> Option<Instant> {
         let since = self.retained_since()?;
         Some(since.checked_add(self.0.pause_bound?).unwrap_or(since))
+    }
+
+    fn recovery_deadline(&self) -> Option<Instant> {
+        let since = self.retained_since()?;
+        Some(since.checked_add(self.0.recovery_bound?).unwrap_or(since))
     }
 
     pub(crate) fn phase(&self) -> WaitActivityPhase {
@@ -1884,42 +1929,15 @@ impl EventDispatcher for VmwpDispatcher<'_> {
     }
 
     fn establish_recovery_pause(&mut self, targets: &[TargetIdentity]) -> Result<()> {
-        if self.state.retained_event.is_some() {
-            // A delayed completion kick cannot be joined while its pause request is blocked behind
-            // this native event. The event itself is the selected provider's write barrier; safe
-            // recovery completes the callback, detaches, and joins the helper in that order.
-            return self.state.confirm_retained_provider_stop(targets);
-        }
-        // A wait may fail while its asynchronous Resume-VM is still outstanding. With no retained
-        // event, join that helper before a fresh Suspend-VM proves recovery quiescence. An incomplete
-        // callback whose exact thread was not retained remains fail-closed.
-        let transition_error = self.state.finish_completion_kick().err();
-        let pause = if matches!(self.state.phase, DispatcherPhase::ReadyForStopInterrupted) {
-            self.pause_armed_without_event(targets)
-        } else if matches!(
-            self.state.phase,
-            DispatcherPhase::Holding(_)
-                | DispatcherPhase::ReturningCallback(_)
-                | DispatcherPhase::CallbackEntry(_)
-                | DispatcherPhase::ReturningHandle(_)
-                | DispatcherPhase::HandleReturn(_)
-                | DispatcherPhase::ReturningNative(_)
-        ) {
-            Err(anyhow!(
-                "an incomplete native callback has no retained thread identity"
-            ))
-        } else {
-            self.pause_for_provider_writes(targets)
-        };
-        match (transition_error, pause) {
-            (None, result) => result,
-            (Some(error), Ok(())) => Err(error
-                .context("the pending VM transition failed before recovery quiescence was proved")),
-            (Some(transition), Err(pause)) => bail!(
-                "the pending VM transition failed: {transition:#}; recovery quiescence also \
-                 failed: {pause:#}"
-            ),
-        }
+        self.establish_recovery_pause_inner(targets, None)
+    }
+
+    fn establish_recovery_pause_until(
+        &mut self,
+        targets: &[TargetIdentity],
+        deadline: Instant,
+    ) -> Result<()> {
+        self.establish_recovery_pause_inner(targets, Some(deadline))
     }
 
     fn verify_instruction(&mut self, instruction: &InstructionGuard) -> Result<()> {
@@ -1939,6 +1957,19 @@ impl EventDispatcher for VmwpDispatcher<'_> {
             .wait_activity
             .as_ref()
             .and_then(WaitActivity::pause_deadline)
+    }
+
+    fn retained_recovery_deadline(&self) -> Option<Instant> {
+        self.state
+            .retained_event
+            .as_ref()
+            .and_then(|retained| retained.recovery_deadline)
+            .or_else(|| {
+                self.state
+                    .wait_activity
+                    .as_ref()
+                    .and_then(WaitActivity::recovery_deadline)
+            })
     }
 
     fn wait_for_stop(
@@ -2058,64 +2089,16 @@ impl EventDispatcher for VmwpDispatcher<'_> {
     }
 
     fn recover(&mut self, safe_to_resume: bool, event: Option<&HeldEvent>) -> Result<()> {
-        if self
-            .state
-            .retained_event
-            .as_ref()
-            .is_some_and(|retained| retained.validation_complete && !retained.release_eligible)
-        {
-            // A pause deadline may expire while joining the prior completion kick or removing the
-            // event-site breakpoint. The event itself was already validated, so recovery may
-            // finish that owned cleanup before deciding whether the callback can be released.
-            self.prepare_held_event(None)?;
-            self.state
-                .retained_event
-                .as_mut()
-                .context("the validated native event lost its retained-thread record")?
-                .release_eligible = true;
-        }
-        self.state.refuse_unsafe_recovery()?;
-        if !safe_to_resume {
-            let why = if self.state.vm_paused {
-                "VTL1 restoration was not proved; the VM remains paused"
-            } else {
-                "VTL1 restoration was not proved; vmwp remains stopped on the worker engine"
-            };
-            self.state.phase = DispatcherPhase::Contained(why.to_string());
-            return Ok(());
-        }
+        self.recover_inner(safe_to_resume, event, None)
+    }
 
-        if let Some(held) = self
-            .state
-            .retained_event
-            .as_ref()
-            .map(|retained| retained.event.clone())
-        {
-            if let Some(expected) = event
-                && expected != &held
-            {
-                bail!("recovery event does not match the event held by the dispatcher");
-            }
-            return self.release_event(&held, ReleaseMode::Resume);
-        }
-
-        if self.state.breakpoint.is_some() {
-            self.remove_owned_breakpoint()?;
-        }
-        if self.state.threads_frozen {
-            self.engine.execute_command("~* u").map_err(debugger)?;
-            self.state.threads_frozen = false;
-        }
-        if self.state.attached {
-            self.detach_handled()?;
-        }
-        self.state.finish_completion_kick()?;
-        if self.state.vm_paused {
-            self.state.begin_vm_resume();
-            run_vm_action(self.bound_vm_id()?, VmAction::Resume, POWERSHELL_WAIT)?;
-            self.state.vm_paused = false;
-        }
-        Ok(())
+    fn recover_until(
+        &mut self,
+        safe_to_resume: bool,
+        event: Option<&HeldEvent>,
+        deadline: Instant,
+    ) -> Result<()> {
+        self.recover_inner(safe_to_resume, event, Some(deadline))
     }
 
     fn teardown(&mut self) -> Result<()> {
@@ -2167,6 +2150,118 @@ impl EventDispatcher for VmwpDispatcher<'_> {
 }
 
 impl VmwpDispatcher<'_> {
+    fn establish_recovery_pause_inner(
+        &mut self,
+        targets: &[TargetIdentity],
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        if self.state.retained_event.is_some() {
+            // A delayed completion kick cannot be joined while its pause request is blocked behind
+            // this native event. The event itself is the selected provider's write barrier; safe
+            // recovery completes the callback, detaches, and joins the helper in that order.
+            return self.state.confirm_retained_provider_stop(targets);
+        }
+        // A wait may fail while its asynchronous Resume-VM is still outstanding. With no retained
+        // event, join that helper before a fresh Suspend-VM proves recovery quiescence. An incomplete
+        // callback whose exact thread was not retained remains fail-closed.
+        let transition_error = self.state.finish_completion_kick_until(deadline).err();
+        let pause = if matches!(self.state.phase, DispatcherPhase::ReadyForStopInterrupted) {
+            self.pause_armed_without_event_inner(targets, deadline)
+        } else if matches!(
+            self.state.phase,
+            DispatcherPhase::Holding(_)
+                | DispatcherPhase::ReturningCallback(_)
+                | DispatcherPhase::CallbackEntry(_)
+                | DispatcherPhase::ReturningHandle(_)
+                | DispatcherPhase::HandleReturn(_)
+                | DispatcherPhase::ReturningNative(_)
+        ) {
+            Err(anyhow!(
+                "an incomplete native callback has no retained thread identity"
+            ))
+        } else {
+            self.pause_for_provider_writes_inner(targets, deadline)
+        };
+        match (transition_error, pause) {
+            (None, result) => result,
+            (Some(error), Ok(())) => Err(error
+                .context("the pending VM transition failed before recovery quiescence was proved")),
+            (Some(transition), Err(pause)) => bail!(
+                "the pending VM transition failed: {transition:#}; recovery quiescence also \
+                 failed: {pause:#}"
+            ),
+        }
+    }
+
+    fn recover_inner(
+        &mut self,
+        safe_to_resume: bool,
+        event: Option<&HeldEvent>,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        if self
+            .state
+            .retained_event
+            .as_ref()
+            .is_some_and(|retained| retained.validation_complete && !retained.release_eligible)
+        {
+            // A pause deadline may expire while joining the prior completion kick or removing the
+            // event-site breakpoint. The event itself was already validated, so recovery may
+            // finish that owned cleanup before deciding whether the callback can be released.
+            self.prepare_held_event(deadline)?;
+            self.state
+                .retained_event
+                .as_mut()
+                .context("the validated native event lost its retained-thread record")?
+                .release_eligible = true;
+        }
+        self.state.refuse_unsafe_recovery()?;
+        if !safe_to_resume {
+            let why = if self.state.vm_paused {
+                "VTL1 restoration was not proved; the VM remains paused"
+            } else {
+                "VTL1 restoration was not proved; vmwp remains stopped on the worker engine"
+            };
+            self.state.phase = DispatcherPhase::Contained(why.to_string());
+            return Ok(());
+        }
+
+        if let Some(held) = self
+            .state
+            .retained_event
+            .as_ref()
+            .map(|retained| retained.event.clone())
+        {
+            if let Some(expected) = event
+                && expected != &held
+            {
+                bail!("recovery event does not match the event held by the dispatcher");
+            }
+            return self.complete_event(ReleaseMode::Resume, deadline);
+        }
+
+        require_completion_deadline(deadline)?;
+        if self.state.breakpoint.is_some() {
+            self.remove_owned_breakpoint()?;
+        }
+        require_completion_deadline(deadline)?;
+        if self.state.threads_frozen {
+            self.engine.execute_command("~* u").map_err(debugger)?;
+            self.state.threads_frozen = false;
+        }
+        require_completion_deadline(deadline)?;
+        if self.state.attached {
+            self.detach_handled()?;
+        }
+        self.state.finish_completion_kick_until(deadline)?;
+        if self.state.vm_paused {
+            self.state.begin_vm_resume();
+            run_vm_action_until(self.bound_vm_id()?, VmAction::Resume, deadline)?;
+            self.state.vm_paused = false;
+        }
+        Ok(())
+    }
+
     fn finish_teardown(&mut self) -> Result<()> {
         if self.state.vm_paused {
             self.state.begin_vm_resume();
@@ -2258,12 +2353,18 @@ impl VmwpDispatcher<'_> {
         if self.state.retained_event.is_some() {
             bail!("the dispatcher already retains a native event thread");
         }
+        let recovery_deadline = self
+            .state
+            .wait_activity
+            .as_ref()
+            .and_then(WaitActivity::recovery_deadline);
         self.state.retained_event = Some(RetainedEvent {
             system_id,
             return_ip: event_site,
             event: event.clone(),
             validation_complete: false,
             release_eligible: false,
+            recovery_deadline,
         });
         let advance = self.read_u8(
             event_pointer
@@ -2288,14 +2389,30 @@ impl VmwpDispatcher<'_> {
     }
 
     fn pause_for_provider_writes(&mut self, targets: &[TargetIdentity]) -> Result<()> {
+        self.pause_for_provider_writes_inner(targets, None)
+    }
+
+    fn pause_for_provider_writes_inner(
+        &mut self,
+        targets: &[TargetIdentity],
+        deadline: Option<Instant>,
+    ) -> Result<()> {
         let target = targets.first().context("no live-control VP targets")?;
-        self.state.finish_completion_kick()?;
+        self.state.finish_completion_kick_until(deadline)?;
         self.state.claim_vm_pause(targets)?;
-        run_vm_action(&target.vm_id, VmAction::Pause, POWERSHELL_WAIT)?;
+        run_vm_action_until(&target.vm_id, VmAction::Pause, deadline)?;
         self.state.confirm_vm_pause()
     }
 
     fn pause_armed_without_event(&mut self, targets: &[TargetIdentity]) -> Result<()> {
+        self.pause_armed_without_event_inner(targets, None)
+    }
+
+    fn pause_armed_without_event_inner(
+        &mut self,
+        targets: &[TargetIdentity],
+        deadline: Option<Instant>,
+    ) -> Result<()> {
         let target = targets
             .first()
             .context("no-event disarm requires at least one selected VP")?;
@@ -2313,11 +2430,12 @@ impl VmwpDispatcher<'_> {
 
         self.remove_owned_breakpoint()?;
         self.detach_handled()?;
-        self.state.finish_completion_kick()?;
+        self.state.finish_completion_kick_until(deadline)?;
         self.state.claim_vm_pause(targets)?;
-        run_vm_action(&target.vm_id, VmAction::Pause, POWERSHELL_WAIT)?;
+        run_vm_action_until(&target.vm_id, VmAction::Pause, deadline)?;
         self.state.confirm_vm_pause()?;
 
+        require_retention_deadline(deadline)?;
         verify_vmwp_pid(&target.vm_id, self.state.vmwp_pid)?;
         let pending = self
             .engine
@@ -2325,6 +2443,7 @@ impl VmwpDispatcher<'_> {
             .map_err(debugger)?;
         self.state.attached = true;
         pending.wait().map_err(debugger)?;
+        require_retention_deadline(deadline)?;
         self.engine.execute_command("sxd 6ba").map_err(debugger)?;
         self.engine
             .execute_command("sxd e06d7363")
@@ -2884,11 +3003,12 @@ impl VmwpDispatcher<'_> {
             }
             ReleaseMode::Resume => {
                 self.settle_native_completion(deadline)?;
+                require_completion_deadline(deadline)?;
                 self.detach_handled()?;
-                self.state.finish_completion_kick()?;
+                self.state.finish_completion_kick_until(deadline)?;
                 if self.state.vm_paused {
                     self.state.begin_vm_resume();
-                    run_vm_action(self.bound_vm_id()?, VmAction::Resume, POWERSHELL_WAIT)?;
+                    run_vm_action_until(self.bound_vm_id()?, VmAction::Resume, deadline)?;
                     self.state.vm_paused = false;
                 }
                 self.state.phase = DispatcherPhase::Detached;
@@ -3809,6 +3929,19 @@ fn run_vm_action(vm_id: &str, action: VmAction, timeout: Duration) -> Result<()>
     run_vm_query(vm_id, action, timeout).map(drop)
 }
 
+fn run_vm_action_until(vm_id: &str, action: VmAction, deadline: Option<Instant>) -> Result<()> {
+    require_completion_deadline(deadline)?;
+    let timeout = deadline
+        .map(|deadline| {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(POWERSHELL_WAIT)
+        })
+        .unwrap_or(POWERSHELL_WAIT);
+    run_vm_action(vm_id, action, timeout)?;
+    require_completion_deadline(deadline)
+}
+
 fn run_vm_query(vm_id: &str, action: VmAction, timeout: Duration) -> Result<String> {
     run_vm_query_inner(vm_id, action, timeout, None)
 }
@@ -4132,7 +4265,11 @@ mod tests {
 
     #[test]
     fn the_pause_budget_starts_when_the_wait_retains_a_stop() {
-        let activity = WaitActivity::for_kd(Duration::from_secs(30), Duration::from_secs(10));
+        let activity = WaitActivity::for_kd(
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+            Duration::from_secs(20),
+        );
         assert_eq!(activity.retained_since(), None);
         let retained_at = Instant::now();
 
@@ -4140,6 +4277,10 @@ mod tests {
         let retained = activity.retained_since().unwrap();
         assert_eq!(retained, retained_at);
         assert_eq!(deadline, retained + Duration::from_secs(10));
+        assert_eq!(
+            activity.recovery_deadline(),
+            Some(retained + Duration::from_secs(20))
+        );
         assert_eq!(
             activity.mark_stop_retained(retained_at + Duration::from_secs(1)),
             Some(deadline)
@@ -4362,6 +4503,7 @@ mod tests {
             event,
             validation_complete: true,
             release_eligible: true,
+            recovery_deadline: None,
         });
         let mut selected = target();
         selected.vp = 1;
@@ -4402,6 +4544,7 @@ mod tests {
             event,
             validation_complete: false,
             release_eligible: false,
+            recovery_deadline: None,
         });
 
         let error = state.refuse_unsafe_recovery().unwrap_err();
