@@ -303,17 +303,20 @@ selected VP's VTL1 registers and memory. The repository ships neither provider a
 tools are refused on this session so they cannot report `vmwp` state as guest state.
 
 Use this route only for an exact, disposable VBS VM under an independent heartbeat, crash-record and
-unchanged-text audit. Before opening, collect the current VM GUID, partition ID, selected VP, VTL1
-CR3, `vmwp` PID and dispatcher VND; the exact-build `vmwp` profile or bounded profile directory; and
-the register-control and live-memory provider commands. `open_sk_live_control` validates the input
-shape, loads the profile and checks the register provider's declared identity and capabilities. It
-does not pause, attach to or inspect the VM. The first `sk_live_arm` pauses the VM and validates the
-live VM/`vmwp` binding, CR3, build and guarded instruction before it changes registers or breakpoints.
+unchanged-text audit. Before the server starts, set `WINDBG_MCP_SK_LIVE_POLICY` to an operator-owned
+file that admits the VM GUID, exact provider command templates and profile root. The worker resolves
+the current `vmwp` PID and discovers the per-boot dispatcher VND and partition id; the register
+provider reports CR3 and the memory provider reports the Secure Kernel base. Request fields for
+those values are optional mismatch assertions. `open_sk_live_control` applies policy, validates the
+input and profile and reserves the VM. It starts no provider and does not pause, attach to or inspect
+the VM. The first `sk_live_arm` performs discovery and validates the provider identities, live
+VM/`vmwp` binding, CR3, build and guarded instruction before it changes registers or breakpoints.
 
 The sequence is:
 
-1. `open_sk_live_control` with `profile`, `control_transport`, `live_transport`, `vmwp_pid`,
-   `dispatcher_vnd`, `vm_id`, `partition_id`, `expected_cr3` and optional `vp`.
+1. `open_sk_live_control` with `profile`, `control_transport`, `live_transport`, `vm_id` and
+   optional `vp`. Supply `vmwp_pid`, `dispatcher_vnd`, `partition_id` or `expected_cr3` only when an
+   independent measurement should be enforced as a mismatch assertion.
 2. `sk_live_arm` with the exact instruction address and 1–15 guarded bytes. Natural mode leaves RIP
    untouched and may arm up to four distinct debug-register slots; redirect mode accepts one and
    deliberately moves RIP.
@@ -341,9 +344,10 @@ a *running* guest, use `--sk-live`: the transport is theirs to supply, the serve
 role runs on the debugger host outside MCP. For a controlled stop, stopped-state inspection, step or
 resume at a chosen address, use `open_sk_live_control` and the epoch-bound MCP sequence above, after
 the operator supplies the exact disposable target and both providers. If they want **WinDbg itself**
-on that stop, the `--sk-kd-target` role serves the serial KD protocol over a local named pipe to a
-`kd -k com:pipe,port=\\.\pipe\<name>,resets=0`; it is a foreground role rather than a tool, and what
-has been measured through it is one `t`, an `r` after it and `q` — the limits are in
+on that stop, use `open_sk_kd`. It returns a generated local named pipe for
+`kd -k com:pipe,port=\\.\pipe\<name>,resets=0`, while MCP retains lifecycle and recovery and WinDbg
+owns execution. The `--sk-kd-target` role remains a standalone diagnostic fallback. What has been
+measured through the facade is one `t`, an `r` after it and `q` — the limits are in
 [`docs/secure-kernel/kd-facade.md`](../../docs/secure-kernel/kd-facade.md).
 
 ## Where the rest of it is

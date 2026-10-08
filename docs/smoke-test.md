@@ -193,23 +193,31 @@ somebody's guest rather than of this server. The figures are in that item.
 
 **The live Secure Kernel tier is a different, explicitly disposable gate.**
 `WINDBG_MCP_SMOKE_SK_LIVE` names a private JSON file containing `profile`, `control_transport`,
-`live_transport`, `vmwp_pid`, `dispatcher_vnd`, `vm_id`, `partition_id`, `expected_cr3`,
+`live_transport`, `dispatcher_vnd`, `vm_id`, `partition_id`, `expected_cr3`,
 `instruction_address` and `instruction_bytes`; `vp` and `read_size` are optional. The file must also
-carry `"disposable": true`. The ignored test opens a separate live-control session, observes an
+carry `"disposable": true`. `vmwp_pid` is an optional mismatch assertion; the server resolves the
+current PID from `vm_id` before it reserves and starts the worker. The ignored test opens a separate
+live-control session, observes an
 exact DR0 VTL1 CPL0 stop, checks the retained registers and a stopped virtual-memory read, consumes
 the epoch to single-step, consumes the next epoch to restore and continue, then requires teardown
 to report both release and a running target. Run it alone through the bench's independent VM
 heartbeat/crash/unchanged-text wrapper. The repository stores none of the config or evidence.
 
-**The Secure Kernel KD facade has no gate, and that is a statement rather than an omission.**
-`--sk-kd-target` — WinDbg as the protocol client of that same live controller over a named pipe,
-[`secure-kernel/kd-facade.md`](secure-kernel/kd-facade.md) — is covered by the four KD modules'
-unit tests over inline packet vectors (23 of them on 2026-10-07) and by nothing that connects a
-debugger: no `WINDBG_MCP_SMOKE_SK_KD` variable exists, no test drives the pipe loop, the wait waker
-or the `Continue2` path, and the only live run is a private bench record from 2026-10-05. A green
-run therefore says nothing about kd still connecting. The tier it would need is the live Secure
-Kernel one above with an installed `kd` and a `-cf` script beside it, and until that exists the
-facade is re-verified by hand or not at all.
+**The managed Secure Kernel KD tier uses the same disposable-machine boundary.**
+WINDBG_MCP_SMOKE_SK_KD names a private JSON config with kd, profile, control_transport,
+live_transport, vm_id, a post_release_audit command array and optional vp/arm_mode. The exact
+initial instruction is a build-relative RVA and byte guard in the profile. That profile section
+also carries the exact-build debugger-data head, block and loaded-module-list RVAs; the worker
+combines all four with the base reported by the live-memory provider and validates the live links,
+so the config carries no boot address.
+It must carry disposable true, and it must omit vmwp_pid, dispatcher_vnd, partition_id,
+expected_cr3 and kernel_base: discovering those is part of the gate. Set the server-side
+WINDBG_MCP_SK_LIVE_POLICY as well. The ignored test opens the managed KD tool, waits for the
+generated pipe, launches installed kd with a one-command-per-line `lm m securekernel`, `t`, `r`,
+`q` file, verifies module enumeration, the returned RIP and registers, observes reconnecting after
+kd quits, then releases the controller
+through MCP. It then runs the bounded external audit and requires three healthy same-PID samples,
+no enabled debug-register breakpoint and unchanged Secure Kernel text.
 
 **The sample they open follows the host.** Four dumps are checked in (below), and the two crashes
 a *memory* read is asserted against are paired with the architecture the tests are running on — so

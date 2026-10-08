@@ -1,7 +1,7 @@
-//! Which of this server's seventy-four tools a run advertises.
+//! Which of this server's seventy-six tools a run advertises.
 //!
 //! The tool surface is paid **once per conversation, before anything is debugged**, and it is
-//! 113,516 bytes — roughly 28k tokens (measured 2026-10-04; every figure here moves with any edit
+//! 119,631 bytes — roughly 30k tokens (measured 2026-10-07; every figure here moves with any edit
 //! to a description, so re-derive rather than cite). Seven tenths of that is prose, and the prose is what tells
 //! a model how to drive the tools, so there is no strip here the way there was in
 //! [`crate::schema`]: `FOLLOWUPS.md` item 24 measured it and the only honest lever left is the one
@@ -30,11 +30,11 @@
 //!   ioctl           11   16,088  driver objects, IRP stacks, reachability, hazards, IOCTL maps,
 //!                                  references to an address, device security and the
 //!                                  whole-driver survey
-//!   securekernel    11   15,906  captured and live VTL1 inspection and execution control
+//!   securekernel    12   19,181  captured and live VTL1 inspection and execution control
 //! ```
 //!
-//! Those bytes are a measurement of **2026-10-05** and move with any edit to a description — the
-//! whole surface they are shares of is 75 tools and 116,356 B, which is what the rows above sum to.
+//! Those bytes are a measurement of **2026-10-07** and move with any edit to a description — the
+//! whole surface they are shares of is 76 tools and 119,631 B, which is what the rows above sum to.
 //! Re-derive rather than quoting them.
 //!
 //! **Those are shares of the whole surface, and they do not sum to a narrowed one.** `crash` reads
@@ -206,6 +206,7 @@ const GROUPS: &[Group] = &[
             "sk_read_memory",
             "sk_symbol",
             "open_sk_live_control",
+            "open_sk_kd",
             "sk_live_arm",
             "sk_live_wait",
             "sk_live_registers",
@@ -541,7 +542,7 @@ mod tests {
         assert!(set.includes("end_session"));
         assert!(!set.includes("ttd_calls"));
         assert!(!set.includes("debug_batch"));
-        assert_eq!(set.summary(), "13 of 75 tools (session, crash)");
+        assert_eq!(set.summary(), "13 of 76 tools (session, crash)");
     }
 
     #[test]
@@ -552,7 +553,7 @@ mod tests {
         assert!(!set.includes("disassemble"));
         assert_eq!(
             set.summary(),
-            "12 of 75 tools (session, backtrace, registers)"
+            "12 of 76 tools (session, backtrace, registers)"
         );
     }
 
@@ -664,7 +665,7 @@ mod tests {
         // Both name the tool and what is served, because those do not depend on who chose it.
         for said in [&run, &own] {
             assert!(said.contains("`debug_batch`"), "{said}");
-            assert!(said.contains("13 of 75 tools (session, crash)"), "{said}");
+            assert!(said.contains("13 of 76 tools (session, crash)"), "{said}");
         }
     }
 

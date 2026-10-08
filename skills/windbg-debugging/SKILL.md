@@ -44,7 +44,7 @@ already does the job.
 | TTD analysis | `ttd_calls`, `ttd_memory`, `ttd_events`, `index_trace`, `record_trace` |
 | Kernel pool | `pool_find_tag`, `pool_chunk`, `pool_census`, `pool_diagnostics` |
 | User Segment Heap | `heap_list`, `heap_allocations`, `heap_chunk`, `heap_census`, `heap_diagnostics` |
-| Secure Kernel | Capture: `open_sk_capture`, `sk_modules`, `sk_read_memory`, `sk_symbol`. Live control: `open_sk_live_control`, `sk_live_arm`, `sk_live_wait`, `sk_live_registers`, `sk_live_read_memory`, `sk_live_step`, `sk_live_continue`. Each route has its own session and refuses ordinary debugger tools; `end_session` still applies |
+| Secure Kernel | Capture: `open_sk_capture`, `sk_modules`, `sk_read_memory`, `sk_symbol`. Live control: `open_sk_live_control`, `sk_live_arm`, `sk_live_wait`, `sk_live_registers`, `sk_live_read_memory`, `sk_live_step`, `sk_live_continue`. WinDbg facade: `open_sk_kd`. Each route has its own session and refuses ordinary debugger tools; `end_session` still applies |
 | Server | `server_log` — the server's own records: the supervisor's, plus your own sessions' workers, tagged by session |
 | Raw | `execute` — run any debugger command, returns full text output |
 

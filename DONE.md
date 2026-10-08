@@ -164,6 +164,8 @@ engine — it adds a target and leaves the current one alone. The entry records 
 - [Item 52](#52-windbg-mcp-the-no-description-names-a-tool-the-client-cannot-call-invariant-does-not-cover-input-schemas--done-2026-10-05) — [windbg-mcp] The "no description names a tool the client cannot call" invariant does not cover **input schemas** — done (2026-10-05)
 - [Item 69](#69-windbg-mcp-record-what-the-ace-kind-rules-were-measured-against--done-2026-10-05) — [windbg-mcp] Record what the ACE-kind rules were measured against — done (2026-10-05)
 - [Item 115](#115-windbg-mcp-the-secure-kernel-kd-facade-shipped-unrecorded--done-2026-10-07) — [windbg-mcp] The Secure Kernel KD facade shipped unrecorded — done (2026-10-07)
+- [Item 120](#120-windbg-mcp-the-secure-kernel-kd-facade-is-not-an-mcp-managed-session--done-2026-10-07) — [windbg-mcp] The Secure Kernel KD facade is an MCP-managed session — done (2026-10-07)
+- [Item 119](#119-windbg-mcp-what-a-vtl1-debugger-still-cannot-do--done-2026-10-07) — [windbg-mcp] The VTL1 capability matrix is live-derived — done (2026-10-07)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -9455,3 +9457,137 @@ saying there is no gate; and the six corrections.
   the fabricated answers, the default descriptor and the out-of-band inputs: nothing in the facade
   moved. The 2026-10-05 run stays the only live measurement, and the review that produced this
   entry did not run the facade either.
+
+## 120. [windbg-mcp] The Secure Kernel KD facade is not an MCP-managed session — **done** (2026-10-07)
+
+**Repo:** `windbg-mcp`. **Origin:** the 2026-10-07 validity pass over the VTL1 review, against the
+goal of making the KD route usable from WinDbg *and* this server.
+
+`--sk-kd-target` is an early command-line role. `main` returns into `worker::run_sk_kd_target`
+before the MCP runtime exists; that function borrows the worker module's engine constructor but
+does not speak the supervisor/worker protocol. The role therefore has no session id, appears in no
+`session_status`, cannot be ended through MCP, and cannot share the held stop with an MCP client.
+`open_sk_live_control` is the inverse: it is an ordinary MCP worker session with no KD peer. These
+are two front ends over the same controller, but they are separate and must be treated as mutually
+exclusive. The supervisor's live-session reservation does not cover a separately launched KD role,
+so it also cannot prevent both processes attaching to one `vmwp`.
+
+The first useful server integration does not need two clients mutating one stop. Make the server
+own the KD facade's lifecycle first, then consider a read-only MCP view of a WinDbg-held stop:
+
+1. Remove the preparatory cdb sessions by moving target discovery onto that worker's engine thread.
+   Extend the exact-build dispatcher profile with the guarded dispatcher-entry site (the current
+   private runner uses `vmwp+0x2c360`) and its original bytes. Resolve the current `vmwp` PID from
+   the VM id through the same Hyper-V lookup that now only verifies a caller-supplied pair; retain an
+   optional PID solely as a mismatch assertion. With that identity and the profiled image proved,
+   the worker sets a typed one-shot breakpoint, drives the bounded pause/resume transition, reads
+   the VND from `poi(rcx)` and the partition handle from `rdx`, removes the breakpoint and proves the
+   original bytes were restored. It then calls the exported
+   `vid!VidGetHvPartitionId` through the same freeze/scratch/return-breakpoint/restore machinery used
+   for handler registration, checks the return value and output, and restores the entire hijacked
+   context. Resolve the export from the loaded `vid.dll` image and verify that image rather than
+   depending on a symbol-server lookup. No second debugger process may attach to `vmwp`.
+2. Make discovered identity authoritative rather than turning the cdb output into new required
+   arguments. Start the register provider with the discovered partition/VP, read CR3 before any
+   write, and require it, the live-memory source's shape and the first retained stop to agree. Have
+   the memory source report the Secure Kernel base and validate the PE there. Operator-supplied
+   partition, CR3 and base values may remain optional assertions during migration, but must not be
+   the values reported to WinDbg.
+3. Add a Secure Kernel KD session opener that starts a dedicated engine worker and returns a
+   session id, a generated pipe name, and the exact WinDbg connection string. The worker, not the
+   supervisor, continues to own the only `DebugEngine`, and every engine call remains on its
+   creating thread.
+4. Give the session explicit states for discovering, arming, waiting for the KD peer, stopped,
+   running, reconnecting, releasing and recovery-required. Initially admit only `session_status`,
+   `server_log`, `interrupt` where it is bound to the running wait, and `end_session`; WinDbg owns
+   execution while connected.
+5. Apply the server-startup policy from item 118 and the pipe identity/DACL work from item 117 to
+   the opener. Reserve both VM id and `vmwp` PID before starting the worker, and add a named
+   cross-process exclusion if the standalone role remains supported.
+6. Put the absolute pause bound, KD connect/reconnect bounds and retained-event barrier in the
+   worker. A lost supervisor or KD peer must take the existing fail-closed recovery path; the
+   supervisor must never kill a worker that still reports an owned event.
+7. Add an opt-in smoke tier that opens the session through MCP, launches installed `kd`/WinDbg with
+   a command file, observes status transitions, performs the measured `t`, `r`, `q` sequence, and
+   checks the external VM/PID/debug-register/text audit after release. The gate supplies only a VM
+   id, selected VP, profile and server-side provider policy; supplying a dispatcher VND or partition
+   id is a failure of the test.
+8. Only after that gate is repeatable, add MCP reads of the held stop. Serialize them on the same
+   worker engine thread, expose the same stop epoch to both views, and keep a single execution lease
+   so MCP and WinDbg cannot arm, step or continue concurrently.
+
+**Implementation status, 2026-10-07:** stages 1 through 7 are implemented. `open_sk_kd` creates a
+dedicated worker, discovers the boot identity on its engine thread, reserves the VM and `vmwp`,
+returns a generated pipe and WinDbg connection string, publishes the explicit phases above, and
+gives WinDbg the sole execution lease. Startup policy, pipe identity, reconnect bounds, the
+absolute pause bound and fail-closed teardown are applied before the peer is admitted. The MCP
+request carries no boot address: the exact-build profile supplies the initial RVA and bytes, and
+the worker resolves it from the provider-reported base. The stage 7 disposable-VM gate passed with
+WinDbg `lm m securekernel`, `t`, `r`, `q`, MCP release, three same-PID health samples through 60
+seconds, clean VTL1 debug registers and unchanged Secure Kernel text. Before serving the version
+record the worker also validated the live debugger-data list, `KDBG` block and loader-list links.
+Stage 8 remains a separate read-only MCP-view feature with the same single execution lease.
+
+- **Why deferred:** it changes process routing and stop ownership, whereas items 116 and 117 can be
+  hardened inside the existing standalone role. Combining the loops before the lifecycle is a
+  measured MCP session would make recovery less clear, not more.
+- **What would close it:** the server-managed session and smoke tier above. Simultaneous mutation
+  from both protocols is not a closing condition; an explicit single-controller lease is.
+- **Where it picks up:** the early-role dispatch in `main.rs`, `worker::run_sk_kd_target`, the
+  `SecureKernelLive` operations in `proto.rs`/`engine.rs`/`worker.rs`, and `kdtarget::run_async`.
+  The two external bootstrap algorithms are `discover_dispatcher` and `discover_partition` in the
+  private `run_k4_stop_step.py`; the in-worker equivalents start beside `verify_vmwp_build`,
+  `register_handler` and the dispatcher pause helpers. `SetInterrupt` remains the only cross-thread
+  DbgEng call.
+
+## 119. [windbg-mcp] What a VTL1 debugger still cannot do — **done** (2026-10-07)
+
+**Repo:** `windbg-mcp`. **Origin:** the 2026-10-07 review (item 115's origin), so that the
+distance between the measured workflow and a debugging session is tracked rather than implied by
+the gates that passed.
+
+The measured workflow is one `t`, one `r` and `q` against a pre-armed five-byte NOP, with eleven
+command-line arguments, two private programs and a build-locked profile. What is absent, on every
+surface:
+
+- a write to VTL1 memory, and a write to any general-purpose register — the provider's write bank
+  is `rip`, `rsp`, `rflags` and the debug registers, and `SetContext` succeeds only for an unchanged
+  prefix;
+- a software breakpoint: four debug-register slots and no `int3` path, by decision, since the
+  catch half of a patched breakpoint has no owner on a managed VM (S4, S5a);
+- a second VP, by measured decision (item 110's four multi-provider gates);
+- a break-in (item 117);
+- symbols in WinDbg, and module discovery beyond the live `securekernel.exe` entry now exposed
+  through the validated loader list (item 116);
+- any decode past `KdDebuggerDataBlock` and the loader list: no Secure Kernel process, thread or
+  trustlet enumeration, no VTL1 stack walk, no secure pool, handle table, NAR/NTE or HVCI
+  page-tracking, no secure-call table, although the research record locates
+  `SkiSecureServiceTable` and its limit;
+- ARM64 guests and five-level paging, refused in `sk::walkable`;
+- the chosen initial instruction and its bytes come from the exact-build profile as an RVA and
+  byte guard. The worker combines that RVA with the provider-reported base, so no caller supplies a
+  boot-specific Secure Kernel address. The worker
+  now resolves the `vmwp` PID, dispatcher VND and partition id itself, while the register provider
+  reads CR3 and the memory provider reports and validates the Secure Kernel base. PID, VND,
+  partition, CR3 and base are optional mismatch assertions rather than authoritative inputs.
+
+- **Why deferred:** these are rungs, not a defect, and each has a guard it must not loosen; the
+  review's ladder orders them (symbols and control space first, then break-in, then bounded
+  destinations for `t` on branches, then run-break-run live, then writes, then a second VP).
+  Filed as one item so the order is in one place.
+- **What would close it:** not the list — each rung closes on its own measurement. What closes the
+  *item* is a tracked capability matrix for the VTL1 routes (the one `secure-kernel-debugging-plan.md`'s
+  deliverables asked for and never got) that says which WinDbg commands work, which are refused,
+  and which answer with something invented, re-derived from a live run per release that touches
+  `kd*.rs` or `sk*.rs`.
+- **Where it picks up:** the ladder in the private review; the inputs in
+  `target/private/run_k4_stop_step.py` (private), whose `discover_dispatcher` and
+  `discover_partition` are the two reads the worker could make itself during the first attach.
+
+**Implementation status, 2026-10-07:** the capability matrix in
+[`docs/secure-kernel/kd-facade.md`](docs/secure-kernel/kd-facade.md) was re-derived from the managed
+live run. It distinguishes live guest state, compatibility state, implemented but unmeasured paths
+and explicit refusals. The measured rows now include the initial stop, `lm m securekernel`, `r`, a
+fall-through `t`, virtual reads, `q`, MCP release and the independent 60-second audit. The matrix
+keeps hardware `bp`/`g`, symbol loading, stack walking and asynchronous break-in in their actual
+unmeasured or unavailable states.

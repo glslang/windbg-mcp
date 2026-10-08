@@ -10,6 +10,8 @@ use std::fmt;
 pub(crate) const MANIPULATE_BYTES: usize = 0x38;
 pub(crate) const WAIT_STATE_CHANGE64_BYTES: usize = 0xf0;
 pub(crate) const AMD64_CONTEXT_BYTES: usize = 0x4d0;
+pub(crate) const AMD64_SPECIAL_REGISTERS_BYTES: usize = 0xe0;
+pub(crate) const AMD64_DEBUG_CONTROL_SPACE_KSPECIAL: u64 = 2;
 /// Protocol-only identity used where native KD expects an NT `KTHREAD` pointer.
 ///
 /// The Secure Kernel does not have a compatible thread object. The target supplies a zero-filled
@@ -19,6 +21,7 @@ pub(crate) const SYNTHETIC_THREAD: u64 = 0xffff_fffe_fffe_0000;
 
 pub(crate) const DBGKD_GET_VERSION_API: u32 = 0x3146;
 pub(crate) const DBGKD_READ_VIRTUAL_MEMORY_API: u32 = 0x3130;
+pub(crate) const DBGKD_GET_CONTEXT_API: u32 = 0x3132;
 pub(crate) const DBGKD_READ_CONTROL_SPACE_API: u32 = 0x3137;
 pub(crate) const DBGKD_WRITE_CONTROL_SPACE_API: u32 = 0x3138;
 pub(crate) const DBGKD_RESTORE_BREAKPOINT_API: u32 = 0x3135;
@@ -52,6 +55,18 @@ impl ManipulateRequest {
             bytes,
             data: payload[MANIPULATE_BYTES..].to_vec(),
         })
+    }
+
+    /// Builds the status response a malformed manipulate request can still receive. Preserve the
+    /// fixed-header bytes that arrived and zero-fill the rest, so even a short request is refused
+    /// without tearing down the retained target stop.
+    pub(crate) fn failure_for_payload(payload: &[u8]) -> Vec<u8> {
+        let mut bytes = [0; MANIPULATE_BYTES];
+        let present = payload.len().min(MANIPULATE_BYTES);
+        bytes[..present].copy_from_slice(&payload[..present]);
+        bytes[8..12].copy_from_slice(&0xc000_0001u32.to_le_bytes());
+        bytes[12..16].fill(0);
+        bytes.to_vec()
     }
 
     pub(crate) fn api_number(&self) -> u32 {
@@ -120,6 +135,18 @@ impl ManipulateRequest {
             offset: word(&self.bytes, 16),
             count: word(&self.bytes, 20),
         })
+    }
+
+    pub(crate) fn get_context_response(&self, context: &Amd64Context) -> Result<Vec<u8>, ApiError> {
+        if self.api_number() != DBGKD_GET_CONTEXT_API {
+            return Err(ApiError::WrongApi {
+                expected: DBGKD_GET_CONTEXT_API,
+                actual: self.api_number(),
+            });
+        }
+        let mut response = self.success_response();
+        response.extend_from_slice(&context.bytes);
+        Ok(response)
     }
 
     pub(crate) fn set_context(&self) -> Option<&[u8]> {
@@ -307,6 +334,26 @@ impl Amd64Context {
     }
 }
 
+/// Encodes the portion of AMD64 `KSPECIAL_REGISTERS` that the VTL1 provider can report.
+///
+/// DbgEng reads this control-space record while assembling its register state even though the
+/// general and debug registers arrive in `CONTEXT`. Unknown descriptor-table, control-register,
+/// branch-record and MSR fields remain zero rather than being invented.
+pub(crate) fn amd64_special_registers(
+    values: &Amd64ContextValues,
+    cr3: u64,
+) -> [u8; AMD64_SPECIAL_REGISTERS_BYTES] {
+    let mut bytes = [0; AMD64_SPECIAL_REGISTERS_BYTES];
+    put_u64(&mut bytes, 0x10, cr3);
+    for (offset, value) in [0x20, 0x28, 0x30, 0x38, 0x40, 0x48]
+        .into_iter()
+        .zip(values.debug)
+    {
+        put_u64(&mut bytes, offset, value);
+    }
+    bytes
+}
+
 pub(crate) fn breakpoint_state_change(
     context: &Amd64ContextValues,
     instruction: &[u8],
@@ -352,6 +399,8 @@ pub(crate) fn breakpoint_state_change(
 pub(crate) struct Version64 {
     pub(crate) build: u16,
     pub(crate) kernel_base: u64,
+    pub(crate) loaded_module_list: u64,
+    pub(crate) debugger_data_list: u64,
 }
 
 impl Version64 {
@@ -359,6 +408,8 @@ impl Version64 {
         Self {
             build: 26_100,
             kernel_base,
+            loaded_module_list: 0,
+            debugger_data_list: 0,
         }
     }
 
@@ -376,6 +427,8 @@ impl Version64 {
         out[11] = 3;
         out[12] = 0x36;
         out[16..24].copy_from_slice(&self.kernel_base.to_le_bytes());
+        out[24..32].copy_from_slice(&self.loaded_module_list.to_le_bytes());
+        out[32..40].copy_from_slice(&self.debugger_data_list.to_le_bytes());
     }
 }
 
@@ -474,7 +527,12 @@ mod tests {
     #[test]
     fn get_version_response_has_the_public_amd64_layout() {
         let request = ManipulateRequest::decode(&[0; MANIPULATE_BYTES]).unwrap();
-        let response = request.get_version_response(Version64::fixture(0xffff_f803_9e60_0000));
+        let response = request.get_version_response(Version64 {
+            build: 26_100,
+            kernel_base: 0xffff_f803_9e60_0000,
+            loaded_module_list: 0xffff_f803_9e72_7770,
+            debugger_data_list: 0xffff_f803_9e73_35c0,
+        });
         assert_eq!(response.len(), MANIPULATE_BYTES);
         assert_eq!(word(&response, 8), STATUS_SUCCESS);
         assert_eq!(half(&response, 16), 0x000f);
@@ -485,6 +543,8 @@ mod tests {
             u64::from_le_bytes(response[32..40].try_into().unwrap()),
             0xffff_f803_9e60_0000
         );
+        assert_eq!(quad(&response, 40), 0xffff_f803_9e72_7770);
+        assert_eq!(quad(&response, 48), 0xffff_f803_9e73_35c0);
     }
 
     #[test]
@@ -495,6 +555,14 @@ mod tests {
                 actual: MANIPULATE_BYTES - 1
             })
         );
+    }
+
+    #[test]
+    fn short_manipulate_header_has_an_explicit_failure_reply() {
+        let response = ManipulateRequest::failure_for_payload(&[0x30, 0x31, 0, 0]);
+        assert_eq!(response.len(), MANIPULATE_BYTES);
+        assert_eq!(&response[..4], &[0x30, 0x31, 0, 0]);
+        assert_eq!(word(&response, 8), 0xc000_0001);
     }
 
     #[test]
@@ -567,6 +635,53 @@ mod tests {
             quad(&response, MANIPULATE_BYTES + 0xf8),
             0xffff_f803_9e63_32cf
         );
+    }
+
+    #[test]
+    fn answers_the_legacy_get_context_request_used_by_windbg_registers() {
+        let values = Amd64ContextValues {
+            gpr: [
+                0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+                0xff, 0x101,
+            ],
+            rip: 0xffff_f803_9e63_32cf,
+            rflags: 0x202,
+            segments: [0x10, 0x18, 0x18, 0x30, 0, 0x18],
+            debug: [1, 2, 3, 4, 5, 6],
+        };
+        let context = Amd64Context::from_values(&values);
+        let mut captured = [0; MANIPULATE_BYTES];
+        captured[..4].copy_from_slice(&DBGKD_GET_CONTEXT_API.to_le_bytes());
+        let request = ManipulateRequest::decode(&captured).unwrap();
+
+        let response = request.get_context_response(&context).unwrap();
+
+        assert_eq!(response.len(), MANIPULATE_BYTES + AMD64_CONTEXT_BYTES);
+        assert_eq!(word(&response, 8), STATUS_SUCCESS);
+        assert_eq!(word(&response, MANIPULATE_BYTES + 0x30), 0x0010_0017);
+        assert_eq!(quad(&response, MANIPULATE_BYTES + 0x78), 0x11);
+        assert_eq!(
+            quad(&response, MANIPULATE_BYTES + 0xf8),
+            0xffff_f803_9e63_32cf
+        );
+    }
+
+    #[test]
+    fn encodes_known_amd64_special_registers_for_control_space() {
+        let values = Amd64ContextValues {
+            debug: [1, 2, 3, 4, 6, 7],
+            ..Amd64ContextValues::default()
+        };
+
+        let special = amd64_special_registers(&values, 0x120_1000);
+
+        assert_eq!(special.len(), AMD64_SPECIAL_REGISTERS_BYTES);
+        assert_eq!(quad(&special, 0x10), 0x120_1000);
+        assert_eq!(quad(&special, 0x20), 1);
+        assert_eq!(quad(&special, 0x38), 4);
+        assert_eq!(quad(&special, 0x40), 6);
+        assert_eq!(quad(&special, 0x48), 7);
+        assert!(special[0x50..].iter().all(|byte| *byte == 0));
     }
 
     #[test]

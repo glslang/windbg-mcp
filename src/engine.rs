@@ -379,6 +379,9 @@ pub enum SessionKind {
     /// A one-VP live VTL1 controller. Its worker may attach DbgEng to `vmwp`, but its tools answer
     /// about the Secure Kernel guest state held by the provider and live-memory transports.
     SecureKernelLive,
+    /// A server-owned Secure Kernel controller whose execution lease belongs to a local WinDbg
+    /// peer over the generated serial KD named pipe.
+    SecureKernelKd,
 }
 
 impl SessionKind {
@@ -392,6 +395,7 @@ impl SessionKind {
             Self::Launch => "launched process",
             Self::SecureKernel => "Secure Kernel capture",
             Self::SecureKernelLive => "live Secure Kernel",
+            Self::SecureKernelKd => "Secure Kernel KD",
         }
     }
 
@@ -399,6 +403,10 @@ impl SessionKind {
     /// `WaitForEvent(INFINITE)` and nothing can interrupt a wait that has not yet connected.
     pub fn waits_indefinitely(self) -> bool {
         matches!(self, Self::Kernel | Self::KernelLocal)
+    }
+
+    fn is_secure_kernel_controller(self) -> bool {
+        matches!(self, Self::SecureKernelLive | Self::SecureKernelKd)
     }
 }
 
@@ -453,6 +461,8 @@ pub enum SessionState {
     /// A live VTL1 teardown could not prove restoration and handled detach. The worker remains
     /// alive so a later explicit teardown can retry; ordinary calls are refused.
     LiveControlUnresolved(String),
+    /// Server-managed Secure Kernel KD lifecycle, reported asynchronously by its worker.
+    SecureKernelKd(crate::proto::SecureKernelKdPhase),
     /// The opener is running and has not created or claimed anything yet. Opening again is the
     /// correct recovery from a failure here.
     Opening,
@@ -483,7 +493,20 @@ pub enum SessionState {
 impl SessionState {
     /// May a call that names this session by handle run against it?
     fn accepts_handle(&self) -> bool {
-        matches!(self, Self::Opening | Self::Attaching | Self::Open)
+        matches!(
+            self,
+            Self::Opening
+                | Self::Attaching
+                | Self::Open
+                | Self::SecureKernelKd(
+                    crate::proto::SecureKernelKdPhase::Discovering
+                        | crate::proto::SecureKernelKdPhase::Arming
+                        | crate::proto::SecureKernelKdPhase::WaitingForPeer
+                        | crate::proto::SecureKernelKdPhase::Stopped
+                        | crate::proto::SecureKernelKdPhase::Running
+                        | crate::proto::SecureKernelKdPhase::Reconnecting
+                )
+        )
     }
 
     /// May a call that named no session be routed here? Broader than [`Self::accepts_handle`] by
@@ -516,7 +539,10 @@ impl SessionState {
         self.accepts_handle()
             || matches!(
                 self,
-                Self::Retired(_) | Self::KernelUnresolved(_) | Self::LiveControlUnresolved(_)
+                Self::Retired(_)
+                    | Self::KernelUnresolved(_)
+                    | Self::LiveControlUnresolved(_)
+                    | Self::SecureKernelKd(_)
             )
     }
 
@@ -552,6 +578,16 @@ impl SessionState {
         match self {
             Self::KernelUnresolved(_) => "kernel_unresolved",
             Self::LiveControlUnresolved(_) => "live_control_unresolved",
+            Self::SecureKernelKd(phase) => match phase {
+                crate::proto::SecureKernelKdPhase::Discovering => "discovering",
+                crate::proto::SecureKernelKdPhase::Arming => "arming",
+                crate::proto::SecureKernelKdPhase::WaitingForPeer => "waiting_for_kd_peer",
+                crate::proto::SecureKernelKdPhase::Stopped => "stopped",
+                crate::proto::SecureKernelKdPhase::Running => "running",
+                crate::proto::SecureKernelKdPhase::Reconnecting => "reconnecting",
+                crate::proto::SecureKernelKdPhase::Releasing => "releasing",
+                crate::proto::SecureKernelKdPhase::RecoveryRequired => "recovery_required",
+            },
             Self::Opening => "opening",
             Self::Attaching => "attaching",
             Self::Open => "open",
@@ -565,7 +601,11 @@ impl SessionState {
     pub fn detail(&self) -> Option<&str> {
         match self {
             Self::KernelUnresolved(why) | Self::LiveControlUnresolved(why) => Some(why),
-            Self::Opening | Self::Attaching | Self::Open => None,
+            Self::SecureKernelKd(crate::proto::SecureKernelKdPhase::RecoveryRequired) => Some(
+                "the KD facade faulted before it could prove release; end_session must complete \
+                 fail-closed recovery",
+            ),
+            Self::SecureKernelKd(_) | Self::Opening | Self::Attaching | Self::Open => None,
             Self::Failed(why) | Self::Retired(why) | Self::Closed(why) => Some(why),
         }
     }
@@ -606,35 +646,46 @@ fn refuse_op_on_kind(kind: SessionKind, op: &EngineOp) -> Option<String> {
             | EngineOp::SkLiveStep { .. }
             | EngineOp::SkLiveContinue { .. }
     );
+    let kd_op = matches!(op, EngineOp::OpenSecureKernelKd(_) | EngineOp::SkKdServe);
     let always = matches!(
         op,
         EngineOp::EndSession | EngineOp::Interrupt { .. } | EngineOp::PreserveKernel
     );
-    match (kind, capture_op, live_op, always) {
-        (_, _, _, true) => None,
-        (SessionKind::SecureKernel, true, _, _) => None,
-        (SessionKind::SecureKernel, false, _, _) => Some(
+    match (kind, capture_op, live_op, kd_op, always) {
+        (_, _, _, _, true) => None,
+        (SessionKind::SecureKernel, true, _, _, _) => None,
+        (SessionKind::SecureKernel, false, _, _, _) => Some(
             "The debugger tools answer about the engine's target, which in this session is \
              the Secure Kernel image on disk — not the guest's VTL1 — so they would answer about \
              the wrong thing rather than fail. Use this session's own capture tools, or end it \
              and open the target you meant."
                 .to_string(),
         ),
-        (SessionKind::SecureKernelLive, _, true, _) => None,
-        (SessionKind::SecureKernelLive, _, false, _) => Some(
+        (SessionKind::SecureKernelLive, _, true, _, _) => None,
+        (SessionKind::SecureKernelLive, _, false, _, _) => Some(
             "This live Secure Kernel session exposes only its epoch-bound VTL1 operations. The \
              debugger target behind the adapter is `vmwp`, so an ordinary debugger tool would \
              answer about the host process rather than the guest."
                 .to_string(),
         ),
-        (_, true, _, _) => Some(
+        (SessionKind::SecureKernelKd, _, _, true, _) => None,
+        (SessionKind::SecureKernelKd, _, _, false, _) => Some(
+            "WinDbg owns this Secure Kernel KD session's execution lease. Only session status, \
+             logs, interrupt and teardown are available through MCP while it is connected."
+                .to_string(),
+        ),
+        (_, true, _, _, _) => Some(
             "The Secure Kernel capture tools read a Hyper-V saved state, and this session \
              holds a debugger target instead. Open a capture in a session of its own."
                 .to_string(),
         ),
-        (_, _, true, _) => Some(
+        (_, _, true, _, _) => Some(
             "The live Secure Kernel tools require a live-control session of their own; this \
              session holds a different target."
+                .to_string(),
+        ),
+        (_, _, _, true, _) => Some(
+            "The Secure Kernel KD service operation belongs to its dedicated managed session."
                 .to_string(),
         ),
         _ => None,
@@ -645,7 +696,7 @@ fn refuse_op_on_kind(kind: SessionKind, op: &EngineOp) -> Option<String> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SecureKernelLiveTarget {
     vmwp_pid: u32,
-    target: crate::skcontrol::TargetIdentity,
+    vm_id: String,
 }
 
 #[derive(Debug, Default)]
@@ -656,20 +707,20 @@ struct ControllerReservations {
 
 impl SecureKernelLiveTarget {
     fn new(request: &crate::skdispatch::OpenRequest) -> Self {
-        let mut target = request.target.clone();
+        let mut vm_id = request.target.vm_id.clone();
         // A GUID's spelling is case-insensitive. Keep two spellings of the same VM from evading
         // the exact-target reservation while leaving the provider's original request untouched.
-        target.vm_id.make_ascii_lowercase();
+        vm_id.make_ascii_lowercase();
         Self {
             vmwp_pid: request.vmwp_pid,
-            target,
+            vm_id,
         }
     }
 
     fn conflicts(&self, other: &Self) -> bool {
         // Pausing is VM-wide and the debugger attachment is process-wide. A different VP, CR3 or
         // partition coordinate does not create an independent controller boundary for either.
-        self.vmwp_pid == other.vmwp_pid || self.target.vm_id == other.target.vm_id
+        self.vmwp_pid == other.vmwp_pid || self.vm_id == other.vm_id
     }
 }
 
@@ -1038,7 +1089,7 @@ impl Session {
         message
     }
 
-    fn preserve_live_control(&self, why: &str) -> String {
+    pub(crate) fn preserve_live_control(&self, why: &str) -> String {
         let message = format!(
             "Live Secure Kernel session `{}` requires recovery: {why}. Worker PID {} will not be \
              terminated automatically because that could discard a fail-closed `vmwp` attachment \
@@ -1141,7 +1192,7 @@ impl Session {
                 || (self.kind == SessionKind::Kernel
                     && !self.released.load(Ordering::SeqCst)
                     && matches!(proposed, Some(SessionState::KernelUnresolved(_))))
-                || (self.kind == SessionKind::SecureKernelLive
+                || (self.kind.is_secure_kernel_controller()
                     && !self.released.load(Ordering::SeqCst)
                     && matches!(proposed, Some(SessionState::LiveControlUnresolved(_))))
                 || matches!(
@@ -1795,6 +1846,9 @@ pub struct Sessions {
     inner: Arc<Mutex<Registry>>,
     call_timeout: Duration,
     rec: crate::record::Recorder,
+    /// Fixed when the registry is created, before either stdio or HTTP serves a request. Keeping
+    /// this beside the shared registry gives every per-client server instance the same authority.
+    secure_kernel_policy: Arc<Result<Option<crate::skpolicy::Policy>, String>>,
 }
 
 impl Sessions {
@@ -1808,6 +1862,9 @@ impl Sessions {
             inner: Arc::new(Mutex::new(Registry::default())),
             call_timeout,
             rec: crate::record::Recorder::disabled(),
+            secure_kernel_policy: Arc::new(
+                crate::skpolicy::Policy::load_from_env().map_err(|error| format!("{error:#}")),
+            ),
         }
     }
 
@@ -1830,6 +1887,29 @@ impl Sessions {
 
     pub fn recorder(&self) -> crate::record::Recorder {
         self.rec.clone()
+    }
+
+    /// Applies the operator's immutable startup authority to a live Secure Kernel opener.
+    pub(crate) fn authorize_secure_kernel_live(
+        &self,
+        vm_id: &str,
+        profile: &std::path::Path,
+        control_transport: &str,
+        live_transport: &str,
+    ) -> Result<(), String> {
+        match self.secure_kernel_policy.as_ref() {
+            Ok(Some(policy)) => policy
+                .authorize(vm_id, profile, control_transport, live_transport)
+                .map_err(|error| format!("{error:#}")),
+            Ok(None) => Err(format!(
+                "live Secure Kernel control is disabled; set {} to an operator-owned policy file \
+                 before starting the server",
+                crate::skpolicy::POLICY_ENV
+            )),
+            Err(error) => Err(format!(
+                "live Secure Kernel startup policy is invalid: {error}"
+            )),
+        }
     }
 
     /// Sets or clears the calling client's starting symbol path for workers opened later.
@@ -2285,6 +2365,9 @@ impl Sessions {
         };
         let secure_kernel_live_target = match &op {
             EngineOp::OpenSecureKernelLive(request) => Some(SecureKernelLiveTarget::new(request)),
+            EngineOp::OpenSecureKernelKd(request) => {
+                Some(SecureKernelLiveTarget::new(&request.open))
+            }
             _ => None,
         };
         let reservations = ControllerReservations {
@@ -3020,7 +3103,7 @@ impl Sessions {
                 "the worker did not confirm release; automatic termination was refused",
             ));
         }
-        if session.kind == SessionKind::SecureKernelLive
+        if session.kind.is_secure_kernel_controller()
             && out.is_err()
             && !session.released.load(Ordering::SeqCst)
         {
@@ -3036,7 +3119,7 @@ impl Sessions {
             session.released.store(true, Ordering::SeqCst);
             if matches!(
                 session.kind,
-                SessionKind::Kernel | SessionKind::SecureKernelLive
+                SessionKind::Kernel | SessionKind::SecureKernelLive | SessionKind::SecureKernelKd
             ) {
                 session.set_state(SessionState::Closed(
                     "worker confirmed target release".into(),
@@ -4580,11 +4663,13 @@ fn pump(
                 SessionKind::Kernel => SessionState::KernelUnresolved(
                     "kernel release is in progress; completion is unconfirmed".into(),
                 ),
-                SessionKind::SecureKernelLive => SessionState::LiveControlUnresolved(
-                    "live Secure Kernel release is in progress; register restoration, handler \
+                SessionKind::SecureKernelLive | SessionKind::SecureKernelKd => {
+                    SessionState::LiveControlUnresolved(
+                        "live Secure Kernel release is in progress; register restoration, handler \
                      cleanup and handled detach are unconfirmed"
-                        .into(),
-                ),
+                            .into(),
+                    )
+                }
                 _ => SessionState::Closed(why.clone()),
             });
         }
@@ -4711,6 +4796,20 @@ async fn reader(
                 promote_opened(&session);
                 tell(&waiters, id, crate::progress::Step::Opened);
             }
+            WorkerMessage::SecureKernelKdPhase { phase } => {
+                if session.kind == SessionKind::SecureKernelKd {
+                    session.update_state(|state| {
+                        state
+                            .is_live()
+                            .then_some(SessionState::SecureKernelKd(phase))
+                    });
+                } else {
+                    tracing::warn!(
+                        "session {}: a non-KD worker reported Secure Kernel KD phase {phase:?}",
+                        session.id
+                    );
+                }
+            }
             // Already recorded by the thread that read it — see [`Session::unwinding`] — so this
             // arm only reports it. Nothing here is on the teardown's critical path, which is the
             // whole reason the store is not here.
@@ -4832,7 +4931,9 @@ async fn reader(
                 let confirmed_guarded_release = ending
                     && matches!(
                         session.kind,
-                        SessionKind::Kernel | SessionKind::SecureKernelLive
+                        SessionKind::Kernel
+                            | SessionKind::SecureKernelLive
+                            | SessionKind::SecureKernelKd
                     )
                     && result.is_ok();
                 if confirmed_guarded_release {
@@ -4889,7 +4990,7 @@ async fn reader(
             session.preserve_kernel(
                 "the worker exited without confirming release; endpoint reservation retained",
             );
-        } else if session.kind == SessionKind::SecureKernelLive
+        } else if session.kind.is_secure_kernel_controller()
             && !session.released.load(Ordering::SeqCst)
         {
             session.update_state(|_| {
@@ -5045,6 +5146,26 @@ mod tests {
             assert!(
                 refuse_op_on_kind(SessionKind::SecureKernelLive, &op).is_none(),
                 "{op:?} must reach a live-control session"
+            );
+        }
+    }
+
+    #[test]
+    fn a_secure_kernel_kd_session_gives_execution_exclusively_to_windbg() {
+        assert!(refuse_op_on_kind(SessionKind::SecureKernelKd, &EngineOp::SkKdServe).is_none());
+        for op in [EngineOp::CurrentLocation, EngineOp::SkLiveRegisters] {
+            let refused = refuse_op_on_kind(SessionKind::SecureKernelKd, &op)
+                .unwrap_or_else(|| panic!("a KD session accepted {op:?}"));
+            assert!(refused.contains("WinDbg owns"), "{refused}");
+        }
+        for op in [
+            EngineOp::EndSession,
+            EngineOp::Interrupt { job: None },
+            EngineOp::PreserveKernel,
+        ] {
+            assert!(
+                refuse_op_on_kind(SessionKind::SecureKernelKd, &op).is_none(),
+                "{op:?} must reach a managed KD session"
             );
         }
     }
@@ -7281,20 +7402,14 @@ mod tests {
         state: SessionState,
         vmwp_pid: u32,
         vm_id: &str,
-        vp: u32,
-        expected_cr3: u64,
+        _vp: u32,
+        _expected_cr3: u64,
     ) -> Arc<Session> {
         let mut session = Arc::into_inner(dormant(id, state)).unwrap();
         session.kind = SessionKind::SecureKernelLive;
         session.secure_kernel_live_target = Some(SecureKernelLiveTarget {
             vmwp_pid,
-            target: crate::skcontrol::TargetIdentity {
-                vm_id: vm_id.into(),
-                partition_id: crate::skcontrol::HexU64(1),
-                vp,
-                vtl: 1,
-                expected_cr3: crate::skcontrol::HexU64(expected_cr3),
-            },
+            vm_id: vm_id.to_ascii_lowercase(),
         });
         Arc::new(session)
     }

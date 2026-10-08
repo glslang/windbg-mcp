@@ -78,6 +78,54 @@ pub(crate) struct TargetIdentity {
     pub(crate) expected_cr3: HexU64,
 }
 
+/// Coordinates proved before a register provider starts. The provider's hello supplies the CR3;
+/// an operator value, when present, is only an assertion over that provider-reported value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TargetSelector {
+    pub(crate) vm_id: String,
+    pub(crate) partition_id: HexU64,
+    pub(crate) vp: u32,
+    pub(crate) expected_cr3: Option<HexU64>,
+}
+
+impl TargetSelector {
+    fn validate(&self) -> Result<()> {
+        let probe = TargetIdentity {
+            vm_id: self.vm_id.clone(),
+            partition_id: self.partition_id,
+            vp: self.vp,
+            vtl: 1,
+            expected_cr3: self.expected_cr3.unwrap_or(HexU64(0x1000)),
+        };
+        probe.validate()
+    }
+
+    fn require(&self, actual: &TargetIdentity) -> Result<()> {
+        self.validate()?;
+        actual.validate()?;
+        if !actual.vm_id.eq_ignore_ascii_case(&self.vm_id)
+            || actual.partition_id != self.partition_id
+            || actual.vp != self.vp
+            || actual.vtl != 1
+        {
+            bail!(
+                "provider hello does not name the target requested by the operator or discovered \
+                 by the worker"
+            );
+        }
+        if let Some(expected_cr3) = self.expected_cr3
+            && actual.expected_cr3 != expected_cr3
+        {
+            bail!(
+                "provider hello CR3 {:#x} does not match asserted CR3 {:#x}",
+                actual.expected_cr3.0,
+                expected_cr3.0
+            );
+        }
+        Ok(())
+    }
+}
+
 impl TargetIdentity {
     pub(crate) fn validate(&self) -> Result<()> {
         let bytes = self.vm_id.as_bytes();
@@ -440,10 +488,29 @@ pub(crate) struct ControlSession<R: BufRead, W: Write> {
 }
 
 impl<R: BufRead, W: Write> ControlSession<R, W> {
+    #[cfg(test)]
     pub(crate) fn open(
-        mut reader: R,
+        reader: R,
         writer: W,
         expected_target: TargetIdentity,
+    ) -> Result<(Self, Vec<String>)> {
+        expected_target.validate()?;
+        Self::open_selected(
+            reader,
+            writer,
+            TargetSelector {
+                vm_id: expected_target.vm_id,
+                partition_id: expected_target.partition_id,
+                vp: expected_target.vp,
+                expected_cr3: Some(expected_target.expected_cr3),
+            },
+        )
+    }
+
+    fn open_selected(
+        mut reader: R,
+        writer: W,
+        expected_target: TargetSelector,
     ) -> Result<(Self, Vec<String>)> {
         expected_target.validate()?;
         let mut skipped = Vec::new();
@@ -463,10 +530,7 @@ impl<R: BufRead, W: Write> ControlSession<R, W> {
                         hello.protocol
                     );
                 }
-                hello.target.validate()?;
-                if hello.target != expected_target {
-                    bail!("provider hello does not name the target requested by the operator");
-                }
+                expected_target.require(&hello.target)?;
                 StopEpoch::new(hello.epoch.0.clone())?;
                 let issued_epochs = HashSet::from([hello.epoch.clone()]);
                 return Ok((
@@ -872,6 +936,21 @@ impl ControlProcess {
         transport: &str,
         expected_target: TargetIdentity,
     ) -> Result<(Self, Vec<String>)> {
+        Self::spawn_selected(
+            transport,
+            TargetSelector {
+                vm_id: expected_target.vm_id,
+                partition_id: expected_target.partition_id,
+                vp: expected_target.vp,
+                expected_cr3: Some(expected_target.expected_cr3),
+            },
+        )
+    }
+
+    pub(crate) fn spawn_selected(
+        transport: &str,
+        expected_target: TargetSelector,
+    ) -> Result<(Self, Vec<String>)> {
         let mut parts = crate::livesrc::split_command(transport);
         let program = parts
             .first()
@@ -900,8 +979,11 @@ impl ControlProcess {
             .as_mut()
             .and_then(|child| child.stdout.take())
             .context("the provider has no stdout")?;
-        let (session, skipped) =
-            ControlSession::open(TimedChildReader::spawn(stdout)?, stdin, expected_target)?;
+        let (session, skipped) = ControlSession::open_selected(
+            TimedChildReader::spawn(stdout)?,
+            stdin,
+            expected_target,
+        )?;
         Ok((
             Self {
                 session: Some(session),
@@ -1187,6 +1269,22 @@ mod tests {
             vtl: 1,
             expected_cr3: HexU64(0x120_1000),
         }
+    }
+
+    #[test]
+    fn selector_accepts_provider_cr3_when_operator_supplies_no_assertion() {
+        let actual = target();
+        let selector = TargetSelector {
+            vm_id: actual.vm_id.clone(),
+            partition_id: actual.partition_id,
+            vp: actual.vp,
+            expected_cr3: None,
+        };
+        selector.require(&actual).unwrap();
+
+        let mut other = actual.clone();
+        other.expected_cr3 = HexU64(0x220_1000);
+        selector.require(&other).unwrap();
     }
 
     fn event() -> HeldEvent {

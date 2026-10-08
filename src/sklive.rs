@@ -11,6 +11,7 @@
 //! bounded recovery path as an unexpected debugger stop.
 
 use anyhow::{Context, Result, anyhow, bail};
+use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind, Register};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -230,6 +231,43 @@ pub(crate) struct DispatcherLayout {
     pub(crate) register_stack_context: u32,
 }
 
+/// Exact-build site used to learn this boot's dispatcher identity before handler registration.
+/// It is optional so existing profiles remain valid until their discovery bytes are measured.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DispatcherDiscoveryProfile {
+    pub(crate) entry: DispatcherSite,
+    pub(crate) vid_image: std::path::PathBuf,
+    pub(crate) vid_sha256: String,
+    pub(crate) vid_size_of_image: u32,
+}
+
+/// Build-relative Secure Kernel instruction used to create the KD facade's first held stop.
+/// The live-memory provider supplies the boot-specific image base; the exact bytes remain in the
+/// build profile so an MCP caller never has to supply a coordinate derived by another debugger.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SecureKernelInitialProfile {
+    pub(crate) rva: HexU64,
+    pub(crate) original: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SecureKernelDebuggerDataProfile {
+    pub(crate) list_head_rva: HexU64,
+    pub(crate) block_rva: HexU64,
+    pub(crate) loaded_module_list_rva: HexU64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SecureKernelKdProfile {
+    pub(crate) build: u16,
+    pub(crate) initial: SecureKernelInitialProfile,
+    pub(crate) debugger_data: SecureKernelDebuggerDataProfile,
+}
+
 /// Exact-build input for the DbgEng dispatcher adapter. It contains only numbers and byte guards;
 /// no field is debugger command text.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -246,6 +284,10 @@ pub(crate) struct DispatcherProfile {
     pub(crate) unregister_handler_rva: HexU64,
     pub(crate) callback_stub_rva: HexU64,
     pub(crate) callback_resume_rva: HexU64,
+    #[serde(default)]
+    pub(crate) discovery: Option<DispatcherDiscoveryProfile>,
+    #[serde(default)]
+    pub(crate) secure_kernel_kd: Option<SecureKernelKdProfile>,
     pub(crate) event_held: DispatcherSite,
     pub(crate) callback_entry: DispatcherSite,
     pub(crate) handle_return: DispatcherSite,
@@ -388,14 +430,68 @@ impl DispatcherProfile {
         ] {
             self.validate_rva(name, rva, 1)?;
         }
-        let sites = [
+        let mut sites = vec![
             ("event_held", &self.event_held),
             ("callback_entry", &self.callback_entry),
             ("handle_return", &self.handle_return),
             ("native_return", &self.native_return),
             ("deferred_cleanup", &self.deferred_cleanup),
         ];
-        for (name, site) in sites {
+        if let Some(discovery) = &self.discovery {
+            sites.push(("discovery.entry", &discovery.entry));
+            if !discovery.vid_image.is_absolute()
+                || !discovery
+                    .vid_image
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.eq_ignore_ascii_case("vid.dll"))
+            {
+                bail!("discovery.vid_image must be an absolute path ending in vid.dll");
+            }
+            if discovery.vid_sha256.len() != 64
+                || !discovery
+                    .vid_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+            {
+                bail!("discovery.vid_sha256 must contain exactly 64 hexadecimal digits");
+            }
+            if discovery.vid_size_of_image == 0 {
+                bail!("discovery.vid_size_of_image must be nonzero");
+            }
+        }
+        if let Some(kd) = &self.secure_kernel_kd {
+            if kd.build == 0 {
+                bail!("secure_kernel_kd.build must be nonzero");
+            }
+            let initial = &kd.initial;
+            if initial.original.is_empty() || initial.original.len() > MAX_INSTRUCTION_BYTES {
+                bail!(
+                    "secure_kernel_kd.initial.original must contain 1..={MAX_INSTRUCTION_BYTES} bytes"
+                );
+            }
+            let end = initial
+                .rva
+                .0
+                .checked_add(initial.original.len() as u64)
+                .context("secure_kernel_kd.initial range overflowed")?;
+            if initial.rva.0 == 0 || end > u64::from(u32::MAX) + 1 {
+                bail!("secure_kernel_kd.initial must be a nonzero 32-bit image-relative range");
+            }
+            for (name, rva) in [
+                ("list_head_rva", kd.debugger_data.list_head_rva.0),
+                ("block_rva", kd.debugger_data.block_rva.0),
+                (
+                    "loaded_module_list_rva",
+                    kd.debugger_data.loaded_module_list_rva.0,
+                ),
+            ] {
+                if rva == 0 || rva > u64::from(u32::MAX) {
+                    bail!("secure_kernel_kd.debugger_data.{name} must be a nonzero 32-bit RVA");
+                }
+            }
+        }
+        for (name, site) in &sites {
             if site.original.is_empty() || site.original.len() > MAX_INSTRUCTION_BYTES {
                 bail!("{name}.original must contain 1..={MAX_INSTRUCTION_BYTES} bytes");
             }
@@ -626,6 +722,7 @@ impl StepGuard {
                 instruction.address.0
             );
         }
+        validate_step_instruction_class(&instruction)?;
 
         let expected_rips = if self.expected_rips.is_empty() {
             vec![HexU64(instruction.successor())]
@@ -634,6 +731,44 @@ impl StepGuard {
         };
         Ok((instruction, expected_rips))
     }
+}
+
+/// Refuses x64 instructions for which TF does not guarantee a trap at the next architectural
+/// instruction. The MCP and KD front ends share this gate so choosing the other protocol cannot
+/// bypass the retained-stop invariant.
+pub(crate) fn validate_step_instruction_class(instruction: &InstructionGuard) -> Result<()> {
+    let mut decoder = Decoder::with_ip(
+        64,
+        &instruction.bytes,
+        instruction.address.0,
+        DecoderOptions::NONE,
+    );
+    let decoded = decoder.decode();
+    if decoded.is_invalid() || decoded.len() != instruction.bytes.len() {
+        bail!("the guarded VTL1 bytes do not decode as exactly one AMD64 instruction");
+    }
+    let writes_ss = decoded.op0_kind() == OpKind::Register
+        && decoded.op0_register() == Register::SS
+        && matches!(decoded.mnemonic(), Mnemonic::Mov | Mnemonic::Pop);
+    let repeats = decoded.is_string_instruction()
+        && (decoded.has_rep_prefix() || decoded.has_repe_prefix() || decoded.has_repne_prefix());
+    if repeats {
+        bail!(
+            "single-step is refused for repeated {:?} at {:#x}; the trap can stop before the \
+             guarded destination",
+            decoded.mnemonic(),
+            instruction.address.0
+        );
+    }
+    if writes_ss || decoded.mnemonic() == Mnemonic::Lss {
+        bail!(
+            "single-step is refused because {:?} can defer the trap-flag exception past the \
+             guarded destination at {:#x}",
+            decoded.mnemonic(),
+            instruction.address.0
+        );
+    }
+    Ok(())
 }
 
 /// Complete register evidence retained for one stop. Status and high halves remain visible instead
@@ -886,6 +1021,10 @@ impl<P: ControlProvider> LiveControl<P> {
             State::Stopped(stop) => Some(stop),
             _ => None,
         }
+    }
+
+    pub(crate) fn selected_target(&self) -> &TargetIdentity {
+        &self.providers[0].target
     }
 
     /// Read additional architectural state while the exact published event remains held.
@@ -3651,6 +3790,83 @@ mod tests {
         );
     }
 
+    #[test]
+    fn every_step_front_end_refuses_instructions_that_can_defer_the_trap() {
+        let guard = |bytes: &[u8]| InstructionGuard {
+            address: HexU64(TARGET_RIP),
+            bytes: bytes.to_vec(),
+        };
+        assert!(validate_step_instruction_class(&guard(&[0x90])).is_ok());
+        for bytes in [
+            &[0x8e, 0xd0][..],
+            &[0x48, 0x0f, 0xb2, 0x20][..],
+            &[0xf3, 0xa4][..],
+        ] {
+            assert!(validate_step_instruction_class(&guard(bytes)).is_err());
+        }
+    }
+
+    #[test]
+    fn dispatcher_discovery_site_is_optional_but_uses_the_same_byte_guards() {
+        let profile = dispatcher_profile();
+        let mut legacy = serde_json::to_value(&profile).unwrap();
+        legacy.as_object_mut().unwrap().remove("discovery");
+        let decoded: DispatcherProfile = serde_json::from_value(legacy).unwrap();
+        assert!(decoded.discovery.is_none());
+        decoded.validate().unwrap();
+
+        let mut discovered = profile.clone();
+        discovered.discovery = Some(DispatcherDiscoveryProfile {
+            entry: site(0x25000),
+            vid_image: r"C:\Windows\System32\vid.dll".into(),
+            vid_sha256: "B".repeat(64),
+            vid_size_of_image: 0x40000,
+        });
+        discovered.validate().unwrap();
+
+        discovered.discovery.as_mut().unwrap().entry.rva = discovered.event_held.rva;
+        assert!(
+            discovered
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("overlap")
+        );
+    }
+
+    #[test]
+    fn secure_kernel_initial_site_is_optional_and_image_relative() {
+        let profile = dispatcher_profile();
+        let mut legacy = serde_json::to_value(&profile).unwrap();
+        legacy.as_object_mut().unwrap().remove("secure_kernel_kd");
+        let decoded: DispatcherProfile = serde_json::from_value(legacy).unwrap();
+        assert!(decoded.secure_kernel_kd.is_none());
+
+        let mut profiled = profile;
+        profiled.secure_kernel_kd = Some(SecureKernelKdProfile {
+            build: 26_100,
+            initial: SecureKernelInitialProfile {
+                rva: HexU64(0xb12b),
+                original: vec![0x0f, 0x1f, 0x44, 0, 0],
+            },
+            debugger_data: SecureKernelDebuggerDataProfile {
+                list_head_rva: HexU64(0x1335c0),
+                block_rva: HexU64(0x1335e0),
+                loaded_module_list_rva: HexU64(0x127770),
+            },
+        });
+        profiled.validate().unwrap();
+
+        profiled.secure_kernel_kd.as_mut().unwrap().initial.rva = HexU64(0);
+        assert!(
+            profiled
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("nonzero 32-bit")
+        );
+    }
+
     fn target() -> TargetIdentity {
         TargetIdentity {
             vm_id: "11111111-2222-3333-4444-555555555555".into(),
@@ -3674,6 +3890,8 @@ mod tests {
             unregister_handler_rva: HexU64(0x11000),
             callback_stub_rva: HexU64(0x12000),
             callback_resume_rva: HexU64(0x13000),
+            discovery: None,
+            secure_kernel_kd: None,
             event_held: site(0x20000),
             callback_entry: site(0x21000),
             handle_return: site(0x22000),

@@ -102,6 +102,12 @@ pub enum EngineOp {
     /// Bind the live Secure Kernel controller to a selected VP set. The opener validates provider
     /// identities and the build profile but does not alter guest execution; arming is separate.
     OpenSecureKernelLive(Box<crate::skdispatch::OpenRequest>),
+    /// Open a server-managed Secure Kernel KD facade. The worker owns the live controller and
+    /// named-pipe lifecycle; a background `SkKdServe` job gives WinDbg the execution lease.
+    OpenSecureKernelKd(Box<crate::kdtarget::ManagedRequest>),
+    /// Serve the generated KD pipe until the peer disconnects, a bound expires, or teardown asks
+    /// the worker to release it. Submitted by the supervisor after a successful opener.
+    SkKdServe,
     /// Save the VTL1 baseline and arm one to four guarded execution breakpoints.
     SkLiveArm {
         breakpoints: Vec<crate::sklive::BreakpointGuard>,
@@ -728,6 +734,7 @@ impl EngineOp {
                 | Self::Launch { .. }
                 | Self::OpenSecureKernel(_)
                 | Self::OpenSecureKernelLive(_)
+                | Self::OpenSecureKernelKd(_)
         )
     }
 
@@ -760,7 +767,9 @@ impl EngineOp {
             // A guest's kernel: the process ids in it are the captured machine's and were never
             // this host's, which is exactly what this variant means and what keeps
             // `may_ask_the_os` from asking Windows about one.
-            Self::OpenSecureKernel(_) | Self::OpenSecureKernelLive(_) => Some(TargetOrigin::Kernel),
+            Self::OpenSecureKernel(_)
+            | Self::OpenSecureKernelLive(_)
+            | Self::OpenSecureKernelKd(_) => Some(TargetOrigin::Kernel),
             _ => None,
         }
     }
@@ -1278,6 +1287,19 @@ pub struct WorkerRequest {
     pub handle_bound: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SecureKernelKdPhase {
+    Discovering,
+    Arming,
+    WaitingForPeer,
+    Stopped,
+    Running,
+    Reconnecting,
+    Releasing,
+    RecoveryRequired,
+}
+
 /// A message up the worker's stdout.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WorkerMessage {
@@ -1312,6 +1334,9 @@ pub enum WorkerMessage {
     /// that report. This is also what moves a kernel attach out of the state it can park in
     /// forever.
     Opened { id: u64 },
+    /// Current lifecycle state of the server-managed Secure Kernel KD facade. It belongs to the
+    /// session rather than one request, so status remains observable while the serving job runs.
+    SecureKernelKdPhase { phase: SecureKernelKdPhase },
     /// An [`EngineOp::Resume`]'s target is moving: `Execute` returned and the engine reports it
     /// running. The pump that will answer that op is about to start.
     ///

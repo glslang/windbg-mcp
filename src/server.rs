@@ -1143,20 +1143,28 @@ pub struct SkSymbolArgs {
 pub struct SkLiveOpenArgs {
     /// Exact build profile JSON, or a bounded directory from which the current image is selected.
     pub profile: String,
-    /// Register-control provider command. An optional `{vp}` names the selected VP.
+    /// Register-control provider command. `{vp}` and `{partition_id}` are replaced with values
+    /// selected and discovered by the worker. `{cr3}` requires the optional CR3 assertion below;
+    /// otherwise the provider must discover CR3 and report it in its hello.
     pub control_transport: String,
-    /// Command line for the live VTL1 physical-memory source child.
+    /// Command line for the live VTL1 physical-memory source child. `{vp}`, `{partition_id}` and
+    /// `{cr3}` are replaced only after the provider identity has been validated.
     pub live_transport: String,
-    /// Exact host `vmwp.exe` process id for this VM.
-    pub vmwp_pid: u32,
-    /// Per-boot VID partition pointer in that `vmwp`, decimal or `0x` hexadecimal.
-    pub dispatcher_vnd: String,
+    /// Optional assertion for the current host `vmwp.exe` process id. The server resolves the PID
+    /// from `vm_id`; a supplied value must match.
+    #[serde(default)]
+    pub vmwp_pid: Option<u32>,
+    /// Optional assertion for the per-boot VID partition pointer discovered inside `vmwp`.
+    #[serde(default)]
+    pub dispatcher_vnd: Option<String>,
     /// Canonical GUID of the exact disposable VM.
     pub vm_id: String,
-    /// Hyper-V partition id, decimal or `0x` hexadecimal.
-    pub partition_id: String,
-    /// VTL1 page-table root read for this boot, decimal or `0x` hexadecimal.
-    pub expected_cr3: String,
+    /// Optional assertion for the Hyper-V partition id discovered by the worker.
+    #[serde(default)]
+    pub partition_id: Option<String>,
+    /// Optional assertion for the VTL1 page-table root reported by the register provider.
+    #[serde(default)]
+    pub expected_cr3: Option<String>,
     /// Allow a natural-flow stop to enter through a different, nonzero page-aligned CR3. This is
     /// required for a VTL1 user-to-Secure-Kernel exception or syscall transition. The initial
     /// paused baseline and live-memory source must still match `expected_cr3` exactly.
@@ -1165,6 +1173,47 @@ pub struct SkLiveOpenArgs {
     /// Virtual processor to control. Defaults to VP 0. The native event must report this VP.
     #[serde(default)]
     pub vp: Option<u32>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SkKdOpenArgs {
+    /// Exact build profile containing the guarded vmwp and vid discovery sites.
+    pub profile: String,
+    /// Register provider command. The worker expands `{vp}` and `{partition_id}` after discovery.
+    pub control_transport: String,
+    /// Live VTL1 memory provider command. The worker expands `{vp}`, `{partition_id}` and `{cr3}`
+    /// from the validated provider identity.
+    pub live_transport: String,
+    /// Canonical GUID of the exact disposable VM.
+    pub vm_id: String,
+    /// Optional assertion for the current vmwp PID resolved from `vm_id`.
+    #[serde(default)]
+    pub vmwp_pid: Option<u32>,
+    /// Optional assertion for the worker-discovered dispatcher VND.
+    #[serde(default)]
+    pub dispatcher_vnd: Option<String>,
+    /// Optional assertion for the worker-discovered partition ID.
+    #[serde(default)]
+    pub partition_id: Option<String>,
+    /// Optional assertion for the provider-reported VTL1 CR3.
+    #[serde(default)]
+    pub expected_cr3: Option<String>,
+    /// Virtual processor to expose. Defaults to VP 0.
+    #[serde(default)]
+    pub vp: Option<u32>,
+    /// Initial stop mode. Redirect is deterministic; natural waits for guest execution.
+    #[serde(default)]
+    pub arm_mode: crate::sklive::ArmMode,
+    /// WinDbg connection bound. Defaults to 30 seconds.
+    #[serde(default)]
+    pub connect_timeout_ms: Option<u64>,
+    /// Maximum KD silence while serving. Defaults to 300 seconds.
+    #[serde(default)]
+    pub idle_timeout_ms: Option<u64>,
+    /// Absolute bound for any WinDbg-held Secure Kernel stop. Defaults to 600 seconds.
+    #[serde(default)]
+    pub max_pause_ms: Option<u64>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -2183,6 +2232,23 @@ fn describe_session(s: &SessionSnapshot) -> String {
         SessionState::LiveControlUnresolved(why) => out.push_str(&format!(
             "  UNRESOLVED LIVE VTL1 CONTROL for {waited}: {why}\n"
         )),
+        SessionState::SecureKernelKd(phase) => out.push_str(&format!(
+            "  Secure Kernel KD has been {} for {waited}.\n",
+            match phase {
+                crate::proto::SecureKernelKdPhase::Discovering => "discovering its target",
+                crate::proto::SecureKernelKdPhase::Arming => "arming the initial stop",
+                crate::proto::SecureKernelKdPhase::WaitingForPeer => "waiting for WinDbg",
+                crate::proto::SecureKernelKdPhase::Stopped => "holding a WinDbg-visible stop",
+                crate::proto::SecureKernelKdPhase::Running => "running under WinDbg control",
+                crate::proto::SecureKernelKdPhase::Reconnecting => {
+                    "holding the stop for WinDbg reconnection"
+                }
+                crate::proto::SecureKernelKdPhase::Releasing => "releasing its controller",
+                crate::proto::SecureKernelKdPhase::RecoveryRequired => {
+                    "waiting for fail-closed recovery"
+                }
+            }
+        )),
         SessionState::Opening => {
             out.push_str(&format!(
                 "  opening for {waited}. Nothing has been created or claimed yet, so a failure \
@@ -2606,7 +2672,7 @@ impl WindbgServer {
         what: String,
         op: EngineOp,
     ) -> Result<CallToolResult, ErrorData> {
-        self.opened_as(kind, what, None, op, OpenShape::Debuggee)
+        self.opened_as(kind, what, None, op, OpenShape::Debuggee, None)
             .await
     }
 
@@ -2627,6 +2693,7 @@ impl WindbgServer {
             None,
             op,
             OpenShape::Capture,
+            None,
         )
         .await
     }
@@ -2646,6 +2713,7 @@ impl WindbgServer {
         profile: Option<structured::ProfileFacts>,
         op: EngineOp,
         shape: OpenShape,
+        after_open: Option<EngineOp>,
     ) -> Result<CallToolResult, ErrorData> {
         // Kept for the typed answer, which describes what was asked for rather than re-deriving
         // it from the report the debugger printed.
@@ -2670,6 +2738,26 @@ impl WindbgServer {
                 summary,
                 sk,
             }) => {
+                if let Some(op) = after_open
+                    && let Some(session) = self.sessions.held(&id)
+                {
+                    let sessions = self.sessions.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = sessions.call(&session, Call::new(op).named(true)).await
+                        {
+                            tracing::error!(
+                                "session {}: background target service failed: {error}",
+                                session.id
+                            );
+                            if session.kind == SessionKind::SecureKernelKd {
+                                session.preserve_live_control(&format!(
+                                    "the managed KD service failed before it released its live \
+                                     controller: {error}"
+                                ));
+                            }
+                        }
+                    });
+                }
                 let mut profile = profile;
                 // **Withdrawn from the session, and reported from there** — one home rather than
                 // three. It was appended to the report here as well, and put in
@@ -3122,6 +3210,7 @@ impl WindbgServer {
                 experimental_break_on_connect: args.experimental_break_on_connect,
             },
             OpenShape::Debuggee,
+            None,
         )
         .await
     }
@@ -3995,10 +4084,10 @@ impl WindbgServer {
             .await;
         engine_result_for(args.session_id.as_deref(), out)
     }
-    /// Open a live Secure Kernel controller for one selected VP. Opening validates argument shape
-    /// and the register provider's declared identity and capabilities, but does not pause or inspect
-    /// the VM. The first arm pauses it, verifies the VM, `vmwp`, CR3, build and instruction identity,
-    /// and only then mutates state.
+    /// Open a live Secure Kernel controller for one selected VP. Opening applies startup policy,
+    /// validates the request and exact-build profile, and reserves the VM without pausing it or
+    /// starting a provider. The first arm discovers the boot identity, starts and cross-checks both
+    /// providers, verifies the VM, `vmwp`, CR3, build and instruction, and only then mutates state.
     #[rmcp::tool(
         annotations(
             title = "Open live Secure Kernel control",
@@ -4013,32 +4102,54 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SkLiveOpenArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Err(why) = self.sessions.authorize_secure_kernel_live(
+            &args.vm_id,
+            std::path::Path::new(&args.profile),
+            &args.control_transport,
+            &args.live_transport,
+        ) {
+            return open_failure(ErrorCategory::InvalidArgument, why, None, TargetCreated::No);
+        }
         let parse =
             |name: &str, value: &str| parse_u64(value).map_err(|why| format!("{name}: {why}"));
-        let dispatcher_vnd = match parse("dispatcher_vnd", &args.dispatcher_vnd) {
+        let dispatcher_vnd = match args
+            .dispatcher_vnd
+            .as_deref()
+            .map(|value| parse("dispatcher_vnd", value))
+            .transpose()
+        {
             Ok(value) => value,
             Err(why) => {
                 return open_failure(ErrorCategory::InvalidArgument, why, None, TargetCreated::No);
             }
         };
-        let partition_id = match parse("partition_id", &args.partition_id) {
+        let partition_id = match args
+            .partition_id
+            .as_deref()
+            .map(|value| parse("partition_id", value))
+            .transpose()
+        {
             Ok(value) => value,
             Err(why) => {
                 return open_failure(ErrorCategory::InvalidArgument, why, None, TargetCreated::No);
             }
         };
-        let expected_cr3 = match parse("expected_cr3", &args.expected_cr3) {
+        let expected_cr3 = match args
+            .expected_cr3
+            .as_deref()
+            .map(|value| parse("expected_cr3", value))
+            .transpose()
+        {
             Ok(value) => value,
             Err(why) => {
                 return open_failure(ErrorCategory::InvalidArgument, why, None, TargetCreated::No);
             }
         };
-        let target = crate::skcontrol::TargetIdentity {
+        let target = crate::skdispatch::TargetRequest {
             vm_id: args.vm_id,
-            partition_id: crate::skcontrol::HexU64(partition_id),
+            partition_id: partition_id.map(crate::skcontrol::HexU64),
             vp: args.vp.unwrap_or(0),
-            vtl: 1,
-            expected_cr3: crate::skcontrol::HexU64(expected_cr3),
+            expected_cr3: expected_cr3.map(crate::skcontrol::HexU64),
         };
         if let Err(error) = target.validate() {
             return open_failure(
@@ -4048,23 +4159,46 @@ impl WindbgServer {
                 TargetCreated::No,
             );
         }
-        if args.vmwp_pid == 0
-            || dispatcher_vnd == 0
+        if dispatcher_vnd == Some(0)
             || args.profile.trim().is_empty()
             || args.control_transport.trim().is_empty()
             || args.live_transport.trim().is_empty()
         {
             return open_failure(
                 ErrorCategory::InvalidArgument,
-                "vmwp_pid, dispatcher_vnd, profile and both transport command lines must be nonzero/nonempty"
+                "dispatcher_vnd assertion must be nonzero, and profile and both transport command \
+                 lines must be nonempty"
                     .to_string(),
                 None,
                 TargetCreated::No,
             );
         }
-        let control_transport = args
-            .control_transport
-            .replace("{vp}", &target.vp.to_string());
+        let vm_id = target.vm_id.clone();
+        let asserted_pid = args.vmwp_pid;
+        let vmwp_pid = match tokio::task::spawn_blocking(move || {
+            crate::skdispatch::resolve_vmwp_pid(&vm_id, asserted_pid)
+        })
+        .await
+        {
+            Ok(Ok(pid)) => pid,
+            Ok(Err(error)) => {
+                return open_failure(
+                    ErrorCategory::InvalidArgument,
+                    error.to_string(),
+                    None,
+                    TargetCreated::No,
+                );
+            }
+            Err(error) => {
+                return open_failure(
+                    ErrorCategory::Debugger,
+                    format!("vmwp lookup task failed: {error}"),
+                    None,
+                    TargetCreated::No,
+                );
+            }
+        };
+        let control_transport = args.control_transport;
         let what = format!("VM {} VTL1 VP {}", target.vm_id, target.vp);
         self.opened(
             SessionKind::SecureKernelLive,
@@ -4073,12 +4207,150 @@ impl WindbgServer {
                 profile: PathBuf::from(args.profile),
                 control_transport,
                 live_transport: args.live_transport,
-                vmwp_pid: args.vmwp_pid,
+                vmwp_pid,
                 dispatcher_vnd,
                 target,
                 allow_transition_cr3: args.allow_transition_cr3,
                 additional_vps: Vec::new(),
             })),
+        )
+        .await
+    }
+
+    /// Open a server-managed Secure Kernel KD facade and return the generated local named-pipe
+    /// connection. The worker discovers vmwp, partition and VND, holds the guarded initial VTL1
+    /// stop, then gives WinDbg the sole execution lease. MCP retains lifecycle and recovery.
+    #[rmcp::tool(
+        annotations(
+            title = "Open Secure Kernel KD",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<structured::OpenOutcome>()
+    )]
+    async fn open_sk_kd(
+        &self,
+        Parameters(args): Parameters<SkKdOpenArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Err(why) = self.sessions.authorize_secure_kernel_live(
+            &args.vm_id,
+            std::path::Path::new(&args.profile),
+            &args.control_transport,
+            &args.live_transport,
+        ) {
+            return open_failure(ErrorCategory::InvalidArgument, why, None, TargetCreated::No);
+        }
+        let parse_optional = |name: &str, value: Option<&str>| {
+            value
+                .map(|value| parse_u64(value).map_err(|why| format!("{name}: {why}")))
+                .transpose()
+        };
+        let dispatcher_vnd = match parse_optional("dispatcher_vnd", args.dispatcher_vnd.as_deref())
+        {
+            Ok(value) => value,
+            Err(why) => {
+                return open_failure(ErrorCategory::InvalidArgument, why, None, TargetCreated::No);
+            }
+        };
+        let partition_id = match parse_optional("partition_id", args.partition_id.as_deref()) {
+            Ok(value) => value,
+            Err(why) => {
+                return open_failure(ErrorCategory::InvalidArgument, why, None, TargetCreated::No);
+            }
+        };
+        let expected_cr3 = match parse_optional("expected_cr3", args.expected_cr3.as_deref()) {
+            Ok(value) => value,
+            Err(why) => {
+                return open_failure(ErrorCategory::InvalidArgument, why, None, TargetCreated::No);
+            }
+        };
+        let target = crate::skdispatch::TargetRequest {
+            vm_id: args.vm_id,
+            partition_id: partition_id.map(crate::skcontrol::HexU64),
+            vp: args.vp.unwrap_or(0),
+            expected_cr3: expected_cr3.map(crate::skcontrol::HexU64),
+        };
+        if let Err(error) = target.validate() {
+            return open_failure(
+                ErrorCategory::InvalidArgument,
+                error.to_string(),
+                None,
+                TargetCreated::No,
+            );
+        }
+        if dispatcher_vnd == Some(0)
+            || args.profile.trim().is_empty()
+            || args.control_transport.trim().is_empty()
+            || args.live_transport.trim().is_empty()
+        {
+            return open_failure(
+                ErrorCategory::InvalidArgument,
+                "assertions must be nonzero, and profile/provider commands must be nonempty"
+                    .to_string(),
+                None,
+                TargetCreated::No,
+            );
+        }
+        let vm_id = target.vm_id.clone();
+        let asserted_pid = args.vmwp_pid;
+        let vmwp_pid = match tokio::task::spawn_blocking(move || {
+            crate::skdispatch::resolve_vmwp_pid(&vm_id, asserted_pid)
+        })
+        .await
+        {
+            Ok(Ok(pid)) => pid,
+            Ok(Err(error)) => {
+                return open_failure(
+                    ErrorCategory::InvalidArgument,
+                    error.to_string(),
+                    None,
+                    TargetCreated::No,
+                );
+            }
+            Err(error) => {
+                return open_failure(
+                    ErrorCategory::Debugger,
+                    format!("vmwp lookup task failed: {error}"),
+                    None,
+                    TargetCreated::No,
+                );
+            }
+        };
+        let token = match crate::client::generate_token() {
+            Ok(token) => token,
+            Err(error) => return Err(ErrorData::internal_error(error.to_string(), None)),
+        };
+        let pipe_token = token.chars().take(32).collect::<String>();
+        let pipe = format!("windbg-mcp-sk-{pipe_token}");
+        let what = format!("VM {} VTL1 VP {} KD pipe {}", target.vm_id, target.vp, pipe);
+        self.opened_as(
+            SessionKind::SecureKernelKd,
+            what,
+            None,
+            EngineOp::OpenSecureKernelKd(Box::new(crate::kdtarget::ManagedRequest {
+                open: crate::skdispatch::OpenRequest {
+                    profile: PathBuf::from(args.profile),
+                    control_transport: args.control_transport,
+                    live_transport: args.live_transport,
+                    vmwp_pid,
+                    dispatcher_vnd,
+                    target,
+                    allow_transition_cr3: false,
+                    additional_vps: Vec::new(),
+                },
+                pipe,
+                kernel_base: None,
+                build: None,
+                initial: None,
+                arm_mode: args.arm_mode,
+                connect_timeout_ms: args.connect_timeout_ms.unwrap_or(30_000),
+                idle_timeout_ms: args.idle_timeout_ms.unwrap_or(300_000),
+                max_pause_ms: args.max_pause_ms.unwrap_or(600_000),
+            })),
+            OpenShape::Debuggee,
+            Some(EngineOp::SkKdServe),
         )
         .await
     }

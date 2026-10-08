@@ -6,8 +6,8 @@
       "inputSchema": 1262,
       "modelVisible": 2631,
       "name": "attach_kernel",
-      "outputSchema": 4614,
-      "wire": 7399
+      "outputSchema": 4659,
+      "wire": 7444
     },
     {
       "annotations": 122,
@@ -15,8 +15,8 @@
       "inputSchema": 103,
       "modelVisible": 400,
       "name": "attach_kernel_local",
-      "outputSchema": 4614,
-      "wire": 5167
+      "outputSchema": 4659,
+      "wire": 5212
     },
     {
       "annotations": 117,
@@ -24,8 +24,8 @@
       "inputSchema": 233,
       "modelVisible": 576,
       "name": "attach_process",
-      "outputSchema": 4614,
-      "wire": 5338
+      "outputSchema": 4659,
+      "wire": 5383
     },
     {
       "annotations": 68,
@@ -321,8 +321,8 @@
       "inputSchema": 258,
       "modelVisible": 615,
       "name": "launch",
-      "outputSchema": 4614,
-      "wire": 5389
+      "outputSchema": 4659,
+      "wire": 5434
     },
     {
       "annotations": 65,
@@ -339,8 +339,8 @@
       "inputSchema": 240,
       "modelVisible": 747,
       "name": "open_dump",
-      "outputSchema": 4614,
-      "wire": 5520
+      "outputSchema": 4659,
+      "wire": 5565
     },
     {
       "annotations": 129,
@@ -348,17 +348,26 @@
       "inputSchema": 2433,
       "modelVisible": 3947,
       "name": "open_sk_capture",
-      "outputSchema": 9756,
-      "wire": 13863
+      "outputSchema": 9801,
+      "wire": 13908
+    },
+    {
+      "annotations": 122,
+      "description": 266,
+      "inputSchema": 2455,
+      "modelVisible": 2772,
+      "name": "open_sk_kd",
+      "outputSchema": 4659,
+      "wire": 7584
     },
     {
       "annotations": 132,
-      "description": 313,
-      "inputSchema": 1688,
-      "modelVisible": 2062,
+      "description": 369,
+      "inputSchema": 2135,
+      "modelVisible": 2565,
       "name": "open_sk_live_control",
-      "outputSchema": 4614,
-      "wire": 6839
+      "outputSchema": 4659,
+      "wire": 7387
     },
     {
       "annotations": 114,
@@ -366,8 +375,8 @@
       "inputSchema": 240,
       "modelVisible": 563,
       "name": "open_trace",
-      "outputSchema": 4614,
-      "wire": 5322
+      "outputSchema": 4659,
+      "wire": 5367
     },
     {
       "annotations": 123,
@@ -474,8 +483,8 @@
       "inputSchema": 343,
       "modelVisible": 1416,
       "name": "session_status",
-      "outputSchema": 4042,
-      "wire": 5562
+      "outputSchema": 4407,
+      "wire": 5927
     },
     {
       "annotations": 114,
@@ -677,15 +686,15 @@
     }
   ],
   "totals": {
-    "annotations": 8184,
-    "description": 44422,
-    "inputSchema": 67961,
+    "annotations": 8306,
+    "description": 44744,
+    "inputSchema": 70863,
     "instructions": 2022,
-    "modelVisible": 116356,
-    "outputSchema": 201834,
-    "payload": 328545,
-    "tools": 75,
-    "wire": 328459,
+    "modelVisible": 119631,
+    "outputSchema": 207218,
+    "payload": 337358,
+    "tools": 76,
+    "wire": 337271,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10308
   }

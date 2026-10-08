@@ -2,6 +2,25 @@
 
 ## Handoff status
 
+- **Server-managed Secure Kernel KD implementation, 2026-10-07:** `open_sk_kd` now owns the
+  facade as an MCP worker session. The worker resolves the current `vmwp` process from the VM id,
+  discovers the dispatcher VND and VID partition id on its one DbgEng thread, treats supplied boot
+  coordinates as optional mismatch assertions, and obtains CR3 and the Secure Kernel base from the
+  providers. It returns a random authenticated named pipe and exact WinDbg connection string,
+  publishes discovery/arm/peer/stop/run/reconnect/release/recovery phases, reserves both VM id and
+  PID in-process and across processes, and gives WinDbg the only execution lease. A startup-loaded
+  server policy now limits disposable VM ids, exact provider command templates and profile roots. The pipe has
+  a protected DACL plus connected-process token verification; malformed KD traffic is retried and
+  bounded; short requests retain the stop; and connect, idle, reconnect and total pause time are
+  bounded. The standalone role still exits on `q`, while only the managed role reconnects. The
+  opt-in MCP smoke tier contains no boot address, PID, VND, partition, CR3 or base input and drives
+  `lm m securekernel`, `t`, `r`, `q` before releasing through MCP. The profile carries the build-relative initial site;
+  the worker resolves it from the provider-reported base. The disposable-VM run passed on
+  2026-10-07, including the same-PID 60-second survival, clean debug-register and unchanged-text
+  audit. The same run validated the live debugger-data list, `KDBG` block and loader-list links
+  before WinDbg enumerated `securekernel.exe`. Read-only MCP inspection of the WinDbg-held stop
+  remains the separately leased stage 8.
+  The completed implementation checklist is in [`DONE.md`](../../DONE.md#120-windbg-mcp-the-secure-kernel-kd-facade-is-not-an-mcp-managed-session--done-2026-10-07).
 - **First EXDI attempts; one reset this workspace, 2026-09-23:** the `Kd=` option set is now read
   out of `dbgeng.dll` 10.0.29617.1000: **six** kernel-discovery modes, of which
   **`Kd=VerAddr:<addr>`** takes an arbitrary `KdVersionBlock` address (parsed, range-checked,
