@@ -626,10 +626,19 @@ impl SessionState {
 /// refused everywhere else for the mirror reason: the worker behind an ordinary session holds no
 /// capture and could only answer that it has none.
 ///
-/// `EndSession` and `Interrupt` are in neither list: a teardown is the answer every refusal gives
-/// and must not be refused by one, and an interrupt is answered ahead of the worker's queue.
-/// `PreserveKernel` is reader-side control and never reaches a capture.
+/// `EndSession` and `Interrupt` are in neither operation list: teardown is the answer every
+/// refusal gives, and an ordinary interrupt is answered ahead of the worker's queue. Managed KD
+/// refuses the latter explicitly because WinDbg owns its stop/run lifecycle. `PreserveKernel` is
+/// reader-side control and never reaches a capture.
 fn refuse_op_on_kind(kind: SessionKind, op: &EngineOp) -> Option<String> {
+    if kind == SessionKind::SecureKernelKd && matches!(op, EngineOp::Interrupt { .. }) {
+        return Some(
+            "WinDbg owns this session's stop/run lifecycle. An MCP interrupt could turn its \
+             active wait into terminal controller release, so it is refused; use WinDbg to break \
+             in, or end_session to release the controller."
+                .to_string(),
+        );
+    }
     let capture_op = matches!(
         op,
         EngineOp::OpenSecureKernel(_)
@@ -672,7 +681,7 @@ fn refuse_op_on_kind(kind: SessionKind, op: &EngineOp) -> Option<String> {
         (SessionKind::SecureKernelKd, _, _, true, _) => None,
         (SessionKind::SecureKernelKd, _, _, false, _) => Some(
             "WinDbg owns this Secure Kernel KD session's execution lease. Only session status, \
-             logs, interrupt and teardown are available through MCP while it is connected."
+             logs and teardown are available through MCP while it is connected."
                 .to_string(),
         ),
         (_, true, _, _, _) => Some(
@@ -5180,16 +5189,19 @@ mod tests {
                 .unwrap_or_else(|| panic!("a KD session accepted {op:?}"));
             assert!(refused.contains("WinDbg owns"), "{refused}");
         }
-        for op in [
-            EngineOp::EndSession,
-            EngineOp::Interrupt { job: None },
-            EngineOp::PreserveKernel,
-        ] {
+        for op in [EngineOp::EndSession, EngineOp::PreserveKernel] {
             assert!(
                 refuse_op_on_kind(SessionKind::SecureKernelKd, &op).is_none(),
                 "{op:?} must reach a managed KD session"
             );
         }
+        let interrupt = refuse_op_on_kind(
+            SessionKind::SecureKernelKd,
+            &EngineOp::Interrupt { job: None },
+        )
+        .expect("a managed KD session accepted an MCP interrupt");
+        assert!(interrupt.contains("WinDbg owns"), "{interrupt}");
+        assert!(interrupt.contains("end_session"), "{interrupt}");
     }
 
     // ---- the worker's protocol channel --------------------------------------------

@@ -2098,14 +2098,15 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// right reason on a reading that did not survive its own re-run.
 ///
 /// The matching [`WIRE_CEILING`] raise and its independent wire-size arithmetic are recorded
-/// below. The current payload is 337,368 B and has 7,632 B left.
+/// below. The current payload is 337,540 B and has 7,460 B left.
 ///
 /// **118,000 -> 123,000 for the managed Secure Kernel KD opener** (2026-10-07, item 120). The
 /// surface moves 116,356 -> 119,631 B across 75 -> 76 tools. `open_sk_kd` is 2,772 B; the other
 /// 503 B are the startup-policy and deferred-discovery contract added to `open_sk_live_control`.
 /// The new opener names the exact-build profile, provider templates and three independent
 /// lifecycle bounds because the server now owns the facade rather than asking an external runner
-/// to own them. The current ceiling leaves 3,369 B (2.7%).
+/// to own them. Refusing MCP `interrupt` on that WinDbg-owned lifecycle later added 172 B, bringing
+/// the current surface to 119,803 B and leaving 3,197 B (2.6%).
 const MODEL_VISIBLE_CEILING: usize = 123_000;
 
 /// Ceiling on the whole `tools/list` payload — the serialized result, not the sum of its tools, so
@@ -2255,8 +2256,8 @@ const MODEL_VISIBLE_CEILING: usize = 123_000;
 /// **330,000 -> 345,000 for `open_sk_kd`** (2026-10-07). The payload moves 328,545 ->
 /// 337,368 B. The new tool is 7,583 B; the Secure Kernel policy/discovery description and
 /// state/output types add 1,228 B across `open_sk_live_control`, `session_status` and the seven
-/// existing opener closures, and one byte is the array comma. The new ceiling leaves 7,632 B
-/// (2.2%).
+/// existing opener closures, and one byte is the array comma. The managed-KD `interrupt` refusal
+/// later adds 172 B, for a current payload of 337,540 B and 7,460 B (2.2%) of headroom.
 const WIRE_CEILING: usize = 345_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,308

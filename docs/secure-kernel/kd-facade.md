@@ -19,7 +19,8 @@ record parked ([`README.md`](README.md)). It is not a KD
 transport inside the guest. Secure Kernel still ships none — gate S5a's finding stands — so this is
 a host-side facade over the root-driven controller, and nothing here changes what the guest can do.
 MCP and WinDbg do not mutate one stop concurrently: WinDbg holds the execution lease, while MCP
-admits status, logs, the bound interrupt and teardown.
+admits status, logs and teardown. Break in through WinDbg; MCP `interrupt` is refused because
+turning its active wait into a generic DbgEng interruption cannot preserve the KD lifecycle.
 
 ## What has been measured
 
@@ -102,7 +103,8 @@ enters a bounded reconnect window. `end_session` cancels a connect or active wai
 ordinary proved controller teardown. Expiry of the connect, idle or absolute-pause bound also runs
 that teardown immediately; `released` means it completed. The worker is preserved only if it
 cannot prove restoration and release. The absolute pause bound defaults to 600 seconds, independent
-of KD traffic; connect and idle bounds default to 30 and 300 seconds.
+of KD traffic and covers response writes as well as reads, so a peer that stops consuming output
+cannot retain the stop. Connect and idle bounds default to 30 and 300 seconds.
 
 ## Standalone compatibility role
 

@@ -1,7 +1,7 @@
 //! Which of this server's seventy-six tools a run advertises.
 //!
 //! The tool surface is paid **once per conversation, before anything is debugged**, and it is
-//! 119,631 bytes — roughly 30k tokens (measured 2026-10-07; every figure here moves with any edit
+//! 119,803 bytes — roughly 30k tokens (measured 2026-10-08; every figure here moves with any edit
 //! to a description, so re-derive rather than cite). Seven tenths of that is prose, and the prose is what tells
 //! a model how to drive the tools, so there is no strip here the way there was in
 //! [`crate::schema`]: `FOLLOWUPS.md` item 24 measured it and the only honest lever left is the one
@@ -22,7 +22,7 @@
 //!   group        tools   bytes   what it is for
 //!   allocator       10   16,906  pool and heap walks, and `walk_memory`
 //!   inspect         10   13,485  registers, stacks, memory, modules, symbols, location, raw commands
-//!   session         10   14,013  opening a target, ending it, and watching this server
+//!   session         10   14,185  opening a target, ending it, and watching this server
 //!   exec            10   15,087  breakpoints and execution control
 //!   batch            1   10,308  `debug_batch`
 //!   crash            3    7,473  a bug check, a user-mode fault, and an error code
@@ -33,12 +33,12 @@
 //!   securekernel    12   19,181  captured and live VTL1 inspection and execution control
 //! ```
 //!
-//! Those bytes are a measurement of **2026-10-07** and move with any edit to a description — the
-//! whole surface they are shares of is 76 tools and 119,631 B, which is what the rows above sum to.
+//! Those bytes are a measurement of **2026-10-08** and move with any edit to a description — the
+//! whole surface they are shares of is 76 tools and 119,803 B, which is what the rows above sum to.
 //! Re-derive rather than quoting them.
 //!
 //! **Those are shares of the whole surface, and they do not sum to a narrowed one.** `crash` reads
-//! 20,320 bytes, not the 21,486 its two rows add to, because the thirteen tools it keeps also stop
+//! 20,492 bytes, not the 21,658 its two rows add to, because the thirteen tools it keeps also stop
 //! carrying the sentences that pointed at `modules`, `debug_batch`, `backtrace`, `continue_async`
 //! and `break_in` — 1,166 bytes of them. A spec is always cheaper than its rows suggest, never
 //! dearer.
