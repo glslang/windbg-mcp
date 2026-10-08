@@ -1101,13 +1101,18 @@ pub fn render(report: &crate::structured::DriverHazards) -> String {
             Standing::NoUnwindEntry,
             report.uncovered_privileged,
             "In bytes no unwind entry covers",
-            " — an executable section is not all instructions, and a linear decode spells a jump              table, a string or TraceLogging metadata as whatever those bytes happen to say. But              code nobody emitted an unwind record for lands here too — hand-written assembly does              — so these are listed rather than dropped. Disassemble one before quoting it",
+            " — an executable section is not all instructions, and a linear decode spells a jump \
+             table, a string or TraceLogging metadata as whatever those bytes happen to say. But \
+             code nobody emitted an unwind record for lands here too — hand-written assembly \
+             does — so these are listed rather than dropped. Disassemble one before quoting it",
         ),
         (
             Standing::Unverified,
             report.unverified_privileged,
             "Not placed against an unwind table",
-            " — this target's unwind entries are not decoded here (x86 has none at all), or the              query for them failed, so these are neither known to be code nor known to be data a              linear decode read as code",
+            " — this target's unwind entries are not decoded here (x86 has none at all), or the \
+             query for them failed, so these are neither known to be code nor known to be data a \
+             linear decode read as code",
         ),
     ];
     if report.privileged_count == 0 {
