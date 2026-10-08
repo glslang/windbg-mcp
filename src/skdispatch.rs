@@ -1153,6 +1153,7 @@ pub(crate) struct WaitActivity(Arc<WaitActivityState>);
 
 struct WaitActivityState {
     phase: AtomicU8,
+    scope_gate: Mutex<()>,
     last_traffic: Mutex<Instant>,
     idle_timeout: Duration,
     managed_job: Option<u64>,
@@ -1188,6 +1189,7 @@ impl WaitActivity {
     ) -> Self {
         Self(Arc::new(WaitActivityState {
             phase: AtomicU8::new(WAIT_ARMED),
+            scope_gate: Mutex::new(()),
             last_traffic: Mutex::new(Instant::now()),
             idle_timeout,
             managed_job,
@@ -1230,7 +1232,21 @@ impl WaitActivity {
     }
 
     pub(crate) fn finish(&self) {
+        let _scope = self
+            .0
+            .scope_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         self.0.phase.store(WAIT_FINISHED, Ordering::Release);
+    }
+
+    pub(crate) fn while_active<T>(&self, operation: impl FnOnce() -> T) -> Option<T> {
+        let _scope = self
+            .0
+            .scope_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        (self.0.phase.load(Ordering::Acquire) == WAIT_ACTIVE).then(operation)
     }
 
     pub(crate) fn same_wait(&self, other: &Self) -> bool {
@@ -1256,20 +1272,28 @@ impl WaitActivity {
     }
 
     fn enter(&self) -> Result<WaitActivityGuard> {
-        self.0
-            .phase
-            .compare_exchange(WAIT_ARMED, WAIT_ACTIVE, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| anyhow!("the interruptible DbgEng wait was entered more than once"))?;
+        let scope = self
+            .0
+            .scope_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.0.phase.load(Ordering::Acquire) != WAIT_ARMED {
+            bail!("the interruptible DbgEng wait was entered more than once");
+        }
         let managed = match self.0.managed_job {
             Some(job) => match crate::worker::begin_kd_wait(job) {
                 Some(guard) => Some(guard),
                 None => {
-                    self.finish();
+                    self.0.phase.store(WAIT_FINISHED, Ordering::Release);
                     bail!("the managed Secure Kernel KD session is ending");
                 }
             },
             None => None,
         };
+        // Publish the interruptible phase only after the worker's binding guard exists. The scope
+        // gate also prevents a transport interrupt from racing the closing transition below.
+        self.0.phase.store(WAIT_ACTIVE, Ordering::Release);
+        drop(scope);
         Ok(WaitActivityGuard {
             activity: self.clone(),
             managed,
@@ -1284,10 +1308,11 @@ struct WaitActivityGuard {
 
 impl Drop for WaitActivityGuard {
     fn drop(&mut self) {
-        // Close the worker's SetInterrupt interval under its binding lock before this function
-        // can return to another engine operation.
-        drop(self.managed.take());
+        // Stop transport interrupts, waiting out one already inside the scope gate, before
+        // releasing the worker's binding guard. The published interval is therefore wholly
+        // contained by the owned DbgEng wait.
         self.activity.finish();
+        drop(self.managed.take());
     }
 }
 
@@ -3993,11 +4018,14 @@ mod tests {
     fn interruptible_wait_activity_exposes_only_its_owned_interval() {
         let activity = WaitActivity::new(Duration::from_secs(1));
         assert_eq!(activity.phase(), WaitActivityPhase::Armed);
+        assert_eq!(activity.while_active(|| 7), None);
         {
             let _guard = activity.enter().unwrap();
             assert_eq!(activity.phase(), WaitActivityPhase::Active);
+            assert_eq!(activity.while_active(|| 7), Some(7));
         }
         assert_eq!(activity.phase(), WaitActivityPhase::Finished);
+        assert_eq!(activity.while_active(|| 7), None);
 
         let cancelled_before_entry = WaitActivity::new(Duration::from_secs(1));
         cancelled_before_entry.finish();
