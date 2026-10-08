@@ -2113,6 +2113,29 @@ impl Sessions {
         self.call_within(session, call, self.call_timeout).await
     }
 
+    /// Runs the managed Secure Kernel KD service for its own bounded lifetime.
+    ///
+    /// This is deliberately narrower than a general no-timeout call. `SkKdServe` owns its connect,
+    /// idle and absolute-pause bounds, and the request reader can end it immediately on teardown;
+    /// applying the ordinary tool-call deadline here would abandon a healthy WinDbg session while
+    /// its worker still held the VTL1 controller.
+    pub async fn serve_secure_kernel_kd(
+        &self,
+        session: &Arc<Session>,
+    ) -> Result<Output, EngineError> {
+        debug_assert_eq!(session.kind, SessionKind::SecureKernelKd);
+        let id = session.next_id.fetch_add(1, Ordering::Relaxed);
+        let reply = self.submit(
+            session,
+            Call::new(EngineOp::SkKdServe).named(true),
+            id,
+            None,
+        )?;
+        reply
+            .await
+            .unwrap_or_else(|_| Err(EngineError::Lost(worker_gone(&session.id))))
+    }
+
     async fn call_within(
         &self,
         session: &Arc<Session>,
@@ -7545,6 +7568,43 @@ mod tests {
             assert_eq!(kernel.kernel_unresolved(), !confirmed);
             assert_eq!(kernel.released.load(Ordering::SeqCst), confirmed);
         }
+    }
+
+    #[tokio::test]
+    async fn the_managed_kd_service_outlives_the_ordinary_call_timeout() {
+        let (session, mut queue) = queued("sess-sk-kd", SessionState::Open);
+        let mut owned = Arc::into_inner(session).unwrap();
+        owned.kind = SessionKind::SecureKernelKd;
+        let session = Arc::new(owned);
+        let sessions = Sessions::new(Duration::from_millis(5));
+        let serving_session = Arc::clone(&session);
+        let serving_sessions = sessions.clone();
+        let mut serving = tokio::spawn(async move {
+            serving_sessions
+                .serve_secure_kernel_kd(&serving_session)
+                .await
+        });
+
+        let job = queue.recv().await.unwrap();
+        assert!(matches!(job.op, EngineOp::SkKdServe));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut serving)
+                .await
+                .is_err(),
+            "the ordinary five-millisecond call timeout ended the managed KD service"
+        );
+
+        let waiter = session.waiters.lock().unwrap().remove(&job.id).unwrap();
+        waiter
+            .done
+            .send(Ok(Output::text("managed KD service ended")))
+            .unwrap();
+        let output = tokio::time::timeout(Duration::from_secs(1), serving)
+            .await
+            .expect("the completed service wait did not finish")
+            .expect("the service task panicked")
+            .expect("the service result failed");
+        assert_eq!(output.text, "managed KD service ended");
     }
 
     #[tokio::test]
