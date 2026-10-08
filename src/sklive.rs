@@ -1452,6 +1452,7 @@ impl<P: ControlProvider> LiveControl<P> {
         let active = self
             .active_provider
             .context("the stopped session has no active VP provider")?;
+        self.providers[active].provider.set_outer_deadline(deadline);
         self.state = State::Releasing;
         let result = (|| {
             let baseline = self.providers[active]
@@ -1486,6 +1487,7 @@ impl<P: ControlProvider> LiveControl<P> {
             dispatcher.release_event(&dispatcher_event, ReleaseMode::ArmNextStop)?;
             Ok(())
         })();
+        self.providers[active].provider.set_outer_deadline(None);
         if let Err(error) = result {
             return Err(self.enter_fault(dispatcher, error, Some(dispatcher_event)));
         }
@@ -1590,6 +1592,7 @@ impl<P: ControlProvider> LiveControl<P> {
         let active = self
             .active_provider
             .context("the stopped session has no active VP provider")?;
+        self.providers[active].provider.set_outer_deadline(deadline);
         self.state = State::Releasing;
         let result = (|| {
             self.restore_owned_state(active)?;
@@ -1634,6 +1637,7 @@ impl<P: ControlProvider> LiveControl<P> {
             dispatcher.release_event(&dispatcher_event, ReleaseMode::ArmNextStop)?;
             Ok(())
         })();
+        self.providers[active].provider.set_outer_deadline(None);
         if let Err(error) = result {
             return Err(self.enter_fault(dispatcher, error, Some(dispatcher_event)));
         }
@@ -2244,6 +2248,10 @@ mod tests {
         fail_reads_while_stopped: Option<&'static str>,
         wrong_cr3_while_stopped: bool,
         read_requests: Vec<Vec<RegisterName>>,
+        outer_deadline: Option<Instant>,
+        deadline_updates: Vec<Option<Instant>>,
+        write_deadlines: Vec<Option<Instant>>,
+        release_deadlines: Vec<Option<Instant>>,
     }
 
     impl FakeProvider {
@@ -2263,6 +2271,10 @@ mod tests {
                 fail_reads_while_stopped: None,
                 wrong_cr3_while_stopped: false,
                 read_requests: Vec::new(),
+                outer_deadline: None,
+                deadline_updates: Vec::new(),
+                write_deadlines: Vec::new(),
+                release_deadlines: Vec::new(),
             }
         }
 
@@ -2443,6 +2455,7 @@ mod tests {
         }
 
         fn write_registers(&mut self, writes: Vec<RegisterWrite>) -> Result<Vec<RegisterValue>> {
+            self.write_deadlines.push(self.outer_deadline);
             if self.phase == FakePhase::Running {
                 bail!("writes while running");
             }
@@ -2470,6 +2483,7 @@ mod tests {
         }
 
         fn release(&mut self) -> Result<()> {
+            self.release_deadlines.push(self.outer_deadline);
             if self.phase != FakePhase::Stopped {
                 bail!("not stopped");
             }
@@ -2477,6 +2491,11 @@ mod tests {
             self.held = None;
             self.rotate("running");
             Ok(())
+        }
+
+        fn set_outer_deadline(&mut self, deadline: Option<Instant>) {
+            self.outer_deadline = deadline;
+            self.deadline_updates.push(deadline);
         }
     }
 
@@ -2691,6 +2710,74 @@ mod tests {
                 Action::Release(ReleaseMode::Resume),
             ]
         );
+    }
+
+    #[test]
+    fn bounded_resume_keeps_the_deadline_on_provider_writes_and_release() {
+        let replacement = InstructionGuard {
+            address: HexU64(TARGET_RIP + 0x20),
+            bytes: vec![0x90],
+        };
+        let mut dispatcher = FakeDispatcher::new([
+            observed(StopReason::HardwareBreakpoint { slot: 0 }),
+            observed(StopReason::SingleStep),
+        ]);
+        let mut control = LiveControl::open(FakeProvider::new()).unwrap();
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Redirect)
+            .unwrap();
+        let hardware = control.wait_for_stop(&mut dispatcher).unwrap();
+
+        let step_writes = control.test_provider().write_deadlines.len();
+        let step_releases = control.test_provider().release_deadlines.len();
+        let step_deadline = Instant::now() + std::time::Duration::from_secs(1);
+        control
+            .step_until(
+                &mut dispatcher,
+                &hardware.epoch,
+                straight_step(),
+                step_deadline,
+            )
+            .unwrap();
+        let provider = control.test_provider();
+        assert!(
+            provider.write_deadlines[step_writes..]
+                .iter()
+                .all(|deadline| *deadline == Some(step_deadline))
+        );
+        assert_eq!(
+            provider.release_deadlines[step_releases..],
+            [Some(step_deadline)]
+        );
+        assert_eq!(provider.outer_deadline, None);
+
+        let stepped = control.wait_for_stop(&mut dispatcher).unwrap();
+        let continue_writes = control.test_provider().write_deadlines.len();
+        let continue_releases = control.test_provider().release_deadlines.len();
+        let continue_deadline = Instant::now() + std::time::Duration::from_secs(1);
+        control
+            .continue_to_breakpoints_until(
+                &mut dispatcher,
+                &stepped.epoch,
+                vec![BreakpointGuard {
+                    slot: 2,
+                    instruction: replacement,
+                }],
+                continue_deadline,
+            )
+            .unwrap();
+        let provider = control.test_provider();
+        assert!(
+            provider.write_deadlines[continue_writes..]
+                .iter()
+                .all(|deadline| *deadline == Some(continue_deadline))
+        );
+        assert_eq!(
+            provider.release_deadlines[continue_releases..],
+            [Some(continue_deadline)]
+        );
+        assert_eq!(provider.outer_deadline, None);
+        assert_eq!(provider.deadline_updates.last(), Some(&None));
     }
 
     #[test]
