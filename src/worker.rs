@@ -3031,7 +3031,7 @@ fn execute(
                 failed(format!("{error:#}"))
             });
             pumping(None);
-            result.map(|()| Output::text("Secure Kernel KD peer disconnected"))
+            result.map(|()| Output::text("Secure Kernel KD service stopped"))
         }
 
         EngineOp::SkModules => {

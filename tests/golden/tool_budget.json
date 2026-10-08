@@ -483,8 +483,8 @@
       "inputSchema": 343,
       "modelVisible": 1416,
       "name": "session_status",
-      "outputSchema": 4407,
-      "wire": 5927
+      "outputSchema": 4418,
+      "wire": 5938
     },
     {
       "annotations": 114,
@@ -691,10 +691,10 @@
     "inputSchema": 70863,
     "instructions": 2022,
     "modelVisible": 119631,
-    "outputSchema": 207218,
-    "payload": 337357,
+    "outputSchema": 207229,
+    "payload": 337368,
     "tools": 76,
-    "wire": 337270,
+    "wire": 337281,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10308
   }

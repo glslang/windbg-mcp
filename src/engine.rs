@@ -586,6 +586,7 @@ impl SessionState {
                 crate::proto::SecureKernelKdPhase::Running => "running",
                 crate::proto::SecureKernelKdPhase::Reconnecting => "reconnecting",
                 crate::proto::SecureKernelKdPhase::Releasing => "releasing",
+                crate::proto::SecureKernelKdPhase::Released => "released",
                 crate::proto::SecureKernelKdPhase::RecoveryRequired => "recovery_required",
             },
             Self::Opening => "opening",
@@ -6024,6 +6025,17 @@ mod tests {
             session.state(),
             SessionState::SecureKernelKd(crate::proto::SecureKernelKdPhase::Releasing)
         );
+    }
+
+    #[test]
+    fn a_released_secure_kernel_kd_session_accepts_only_teardown() {
+        let released = SessionState::SecureKernelKd(crate::proto::SecureKernelKdPhase::Released);
+
+        assert!(!released.accepts_handle());
+        assert!(!released.accepts_default());
+        assert!(released.accepts_teardown());
+        assert!(!released.accepts_execution_read());
+        assert_eq!(released.name(), "released");
     }
 
     #[test]

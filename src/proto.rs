@@ -1297,6 +1297,7 @@ pub enum SecureKernelKdPhase {
     Running,
     Reconnecting,
     Releasing,
+    Released,
     RecoveryRequired,
 }
 
