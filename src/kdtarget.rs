@@ -532,52 +532,9 @@ impl Drop for LocalAllocation {
 pub(crate) fn create_kd_pipe(
     path: &str,
 ) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
-    let mut token: HANDLE = std::ptr::null_mut();
-    // SAFETY: the current-process pseudo-handle is valid, and `token` is writable.
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let token = OwnedHandle(token);
-    let mut required = 0u32;
-    // The first call intentionally supplies no buffer to obtain the required size.
-    unsafe { GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut required) };
-    if required == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let words = usize::try_from(required)
-        .unwrap_or(usize::MAX)
-        .div_ceil(std::mem::size_of::<usize>());
-    let mut storage = vec![0usize; words];
-    // SAFETY: `storage` is aligned for TOKEN_USER and has the byte length Windows requested.
-    if unsafe {
-        GetTokenInformation(
-            token.0,
-            TokenUser,
-            storage.as_mut_ptr().cast(),
-            required,
-            &mut required,
-        )
-    } == 0
-    {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: a successful TokenUser query begins with a TOKEN_USER.
-    let user = unsafe { &*storage.as_ptr().cast::<TOKEN_USER>() };
-    let mut sid_text = std::ptr::null_mut();
-    // SAFETY: the SID pointer belongs to the token-information buffer and remains live here.
-    if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut sid_text) } == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let sid_text_guard = LocalAllocation(sid_text.cast());
-    let mut sid_length = 0usize;
-    // SAFETY: ConvertSidToStringSidW returned a NUL-terminated UTF-16 allocation.
-    while unsafe { *sid_text.add(sid_length) } != 0 {
-        sid_length += 1;
-    }
-    // SAFETY: the loop found the terminator inside the API-owned string.
-    let sid = String::from_utf16(unsafe { std::slice::from_raw_parts(sid_text, sid_length) })
-        .map_err(|_| std::io::Error::other("the current token SID was not valid UTF-16"))?;
-    drop(sid_text_guard);
+    // SAFETY: GetCurrentProcess returns a valid pseudo-handle for this process.
+    let sid = process_user_sid(unsafe { GetCurrentProcess() })
+        .map_err(|error| std::io::Error::other(format!("{error:#}")))?;
 
     // Protected DACL: the exact server account, LocalSystem and builtin Administrators only.
     let mut sddl = format!("D:P(A;;GA;;;{sid})(A;;GA;;;SY)(A;;GA;;;BA)")
@@ -694,6 +651,12 @@ fn process_user_sid(process: HANDLE) -> Result<String> {
     Ok(text)
 }
 
+fn report_managed_phase(managed_job: Option<u64>, phase: crate::proto::SecureKernelKdPhase) {
+    if managed_job.is_some() {
+        crate::worker::report_sk_kd_phase(phase);
+    }
+}
+
 async fn run_async(
     options: &ManagedOptions,
     engine: &DebugEngine,
@@ -702,7 +665,7 @@ async fn run_async(
     managed_job: Option<u64>,
 ) -> Result<()> {
     refuse_managed_teardown()?;
-    crate::worker::report_sk_kd_phase(crate::proto::SecureKernelKdPhase::Discovering);
+    report_managed_phase(managed_job, crate::proto::SecureKernelKdPhase::Discovering);
     for line in session.prepare_for_kd(engine)? {
         eprintln!("control provider: {line}");
     }
@@ -751,7 +714,7 @@ async fn run_async(
         "arming initial Secure Kernel stop at {:#x}",
         initial.address.0
     );
-    crate::worker::report_sk_kd_phase(crate::proto::SecureKernelKdPhase::Arming);
+    report_managed_phase(managed_job, crate::proto::SecureKernelKdPhase::Arming);
     session.arm(
         engine,
         vec![BreakpointGuard {
@@ -760,12 +723,12 @@ async fn run_async(
         }],
         options.arm_mode,
     )?;
-    crate::worker::report_sk_kd_phase(crate::proto::SecureKernelKdPhase::Running);
+    report_managed_phase(managed_job, crate::proto::SecureKernelKdPhase::Running);
     let initial_activity = wait_activity(options.idle_timeout, managed_job);
     let mut stop = session.wait_for_stop_interruptible(engine, &initial_activity)?;
     let mut stopped_since = Instant::now();
     refuse_managed_teardown()?;
-    crate::worker::report_sk_kd_phase(crate::proto::SecureKernelKdPhase::Stopped);
+    report_managed_phase(managed_job, crate::proto::SecureKernelKdPhase::Stopped);
     let kernel_base = provider_kernel_base;
     let metadata = validate_debugger_metadata(session, kernel_base, &profile.debugger_data)?;
     let (mut values, mut context) = read_context(session, &stop)?;
@@ -774,20 +737,22 @@ async fn run_async(
     let path = format!(r"\\.\pipe\{}", options.pipe);
     let mut reconnecting = false;
     'connections: loop {
-        let connect_wait = options
-            .connect_timeout
-            .min(remaining_pause(stopped_since, options.max_pause)?);
+        let connect_wait =
+            bounded_pause_wait(options.connect_timeout, stopped_since, options.max_pause)?;
         let pipe = create_kd_pipe(&path)
             .with_context(|| format!("creating Secure Kernel KD pipe {path}"))?;
         eprintln!(
             "Secure Kernel stop held at {:#x}; waiting for WinDbg on {path}",
             values.rip
         );
-        crate::worker::report_sk_kd_phase(if reconnecting {
-            crate::proto::SecureKernelKdPhase::Reconnecting
-        } else {
-            crate::proto::SecureKernelKdPhase::WaitingForPeer
-        });
+        report_managed_phase(
+            managed_job,
+            if reconnecting {
+                crate::proto::SecureKernelKdPhase::Reconnecting
+            } else {
+                crate::proto::SecureKernelKdPhase::WaitingForPeer
+            },
+        );
         tokio::select! {
             connected = tokio::time::timeout(connect_wait, pipe.connect()) => {
                 connected
@@ -803,7 +768,7 @@ async fn run_async(
         }
         let (client_pid, client_sid) = pipe_client_identity(&pipe)?;
         eprintln!("accepted Secure Kernel KD client PID {client_pid} as {client_sid}");
-        crate::worker::report_sk_kd_phase(crate::proto::SecureKernelKdPhase::Stopped);
+        report_managed_phase(managed_job, crate::proto::SecureKernelKdPhase::Stopped);
 
         let (reader, mut writer) = tokio::io::split(pipe);
         let (transport_tx, mut transport_rx) = mpsc::channel(TRANSPORT_QUEUE_DEPTH);
@@ -811,12 +776,23 @@ async fn run_async(
         let reader_waker = wait_waker.clone();
         tokio::spawn(read_transport(reader, transport_tx, reader_waker));
         let mut link = TargetLink::new();
-        let reset = tokio::time::timeout(
-            options.connect_timeout,
-            wait_for_reset(&mut writer, &mut transport_rx, &mut link),
-        )
-        .await
-        .context("waiting for WinDbg's KD reset timed out")?;
+        let reset_wait =
+            bounded_pause_wait(options.connect_timeout, stopped_since, options.max_pause)?;
+        let reset = tokio::select! {
+            reset = tokio::time::timeout(
+                reset_wait,
+                wait_for_reset(&mut writer, &mut transport_rx, &mut link),
+            ) => {
+                reset.with_context(|| {
+                    if stopped_since.elapsed() >= options.max_pause {
+                        "the absolute Secure Kernel pause bound expired while waiting for WinDbg's KD reset"
+                    } else {
+                        "waiting for WinDbg's KD reset timed out"
+                    }
+                })?
+            }
+            () = wait_for_managed_teardown() => return Err(ManagedTeardown.into()),
+        };
         if let Err(error) = reset {
             if reconnect && error.downcast_ref::<Disconnected>().is_some() {
                 reconnecting = true;
@@ -830,9 +806,8 @@ async fn run_async(
         let mut breakpoints = BTreeMap::<u32, BreakpointGuard>::new();
         let mut compatibility = CompatibilityMemory::default();
         loop {
-            let frame_wait = options
-                .idle_timeout
-                .min(remaining_pause(stopped_since, options.max_pause)?);
+            let frame_wait =
+                bounded_pause_wait(options.idle_timeout, stopped_since, options.max_pause)?;
             let next = tokio::select! {
                 frame = tokio::time::timeout(frame_wait, read_frame(&mut transport_rx)) => {
                     frame.with_context(|| {
@@ -1013,7 +988,7 @@ async fn run_async(
                 request.success_response()
             } else if let Some(trace) = request.continue2_trace() {
                 eprintln!("KD Continue2 trace={trace}");
-                crate::worker::report_sk_kd_phase(crate::proto::SecureKernelKdPhase::Running);
+                report_managed_phase(managed_job, crate::proto::SecureKernelKdPhase::Running);
                 let activity = wait_activity(options.idle_timeout, managed_job);
                 wait_waker.begin(activity.clone());
                 let resume = if trace {
@@ -1043,7 +1018,7 @@ async fn run_async(
                     if session.phase() != crate::sklive::LivePhase::Stopped {
                         return Err(error);
                     }
-                    crate::worker::report_sk_kd_phase(crate::proto::SecureKernelKdPhase::Stopped);
+                    report_managed_phase(managed_job, crate::proto::SecureKernelKdPhase::Stopped);
                     eprintln!("KD Continue2 refused; current held stop preserved: {error:#}");
                     send_stop(&mut writer, &mut link, &reported_instruction.bytes, &values).await?;
                     continue;
@@ -1065,7 +1040,7 @@ async fn run_async(
                     (Err(error), Some(reason)) => return Err(error.context(reason.to_string())),
                     (Err(error), None) => return Err(error),
                 };
-                crate::worker::report_sk_kd_phase(crate::proto::SecureKernelKdPhase::Stopped);
+                report_managed_phase(managed_job, crate::proto::SecureKernelKdPhase::Stopped);
                 stopped_since = Instant::now();
                 (values, context) = read_context(session, &stop)?;
                 reported_instruction = read_instruction_guard(session, values.rip)?;
@@ -1103,6 +1078,10 @@ fn remaining_pause(since: Instant, bound: Duration) -> Result<Duration> {
     bound.checked_sub(since.elapsed()).context(
         "the absolute Secure Kernel pause bound expired; the worker will enter fail-closed recovery",
     )
+}
+
+fn bounded_pause_wait(requested: Duration, since: Instant, bound: Duration) -> Result<Duration> {
+    Ok(requested.min(remaining_pause(since, bound)?))
 }
 
 async fn wait_for_managed_teardown() {
@@ -1777,5 +1756,26 @@ mod tests {
         assert_eq!(request.open.target.expected_cr3, None);
         assert_eq!(request.kernel_base, None);
         assert_eq!(request.initial, None);
+    }
+
+    #[test]
+    fn every_protocol_wait_is_capped_by_the_absolute_pause_bound() {
+        let since = Instant::now() - Duration::from_secs(4);
+        let wait =
+            bounded_pause_wait(Duration::from_secs(30), since, Duration::from_secs(10)).unwrap();
+        assert!(wait <= Duration::from_secs(6));
+        assert!(wait > Duration::from_secs(5));
+
+        let expired = bounded_pause_wait(
+            Duration::from_secs(1),
+            Instant::now() - Duration::from_secs(2),
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(
+            expired
+                .to_string()
+                .contains("absolute Secure Kernel pause bound")
+        );
     }
 }

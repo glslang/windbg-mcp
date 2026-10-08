@@ -1162,7 +1162,13 @@ pub fn run(args: &[String]) -> ! {
     // is working perfectly and this process exits with the target never released: exactly the
     // halted live kernel the paragraph above exists to prevent, reached by the one path where
     // nobody is left to ask again.
-    stop_resuming();
+    KD_TEARDOWN_REQUESTED.store(true, Ordering::SeqCst);
+    if KD_ACTIVE.load(Ordering::SeqCst) {
+        report_sk_kd_phase(crate::proto::SecureKernelKdPhase::Releasing);
+        stop_managed_kd();
+    } else {
+        stop_resuming();
+    }
     let grace = match BATCH.abandon(0) {
         Some(within) => {
             tracing::info!(
