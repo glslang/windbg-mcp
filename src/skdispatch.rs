@@ -68,6 +68,13 @@ fn require_completion_deadline(deadline: Option<Instant>) -> Result<()> {
     Ok(())
 }
 
+fn require_retention_deadline(deadline: Option<Instant>) -> Result<()> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        bail!("the absolute Secure Kernel pause bound expired during retention cleanup");
+    }
+    Ok(())
+}
+
 fn debug_wait_remaining(deadline: Instant, activity: Option<&WaitActivity>) -> Duration {
     let deadline_remaining = deadline.saturating_duration_since(Instant::now());
     activity
@@ -777,6 +784,7 @@ struct RetainedEvent {
     system_id: u32,
     return_ip: u64,
     event: HeldEvent,
+    validation_complete: bool,
     release_eligible: bool,
 }
 
@@ -1077,10 +1085,18 @@ impl VmwpDispatcherState {
     }
 
     fn finish_completion_kick(&mut self) -> Result<()> {
-        let Some(kick) = self.completion_kick.take() else {
+        self.finish_completion_kick_until(None)
+    }
+
+    fn finish_completion_kick_until(&mut self, deadline: Option<Instant>) -> Result<()> {
+        let Some(kick) = self.completion_kick.as_mut() else {
             return Ok(());
         };
-        if let Err(error) = kick.finish() {
+        let result = kick.finish_until(deadline);
+        if kick.finished() {
+            self.completion_kick = None;
+        }
+        if let Err(error) = result {
             // Every transition held here ends in Resume-VM; a delayed completion kick first pauses
             // the VM. If the helper fails, the only safe retained state is that a pause may have
             // succeeded. Recovery and teardown will issue an idempotent resume before release.
@@ -1198,14 +1214,14 @@ impl WaitActivity {
         }))
     }
 
-    fn mark_stop_retained(&self) -> Option<Instant> {
+    fn mark_stop_retained(&self, since: Instant) -> Option<Instant> {
         let bound = self.0.pause_bound?;
         let mut retained = self
             .0
             .retained_since
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let since = *retained.get_or_insert_with(Instant::now);
+        let since = *retained.get_or_insert(since);
         Some(since.checked_add(bound).unwrap_or(since))
     }
 
@@ -1952,12 +1968,15 @@ impl EventDispatcher for VmwpDispatcher<'_> {
 
         let deadline = Instant::now() + Duration::from_millis(u64::from(DEBUG_WAIT));
         let (event_pointer, event) = self.wait_for_owned_event(targets, event_site, deadline)?;
-        self.retain_current_event(event_pointer, event_site, &event)?;
+        // The callback is held as soon as the owned breakpoint returns. Start the absolute budget
+        // before any retention cleanup, including a pending Hyper-V transition join.
+        let retained_at = Instant::now();
         let pause_deadline = self
             .state
             .wait_activity
             .as_ref()
-            .and_then(WaitActivity::mark_stop_retained);
+            .and_then(|activity| activity.mark_stop_retained(retained_at));
+        self.retain_current_event(event_pointer, event_site, &event, pause_deadline)?;
         self.state.vm_paused = false;
         self.state.confirm_retained_provider_stop(targets)?;
         let memory = self
@@ -2027,6 +2046,22 @@ impl EventDispatcher for VmwpDispatcher<'_> {
     }
 
     fn recover(&mut self, safe_to_resume: bool, event: Option<&HeldEvent>) -> Result<()> {
+        if self
+            .state
+            .retained_event
+            .as_ref()
+            .is_some_and(|retained| retained.validation_complete && !retained.release_eligible)
+        {
+            // A pause deadline may expire while joining the prior completion kick or removing the
+            // event-site breakpoint. The event itself was already validated, so recovery may
+            // finish that owned cleanup before deciding whether the callback can be released.
+            self.prepare_held_event(None)?;
+            self.state
+                .retained_event
+                .as_mut()
+                .context("the validated native event lost its retained-thread record")?
+                .release_eligible = true;
+        }
         self.state.refuse_unsafe_recovery()?;
         if !safe_to_resume {
             let why = if self.state.vm_paused {
@@ -2130,11 +2165,14 @@ impl VmwpDispatcher<'_> {
         Ok(())
     }
 
-    fn prepare_held_event(&mut self) -> Result<()> {
-        self.state.finish_completion_kick()?;
+    fn prepare_held_event(&mut self, deadline: Option<Instant>) -> Result<()> {
+        require_retention_deadline(deadline)?;
+        self.state.finish_completion_kick_until(deadline)?;
+        require_retention_deadline(deadline)?;
         if self.state.breakpoint.is_some() {
             self.remove_owned_breakpoint()?;
         }
+        require_retention_deadline(deadline)?;
         Ok(())
     }
 
@@ -2198,6 +2236,7 @@ impl VmwpDispatcher<'_> {
         event_pointer: u64,
         event_site: u64,
         event: &HeldEvent,
+        deadline: Option<Instant>,
     ) -> Result<()> {
         // Name the native event before any fallible inspection. Once the exact callback thread is
         // known, retain that identity before cleanup so recovery can either complete it or contain
@@ -2211,6 +2250,7 @@ impl VmwpDispatcher<'_> {
             system_id,
             return_ip: event_site,
             event: event.clone(),
+            validation_complete: false,
             release_eligible: false,
         });
         let advance = self.read_u8(
@@ -2221,7 +2261,12 @@ impl VmwpDispatcher<'_> {
         if advance != 0 {
             bail!("the native dispatcher event already requests instruction-pointer advance");
         }
-        self.prepare_held_event()?;
+        self.state
+            .retained_event
+            .as_mut()
+            .context("the validated native event lost its retained-thread record")?
+            .validation_complete = true;
+        self.prepare_held_event(deadline)?;
         self.state
             .retained_event
             .as_mut()
@@ -2368,11 +2413,11 @@ impl VmwpDispatcher<'_> {
         self.set_site_breakpoint(&discovery.entry)?;
 
         self.state.begin_vm_resume();
-        let transition = VmTransition::immediate(self.state.vm_id.clone(), VmAction::Resume);
+        let mut transition = VmTransition::immediate(self.state.vm_id.clone(), VmAction::Resume);
         let stop = self.run_to_current_breakpoint(
             Instant::now() + Duration::from_millis(u64::from(DEBUG_WAIT)),
         );
-        let resumed = transition.finish();
+        let resumed = transition.finish_until(None);
         match (stop, resumed) {
             (Ok(()), Ok(())) => {
                 self.state.vm_paused = false;
@@ -3909,18 +3954,43 @@ impl VmTransition {
         }
     }
 
-    fn finish(mut self) -> Result<()> {
+    fn finish_until(&mut self, deadline: Option<Instant>) -> Result<()> {
         let _ = self.cancel.send(());
-        let result = self
-            .result
-            .recv_timeout(POWERSHELL_WAIT + POWERSHELL_WAIT + Duration::from_secs(5))
-            .context("Hyper-V transition helper did not finish")?;
+        let maximum = POWERSHELL_WAIT + POWERSHELL_WAIT + Duration::from_secs(5);
+        let wait = deadline
+            .map(|deadline| {
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(maximum)
+            })
+            .unwrap_or(maximum);
+        require_retention_deadline(deadline)?;
+        let result = match self.result.recv_timeout(wait) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                require_retention_deadline(deadline)?;
+                bail!("Hyper-V transition helper did not finish before its cleanup bound")
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if let Some(thread) = self.thread.take() {
+                    thread
+                        .join()
+                        .map_err(|_| anyhow!("Hyper-V transition helper panicked"))?;
+                }
+                bail!("Hyper-V transition helper exited without reporting its result")
+            }
+        };
         if let Some(thread) = self.thread.take() {
             thread
                 .join()
                 .map_err(|_| anyhow!("Hyper-V transition helper panicked"))?;
         }
+        require_retention_deadline(deadline)?;
         result
+    }
+
+    fn finished(&self) -> bool {
+        self.thread.is_none()
     }
 
     #[cfg(test)]
@@ -4037,13 +4107,16 @@ mod tests {
     fn the_pause_budget_starts_when_the_wait_retains_a_stop() {
         let activity = WaitActivity::for_kd(Duration::from_secs(30), Duration::from_secs(10));
         assert_eq!(activity.retained_since(), None);
-        let before = Instant::now();
+        let retained_at = Instant::now();
 
-        let deadline = activity.mark_stop_retained().unwrap();
+        let deadline = activity.mark_stop_retained(retained_at).unwrap();
         let retained = activity.retained_since().unwrap();
-        assert!(retained >= before);
+        assert_eq!(retained, retained_at);
         assert_eq!(deadline, retained + Duration::from_secs(10));
-        assert_eq!(activity.mark_stop_retained(), Some(deadline));
+        assert_eq!(
+            activity.mark_stop_retained(retained_at + Duration::from_secs(1)),
+            Some(deadline)
+        );
     }
 
     #[test]
@@ -4260,6 +4333,7 @@ mod tests {
             system_id: 0x1234,
             return_ip: 0x2000_0000_3000,
             event,
+            validation_complete: true,
             release_eligible: true,
         });
         let mut selected = target();
@@ -4299,6 +4373,7 @@ mod tests {
             system_id: 0x1234,
             return_ip: 0x2000_0000_3000,
             event,
+            validation_complete: false,
             release_eligible: false,
         });
 
@@ -4493,6 +4568,41 @@ mod tests {
         assert!(error.to_string().contains("conservatively retained"));
         assert!(state.vm_paused);
         assert!(!state.provider_writes_quiesced);
+        assert!(state.completion_kick.is_none());
+    }
+
+    #[test]
+    fn an_expired_retention_cleanup_keeps_the_transition_owned_for_retry() {
+        let mut state = VmwpDispatcherState::new(
+            profile(),
+            4242,
+            Some(0x2000_0000_1000),
+            "11111111-2222-3333-4444-555555555555".into(),
+        )
+        .unwrap();
+        let (begun_tx, begun_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        state.completion_kick = Some(VmTransition::spawn(
+            state.vm_id.clone(),
+            Duration::ZERO,
+            move |_vm_id, _cancel| {
+                begun_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            },
+        ));
+        begun_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let error = state
+            .finish_completion_kick_until(Some(Instant::now() + Duration::from_millis(10)))
+            .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("pause bound expired"), "{message}");
+        assert!(state.completion_kick.is_some());
+        assert!(state.vm_paused);
+        release_tx.send(()).unwrap();
+        state.finish_completion_kick().unwrap();
         assert!(state.completion_kick.is_none());
     }
 

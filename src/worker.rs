@@ -8342,6 +8342,10 @@ fn open_secure_kernel_live(
     Ok(Output::opened(text, summary))
 }
 
+const MANAGED_KD_LIMITATION: &str = "WinDbg owns execution for this Secure Kernel KD session. MCP may inspect session status and \
+     logs, or end the session. Running-state break-in is unsupported; use end_session to release \
+     the controller.";
+
 fn open_secure_kernel_kd(
     id: u64,
     request: &crate::kdtarget::ManagedRequest,
@@ -8372,11 +8376,7 @@ fn open_secure_kernel_kd(
     let summary = structured::TargetSummary {
         kernel_mode: Some(true),
         kernel_target: Some(structured::KernelTarget::Windows),
-        limitation: Some(
-            "WinDbg owns execution for this Secure Kernel KD session. MCP may inspect session \
-             status and logs, or end the session. Use WinDbg itself to break into VTL1."
-                .to_string(),
-        ),
+        limitation: Some(MANAGED_KD_LIMITATION.to_string()),
         ..Default::default()
     };
     *live_slot = Some(session);
@@ -11789,6 +11789,13 @@ mod tests {
     };
 
     use super::TargetFingerprint;
+
+    #[test]
+    fn managed_kd_summary_does_not_offer_terminal_break_in_as_a_stop() {
+        assert!(super::MANAGED_KD_LIMITATION.contains("break-in is unsupported"));
+        assert!(super::MANAGED_KD_LIMITATION.contains("end_session"));
+        assert!(!super::MANAGED_KD_LIMITATION.contains("break into VTL1"));
+    }
 
     /// **One module enumeration per reference scan, in the arm that has no name to resolve.**
     ///
