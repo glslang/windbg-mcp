@@ -2259,7 +2259,14 @@ mod tests {
                 let mut address = at;
                 while address + 1 < at + want as u64 {
                     block.push(call_slot(address, BASE + 0x3008));
-                    block.push(insn(address + 1, "f4", "hlt", Flow::Trap, Vec::new()));
+                    block.push(privileged_insn(
+                        Privilege::Other,
+                        address + 1,
+                        "f4",
+                        "hlt",
+                        Flow::Trap,
+                        Vec::new(),
+                    ));
                     address += 2;
                 }
                 Some(block)
@@ -2738,7 +2745,14 @@ mod tests {
         let imports = [import("memcpy", BASE + 0x3008)];
         let block = vec![
             call_slot(BASE + 0x1000, BASE + 0x3008),
-            insn(BASE + 0x1006, "f4", "hlt", Flow::Trap, Vec::new()),
+            privileged_insn(
+                Privilege::Other,
+                BASE + 0x1006,
+                "f4",
+                "hlt",
+                Flow::Trap,
+                Vec::new(),
+            ),
             insn(BASE + 0x1007, "c3", "ret", Flow::Return, Vec::new()),
         ];
 
