@@ -4819,7 +4819,8 @@ impl WindbgServer {
     /// not connected yet (see `session_status`). Pending or unresolved remote kernel controllers
     /// refuse interrupts; inspect them out of band and use explicit recovery handoff if needed.
     /// Managed Secure Kernel KD sessions also refuse this tool because WinDbg owns their stop/run
-    /// lifecycle; use WinDbg to break in, or `end_session` to release the controller.
+    /// lifecycle. Running-state break-in is unsupported there; use `end_session` to release the
+    /// controller.
     // `idempotent_hint = false`, which is not the intuitive reading: raising the same Ctrl+Break
     // twice on the same operation plainly has no second effect. But the hint is about *repeating
     // the call*, and what a repeat addresses is whichever job is running when it arrives — which

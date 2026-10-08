@@ -6,7 +6,7 @@ how much of that surface a run serves, and four behaviours the table has no room
 ## Serving fewer tools (`--tools`)
 
 All seventy-six tools are served unless you say otherwise, and their definitions cost the model
-**119,803 bytes — about 30k tokens — before it has asked anything**, once per conversation. Every
+**119,826 bytes — about 30k tokens — before it has asked anything**, once per conversation. Every
 figure on this page is a measurement of 2026-10-08 rather than an invariant: any edit to a tool's
 description moves it, so re-derive before quoting one. The tables below are checked against a
 running server by `every_documented_surface_figure_matches_the_served_surface`; this sentence is
@@ -22,10 +22,10 @@ windbg-mcp.exe --tools session,inspect,crash
 
 | `--tools` | Tools | Model context |
 |---|---:|---:|
-| *(absent)* — every tool | 76 | 119,803 B |
-| `session,inspect,exec,crash` | 33 | 49,309 B |
-| `session,inspect,crash` | 23 | 34,069 B |
-| `crash` | 13 | 20,492 B |
+| *(absent)* — every tool | 76 | 119,826 B |
+| `session,inspect,exec,crash` | 33 | 49,332 B |
+| `session,inspect,crash` | 23 | 34,092 B |
+| `crash` | 13 | 20,515 B |
 
 The spec is a comma-separated list of the group names in the [tool table](../README.md#tools), of
 individual tool names, or `all`.
