@@ -822,9 +822,11 @@ async fn run_async(
         options.arm_mode,
     )?;
     report_managed_phase(managed_job, crate::proto::SecureKernelKdPhase::Running);
-    let initial_activity = wait_activity(options.idle_timeout, managed_job);
+    let initial_activity = wait_activity(options.idle_timeout, options.max_pause, managed_job);
     let mut stop = session.wait_for_stop_interruptible(engine, &initial_activity)?;
-    let mut stopped_since = Instant::now();
+    let mut stopped_since = initial_activity
+        .retained_since()
+        .context("the Secure Kernel wait did not record when it retained the stop")?;
     let mut stopped_deadline = pause_deadline(stopped_since, options.max_pause)?;
     refuse_managed_teardown()?;
     report_managed_phase(managed_job, crate::proto::SecureKernelKdPhase::Stopped);
@@ -1117,7 +1119,7 @@ async fn run_async(
             } else if let Some(trace) = request.continue2_trace() {
                 eprintln!("KD Continue2 trace={trace}");
                 report_managed_phase(managed_job, crate::proto::SecureKernelKdPhase::Running);
-                let activity = wait_activity(options.idle_timeout, managed_job);
+                let activity = wait_activity(options.idle_timeout, options.max_pause, managed_job);
                 wait_waker.begin(activity.clone());
                 let resume = if trace {
                     stopped_low(&stop, RegisterName::Rip).and_then(|rip| {
@@ -1188,7 +1190,9 @@ async fn run_async(
                     (Err(error), None) => return Err(error),
                 };
                 report_managed_phase(managed_job, crate::proto::SecureKernelKdPhase::Stopped);
-                stopped_since = Instant::now();
+                stopped_since = activity
+                    .retained_since()
+                    .context("the Secure Kernel wait did not record when it retained the stop")?;
                 stopped_deadline = pause_deadline(stopped_since, options.max_pause)?;
                 (values, context) = read_context(session, &stop, stopped_deadline)?;
                 reported_instruction =
@@ -1217,10 +1221,14 @@ async fn run_async(
     }
 }
 
-fn wait_activity(idle_timeout: Duration, job: Option<u64>) -> crate::skdispatch::WaitActivity {
+fn wait_activity(
+    idle_timeout: Duration,
+    max_pause: Duration,
+    job: Option<u64>,
+) -> crate::skdispatch::WaitActivity {
     match job {
-        Some(job) => crate::skdispatch::WaitActivity::for_managed_kd(idle_timeout, job),
-        None => crate::skdispatch::WaitActivity::new(idle_timeout),
+        Some(job) => crate::skdispatch::WaitActivity::for_managed_kd(idle_timeout, max_pause, job),
+        None => crate::skdispatch::WaitActivity::for_kd(idle_timeout, max_pause),
     }
 }
 

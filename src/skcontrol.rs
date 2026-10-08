@@ -1074,6 +1074,10 @@ impl ControlProcess {
         result
     }
 
+    pub(crate) fn set_outer_deadline(&mut self, deadline: Option<Instant>) {
+        self.session_mut().reader.set_outer_deadline(deadline);
+    }
+
     pub(crate) fn write_registers(
         &mut self,
         writes: Vec<RegisterWrite>,

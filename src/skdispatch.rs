@@ -1134,6 +1134,8 @@ struct WaitActivityState {
     last_traffic: Mutex<Instant>,
     idle_timeout: Duration,
     managed_job: Option<u64>,
+    pause_bound: Option<Duration>,
+    retained_since: Mutex<Option<Instant>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1144,21 +1146,56 @@ pub(crate) enum WaitActivityPhase {
 }
 
 impl WaitActivity {
+    #[cfg(test)]
     pub(crate) fn new(idle_timeout: Duration) -> Self {
-        Self::with_managed_job(idle_timeout, None)
+        Self::with_options(idle_timeout, None, None)
     }
 
-    pub(crate) fn for_managed_kd(idle_timeout: Duration, job: u64) -> Self {
-        Self::with_managed_job(idle_timeout, Some(job))
+    pub(crate) fn for_kd(idle_timeout: Duration, pause_bound: Duration) -> Self {
+        Self::with_options(idle_timeout, Some(pause_bound), None)
     }
 
-    fn with_managed_job(idle_timeout: Duration, managed_job: Option<u64>) -> Self {
+    pub(crate) fn for_managed_kd(idle_timeout: Duration, pause_bound: Duration, job: u64) -> Self {
+        Self::with_options(idle_timeout, Some(pause_bound), Some(job))
+    }
+
+    fn with_options(
+        idle_timeout: Duration,
+        pause_bound: Option<Duration>,
+        managed_job: Option<u64>,
+    ) -> Self {
         Self(Arc::new(WaitActivityState {
             phase: AtomicU8::new(WAIT_ARMED),
             last_traffic: Mutex::new(Instant::now()),
             idle_timeout,
             managed_job,
+            pause_bound,
+            retained_since: Mutex::new(None),
         }))
+    }
+
+    fn mark_stop_retained(&self) -> Option<Instant> {
+        let bound = self.0.pause_bound?;
+        let mut retained = self
+            .0
+            .retained_since
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let since = *retained.get_or_insert_with(Instant::now);
+        Some(since.checked_add(bound).unwrap_or(since))
+    }
+
+    pub(crate) fn retained_since(&self) -> Option<Instant> {
+        *self
+            .0
+            .retained_since
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn pause_deadline(&self) -> Option<Instant> {
+        let since = self.retained_since()?;
+        Some(since.checked_add(self.0.pause_bound?).unwrap_or(since))
     }
 
     pub(crate) fn phase(&self) -> WaitActivityPhase {
@@ -1430,11 +1467,19 @@ impl LiveGuestMemory {
     }
 
     fn bind_root(&mut self, cr3: u64) -> Result<()> {
+        self.bind_root_inner(cr3, None)
+    }
+
+    fn bind_root_until(&mut self, cr3: u64, deadline: Instant) -> Result<()> {
+        self.bind_root_inner(cr3, Some(deadline))
+    }
+
+    fn bind_root_inner(&mut self, cr3: u64, deadline: Option<Instant>) -> Result<()> {
         if cr3 == 0 || cr3 & 0xfff != 0 {
             bail!("live VTL1 stop CR3 must be nonzero and page aligned");
         }
         let root = sk::Gpa(cr3);
-        self.space = Self::walk_space(&self.source, root, "stop-CR3 rebind")?;
+        self.space = Self::walk_space_until(&self.source, root, "stop-CR3 rebind", deadline)?;
         self.root = root;
         Ok(())
     }
@@ -1486,10 +1531,6 @@ impl LiveGuestMemory {
         let result = sk::Space::new(&reader, &self.space).read_span(at, size);
         source.require_within_deadline()?;
         result.map_err(|why| anyhow!("{why:?}"))
-    }
-
-    fn read_guard(&self, guard: &InstructionGuard) -> Result<InstructionGuard> {
-        self.read_guard_until(guard, None)
     }
 
     fn read_guard_until(
@@ -1818,6 +1859,13 @@ impl EventDispatcher for VmwpDispatcher<'_> {
         VmwpDispatcher::verify_instruction_until(self, instruction, deadline)
     }
 
+    fn retained_pause_deadline(&self) -> Option<Instant> {
+        self.state
+            .wait_activity
+            .as_ref()
+            .and_then(WaitActivity::pause_deadline)
+    }
+
     fn wait_for_stop(
         &mut self,
         targets: &[TargetIdentity],
@@ -1858,6 +1906,11 @@ impl EventDispatcher for VmwpDispatcher<'_> {
         let deadline = Instant::now() + Duration::from_millis(u64::from(DEBUG_WAIT));
         let (event_pointer, event) = self.wait_for_owned_event(targets, event_site, deadline)?;
         self.retain_current_event(event_pointer, event_site, &event)?;
+        let pause_deadline = self
+            .state
+            .wait_activity
+            .as_ref()
+            .and_then(WaitActivity::mark_stop_retained);
         self.state.vm_paused = false;
         self.state.confirm_retained_provider_stop(targets)?;
         let memory = self
@@ -1865,10 +1918,13 @@ impl EventDispatcher for VmwpDispatcher<'_> {
             .memory
             .as_mut()
             .context("the live VTL1 memory source is absent")?;
-        memory.refresh()?;
+        match pause_deadline {
+            Some(deadline) => memory.refresh_until(deadline)?,
+            None => memory.refresh()?,
+        }
         let observed_instructions = instructions
             .iter()
-            .map(|instruction| memory.read_guard(instruction))
+            .map(|instruction| memory.read_guard_until(instruction, pause_deadline))
             .collect::<Result<Vec<_>>>()?;
         Ok(ObservedStop {
             event,
@@ -1882,6 +1938,14 @@ impl EventDispatcher for VmwpDispatcher<'_> {
             .as_mut()
             .context("the live VTL1 memory source is absent")?
             .bind_root(cr3)
+    }
+
+    fn bind_stop_cr3_until(&mut self, cr3: u64, deadline: Instant) -> Result<()> {
+        self.state
+            .memory
+            .as_mut()
+            .context("the live VTL1 memory source is absent")?
+            .bind_root_until(cr3, deadline)
     }
 
     fn release_event(&mut self, event: &HeldEvent, mode: ReleaseMode) -> Result<()> {
@@ -3884,6 +3948,19 @@ mod tests {
         cancelled_before_entry.finish();
         assert_eq!(cancelled_before_entry.phase(), WaitActivityPhase::Finished);
         assert!(cancelled_before_entry.enter().is_err());
+    }
+
+    #[test]
+    fn the_pause_budget_starts_when_the_wait_retains_a_stop() {
+        let activity = WaitActivity::for_kd(Duration::from_secs(30), Duration::from_secs(10));
+        assert_eq!(activity.retained_since(), None);
+        let before = Instant::now();
+
+        let deadline = activity.mark_stop_retained().unwrap();
+        let retained = activity.retained_since().unwrap();
+        assert!(retained >= before);
+        assert_eq!(deadline, retained + Duration::from_secs(10));
+        assert_eq!(activity.mark_stop_retained(), Some(deadline));
     }
 
     #[test]

@@ -78,6 +78,7 @@ pub(crate) trait ControlProvider {
     ) -> Result<Vec<RegisterValue>> {
         self.read_registers(registers)
     }
+    fn set_outer_deadline(&mut self, _deadline: Option<Instant>) {}
     fn write_registers(&mut self, writes: Vec<RegisterWrite>) -> Result<Vec<RegisterValue>>;
     fn release(&mut self) -> Result<()>;
 }
@@ -157,6 +158,10 @@ impl ControlProvider for ControlProcess {
         ControlProcess::read_registers_until(self, registers, deadline)
     }
 
+    fn set_outer_deadline(&mut self, deadline: Option<Instant>) {
+        ControlProcess::set_outer_deadline(self, deadline);
+    }
+
     fn write_registers(&mut self, writes: Vec<RegisterWrite>) -> Result<Vec<RegisterValue>> {
         ControlProcess::write_registers(self, writes)
     }
@@ -204,6 +209,9 @@ pub(crate) trait EventDispatcher {
     ) -> Result<()> {
         self.verify_instruction(instruction)
     }
+    fn retained_pause_deadline(&self) -> Option<Instant> {
+        None
+    }
     /// Return an owned event only after every provider whose registers may be accessed is quiesced.
     fn wait_for_stop(
         &mut self,
@@ -212,6 +220,9 @@ pub(crate) trait EventDispatcher {
     ) -> Result<ObservedStop>;
     /// Rebind live virtual-memory translation to the CR3 proved by the held register snapshot.
     fn bind_stop_cr3(&mut self, cr3: u64) -> Result<()>;
+    fn bind_stop_cr3_until(&mut self, cr3: u64, _deadline: Instant) -> Result<()> {
+        self.bind_stop_cr3(cr3)
+    }
     fn release_event(&mut self, event: &HeldEvent, mode: ReleaseMode) -> Result<()>;
     fn recover(&mut self, safe_to_resume: bool, event: Option<&HeldEvent>) -> Result<()>;
     fn teardown(&mut self) -> Result<()>;
@@ -321,10 +332,13 @@ pub(crate) struct DispatcherProfile {
 
 impl DispatcherProfile {
     pub(crate) fn load(path: &std::path::Path) -> Result<Self> {
+        let path = path
+            .canonicalize()
+            .with_context(|| format!("canonicalizing dispatcher profile {}", path.display()))?;
         if path.is_dir() {
-            return Self::load_catalog(path);
+            return Self::load_catalog(&path);
         }
-        Self::load_file(path)
+        Self::load_file(&path)
     }
 
     fn load_file(path: &std::path::Path) -> Result<Self> {
@@ -363,6 +377,19 @@ impl DispatcherProfile {
                 .and_then(|extension| extension.to_str())
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
             {
+                let entry = entry.canonicalize().with_context(|| {
+                    format!(
+                        "canonicalizing dispatcher profile entry {}",
+                        entry.display()
+                    )
+                })?;
+                if entry.parent() != Some(path) {
+                    bail!(
+                        "dispatcher profile entry {} resolves outside catalog {}",
+                        entry.display(),
+                        path.display()
+                    );
+                }
                 entries.push(entry);
             }
         }
@@ -1304,14 +1331,18 @@ impl<P: ControlProvider> LiveControl<P> {
         if let Err(error) = self.validate_observation(active, &observed, &expected_stop) {
             return Err(self.enter_fault(dispatcher, error, Some(observed.event)));
         }
-        if let Err(error) = self.providers[active]
-            .provider
-            .publish_stop(observed.event.clone())
-        {
-            return Err(self.enter_fault(dispatcher, error, Some(observed.event)));
+        let pause_deadline = dispatcher.retained_pause_deadline();
+        for provider in &mut self.providers {
+            provider.provider.set_outer_deadline(pause_deadline);
         }
-        self.providers[active].provider_phase = ProviderPhase::Stopped;
         let result = (|| {
+            if pause_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                bail!("the absolute Secure Kernel pause bound expired while accepting the stop");
+            }
+            self.providers[active]
+                .provider
+                .publish_stop(observed.event.clone())?;
+            self.providers[active].provider_phase = ProviderPhase::Stopped;
             let echoed = self.providers[active].provider.held_event()?;
             if echoed != observed.event {
                 bail!("provider changed the dispatcher event after publication");
@@ -1333,10 +1364,18 @@ impl<P: ControlProvider> LiveControl<P> {
             if first != second {
                 bail!("VTL1 registers changed while the dispatcher event was held");
             }
-            dispatcher.bind_stop_cr3(stop_cr3)?;
+            match pause_deadline {
+                Some(deadline) => dispatcher.bind_stop_cr3_until(stop_cr3, deadline)?,
+                None => dispatcher.bind_stop_cr3(stop_cr3)?,
+            }
             if self.allow_transition_cr3 {
                 for instruction in &expected_instructions {
-                    dispatcher.verify_instruction(instruction)?;
+                    match pause_deadline {
+                        Some(deadline) => {
+                            dispatcher.verify_instruction_until(instruction, deadline)?
+                        }
+                        None => dispatcher.verify_instruction(instruction)?,
+                    }
                 }
             }
             let (reason, instruction, expected_rips) =
@@ -1353,6 +1392,9 @@ impl<P: ControlProvider> LiveControl<P> {
                 arm_mode: self.arm_mode.context("the armed session has no arm mode")?,
             })
         })();
+        for provider in &mut self.providers {
+            provider.provider.set_outer_deadline(None);
+        }
         match result {
             Ok(stop) => {
                 self.dispatcher_event = Some(observed.event);
