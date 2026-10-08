@@ -4241,6 +4241,23 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SkKdOpenArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        let connect_timeout_ms = args.connect_timeout_ms.unwrap_or(30_000);
+        let idle_timeout_ms = args.idle_timeout_ms.unwrap_or(300_000);
+        let max_pause_ms = args.max_pause_ms.unwrap_or(600_000);
+        for (name, value) in [
+            ("connect_timeout_ms", connect_timeout_ms),
+            ("idle_timeout_ms", idle_timeout_ms),
+            ("max_pause_ms", max_pause_ms),
+        ] {
+            if let Err(error) = crate::kdtarget::validate_managed_timeout_ms(name, value) {
+                return open_failure(
+                    ErrorCategory::InvalidArgument,
+                    error.to_string(),
+                    None,
+                    TargetCreated::No,
+                );
+            }
+        }
         let authorized = match self.sessions.authorize_secure_kernel_live(
             &args.vm_id,
             std::path::Path::new(&args.profile),
@@ -4355,9 +4372,9 @@ impl WindbgServer {
                 build: None,
                 initial: None,
                 arm_mode: args.arm_mode,
-                connect_timeout_ms: args.connect_timeout_ms.unwrap_or(30_000),
-                idle_timeout_ms: args.idle_timeout_ms.unwrap_or(300_000),
-                max_pause_ms: args.max_pause_ms.unwrap_or(600_000),
+                connect_timeout_ms,
+                idle_timeout_ms,
+                max_pause_ms,
             })),
             OpenShape::Debuggee,
             Some(EngineOp::SkKdServe),
@@ -9086,6 +9103,51 @@ mod tests {
             text,
             "the typed message and the text are one failure, not two accounts of it"
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_secure_kernel_kd_timeouts_are_request_errors_before_open() {
+        let server = WindbgServer::new(Sessions::new(Duration::from_secs(1)));
+        let too_large = crate::kdtarget::MAX_MANAGED_TIMEOUT_MS + 1;
+        for (name, connect_timeout_ms, idle_timeout_ms, max_pause_ms) in [
+            ("connect_timeout_ms", Some(0), None, None),
+            ("connect_timeout_ms", Some(too_large), None, None),
+            ("idle_timeout_ms", None, Some(0), None),
+            ("idle_timeout_ms", None, Some(too_large), None),
+            ("max_pause_ms", None, None, Some(0)),
+            ("max_pause_ms", None, None, Some(too_large)),
+        ] {
+            let result = server
+                .open_sk_kd(Parameters(SkKdOpenArgs {
+                    profile: "not consulted".into(),
+                    control_transport: "not consulted".into(),
+                    live_transport: "not consulted".into(),
+                    vm_id: "not consulted".into(),
+                    vmwp_pid: None,
+                    dispatcher_vnd: None,
+                    partition_id: None,
+                    expected_cr3: None,
+                    vp: None,
+                    arm_mode: crate::sklive::ArmMode::Redirect,
+                    connect_timeout_ms,
+                    idle_timeout_ms,
+                    max_pause_ms,
+                }))
+                .await
+                .expect("an invalid timeout is a tool error, not a protocol error");
+            let data = result
+                .structured_content
+                .expect("a schema-bearing tool must answer with structured content");
+            assert_eq!(data["status"], "error", "{data}");
+            assert_eq!(data["error"]["category"], "invalid_argument", "{data}");
+            assert_eq!(data["target"], "no", "{data}");
+            assert!(
+                data["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains(name)),
+                "{data}"
+            );
+        }
     }
 
     /// The typo that would be worst to ignore: `always` misspelt is a batch with **no rollback
