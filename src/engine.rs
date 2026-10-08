@@ -636,8 +636,9 @@ fn refuse_op_on_kind(kind: SessionKind, op: &EngineOp) -> Option<String> {
     if kind == SessionKind::SecureKernelKd && matches!(op, EngineOp::Interrupt { .. }) {
         return Some(
             "WinDbg owns this session's stop/run lifecycle. An MCP interrupt could turn its \
-             active wait into terminal controller release, so it is refused; use WinDbg to break \
-             in, or end_session to release the controller."
+             active wait into terminal controller release, so it is refused. Running-state \
+             break-in is unsupported for managed Secure Kernel KD; use end_session to release \
+             the controller."
                 .to_string(),
         );
     }
@@ -5213,7 +5214,9 @@ mod tests {
         )
         .expect("a managed KD session accepted an MCP interrupt");
         assert!(interrupt.contains("WinDbg owns"), "{interrupt}");
+        assert!(interrupt.contains("break-in is unsupported"), "{interrupt}");
         assert!(interrupt.contains("end_session"), "{interrupt}");
+        assert!(!interrupt.contains("use WinDbg to break in"), "{interrupt}");
     }
 
     // ---- the worker's protocol channel --------------------------------------------

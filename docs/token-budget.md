@@ -349,7 +349,7 @@ None of these is a bug. They are recorded because they were invisible, and
    | `ioctl` | 11 | 16,088 | 13.4% |
    | `securekernel` | 12 | 19,181 | 16.0% |
    | `exec` | 10 | 15,087 | 12.6% |
-   | `session` | 10 | 14,185 | 11.8% |
+   | `session` | 10 | 14,208 | 11.9% |
    | `inspect` | 10 | 13,485 | 11.3% |
    | `batch` | 1 | 10,308 | 8.6% |
    | `crash` | 3 | 7,473 | 6.2% |
@@ -357,14 +357,14 @@ None of these is a bug. They are recorded because they were invisible, and
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 76 | 119,803 |
-   | `session,inspect,exec,crash` | 33 | 49,309 |
-   | `session,inspect,crash` | 23 | 34,069 |
-   | `crash` | 13 | 20,492 |
+   | *(absent)* | 76 | 119,826 |
+   | `session,inspect,exec,crash` | 33 | 49,332 |
+   | `session,inspect,crash` | 23 | 34,092 |
+   | `crash` | 13 | 20,515 |
 
    **The two tables do not reconcile, and that is the point of item 41.** The first is each group's
    share of the whole surface; the second is what a spec actually serves, which is less — `crash`
-   is 20,492 rather than the 21,658 its two rows sum to, because the cross-references leave with
+   is 20,515 rather than the 21,681 its two rows sum to, because the cross-references leave with
    the tools they name — 1,166 B of them, pointing at `modules`, `debug_batch`, `backtrace`,
    `continue_async` and `break_in`.
 
