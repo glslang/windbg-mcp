@@ -74,8 +74,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.xdata` rather than an end address; `nt!HalpHalt` is the `.xdata` form. The list gained a **second budget** so
   that neither population can push the other out of it: one budget spent in address order lists
   `DTrace`'s 879 data bytes and drops its one real finding. A target whose unwind entries are not
-  decoded here -- x86, which has no unwind table at all -- reports exactly what it reported before,
-  with every row saying `unverified` and a sentence saying the question was not answered. The scan
+  decoded here -- x86, which has no unwind table at all -- **keeps the whole problem**, and says so
+  rather than implying a coverage it has not got: measured on
+  `docs/samples/cppthrow-fastfail-x86.dmp`, the 32-bit `ntdll` reports 10,623 findings with
+  `uncovered_privileged` zero, every row `unverified`, and a sentence saying the question was not
+  answered. The scan
   costs the same: 0.92 s against 0.82 s on `nt`'s 4 MB and 5,535 findings, because a
   `RUNTIME_FUNCTION` region is contiguous and the walk visits addresses in order, so a routine
   with forty `rdmsr` in it costs one query. The **call sites** are untouched, and that was measured

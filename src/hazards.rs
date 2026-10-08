@@ -414,6 +414,12 @@ pub enum Standing {
     /// out of one. x86 lands here — 32-bit Windows has no unwind table, so there is nothing to ask
     /// — as does a target whose entry layout this build does not decode, and an engine that failed
     /// the query.
+    ///
+    /// **x86 therefore keeps the whole of issue #303**, and this says so rather than implying a
+    /// coverage it has not got: measured on `docs/samples/cppthrow-fastfail-x86.dmp`, the 32-bit
+    /// `ntdll` reports 10,623 privileged instructions with `uncovered_privileged` zero and every
+    /// row `unverified`. Nothing was filtered and nothing was claimed, which is the same answer
+    /// that image got before this field existed.
     Unverified,
 }
 
