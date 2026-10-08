@@ -261,14 +261,16 @@ impl WaitWaker {
             loop {
                 match activity.phase() {
                     crate::skdispatch::WaitActivityPhase::Armed => {}
-                    crate::skdispatch::WaitActivityPhase::Active => match interrupt.interrupt() {
-                        Ok(BreakRequest::Raised { .. }) => return,
-                        Ok(BreakRequest::NothingRunning) => {}
-                        Err(error) => {
-                            eprintln!("KD wait interrupt failed: {error}");
-                            return;
+                    crate::skdispatch::WaitActivityPhase::Active => {
+                        match activity.while_active(|| interrupt.interrupt()) {
+                            Some(Ok(BreakRequest::Raised { .. })) => return,
+                            Some(Ok(BreakRequest::NothingRunning)) | None => {}
+                            Some(Err(error)) => {
+                                eprintln!("KD wait interrupt failed: {error}");
+                                return;
+                            }
                         }
-                    },
+                    }
                     crate::skdispatch::WaitActivityPhase::Finished => return,
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
