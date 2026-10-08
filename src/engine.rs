@@ -39,7 +39,9 @@ use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 use windows_sys::Win32::System::Console::GetConsoleProcessList;
 
 use crate::kdconn;
-use crate::proto::{EngineOp, Output, SymbolPathSetting, WorkerMessage, WorkerRequest};
+use crate::proto::{
+    EngineOp, Output, SecureKernelKdPhase, SymbolPathSetting, WorkerMessage, WorkerRequest,
+};
 use crate::worker::{MESSAGES_FLAG, REQUESTS_FLAG, TARGET_FLAG, WORKER_FLAG};
 
 /// How many sessions may be open at once.
@@ -4831,9 +4833,7 @@ async fn reader(
             }
             WorkerMessage::SecureKernelKdPhase { phase } => {
                 if session.kind == SessionKind::SecureKernelKd {
-                    // Use the ordinary guarded transition so a late worker milestone cannot erase
-                    // a fail-closed unresolved release while this session still owns its target.
-                    session.set_state(SessionState::SecureKernelKd(phase));
+                    record_secure_kernel_kd_phase(&session, phase);
                 } else {
                     tracing::warn!(
                         "session {}: a non-KD worker reported Secure Kernel KD phase {phase:?}",
@@ -5047,6 +5047,18 @@ async fn reader(
         });
     }
     session.fail_outstanding(&worker_gone(&session.id));
+}
+
+fn record_secure_kernel_kd_phase(session: &Session, phase: SecureKernelKdPhase) {
+    // The provider's Released milestone confirms that native execution was restored. Record that
+    // fact before moving the visible state so a following EOF cannot downgrade a completed
+    // release to fail-closed unresolved ownership.
+    if phase == SecureKernelKdPhase::Released {
+        session.released.store(true, Ordering::SeqCst);
+    }
+    // Use the ordinary guarded transition so a late worker milestone cannot erase a fail-closed
+    // unresolved release while this session still owns its target.
+    session.set_state(SessionState::SecureKernelKd(phase));
 }
 
 #[cfg(test)]
@@ -6036,6 +6048,30 @@ mod tests {
         assert_eq!(
             session.state(),
             SessionState::SecureKernelKd(crate::proto::SecureKernelKdPhase::Releasing)
+        );
+    }
+
+    #[test]
+    fn an_automatic_secure_kernel_kd_release_is_confirmation() {
+        let mut session = Arc::into_inner(dormant(
+            "sess-sk-kd-released",
+            SessionState::SecureKernelKd(crate::proto::SecureKernelKdPhase::Releasing),
+        ))
+        .unwrap();
+        session.kind = SessionKind::SecureKernelKd;
+        let session = Arc::new(session);
+
+        record_secure_kernel_kd_phase(&session, crate::proto::SecureKernelKdPhase::Released);
+
+        assert!(session.released.load(Ordering::SeqCst));
+        assert_eq!(
+            session.state(),
+            SessionState::SecureKernelKd(crate::proto::SecureKernelKdPhase::Released)
+        );
+        session.preserve_live_control("the worker exited after reporting release");
+        assert_eq!(
+            session.state(),
+            SessionState::SecureKernelKd(crate::proto::SecureKernelKdPhase::Released)
         );
     }
 

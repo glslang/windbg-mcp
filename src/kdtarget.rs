@@ -41,6 +41,7 @@ pub(crate) const TARGET_FLAG: &str = "--sk-kd-target";
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_MAX_PAUSE: Duration = Duration::from_secs(600);
+pub(crate) const MAX_MANAGED_TIMEOUT_MS: u64 = 3_600_000;
 const MAX_PIPE_NAME: usize = 128;
 const MAX_INSTRUCTION_BYTES: u32 = 15;
 const COMPATIBILITY_PAGE_BYTES: u64 = 0x1000;
@@ -509,15 +510,9 @@ pub(crate) fn open_managed(
     request: &ManagedRequest,
 ) -> Result<(crate::skdispatch::Session, ManagedOptions, Vec<String>)> {
     validate_pipe_name(&request.pipe)?;
-    if request.connect_timeout_ms == 0 || request.connect_timeout_ms > 3_600_000 {
-        bail!("Secure Kernel KD connect_timeout_ms must be in 1..=3600000");
-    }
-    if request.idle_timeout_ms == 0 || request.idle_timeout_ms > 3_600_000 {
-        bail!("Secure Kernel KD idle_timeout_ms must be in 1..=3600000");
-    }
-    if request.max_pause_ms == 0 || request.max_pause_ms > 3_600_000 {
-        bail!("Secure Kernel KD max_pause_ms must be in 1..=3600000");
-    }
+    validate_managed_timeout_ms("connect_timeout_ms", request.connect_timeout_ms)?;
+    validate_managed_timeout_ms("idle_timeout_ms", request.idle_timeout_ms)?;
+    validate_managed_timeout_ms("max_pause_ms", request.max_pause_ms)?;
     if let Some(initial) = &request.initial {
         initial.validate()?;
     }
@@ -536,6 +531,13 @@ pub(crate) fn open_managed(
         },
         skipped,
     ))
+}
+
+pub(crate) fn validate_managed_timeout_ms(name: &str, value: u64) -> Result<()> {
+    if value == 0 || value > MAX_MANAGED_TIMEOUT_MS {
+        bail!("Secure Kernel KD {name} must be in 1..={MAX_MANAGED_TIMEOUT_MS}");
+    }
+    Ok(())
 }
 
 pub(crate) fn serve_managed(
@@ -767,6 +769,7 @@ async fn run_async(
     for line in session.prepare_for_kd(engine)? {
         eprintln!("control provider: {line}");
     }
+    refuse_managed_teardown()?;
     let provider_kernel_base = session
         .kernel_base()
         .context("the live-memory provider did not report the Secure Kernel base")?;
@@ -813,6 +816,7 @@ async fn run_async(
         initial.address.0
     );
     report_managed_phase(managed_job, crate::proto::SecureKernelKdPhase::Arming);
+    refuse_managed_teardown()?;
     session.arm(
         engine,
         vec![BreakpointGuard {
@@ -1974,6 +1978,18 @@ mod tests {
                 .to_string()
                 .contains("ASCII")
         );
+    }
+
+    #[test]
+    fn managed_timeout_values_are_validated_at_the_request_boundary() {
+        for value in [1, MAX_MANAGED_TIMEOUT_MS] {
+            assert!(validate_managed_timeout_ms("max_pause_ms", value).is_ok());
+        }
+        for value in [0, MAX_MANAGED_TIMEOUT_MS + 1] {
+            let error = validate_managed_timeout_ms("idle_timeout_ms", value).unwrap_err();
+            assert!(error.to_string().contains("idle_timeout_ms"));
+            assert!(error.to_string().contains("1..=3600000"));
+        }
     }
 
     #[test]
