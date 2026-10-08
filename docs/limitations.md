@@ -144,8 +144,10 @@
   separates them with no symbols is the image's own
   **unwind table**: the `RUNTIME_FUNCTION` records the x64 and ARM64 ABIs oblige a compiler to emit
   for the code it generates, carried by a stripped third-party driver exactly as by a Microsoft one,
-  and read-only -- so present on a dump for the same reason the code is. Each row's `standing` says
-  what that table answered and `uncovered_privileged` counts the ones it does not cover. Three
+  and read-only -- so present on a dump for the same reason the code is. Each row's `standing` says what that
+  table answered, and three counts partition `privileged_count` between the three standings exactly
+  -- `in_function_privileged`, `uncovered_privileged`, `unverified_privileged` -- so an unanswered
+  query is never counted as the answer *this is code*. Three
   limits on reading it. **`no_unwind_entry` is a qualification and not a verdict**, having three
   readings this cannot choose between -- data, code nobody emitted an unwind record for, or a table
   that would not read -- which is why those findings are listed and counted rather than dropped.
@@ -157,8 +159,9 @@
   the question rather than settling it. And **x86 cannot be asked at all** -- 32-bit Windows has no
   unwind table -- so an x86 image **keeps the whole of this problem**, and says so rather than
   implying a coverage it has not got: measured on `docs/samples/cppthrow-fastfail-x86.dmp`, the
-  32-bit `ntdll` reports 10,623 privileged instructions with `uncovered_privileged` zero and every
-  row `unverified`, which is the answer it gave before this existed. A target whose entry layout
+  32-bit `ntdll` reports 10,623 privileged instructions, every one counted in
+  `unverified_privileged` and none in the other two, which is the answer it gave before this
+  existed. A target whose entry layout
   this build does not decode, and an engine whose query failed, answer the same way. The **call sites** are not exposed to any of this, which was measured
   rather than assumed: all 10,349 of them across the same dump are inside covered regions, a
   slot-relative indirect call in random data being a far rarer coincidence than a one-byte opcode.

@@ -54,9 +54,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RUNTIME_FUNCTION` records the x64 and ARM64 ABIs oblige a compiler to emit, which a stripped
   third-party driver carries exactly as a Microsoft one does, and which is read-only and so is in
   a dump for the same reason the code is. So each `privileged` row now carries a `standing`
-  (`in_function`, `no_unwind_entry`, or `unverified` where there was no table to ask), the new
-  `uncovered_privileged` counts the second kind exactly beside `privileged_count`, and the
-  rendered form prints the two under separate headings. It separates the two populations almost
+  (`in_function`, `no_unwind_entry`, or `unverified` where there was no table to ask), three counts
+  partition `privileged_count` between those three exactly -- `in_function_privileged`,
+  `uncovered_privileged`, `unverified_privileged`, the same arithmetic `xrefs` has between
+  `site_count` and its three kinds -- and the rendered form prints one headed group per standing. It separates the two populations almost
   perfectly: of the 1,434 listed findings that are `ins`/`outs`, 1,405 have no entry, while of the
   other 1,560, 1,453 are inside one. Cross-checked against the engine's own `.fnent` over every one
   of the 2,994 listed findings -- the two classifications agree on all 34 modules, 0 mismatches.
@@ -76,9 +77,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DTrace`'s 879 data bytes and drops its one real finding. A target whose unwind entries are not
   decoded here -- x86, which has no unwind table at all -- **keeps the whole problem**, and says so
   rather than implying a coverage it has not got: measured on
-  `docs/samples/cppthrow-fastfail-x86.dmp`, the 32-bit `ntdll` reports 10,623 findings with
-  `uncovered_privileged` zero, every row `unverified`, and a sentence saying the question was not
-  answered. The scan
+  `docs/samples/cppthrow-fastfail-x86.dmp`, the 32-bit `ntdll` reports 10,623 findings, every one
+  of them counted in `unverified_privileged` and none in the other two, under a heading that says
+  the question was not answered. The scan
   costs the same: 0.92 s against 0.82 s on `nt`'s 4 MB and 5,535 findings, because a
   `RUNTIME_FUNCTION` region is contiguous and the walk visits addresses in order, so a routine
   with forty `rdmsr` in it costs one query. The **call sites** are untouched, and that was measured
