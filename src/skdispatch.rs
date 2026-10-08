@@ -59,6 +59,7 @@ pub(crate) struct Session {
     control: Option<LiveControl<crate::skcontrol::ControlProcess>>,
     dispatcher: VmwpDispatcherState,
     pending: Option<PendingControl>,
+    preparation_failed: Option<String>,
     _reservation: VmReservation,
 }
 
@@ -94,8 +95,10 @@ impl VmReservation {
 
 impl Drop for VmReservation {
     fn drop(&mut self) {
-        // SAFETY: this is the non-null handle returned by CreateMutexW.
-        unsafe { CloseHandle(self.0) };
+        if !self.0.is_null() {
+            // SAFETY: this is the non-null handle returned by CreateMutexW.
+            unsafe { CloseHandle(self.0) };
+        }
     }
 }
 
@@ -134,6 +137,7 @@ impl Session {
                     target: request.target.clone(),
                     allow_transition_cr3: request.allow_transition_cr3,
                 }),
+                preparation_failed: None,
                 _reservation: reservation,
             },
             Vec::new(),
@@ -141,10 +145,14 @@ impl Session {
     }
 
     pub(crate) fn phase(&self) -> LivePhase {
-        self.control
-            .as_ref()
-            .map(LiveControl::phase)
-            .unwrap_or(LivePhase::Running)
+        if self.preparation_failed.is_some() {
+            LivePhase::Faulted
+        } else {
+            self.control
+                .as_ref()
+                .map(LiveControl::phase)
+                .unwrap_or(LivePhase::Running)
+        }
     }
 
     pub(crate) fn stopped(&self) -> Option<&StopRecord> {
@@ -172,9 +180,22 @@ impl Session {
     }
 
     fn prepare(&mut self, engine: &DebugEngine) -> Result<Vec<String>> {
+        self.ensure_preparation_succeeded()?;
         let Some(pending) = self.pending.take() else {
             return Ok(Vec::new());
         };
+        let prepared = self.prepare_pending(engine, pending);
+        if let Err(error) = &prepared {
+            self.preparation_failed = Some(format!("{error:#}"));
+        }
+        prepared
+    }
+
+    fn prepare_pending(
+        &mut self,
+        engine: &DebugEngine,
+        pending: PendingControl,
+    ) -> Result<Vec<String>> {
         let found = {
             let mut dispatcher = self.dispatcher.bind(engine);
             dispatcher.prepare_identity(pending.target.partition_id.map(|value| value.0))?
@@ -212,13 +233,25 @@ impl Session {
             .collect())
     }
 
+    fn ensure_preparation_succeeded(&self) -> Result<()> {
+        if let Some(error) = &self.preparation_failed {
+            bail!(
+                "live Secure Kernel target preparation failed earlier: {error}; call \
+                 `end_session` before attempting another operation"
+            );
+        }
+        Ok(())
+    }
+
     fn control(&self) -> Result<&LiveControl<crate::skcontrol::ControlProcess>> {
+        self.ensure_preparation_succeeded()?;
         self.control
             .as_ref()
             .context("live Secure Kernel control has not completed target discovery")
     }
 
     fn control_mut(&mut self) -> Result<&mut LiveControl<crate::skcontrol::ControlProcess>> {
+        self.ensure_preparation_succeeded()?;
         self.control
             .as_mut()
             .context("live Secure Kernel control has not completed target discovery")
@@ -231,6 +264,7 @@ impl Session {
         mode: ArmMode,
     ) -> Result<LiveTransition> {
         let _skipped = self.prepare(engine)?;
+        self.ensure_preparation_succeeded()?;
         let control = self
             .control
             .as_mut()
@@ -244,6 +278,7 @@ impl Session {
     }
 
     pub(crate) fn wait_for_stop(&mut self, engine: &DebugEngine) -> Result<StopRecord> {
+        self.ensure_preparation_succeeded()?;
         let control = self
             .control
             .as_mut()
@@ -261,6 +296,7 @@ impl Session {
         engine: &DebugEngine,
         activity: &WaitActivity,
     ) -> Result<StopRecord> {
+        self.ensure_preparation_succeeded()?;
         self.dispatcher.wait_activity = Some(activity.clone());
         let control = self
             .control
@@ -281,6 +317,7 @@ impl Session {
         epoch: &crate::skcontrol::StopEpoch,
         guard: crate::sklive::StepGuard,
     ) -> Result<LiveTransition> {
+        self.ensure_preparation_succeeded()?;
         let control = self
             .control
             .as_mut()
@@ -298,6 +335,7 @@ impl Session {
         engine: &DebugEngine,
         epoch: &crate::skcontrol::StopEpoch,
     ) -> Result<LiveTransition> {
+        self.ensure_preparation_succeeded()?;
         let control = self
             .control
             .as_mut()
@@ -326,6 +364,7 @@ impl Session {
         epoch: &crate::skcontrol::StopEpoch,
         breakpoints: Vec<BreakpointGuard>,
     ) -> Result<LiveTransition> {
+        self.ensure_preparation_succeeded()?;
         let control = self
             .control
             .as_mut()
@@ -2158,24 +2197,39 @@ impl VmwpDispatcher<'_> {
                 .map_err(debugger)
         })?;
         let saved = HijackContext::capture(self)?;
-        let return_address = self.read_u64(self.register("rsp")?)?;
-        self.set_dynamic_breakpoint(return_address)?;
         self.state.phase = DispatcherPhase::Discovering;
-        self.write_u64(self.state.profile.scratch_base.0, 0)?;
-        self.write_register("rcx", partition_handle)?;
-        self.write_register("rdx", self.state.profile.scratch_base.0)?;
-        self.write_register("rip", export)?;
-        self.run_to_current_breakpoint(
-            Instant::now() + Duration::from_millis(u64::from(DEBUG_WAIT)),
-        )?;
-        if self.engine.instruction_pointer().map_err(debugger)? != return_address {
-            bail!("VidGetHvPartitionId stopped away from its return address");
-        }
-        let returned = self.register("rax");
-        let partition_id = self.read_u64(self.state.profile.scratch_base.0);
-        let breakpoint_cleanup = self.remove_owned_breakpoint();
+        // From this point every exit goes through the cleanup below. The call temporarily owns
+        // the selected thread's context, one dynamic breakpoint and the other threads' freeze.
+        let operation = (|| {
+            let return_address = self.read_u64(self.register("rsp")?)?;
+            self.set_dynamic_breakpoint(return_address)?;
+            self.write_u64(self.state.profile.scratch_base.0, 0)?;
+            self.write_register("rcx", partition_handle)?;
+            self.write_register("rdx", self.state.profile.scratch_base.0)?;
+            self.write_register("rip", export)?;
+            self.run_to_current_breakpoint(
+                Instant::now() + Duration::from_millis(u64::from(DEBUG_WAIT)),
+            )?;
+            if self.engine.instruction_pointer().map_err(debugger)? != return_address {
+                bail!("VidGetHvPartitionId stopped away from its return address");
+            }
+            if self.register("rax")? != 1 {
+                bail!("VidGetHvPartitionId returned failure");
+            }
+            let partition_id = self.read_u64(self.state.profile.scratch_base.0)?;
+            if partition_id == 0 {
+                bail!("VidGetHvPartitionId returned partition zero");
+            }
+            Ok(partition_id)
+        })();
+
         let restored = saved.restore();
-        let thawed = if restored.is_ok() {
+        let breakpoint_cleanup = if self.state.breakpoint.is_some() {
+            self.remove_owned_breakpoint()
+        } else {
+            Ok(())
+        };
+        let thawed = if restored.is_ok() && breakpoint_cleanup.is_ok() {
             self.engine
                 .execute_command("~* u")
                 .map(|_| ())
@@ -2183,30 +2237,37 @@ impl VmwpDispatcher<'_> {
         } else {
             Ok(())
         };
-        if restored.is_ok() && thawed.is_ok() {
+        if restored.is_ok() && breakpoint_cleanup.is_ok() && thawed.is_ok() {
             self.state.threads_frozen = false;
             self.state.phase = DispatcherPhase::Fresh;
         }
+
+        let mut cleanup_errors = Vec::new();
         if let Err(error) = restored {
-            return Err(error.context(
-                "VidGetHvPartitionId returned, but the hijacked thread context was not restored",
+            cleanup_errors.push(format!(
+                "restoring the hijacked vmwp thread context: {error:#}"
+            ));
+        }
+        if let Err(error) = breakpoint_cleanup {
+            cleanup_errors.push(format!(
+                "removing the VidGetHvPartitionId return breakpoint: {error:#}"
             ));
         }
         if let Err(error) = thawed {
-            return Err(error.context(
-                "VidGetHvPartitionId returned and context was restored, but frozen threads were \
-                 not released",
-            ));
+            cleanup_errors.push(format!("releasing the frozen vmwp threads: {error:#}"));
         }
-        breakpoint_cleanup.context("removing the VidGetHvPartitionId return breakpoint")?;
-        if returned? != 1 {
-            bail!("VidGetHvPartitionId returned failure after the hijacked context was restored");
+        match (operation, cleanup_errors.is_empty()) {
+            (Ok(partition_id), true) => Ok(partition_id),
+            (Err(error), true) => Err(error),
+            (Ok(_), false) => bail!(
+                "VidGetHvPartitionId cleanup failed: {}",
+                cleanup_errors.join("; ")
+            ),
+            (Err(error), false) => bail!(
+                "VidGetHvPartitionId call failed: {error:#}; cleanup also failed: {}",
+                cleanup_errors.join("; ")
+            ),
         }
-        let partition_id = partition_id?;
-        if partition_id == 0 {
-            bail!("VidGetHvPartitionId returned partition zero after context restoration");
-        }
-        Ok(partition_id)
     }
 
     fn verify_vid_build(
@@ -3772,6 +3833,39 @@ mod tests {
         };
 
         assert!(error.to_string().contains("exactly one selected VP"));
+    }
+
+    #[test]
+    fn a_failed_preparation_stays_faulted_and_preserves_its_cause() {
+        let mut session = Session {
+            control: None,
+            dispatcher: VmwpDispatcherState::new(
+                profile(),
+                4242,
+                Some(0x2000_0000_1000),
+                "11111111-2222-3333-4444-555555555555".into(),
+            )
+            .unwrap(),
+            pending: None,
+            preparation_failed: Some("partition discovery failed".into()),
+            // No kernel object is needed for a state-only test.
+            _reservation: VmReservation(std::ptr::null_mut()),
+        };
+
+        assert_eq!(session.phase(), LivePhase::Faulted);
+        let error = match session.control() {
+            Ok(_) => panic!("failed preparation unexpectedly exposed live control"),
+            Err(error) => error,
+        };
+        let mutable_error = match session.control_mut() {
+            Ok(_) => panic!("failed preparation unexpectedly exposed mutable live control"),
+            Err(error) => error,
+        };
+        for error in [error, mutable_error] {
+            let message = error.to_string();
+            assert!(message.contains("partition discovery failed"), "{message}");
+            assert!(message.contains("end_session"), "{message}");
+        }
     }
 
     #[test]

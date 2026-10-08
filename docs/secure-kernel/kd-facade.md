@@ -37,7 +37,7 @@ the AMD64 control-space selector for `KSPECIAL_REGISTERS` after a successful `Ge
 target rejects the read, DbgEng reports `GetContextState failed` and discards the usable general
 context. The facade now returns the measured CR3 and debug registers in that bounded `0xe0`-byte
 record and zeroes fields the provider cannot report. The independent post-release audit kept the
-same `vmwp` PID healthy at immediate, 30-second and 60-second samples, found DR0â€“DR3 zero, DR7 with
+same `vmwp` PID healthy at immediate, 30-second and 60-second samples, found DR0–DR3 zero, DR7 with
 no local enable bits, TF/RF clear, and read the original guarded Secure Kernel bytes twice.
 
 A later run added live debugger metadata without a preparatory cdb session. Before admitting the KD

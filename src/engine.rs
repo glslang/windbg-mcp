@@ -4798,11 +4798,9 @@ async fn reader(
             }
             WorkerMessage::SecureKernelKdPhase { phase } => {
                 if session.kind == SessionKind::SecureKernelKd {
-                    session.update_state(|state| {
-                        state
-                            .is_live()
-                            .then_some(SessionState::SecureKernelKd(phase))
-                    });
+                    // Use the ordinary guarded transition so a late worker milestone cannot erase
+                    // a fail-closed unresolved release while this session still owns its target.
+                    session.set_state(SessionState::SecureKernelKd(phase));
                 } else {
                     tracing::warn!(
                         "session {}: a non-KD worker reported Secure Kernel KD phase {phase:?}",
@@ -5975,6 +5973,34 @@ mod tests {
             assert!(!over.accepts_teardown());
             assert!(!over.accepts_execution_read());
         }
+    }
+
+    #[test]
+    fn a_late_secure_kernel_kd_phase_cannot_erase_unresolved_ownership() {
+        let mut session = Arc::into_inner(dormant(
+            "sess-sk-kd",
+            SessionState::LiveControlUnresolved("release unconfirmed".into()),
+        ))
+        .unwrap();
+        session.kind = SessionKind::SecureKernelKd;
+        let session = Arc::new(session);
+
+        session.set_state(SessionState::SecureKernelKd(
+            crate::proto::SecureKernelKdPhase::Running,
+        ));
+        assert_eq!(
+            session.state(),
+            SessionState::LiveControlUnresolved("release unconfirmed".into())
+        );
+
+        session.released.store(true, Ordering::SeqCst);
+        session.set_state(SessionState::SecureKernelKd(
+            crate::proto::SecureKernelKdPhase::Releasing,
+        ));
+        assert_eq!(
+            session.state(),
+            SessionState::SecureKernelKd(crate::proto::SecureKernelKdPhase::Releasing)
+        );
     }
 
     #[test]

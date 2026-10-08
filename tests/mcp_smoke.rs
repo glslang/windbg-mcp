@@ -48,7 +48,7 @@
 //!   trap-flag step, restore, continue and teardown. The profile and privileged provider stay
 //!   outside the repository. Run it alone under the bench health wrapper.
 //! * **Secure Kernel KD** (`#[ignore]`d and
-//!   `WINDBG_MCP_SMOKE_SK_KD=<private JSON config>`) â€” opens the same disposable VM through the
+//!   `WINDBG_MCP_SMOKE_SK_KD=<private JSON config>`) — opens the same disposable VM through the
 //!   MCP-managed KD session, connects an installed `kd.exe`, performs `t`, `r`, `q`, observes the
 //!   server phases, then releases through MCP. Boot-specific VND, partition, CR3, kernel base and
 //!   vmwp PID values are deliberately absent from the call.
@@ -2097,8 +2097,8 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// it is fixed at the open. 146 B back, and worth recording because the clause was added for the
 /// right reason on a reading that did not survive its own re-run.
 ///
-/// [`WIRE_CEILING`] is **not** raised with it: the current payload is 337,358 and has 7,642 B left,
-/// and a ceiling raised before something needs it absorbs the next regression in silence.
+/// The matching [`WIRE_CEILING`] raise and its independent wire-size arithmetic are recorded
+/// below. The current payload is 337,358 B and has 7,642 B left.
 ///
 /// **118,000 -> 123,000 for the managed Secure Kernel KD opener** (2026-10-07, item 120). The
 /// surface moves 116,356 -> 119,631 B across 75 -> 76 tools. `open_sk_kd` is 2,772 B; the other
@@ -2252,11 +2252,11 @@ const MODEL_VISIBLE_CEILING: usize = 123_000;
 /// first left 11,145 B. Natural mode, bounded repeated-step inputs and the stop's mode/destination
 /// evidence move it another 1,827 B to 320,682 B, leaving 9,318 B (2.8%).
 ///
-/// **330,000 -> 345,000 for `open_sk_kd`** (2026-10-07). The payload moves 327,917 ->
-/// 337,132 B. The new tool is 7,986 B; the Secure Kernel policy/discovery description and
+/// **330,000 -> 345,000 for `open_sk_kd`** (2026-10-07). The payload moves 328,545 ->
+/// 337,358 B. The new tool is 7,584 B; the Secure Kernel policy/discovery description and
 /// state/output types add 1,228 B across `open_sk_live_control`, `session_status` and the seven
-/// existing opener closures, and one byte is the array comma. The new ceiling leaves 7,868 B
-/// (2.3%).
+/// existing opener closures, and one byte is the array comma. The new ceiling leaves 7,642 B
+/// (2.2%).
 const WIRE_CEILING: usize = 345_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,308
