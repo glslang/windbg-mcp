@@ -9069,9 +9069,13 @@ fn hazards_at(
 /// `Unsupported` and an engine error alike become [`hazards::Standing::Unverified`], which is the
 /// bucket with the ordinary list budget. So a target this cannot ask about reports exactly what it
 /// reported before the field existed, and a broken query cannot make a real finding look
-/// fabricated. `a_finding_the_unwind_table_cannot_be_asked_about_is_not_called_data` is the
-/// assertion, because *this fails safe* is a hypothesis
-/// (`.claude/rules/measurement-provenance.md`).
+/// fabricated. Two assertions, because one of them is not enough:
+/// `hazards::tests::a_finding_the_unwind_table_cannot_be_asked_about_is_not_called_data` pins what
+/// `Unverified` then *does*, and `an_unanswered_unwind_query_leaves_a_finding_unplaced` pins **this
+/// mapping** — which is why [`Covers::read`] is split from the call that feeds it, a test having no
+/// way to make a `DebugEngine`. *This fails safe* is a hypothesis rather than something to read off
+/// the code (`.claude/rules/measurement-provenance.md`), and the first assertion alone would have
+/// left the half that decides the direction unmeasured.
 #[derive(Debug, Default)]
 struct Covers {
     /// The last region an answer named, so the next finding inside it costs no engine call.
@@ -9087,6 +9091,7 @@ struct Covers {
 }
 
 impl Covers {
+    /// What the table says about `at`, asking the engine only where the cache cannot answer.
     fn standing(&mut self, e: &DebugEngine, at: u64) -> hazards::Standing {
         if self.unsupported {
             return hazards::Standing::Unverified;
@@ -9096,7 +9101,18 @@ impl Covers {
         {
             return hazards::Standing::InFunction;
         }
-        match e.function_extent(at) {
+        self.read(at, e.function_extent(at))
+    }
+
+    /// One answer's meaning, separated from the call that produced it so that a test can supply
+    /// the answer: nothing in this crate's unit tests can make a `DebugEngine`, and the direction
+    /// this mapping sends a *failure* is the half worth asserting.
+    fn read(
+        &mut self,
+        at: u64,
+        extent: Result<FunctionExtent, dbgscope::dbgeng::DbgEngError>,
+    ) -> hazards::Standing {
+        match extent {
             Ok(FunctionExtent::Region { begin, end }) => {
                 self.region = Some((begin, end));
                 hazards::Standing::InFunction
@@ -13204,6 +13220,69 @@ mod tests {
         assert!(
             body.contains("within_module(base, loaded_size, at, len)"),
             "`driver_hazards` reads the image unbounded again, so a header field can send the              parser into whatever is mapped after the module."
+        );
+    }
+
+    /// **An unwind query that did not answer leaves a finding unplaced rather than calling it
+    /// data** (issue #303).
+    ///
+    /// `Covers::read` is the one place that decides what each of `function_extent`'s outcomes means
+    /// for a privileged finding, and the half worth asserting is where a *failure* goes:
+    /// `Unsupported` is an architecture with no unwind table and an `Err` is a query that broke, and
+    /// neither is evidence about an address. Both must land in `Unverified`, which keeps the finding
+    /// listed on the ordinary budget and out of `uncovered_privileged` — so a broken query cannot
+    /// make a real `out` read like a byte of a string literal. The *consequence* of `Unverified` is
+    /// pinned in `hazards::tests::a_finding_the_unwind_table_cannot_be_asked_about_is_not_called_data`;
+    /// this is the mapping that produces it.
+    ///
+    /// **Mutation-verified**: send the `Err` arm to `NoUnwindEntry` and the third assertion fails.
+    /// Written because *this fails safe* is a hypothesis
+    /// (`.claude/rules/measurement-provenance.md`), and the consequence test passes whatever this
+    /// mapping does.
+    #[test]
+    fn an_unanswered_unwind_query_leaves_a_finding_unplaced() {
+        use dbgscope::dbgeng::{DbgEngError, InstructionSet};
+        let at = 0xffff_f800_0000_1000u64;
+        let mut covers = Covers::default();
+
+        assert_eq!(
+            covers.read(
+                at,
+                Ok(FunctionExtent::Region {
+                    begin: at,
+                    end: at + 0x20
+                })
+            ),
+            hazards::Standing::InFunction
+        );
+        assert_eq!(
+            covers.read(at, Ok(FunctionExtent::NoEntry)),
+            hazards::Standing::NoUnwindEntry,
+            "the image has a table and nothing in it covers this address"
+        );
+        assert_eq!(
+            covers.read(at, Err(DbgEngError::NoDebuggee)),
+            hazards::Standing::Unverified,
+            "a query that failed is not a leaf function and must not read as one"
+        );
+        assert_eq!(
+            covers.read(at, Ok(FunctionExtent::Unsupported(InstructionSet::X86))),
+            hazards::Standing::Unverified,
+            "and neither is an architecture that has no unwind table to ask"
+        );
+
+        // The region is remembered, which is what keeps a routine with forty `rdmsr` in it to one
+        // query. Asserted through the field rather than by counting calls, there being no engine
+        // here to count them against.
+        assert_eq!(covers.region, Some((at, at + 0x20)));
+        // And `Unsupported` latches, because it is a fact about the target: every later finding is
+        // answered without asking again.
+        assert!(covers.unsupported);
+        assert_eq!(
+            covers.read(at, Ok(FunctionExtent::NoEntry)),
+            hazards::Standing::NoUnwindEntry,
+            "`read` itself is the mapping; the latch is read by `standing`, which is what skips the \
+             call -- so this stays a test of the mapping alone"
         );
     }
 
