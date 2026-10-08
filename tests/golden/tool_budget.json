@@ -281,12 +281,12 @@
     },
     {
       "annotations": 132,
-      "description": 2365,
+      "description": 2537,
       "inputSchema": 343,
-      "modelVisible": 2758,
+      "modelVisible": 2930,
       "name": "interrupt",
       "outputSchema": 0,
-      "wire": 2905
+      "wire": 3077
     },
     {
       "annotations": 89,
@@ -687,14 +687,14 @@
   ],
   "totals": {
     "annotations": 8305,
-    "description": 44744,
+    "description": 44916,
     "inputSchema": 70863,
     "instructions": 2022,
-    "modelVisible": 119631,
+    "modelVisible": 119803,
     "outputSchema": 207229,
-    "payload": 337368,
+    "payload": 337540,
     "tools": 76,
-    "wire": 337281,
+    "wire": 337453,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10308
   }

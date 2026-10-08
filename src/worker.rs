@@ -8374,7 +8374,7 @@ fn open_secure_kernel_kd(
         kernel_target: Some(structured::KernelTarget::Windows),
         limitation: Some(
             "WinDbg owns execution for this Secure Kernel KD session. MCP may inspect session \
-             status and logs, interrupt the active wait, or end the session."
+             status and logs, or end the session. Use WinDbg itself to break into VTL1."
                 .to_string(),
         ),
         ..Default::default()

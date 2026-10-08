@@ -817,7 +817,13 @@ async fn run_async(
         let reset = tokio::select! {
             reset = tokio::time::timeout(
                 reset_wait,
-                wait_for_reset(&mut writer, &mut transport_rx, &mut link),
+                wait_for_reset(
+                    &mut writer,
+                    &mut transport_rx,
+                    &mut link,
+                    stopped_since,
+                    options.max_pause,
+                ),
             ) => {
                 reset.with_context(|| {
                     if stopped_since.elapsed() >= options.max_pause {
@@ -836,7 +842,15 @@ async fn run_async(
             }
             return Err(error);
         }
-        send_stop(&mut writer, &mut link, &reported_instruction.bytes, &values).await?;
+        send_stop(
+            &mut writer,
+            &mut link,
+            &reported_instruction.bytes,
+            &values,
+            stopped_since,
+            options.max_pause,
+        )
+        .await?;
         eprintln!("initial KD state change sent");
 
         let mut breakpoints = BTreeMap::<u32, BreakpointGuard>::new();
@@ -869,10 +883,10 @@ async fn run_async(
             let break_in = inbound.break_in;
             let protocol_error = inbound.protocol_error;
             for write in inbound.writes {
-                writer.write_all(&write).await?;
+                write_stopped_pipe(&mut writer, &write, stopped_since, options.max_pause).await?;
             }
             if let Some(error) = protocol_error {
-                writer.flush().await?;
+                flush_stopped_pipe(&mut writer, stopped_since, options.max_pause).await?;
                 bail!("KD peer exceeded the consecutive framing-error bound: {error}");
             }
             if break_in {
@@ -880,22 +894,30 @@ async fn run_async(
                     "Secure Kernel KD break-in is unsupported while the target is already stopped; \
                      the retained stop was left unchanged"
                 );
-                writer.flush().await?;
+                flush_stopped_pipe(&mut writer, stopped_since, options.max_pause).await?;
                 continue;
             }
             if peer_reset {
                 compatibility = CompatibilityMemory::default();
                 breakpoints.clear();
-                send_stop(&mut writer, &mut link, &reported_instruction.bytes, &values).await?;
+                send_stop(
+                    &mut writer,
+                    &mut link,
+                    &reported_instruction.bytes,
+                    &values,
+                    stopped_since,
+                    options.max_pause,
+                )
+                .await?;
                 eprintln!("KD peer reset; current held stop resent");
                 continue;
             }
             let Some(packet) = inbound.packet else {
-                writer.flush().await?;
+                flush_stopped_pipe(&mut writer, stopped_since, options.max_pause).await?;
                 continue;
             };
             if packet.packet_type != crate::kdwire::PACKET_TYPE_STATE_MANIPULATE {
-                writer.flush().await?;
+                flush_stopped_pipe(&mut writer, stopped_since, options.max_pause).await?;
                 continue;
             }
             let request = match ManipulateRequest::decode(&packet.payload) {
@@ -908,8 +930,9 @@ async fn run_async(
                             &ManipulateRequest::failure_for_payload(&packet.payload),
                         )
                         .map_err(anyhow::Error::msg)?;
-                    writer.write_all(&response).await?;
-                    writer.flush().await?;
+                    write_stopped_pipe(&mut writer, &response, stopped_since, options.max_pause)
+                        .await?;
+                    flush_stopped_pipe(&mut writer, stopped_since, options.max_pause).await?;
                     continue;
                 }
             };
@@ -1056,14 +1079,28 @@ async fn run_async(
                     }
                     report_managed_phase(managed_job, crate::proto::SecureKernelKdPhase::Stopped);
                     eprintln!("KD Continue2 refused; current held stop preserved: {error:#}");
-                    send_stop(&mut writer, &mut link, &reported_instruction.bytes, &values).await?;
+                    send_stop(
+                        &mut writer,
+                        &mut link,
+                        &reported_instruction.bytes,
+                        &values,
+                        stopped_since,
+                        options.max_pause,
+                    )
+                    .await?;
                     continue;
                 }
                 wait_waker.start_idle_watchdog(activity.clone());
-                if let Err(error) = writer.flush().await {
+                if let Err(error) = bounded_pipe_io(
+                    writer.flush(),
+                    options.idle_timeout,
+                    "WinDbg did not consume the pending KD output while VTL1 was running",
+                )
+                .await
+                {
                     activity.finish();
                     wait_waker.finish();
-                    return Err(error.into());
+                    return Err(error);
                 }
                 let waited = session.wait_for_stop_interruptible(engine, &activity);
                 let wake = wait_waker.finish();
@@ -1081,7 +1118,15 @@ async fn run_async(
                 (values, context) = read_context(session, &stop)?;
                 reported_instruction = read_instruction_guard(session, values.rip)?;
                 compatibility = CompatibilityMemory::default();
-                send_stop(&mut writer, &mut link, &reported_instruction.bytes, &values).await?;
+                send_stop(
+                    &mut writer,
+                    &mut link,
+                    &reported_instruction.bytes,
+                    &values,
+                    stopped_since,
+                    options.max_pause,
+                )
+                .await?;
                 continue;
             } else {
                 eprintln!("KD API {:#x} is not implemented", request.api_number());
@@ -1090,8 +1135,8 @@ async fn run_async(
             let response = link
                 .send(crate::kdwire::PACKET_TYPE_STATE_MANIPULATE, &response)
                 .map_err(anyhow::Error::msg)?;
-            writer.write_all(&response).await?;
-            writer.flush().await?;
+            write_stopped_pipe(&mut writer, &response, stopped_since, options.max_pause).await?;
+            flush_stopped_pipe(&mut writer, stopped_since, options.max_pause).await?;
         }
     }
 }
@@ -1120,6 +1165,48 @@ fn bounded_pause_wait(requested: Duration, since: Instant, bound: Duration) -> R
     Ok(requested.min(remaining_pause(since, bound)?))
 }
 
+async fn bounded_pipe_io<T>(
+    operation: impl std::future::Future<Output = std::io::Result<T>>,
+    within: Duration,
+    timeout: &str,
+) -> Result<T> {
+    tokio::select! {
+        result = tokio::time::timeout(within, operation) => {
+            result.with_context(|| timeout.to_string())?.map_err(Into::into)
+        }
+        () = wait_for_managed_teardown() => Err(ManagedTeardown.into()),
+    }
+}
+
+async fn write_stopped_pipe<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    bytes: &[u8],
+    stopped_since: Instant,
+    max_pause: Duration,
+) -> Result<()> {
+    let within = remaining_pause(stopped_since, max_pause)?;
+    bounded_pipe_io(
+        writer.write_all(bytes),
+        within,
+        "the absolute Secure Kernel pause bound expired while writing KD output",
+    )
+    .await
+}
+
+async fn flush_stopped_pipe<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    stopped_since: Instant,
+    max_pause: Duration,
+) -> Result<()> {
+    let within = remaining_pause(stopped_since, max_pause)?;
+    bounded_pipe_io(
+        writer.flush(),
+        within,
+        "the absolute Secure Kernel pause bound expired while flushing KD output",
+    )
+    .await
+}
+
 async fn wait_for_managed_teardown() {
     while !crate::worker::kd_teardown_requested() {
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1130,14 +1217,16 @@ async fn wait_for_reset<W: AsyncWrite + Unpin>(
     writer: &mut W,
     transport: &mut mpsc::Receiver<TransportMessage>,
     link: &mut TargetLink,
+    stopped_since: Instant,
+    max_pause: Duration,
 ) -> Result<()> {
     loop {
         let inbound = link.receive(read_frame(transport).await?);
         let protocol_error = inbound.protocol_error;
         for write in inbound.writes {
-            writer.write_all(&write).await?;
+            write_stopped_pipe(writer, &write, stopped_since, max_pause).await?;
         }
-        writer.flush().await?;
+        flush_stopped_pipe(writer, stopped_since, max_pause).await?;
         if let Some(error) = protocol_error {
             bail!("KD peer exceeded the consecutive framing-error bound: {error}");
         }
@@ -1247,6 +1336,8 @@ async fn send_stop<W: AsyncWrite + Unpin>(
     link: &mut TargetLink,
     instruction: &[u8],
     values: &Amd64ContextValues,
+    stopped_since: Instant,
+    max_pause: Duration,
 ) -> Result<()> {
     tracing::info!(
         processor = 0u16,
@@ -1259,8 +1350,8 @@ async fn send_stop<W: AsyncWrite + Unpin>(
     let packet = link
         .send(crate::kdwire::PACKET_TYPE_STATE_CHANGE64, &state)
         .map_err(anyhow::Error::msg)?;
-    writer.write_all(&packet).await?;
-    writer.flush().await?;
+    write_stopped_pipe(writer, &packet, stopped_since, max_pause).await?;
+    flush_stopped_pipe(writer, stopped_since, max_pause).await?;
     Ok(())
 }
 
@@ -1812,6 +1903,26 @@ mod tests {
             expired
                 .to_string()
                 .contains("absolute Secure Kernel pause bound")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_pipe_write_cannot_outlive_the_absolute_pause_bound() {
+        let (mut writer, _reader) = tokio::io::duplex(1);
+        let error = write_stopped_pipe(
+            &mut writer,
+            &[0, 1],
+            Instant::now(),
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("absolute Secure Kernel pause bound"),
+            "{error:#}"
         );
     }
 
