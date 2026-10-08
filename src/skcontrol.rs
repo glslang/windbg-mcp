@@ -951,7 +951,8 @@ struct WriteRequest {
 /// Moves blocking request writes off the engine thread. Anonymous child stdin has no standard
 /// timeout, and a provider which stops draining it must not extend an owned VTL1 pause forever.
 struct TimedChildWriter {
-    requests: Sender<WriteRequest>,
+    requests: Option<Sender<WriteRequest>>,
+    worker: Option<std::thread::JoinHandle<()>>,
     pending: Vec<u8>,
     request_grace: Duration,
     outer_deadline: Option<Instant>,
@@ -963,7 +964,7 @@ impl TimedChildWriter {
         W: Write + Send + 'static,
     {
         let (requests, receive) = mpsc::channel::<WriteRequest>();
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("sk-control-writer".into())
             .spawn(move || {
                 while let Ok(request) = receive.recv() {
@@ -977,7 +978,8 @@ impl TimedChildWriter {
             })
             .context("spawning the control-provider writer failed")?;
         Ok(Self {
-            requests,
+            requests: Some(requests),
+            worker: Some(worker),
             pending: Vec::new(),
             request_grace: PROVIDER_REPLY_GRACE,
             outer_deadline: None,
@@ -1004,6 +1006,20 @@ impl TimedChildWriter {
             remaining <= self.request_grace,
         ))
     }
+
+    fn synchronize(&mut self) -> io::Result<()> {
+        self.stop_accepting();
+        if let Some(worker) = self.worker.take() {
+            worker.join().map_err(|_| {
+                io::Error::other("control-provider writer thread panicked during shutdown")
+            })?;
+        }
+        Ok(())
+    }
+
+    fn stop_accepting(&mut self) {
+        self.requests.take();
+    }
 }
 
 impl Write for TimedChildWriter {
@@ -1021,6 +1037,10 @@ impl Write for TimedChildWriter {
         let (completed, result) = mpsc::sync_channel(1);
         let bytes = std::mem::take(&mut self.pending);
         self.requests
+            .as_ref()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "control-provider writer stopped")
+            })?
             .send(WriteRequest { bytes, completed })
             .map_err(|_| {
                 io::Error::new(io::ErrorKind::BrokenPipe, "control-provider writer stopped")
@@ -1040,6 +1060,12 @@ impl Write for TimedChildWriter {
                 "control-provider writer stopped",
             )),
         }
+    }
+}
+
+impl Drop for TimedChildWriter {
+    fn drop(&mut self) {
+        let _ = self.synchronize();
     }
 }
 
@@ -1124,6 +1150,38 @@ impl ControlProcess {
             .expect("a live ControlProcess always owns its session")
     }
 
+    fn call<T>(
+        &mut self,
+        operation: impl FnOnce(&mut ControlSession<TimedChildReader, TimedChildWriter>) -> Result<T>,
+    ) -> Result<T> {
+        let result = operation(self.session_mut());
+        self.finish_call(result)
+    }
+
+    fn finish_call<T>(&mut self, result: Result<T>) -> Result<T> {
+        if !result.as_ref().is_err_and(provider_io_timed_out) {
+            return result;
+        }
+        let cleanup = self.abort_timed_out_transport();
+        match (result, cleanup) {
+            (Err(primary), Ok(())) => Err(primary),
+            (Err(primary), Err(cleanup)) => Err(anyhow::anyhow!(
+                "{primary:#}; terminating the timed-out provider transport also failed: {cleanup:#}"
+            )),
+            (Ok(value), _) => Ok(value),
+        }
+    }
+
+    fn abort_timed_out_transport(&mut self) -> Result<()> {
+        self.child
+            .terminate_now()
+            .context("terminating the timed-out control provider")?;
+        self.session_mut()
+            .writer
+            .synchronize()
+            .context("synchronizing the timed-out control-provider writer")
+    }
+
     pub(crate) fn target(&self) -> &TargetIdentity {
         self.session().target()
     }
@@ -1133,30 +1191,30 @@ impl ControlProcess {
     }
 
     pub(crate) fn capabilities(&mut self) -> Result<Capabilities> {
-        self.session_mut().capabilities()
+        self.call(ControlSession::capabilities)
     }
 
     pub(crate) fn begin_arm(&mut self) -> Result<()> {
-        self.session_mut().begin_arm()
+        self.call(ControlSession::begin_arm)
     }
 
     pub(crate) fn finish_arm(&mut self) -> Result<()> {
-        self.session_mut().finish_arm()
+        self.call(ControlSession::finish_arm)
     }
 
     pub(crate) fn publish_stop(&mut self, event: HeldEvent) -> Result<()> {
-        self.session_mut().publish_stop(event)
+        self.call(|session| session.publish_stop(event))
     }
 
     pub(crate) fn held_event(&mut self) -> Result<HeldEvent> {
-        self.session_mut().held_event()
+        self.call(ControlSession::held_event)
     }
 
     pub(crate) fn read_registers(
         &mut self,
         registers: Vec<RegisterName>,
     ) -> Result<Vec<RegisterValue>> {
-        self.session_mut().read_registers(registers)
+        self.call(|session| session.read_registers(registers))
     }
 
     pub(crate) fn read_registers_until(
@@ -1167,13 +1225,16 @@ impl ControlProcess {
         if Instant::now() >= deadline {
             bail!("control-provider register read reached its outer deadline");
         }
-        let session = self.session_mut();
-        session.reader.set_outer_deadline(Some(deadline));
-        session.writer.set_outer_deadline(Some(deadline));
-        let result = session.read_registers(registers);
-        session.reader.set_outer_deadline(None);
-        session.writer.set_outer_deadline(None);
-        result
+        let result = {
+            let session = self.session_mut();
+            session.reader.set_outer_deadline(Some(deadline));
+            session.writer.set_outer_deadline(Some(deadline));
+            let result = session.read_registers(registers);
+            session.reader.set_outer_deadline(None);
+            session.writer.set_outer_deadline(None);
+            result
+        };
+        self.finish_call(result)
     }
 
     pub(crate) fn set_outer_deadline(&mut self, deadline: Option<Instant>) {
@@ -1186,18 +1247,32 @@ impl ControlProcess {
         &mut self,
         writes: Vec<RegisterWrite>,
     ) -> Result<Vec<RegisterValue>> {
-        self.session_mut().write_registers(writes)
+        self.call(|session| session.write_registers(writes))
     }
 
     pub(crate) fn release(&mut self) -> Result<()> {
-        self.session_mut().release()
+        self.call(ControlSession::release)
     }
+}
+
+fn provider_io_timed_out(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.kind() == io::ErrorKind::TimedOut)
+    })
 }
 
 impl Drop for ControlProcess {
     fn drop(&mut self) {
-        drop(self.session.take());
+        if let Some(session) = self.session.as_mut() {
+            session.writer.stop_accepting();
+        }
         self.child.reap();
+        if let Some(session) = self.session.as_mut() {
+            let _ = session.writer.synchronize();
+        }
+        drop(self.session.take());
     }
 }
 
@@ -1365,6 +1440,25 @@ fn cli_word(name: &str, value: &str) -> Result<u64> {
 struct ChildGuard(Option<Child>);
 
 impl ChildGuard {
+    fn terminate_now(&mut self) -> io::Result<()> {
+        let Some(mut child) = self.0.take() else {
+            return Ok(());
+        };
+        let probe_error = match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => None,
+            Err(error) => Some(error),
+        };
+        let kill_error = child.kill().err();
+        match child.wait() {
+            Ok(_) => Ok(()),
+            Err(wait_error) => {
+                self.0 = Some(child);
+                Err(kill_error.or(probe_error).unwrap_or(wait_error))
+            }
+        }
+    }
+
     fn reap(&mut self) {
         let Some(child) = self.0.as_mut() else {
             return;
@@ -1382,9 +1476,7 @@ impl ChildGuard {
                 _ => break,
             }
         }
-        let _ = child.kill();
-        let _ = child.wait();
-        self.0.take();
+        let _ = self.terminate_now();
     }
 }
 
@@ -1852,12 +1944,13 @@ mod tests {
     }
 
     #[test]
-    fn an_outer_deadline_caps_a_blocked_provider_request_write() {
-        struct SlowWriter;
+    fn an_outer_deadline_caps_and_synchronizes_a_blocked_provider_request_write() {
+        struct SlowWriter(std::sync::Arc<std::sync::atomic::AtomicBool>);
 
         impl Write for SlowWriter {
             fn write(&mut self, input: &[u8]) -> io::Result<usize> {
                 std::thread::sleep(Duration::from_millis(250));
+                self.0.store(true, std::sync::atomic::Ordering::Release);
                 Ok(input.len())
             }
 
@@ -1866,12 +1959,15 @@ mod tests {
             }
         }
 
-        let mut writer = TimedChildWriter::spawn(SlowWriter).unwrap();
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut writer = TimedChildWriter::spawn(SlowWriter(completed.clone())).unwrap();
         writer.set_outer_deadline(Some(Instant::now() + Duration::from_millis(25)));
         writer.write_all(b"request\n").unwrap();
 
         let error = writer.flush().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(error.to_string().contains("outer deadline"));
+        writer.synchronize().unwrap();
+        assert!(completed.load(std::sync::atomic::Ordering::Acquire));
     }
 }

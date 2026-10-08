@@ -474,18 +474,30 @@ fn expand_target_command(
     target: &TargetIdentity,
     cr3_known: bool,
 ) -> Result<String> {
-    let mut expanded = command
-        .replace("{vp}", &target.vp.to_string())
-        .replace("{partition_id}", &format!("0x{:x}", target.partition_id.0));
+    let mut words = crate::livesrc::split_command(command);
+    if words.is_empty() {
+        bail!("the provider command line is empty");
+    }
+    for argument in words.iter_mut().skip(1) {
+        *argument = argument
+            .replace("{vp}", &target.vp.to_string())
+            .replace("{partition_id}", &format!("0x{:x}", target.partition_id.0));
+    }
     if cr3_known {
-        expanded = expanded.replace("{cr3}", &format!("0x{:x}", target.expected_cr3.0));
-    } else if expanded.contains("{cr3}") {
+        for argument in words.iter_mut().skip(1) {
+            *argument = argument.replace("{cr3}", &format!("0x{:x}", target.expected_cr3.0));
+        }
+    } else if words
+        .iter()
+        .skip(1)
+        .any(|argument| argument.contains("{cr3}"))
+    {
         bail!(
             "the provider command uses {{cr3}}, but no CR3 assertion was supplied; the provider \
              must discover CR3 and report it in its hello"
         );
     }
-    Ok(expanded)
+    Ok(crate::skpolicy::render_transport(&words))
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -4073,6 +4085,21 @@ mod tests {
             .unwrap(),
             "provider --partition 0x85 --vp 0 --cr3 0x1201000"
         );
+    }
+
+    #[test]
+    fn target_placeholders_never_rewrite_the_authorized_executable() {
+        let target = target();
+        let expanded = expand_target_command(
+            r#""C:\provider {vp} {cr3}.exe" --partition {partition_id} --vp {vp}"#,
+            &target,
+            false,
+        )
+        .unwrap();
+        let words = crate::livesrc::split_command(&expanded);
+
+        assert_eq!(words[0], r"C:\provider {vp} {cr3}.exe");
+        assert_eq!(&words[1..], ["--partition", "0x85", "--vp", "0"]);
     }
 
     #[test]
