@@ -3362,23 +3362,31 @@ pub struct DriverHazards {
     /// does not cannot push each other out of it. Each row's `standing` says which it is; see
     /// [`Self::uncovered_privileged`].
     pub privileged: Vec<PrivilegedInstruction>,
-    /// How many were found, exact however many are listed.
+    /// How many were found, exact however many are listed. The **sum** of the three counts below,
+    /// which is the same arithmetic [`Xrefs::site_count`] has with its three kinds.
     pub privileged_count: usize,
-    /// How many of those are in bytes **no unwind entry covers**, exact however many are listed.
+    /// How many are in a region the image's own unwind table covers, exact however many are
+    /// listed: the findings that are in code the compiler generated.
+    pub in_function_privileged: usize,
+    /// How many are in bytes **no unwind entry covers**, exact however many are listed.
     ///
     /// The number that says how much of [`Self::privileged_count`] a linear decode read off data.
     /// An executable section carries jump tables, string literals and `TraceLogging` metadata
     /// beside its code, and a sweep decoding from a section's first byte to its last reports what
     /// those bytes happen to spell — on one sample kernel dump, a fifth of every finding and half
     /// of the ones it listed, with two modules supplying almost all of it.
-    /// `privileged_count` less this is how many are in code the compiler generated; both are
-    /// exact, and neither is derivable from a list that is a sample.
     ///
-    /// **Zero does not mean the question was asked.** A target whose unwind entries are not
-    /// decoded here — x86, which has no unwind table at all — reports zero with every row's
-    /// `standing` saying `unverified`. [`PrivilegedInstruction::standing`] is what distinguishes
-    /// them, and the rendered form says so in a sentence.
+    /// **Zero does not mean the question was asked**; [`Self::unverified_privileged`] is where an
+    /// unasked one is counted, and the two must be read together.
     pub uncovered_privileged: usize,
+    /// How many the unwind table could not be asked about at all, exact however many are listed.
+    ///
+    /// Neither placed in a function nor outside one: an x86 image has no unwind table, so every
+    /// finding in one is here, and so is a finding whose query failed on a target that answered
+    /// for the rest. **Counted apart from [`Self::in_function_privileged`]** — folded in, an
+    /// unanswered question was reported as the answer *this is code*, which is the shape this
+    /// result must never take.
+    pub unverified_privileged: usize,
     /// What was decoded, one entry per **contiguous** run. A section with a hole in it appears
     /// twice, which is what lets a reader see where the hole was.
     pub scanned: Vec<ScannedRange>,
@@ -3499,10 +3507,13 @@ impl DriverHazards {
             sinks: _,
             privileged: _,
             privileged_count: _,
-            // **Not a shortfall.** A finding no unwind entry covers is one this *did* read and
-            // qualified; a shortfall is code it did not read at all, and folding the two would
-            // send a reader to re-run a scan that answered their question in full.
+            // **Not a shortfall.** A finding no unwind entry covers, or one the table could not be
+            // asked about, is one this *did* read and qualified on the row; a shortfall is code it
+            // did not read at all, and folding the two would send a reader to re-run a scan that
+            // answered their question in full.
+            in_function_privileged: _,
             uncovered_privileged: _,
+            unverified_privileged: _,
             scanned: _,
             other_imports: _,
             ordinal_imports,
@@ -5753,7 +5764,9 @@ mod tests {
             sinks: Vec::new(),
             privileged: Vec::new(),
             privileged_count: 0,
+            in_function_privileged: 0,
             uncovered_privileged: 0,
+            unverified_privileged: 0,
             scanned: vec![ScannedRange {
                 section: ".text".into(),
                 start: addr(0xfffff803_1ab11000),

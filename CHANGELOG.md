@@ -86,6 +86,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which is what the issue predicted from a slot-relative indirect call being a rarer coincidence
   than a one-byte opcode.
 
+  Review on [#468](https://github.com/glslang/windbg-mcp/pull/468) corrected three things that were
+  all one mistake: `unverified` shared `in_function`'s count and its list budget. Folded into the
+  count, a finding whose query failed was reported as one *known* to be code; past the shared
+  budget its row was dropped as well, so a renderer looking for that standing among the listed rows
+  found none and said nothing -- an unanswered question rendered as an answer, which is the shape
+  this result must never take. The same appended sentence also said "none of the above is known to
+  be code" over a list whose other rows were confirmed. Three exact counts and one headed group per
+  standing close all three; the budget stays shared, because on x86 the unverified findings *are*
+  the whole report and a budget of their own would have to be the full one. And the unwind query is
+  now behind the walk's own stop predicate, latched: `walk_code` polls that between 64 KiB windows,
+  which bounds the decode, while the query runs per finding -- so a window of one-byte privileged
+  opcodes was tens of thousands of engine calls inside one of those gaps, run by a scan whose
+  caller may already have timed out.
+
 ### Changed
 
 - **`CLAUDE.md` lives in `.claude/`, so strict plugin validation passes.** The plugin root is the
