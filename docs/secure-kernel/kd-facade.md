@@ -19,8 +19,10 @@ record parked ([`README.md`](README.md)). It is not a KD
 transport inside the guest. Secure Kernel still ships none — gate S5a's finding stands — so this is
 a host-side facade over the root-driven controller, and nothing here changes what the guest can do.
 MCP and WinDbg do not mutate one stop concurrently: WinDbg holds the execution lease, while MCP
-admits status, logs and teardown. Break in through WinDbg; MCP `interrupt` is refused because
-turning its active wait into a generic DbgEng interruption cannot preserve the KD lifecycle.
+admits status, logs and teardown. While stopped, WinDbg can inspect the target and issue the
+supported execution commands. While running, use MCP `end_session` to recover and release the
+controller: WinDbg Ctrl+Break and MCP `interrupt` cannot preserve the KD lifecycle and are
+unavailable.
 
 ## What has been measured
 
