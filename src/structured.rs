@@ -3219,6 +3219,33 @@ pub struct PrivilegedInstruction {
     pub kind: String,
     /// The mnemonic, for a reader who wants to know which of the family it was.
     pub mnemonic: String,
+    /// What the image's own unwind table says about this address: `in_function`,
+    /// `no_unwind_entry`, or `unverified` where there was no table to ask.
+    ///
+    /// **An executable section is not all instructions**, and a linear decode spells a jump table,
+    /// a string literal or `TraceLogging` metadata as whatever those bytes happen to say — four of
+    /// x86's one-byte port-I/O opcodes are ASCII letters. The `RUNTIME_FUNCTION` records the x64
+    /// and ARM64 ABIs oblige a compiler to emit are what tells the two apart with no symbols, so
+    /// this is the field that says whether a finding is in code the compiler generated.
+    /// `no_unwind_entry` is a **qualification and not a verdict**: code nobody emitted an unwind
+    /// record for lands there too -- measured, ARM64 `nt`'s hand-written `HalpStartupStub` does --
+    /// and `crate::hazards::Standing` has the three readings.
+    ///
+    /// **Omitted when it is `in_function`**, which is the expected answer for real code: a thousand
+    /// repetitions of the uninteresting value is what a reader pays for and skips. An absent field
+    /// is `in_function`.
+    #[serde(default = "in_function", skip_serializing_if = "is_in_function")]
+    pub standing: String,
+}
+
+/// The `standing` an absent [`PrivilegedInstruction::standing`] means.
+fn in_function() -> String {
+    crate::hazards::Standing::InFunction.name().to_string()
+}
+
+/// Whether a `standing` is the one the wire leaves out.
+fn is_in_function(standing: &str) -> bool {
+    standing == crate::hazards::Standing::InFunction.name()
 }
 
 /// One executable range a scan covered.
@@ -3326,9 +3353,28 @@ pub struct DriverHazards {
     /// says which, because an order stated and not kept is worse than one nobody promised.
     pub sinks: Vec<ImportedSink>,
     /// The privileged instructions found, in address order, and bounded like the call sites above.
+    ///
+    /// **Two budgets on one list**, so that the findings an unwind entry covers and the ones it
+    /// does not cannot push each other out of it. Each row's `standing` says which it is; see
+    /// [`Self::uncovered_privileged`].
     pub privileged: Vec<PrivilegedInstruction>,
     /// How many were found, exact however many are listed.
     pub privileged_count: usize,
+    /// How many of those are in bytes **no unwind entry covers**, exact however many are listed.
+    ///
+    /// The number that says how much of [`Self::privileged_count`] a linear decode read off data.
+    /// An executable section carries jump tables, string literals and `TraceLogging` metadata
+    /// beside its code, and a sweep decoding from a section's first byte to its last reports what
+    /// those bytes happen to spell — on one sample kernel dump, a fifth of every finding and half
+    /// of the ones it listed, with two modules supplying almost all of it.
+    /// `privileged_count` less this is how many are in code the compiler generated; both are
+    /// exact, and neither is derivable from a list that is a sample.
+    ///
+    /// **Zero does not mean the question was asked.** A target whose unwind entries are not
+    /// decoded here — x86, which has no unwind table at all — reports zero with every row's
+    /// `standing` saying `unverified`. [`PrivilegedInstruction::standing`] is what distinguishes
+    /// them, and the rendered form says so in a sentence.
+    pub uncovered_privileged: usize,
     /// What was decoded, one entry per **contiguous** run. A section with a hole in it appears
     /// twice, which is what lets a reader see where the hole was.
     pub scanned: Vec<ScannedRange>,
@@ -3449,6 +3495,10 @@ impl DriverHazards {
             sinks: _,
             privileged: _,
             privileged_count: _,
+            // **Not a shortfall.** A finding no unwind entry covers is one this *did* read and
+            // qualified; a shortfall is code it did not read at all, and folding the two would
+            // send a reader to re-run a scan that answered their question in full.
+            uncovered_privileged: _,
             scanned: _,
             other_imports: _,
             ordinal_imports,
@@ -5699,6 +5749,7 @@ mod tests {
             sinks: Vec::new(),
             privileged: Vec::new(),
             privileged_count: 0,
+            uncovered_privileged: 0,
             scanned: vec![ScannedRange {
                 section: ".text".into(),
                 start: addr(0xfffff803_1ab11000),

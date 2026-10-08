@@ -48,8 +48,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use dbgscope::dbgeng::{
-    BreakpointAt, BreakpointSpec, CommandRun, DebugEngine, DebuggeeType, Instruction,
-    InterruptHandle, Interruption, RunToOutcome, WaitOutcome,
+    BreakpointAt, BreakpointSpec, CommandRun, DebugEngine, DebuggeeType, FunctionExtent,
+    Instruction, InterruptHandle, Interruption, RunToOutcome, WaitOutcome,
 };
 use dbgscope::heap::{self as heap_query, HeapAllocation, HeapBackend, HeapState, HeapWalk};
 use dbgscope::pool::query::{self, PoolPageFilter, PoolWalk};
@@ -9004,6 +9004,7 @@ fn hazards_at(
         pe_failure(module, &why, stopped_by.get(), discarded.as_deref())
     })?;
 
+    let mut covers = Covers::default();
     let mut scan = hazards::scan(
         &image,
         &table.imports,
@@ -9021,6 +9022,7 @@ fn hazards_at(
                 None
             }
         },
+        |at| covers.standing(e, at),
     );
     scan.unnamed_libraries = table.unnamed_libraries;
 
@@ -9039,6 +9041,88 @@ fn hazards_at(
     // stop is the one that happened.
     report.stopped = report.stopped.or_else(|| stopped.get());
     Ok(report)
+}
+
+/// The image's own unwind table, asked one address at a time
+/// ([#303](https://github.com/glslang/windbg-mcp/issues/303)).
+///
+/// **It is the engine's `GetFunctionEntryByOffset` rather than a `.pdata` parse**, through
+/// dbgscope's `function_extent`, because that call already decodes both record layouts that exist
+/// — x64's three RVAs and ARM64's two words, the second of which is unwind data packed into a word
+/// or an RVA into `.xdata` needing one more read — and already separates "this image has no entry
+/// here" from "this build does not decode that layout". A parse here would be a second, unmeasured
+/// copy of that.
+///
+/// # Why there is a cache and what it is worth
+///
+/// A `RUNTIME_FUNCTION` region is contiguous and [`hazards::scan`] visits addresses in ascending
+/// order, so a routine with forty `rdmsr` in it costs **one** query rather than forty. What the
+/// cache cannot shorten is a run of findings no entry covers — there is no region to remember —
+/// which is the shape a data blob has. That is bounded by the scan's own deadline, the same budget
+/// that bounds the decode, and not by a query cap of its own: a cap would have to answer
+/// [`hazards::Standing::Unverified`] past its bound, which is a fourth outcome whose only remedy
+/// is the clock this already has.
+///
+/// # The direction a failure goes, and it is measured rather than assumed
+///
+/// Everything but an answered region reads as a finding that stays **listed and unqualified**:
+/// `Unsupported` and an engine error alike become [`hazards::Standing::Unverified`], which is the
+/// bucket with the ordinary list budget. So a target this cannot ask about reports exactly what it
+/// reported before the field existed, and a broken query cannot make a real finding look
+/// fabricated. `a_finding_the_unwind_table_cannot_be_asked_about_is_not_called_data` is the
+/// assertion, because *this fails safe* is a hypothesis
+/// (`.claude/rules/measurement-provenance.md`).
+#[derive(Debug, Default)]
+struct Covers {
+    /// The last region an answer named, so the next finding inside it costs no engine call.
+    region: Option<(u64, u64)>,
+    /// Latched once the engine says this target's entry layout is not decoded here, which is a
+    /// fact about the **target** and not about an address — x86 has no unwind table at all, so
+    /// asking again per finding is a query per byte of a 32-bit driver's data for one answer.
+    unsupported: bool,
+    /// Queries that failed, logged once. A failure is not a leaf function and must not read as
+    /// one; what it is, is a server fact, so it goes to the log rather than into the caller's
+    /// answer.
+    failed: usize,
+}
+
+impl Covers {
+    fn standing(&mut self, e: &DebugEngine, at: u64) -> hazards::Standing {
+        if self.unsupported {
+            return hazards::Standing::Unverified;
+        }
+        if let Some((begin, end)) = self.region
+            && (begin..end).contains(&at)
+        {
+            return hazards::Standing::InFunction;
+        }
+        match e.function_extent(at) {
+            Ok(FunctionExtent::Region { begin, end }) => {
+                self.region = Some((begin, end));
+                hazards::Standing::InFunction
+            }
+            Ok(FunctionExtent::NoEntry) => hazards::Standing::NoUnwindEntry,
+            Ok(FunctionExtent::Unsupported(set)) => {
+                tracing::debug!(
+                    ?set,
+                    "no unwind-entry layout for this target, so privileged findings are unplaced"
+                );
+                self.unsupported = true;
+                hazards::Standing::Unverified
+            }
+            Err(why) => {
+                self.failed += 1;
+                if self.failed == 1 {
+                    tracing::warn!(
+                        at = format_args!("{at:#x}"),
+                        error = %why,
+                        "the unwind entry would not read, so this finding is unplaced"
+                    );
+                }
+                hazards::Standing::Unverified
+            }
+        }
+    }
 }
 
 /// The directory a driver object is filed in, and the one a file-system driver is filed in.

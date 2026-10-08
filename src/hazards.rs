@@ -366,6 +366,68 @@ pub struct Sink {
     pub call_site_count: usize,
 }
 
+/// Whether the image's own unwind table has an entry covering a finding's address.
+///
+/// **The answer to [#303](https://github.com/glslang/windbg-mcp/issues/303), and the reason it is
+/// a field rather than a filter.** An executable section is not all instructions: a compiler puts
+/// jump tables, `TraceLogging` metadata, import descriptors, string literals and alignment padding
+/// in `.text`, and a linear decode spells those bytes as code and reports what they happen to say.
+/// Four of the one-byte x86 port-I/O opcodes are ASCII letters — `6c`–`6f` are `l`, `m`, `n`, `o` —
+/// so a string in `.text` reads as `insb`/`outsd` all day.
+///
+/// What tells the two apart with no symbols and no guesswork is the image's **unwind table**: the
+/// `RUNTIME_FUNCTION` records in `.pdata`, which the x64 and ARM64 ABIs oblige a compiler to emit
+/// for the code it generates, and which a stripped third-party driver carries exactly as a Microsoft
+/// one does. It is read-only, so it is in a dump for the same reason the code is.
+///
+/// **Measured, and it splits the two populations almost perfectly.** Over the 2,994 findings one
+/// scan of `docs/samples/081226-2187-01.dmp` listed: of the 1,434 that are `ins`/`outs` —
+/// the opcodes a string literal spells — **1,405 have no entry** covering them, while of the other
+/// 1,560, **1,453 are inside one**. By module, the concentration is the point: `tpm` 623 of 638
+/// uncovered, `DTrace` 879 of 880, and `nt` **0 of 5,535**. Cross-checked against the engine's own
+/// `.fnent` over every one of those findings — the two classifications agree on all 34 modules
+/// that have any, with no mismatch.
+///
+/// **Three outcomes rather than a `bool`**, for the reason `dbgscope`'s own `FunctionExtent` gives:
+/// collapsing them lets a reader take "not answered" for "not code".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum Standing {
+    /// An unwind entry covers this address: the compiler emitted a function here.
+    ///
+    /// **Not a guarantee the byte is an instruction.** A jump table embedded inside a function's
+    /// own region is covered by its entry, so this narrows the question rather than settling it.
+    /// It is the default because it is the expected answer for real code, and what the wire omits.
+    #[default]
+    InFunction,
+    /// No unwind entry covers it, which has three readings and this cannot choose between them:
+    /// data in an executable section (the case that motivates the field), code nobody emitted an
+    /// unwind record for, or an unwind table that could not be read.
+    ///
+    /// So it is a **qualification and not a verdict**: these findings are listed and counted, and
+    /// nothing here calls them fabricated. The second reading is not hypothetical, which is what
+    /// settled it — measured on `docs/samples/082126-7015-01.dmp`, 240 of ARM64 `nt`'s 1,373
+    /// findings have no entry, and the first of them is `nt!HalpStartupStub`, hand-written
+    /// assembly whose `mrs x1,DAIF` and `msr daifset,#1` are exactly what this tool is for. A
+    /// filter would have dropped them.
+    NoUnwindEntry,
+    /// The question was not answered at all, so the finding is neither placed in a function nor
+    /// out of one. x86 lands here — 32-bit Windows has no unwind table, so there is nothing to ask
+    /// — as does a target whose entry layout this build does not decode, and an engine that failed
+    /// the query.
+    Unverified,
+}
+
+impl Standing {
+    /// A short label for a rendering, and the `snake_case` a typed result carries.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::InFunction => "in_function",
+            Self::NoUnwindEntry => "no_unwind_entry",
+            Self::Unverified => "unverified",
+        }
+    }
+}
+
 /// One privileged instruction, and what it reaches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Privileged {
@@ -373,16 +435,30 @@ pub struct Privileged {
     pub kind: PrivilegeKind,
     /// The mnemonic, for a reader who wants to know which of the family it was.
     pub mnemonic: String,
+    /// What the image's unwind table says about this address. See [`Standing`].
+    pub standing: Standing,
 }
 
 /// What a scan found, and how much of the image it looked at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scan {
     pub sinks: Vec<Sink>,
-    /// The privileged instructions found, in address order, up to [`MAX_PRIVILEGED`].
+    /// The privileged instructions found, in address order.
+    ///
+    /// **Two budgets on one list**, [`MAX_PRIVILEGED`] and [`MAX_UNCOVERED_PRIVILEGED`], so that
+    /// neither population can push the other out of it: a module like the sample dump's `DTrace`,
+    /// whose 880 findings are 879 bytes of data an unwind entry does not cover, would otherwise
+    /// spend a single budget on noise and list none of the code.
     pub privileged: Vec<Privileged>,
     /// How many were found, which is exact however many are listed above.
     pub privileged_count: usize,
+    /// How many of those are in bytes **no unwind entry covers** —
+    /// [`Standing::NoUnwindEntry`] — which is exact however many of them are listed.
+    ///
+    /// A count of its own rather than something to derive from the list, for the reason every
+    /// count here is one: the list is a sample. It is what says how much of
+    /// [`Self::privileged_count`] is a linear decode's reading of data rather than of code.
+    pub uncovered_privileged: usize,
     pub scanned: Vec<Scanned>,
     /// Executable ranges that were **not** decoded, and therefore say nothing: bytes that would
     /// not read, and any part of a section whose declared span ran past the image.
@@ -457,8 +533,18 @@ pub const MAX_CALL_SITES_PER_SINK: usize = 256;
 /// The total across every sink. See [`MAX_CALL_SITES_PER_SINK`]: the per-sink cap keeps one name
 /// from taking the whole budget, and this is what actually bounds the answer.
 pub const MAX_CALL_SITES_TOTAL: usize = 4096;
-/// See [`MAX_CALL_SITES_PER_SINK`].
+/// See [`MAX_CALL_SITES_PER_SINK`]. The budget for findings an unwind entry covers, and for the
+/// ones no unwind table could be asked about.
 pub const MAX_PRIVILEGED: usize = 1024;
+/// The budget [`Standing::NoUnwindEntry`] findings have **of their own**, on the same list.
+///
+/// **A second budget rather than a share of the first**, because the two populations are not
+/// competing for a reader's attention — a reader wants the code findings, and enough of the
+/// uncovered ones to check the qualification against. Measured on `docs/samples/081226-2187-01.dmp`:
+/// `DTrace` finds 880 privileged instructions of which 879 are uncovered, so one budget spent in
+/// address order lists the data and drops the one real finding. Small, because a sample is all
+/// these are for: the count beside them is the fact.
+pub const MAX_UNCOVERED_PRIVILEGED: usize = 128;
 /// See [`MAX_CALL_SITES_PER_SINK`]. One in every real image; more means a repeated name.
 pub const MAX_SLOTS_PER_SINK: usize = 16;
 
@@ -469,12 +555,20 @@ pub const MAX_SLOTS_PER_SINK: usize = 16;
 /// window out of [`Scan::scanned`]. `halt` is polled between windows. Both are handed to
 /// [`codewalk::walk_code`], which owns the section walk, the window boundaries and the two
 /// budgets; what stays here is the per-instruction reading.
+///
+/// `standing` answers what the image's unwind table says about one address, and is asked **once
+/// per privileged finding** — including the ones past a list budget, since
+/// [`Scan::uncovered_privileged`] is a count and a count is exact. See [`Standing`] for what it
+/// buys and why a caller that cannot answer returns [`Standing::Unverified`] rather than guessing.
+/// It is a closure for the reason the other two are: the worker's reaches an engine, and a test's
+/// is a fixture.
 pub fn scan(
     image: &pe::Image,
     imports: &[pe::Import],
     set: InstructionSet,
     decode: impl FnMut(u64, usize) -> Option<Vec<Instruction>>,
     halt: impl FnMut() -> Option<Halt>,
+    mut standing: impl FnMut(u64) -> Standing,
 ) -> Scan {
     let by_slot = pe::imports_by_slot(imports);
     // **Keyed by library and name, not by slot**, which is what bounds this list by construction:
@@ -516,6 +610,11 @@ pub fn scan(
 
     let mut privileged = Vec::new();
     let mut privileged_count = 0usize;
+    let mut uncovered_privileged = 0usize;
+    // The two list budgets, counted apart. One list, so it stays in address order; two counters,
+    // so the uncovered findings cannot spend the covered ones' budget or be spent by them.
+    let mut listed_covered = 0usize;
+    let mut listed_uncovered = 0usize;
     let mut listed_call_sites = 0usize;
     // The addresses this code has been watched computing, for the calls that reach an import
     // through a register rather than through a memory operand. Cleared at every discontinuity the
@@ -547,11 +646,23 @@ pub fn scan(
         }
         if let Some(kind) = privilege_kind(instruction, set) {
             privileged_count += 1;
-            if privileged.len() < MAX_PRIVILEGED {
+            // **Asked for every finding, not for every listed one.** `uncovered_privileged` is a
+            // count, and a count that stopped being taken at a list's cap would report a module
+            // whose findings are all data as one whose first thousand are.
+            let standing = standing(instruction.address);
+            let (listed, cap) = if standing == Standing::NoUnwindEntry {
+                uncovered_privileged += 1;
+                (&mut listed_uncovered, MAX_UNCOVERED_PRIVILEGED)
+            } else {
+                (&mut listed_covered, MAX_PRIVILEGED)
+            };
+            if *listed < cap {
+                *listed += 1;
                 privileged.push(Privileged {
                     address: instruction.address,
                     kind,
                     mnemonic: instruction.mnemonic.clone(),
+                    standing,
                 });
             }
         }
@@ -571,6 +682,7 @@ pub fn scan(
         sinks: sinks.into_values().collect(),
         privileged,
         privileged_count,
+        uncovered_privileged,
         scanned: covered.scanned,
         unreadable: covered.unreadable,
         other_imports,
@@ -776,9 +888,11 @@ pub fn structured_report(
                 at: locate(found.address),
                 kind: found.kind.name().to_string(),
                 mnemonic: found.mnemonic.clone(),
+                standing: found.standing.name().to_string(),
             })
             .collect(),
         privileged_count: scan.privileged_count,
+        uncovered_privileged: scan.uncovered_privileged,
         scanned: scan.scanned.iter().map(codewalk::range_report).collect(),
         unreadable: scan.unreadable.iter().map(codewalk::range_report).collect(),
         other_imports: scan.other_imports,
@@ -894,23 +1008,68 @@ pub fn render(report: &crate::structured::DriverHazards) -> String {
     if report.privileged.is_empty() {
         out.push_str("  Privileged instructions: none\n");
     } else {
-        let listed = if report.privileged_count > report.privileged.len() {
-            format!(", first {} listed", report.privileged.len())
-        } else {
-            String::new()
-        };
-        out.push_str(&format!(
-            "  Privileged instructions ({}{listed}):\n",
-            report.privileged_count
-        ));
-        for found in &report.privileged {
-            let rva = found.at.rva.as_deref().unwrap_or("?");
-            out.push_str(&format!(
+        // **Split by standing rather than printed in one run**, which is the whole of what a text
+        // reader gets from issue #303: the two groups read identically as rows -- a real `tdcall`
+        // and a `jo` that is the fifth byte of a `TraceLogging` blob -- and the only thing that
+        // tells them apart is the heading they sit under.
+        let (covered, uncovered): (Vec<_>, Vec<_>) = report
+            .privileged
+            .iter()
+            .partition(|found| found.standing != Standing::NoUnwindEntry.name());
+        let row = |found: &crate::structured::PrivilegedInstruction| {
+            format!(
                 "    {:<16} {:<24} {}\n",
                 crate::structured::renderable(&found.mnemonic),
                 found.kind,
-                rva
+                found.at.rva.as_deref().unwrap_or("?")
+            )
+        };
+        // The count of **this** group, which is the total less the uncovered one -- both exact,
+        // and neither derivable from a list that is a sample.
+        let in_code = report
+            .privileged_count
+            .saturating_sub(report.uncovered_privileged);
+        let listed = if in_code > covered.len() {
+            format!(", first {} listed", covered.len())
+        } else {
+            String::new()
+        };
+        out.push_str(&format!("  Privileged instructions ({in_code}{listed}):\n"));
+        if covered.is_empty() {
+            out.push_str("    none in bytes an unwind entry covers\n");
+        }
+        for found in &covered {
+            out.push_str(&row(found));
+        }
+        if report.uncovered_privileged > 0 {
+            let listed = if report.uncovered_privileged > uncovered.len() {
+                format!(", first {} listed", uncovered.len())
+            } else {
+                String::new()
+            };
+            out.push_str(&format!(
+                "  In bytes no unwind entry covers ({}{listed}) — an executable section is not\n           \
+                 all instructions, and a linear decode spells a jump table, a string or\n           \
+                 TraceLogging metadata as whatever those bytes happen to say. But code nobody\n           \
+                 emitted an unwind record for lands here too — hand-written assembly does — so\n           \
+                 these are listed rather than dropped. Disassemble one before quoting it:\n",
+                report.uncovered_privileged
             ));
+            for found in &uncovered {
+                out.push_str(&row(found));
+            }
+        }
+        // Said once for the whole group rather than per row: where the table cannot be asked, it
+        // cannot be asked about any of them.
+        if covered
+            .iter()
+            .any(|found| found.standing == Standing::Unverified.name())
+        {
+            out.push_str(
+                "  Not placed against an unwind table: this target's unwind entries are not\n           \
+                 decoded here (x86 has none at all), so none of the above is known to be code\n           \
+                 rather than data a linear decode read as code.\n",
+            );
         }
     }
 
@@ -1142,6 +1301,23 @@ mod tests {
         None
     }
 
+    /// The `standing` fixture for a test that is not about the unwind table: every address is in a
+    /// function, which is what a real image's own code answers.
+    ///
+    /// **Named rather than defaulted**, for the same reason `privileged_insn` is separate from
+    /// `insn`: a fixture answers here for something the engine answers on a target, so a call site
+    /// says which answer it is standing in for. The two tests that *are* about the table supply
+    /// `unplaced` and `no_entry_at` instead.
+    fn in_functions(_: u64) -> Standing {
+        Standing::InFunction
+    }
+
+    /// The fixture for a target whose unwind entries this build does not decode -- x86, which has
+    /// no unwind table at all -- and for an engine whose query failed.
+    fn unplaced(_: u64) -> Standing {
+        Standing::Unverified
+    }
+
     /// The `locate` a test supplies: coordinates invented, because attributing an address is an
     /// engine call and this file has never seen an engine.
     fn invented(address: u64) -> crate::structured::CodeLocation {
@@ -1188,6 +1364,7 @@ mod tests {
             InstructionSet::Amd64,
             |_, _| None,
             never,
+            in_functions,
         );
         assert_eq!(found.ordinal_imports, 1);
         assert_eq!(
@@ -1237,6 +1414,7 @@ mod tests {
             InstructionSet::Amd64,
             |_, _| None,
             never,
+            in_functions,
         );
         assert_eq!(named.ordinal_imports, 0);
         let plain = render(&structured_report("vid", BASE, &named, invented));
@@ -1285,6 +1463,7 @@ mod tests {
             InstructionSet::Amd64,
             |_, _| None,
             never,
+            in_functions,
         );
         assert_eq!(found.framework, Some(crate::framework::Framework::Kmdf));
         assert_eq!(
@@ -1325,6 +1504,7 @@ mod tests {
             InstructionSet::Amd64,
             |_, _| None,
             never,
+            in_functions,
         );
         assert_eq!(wdm.framework, None);
 
@@ -1420,6 +1600,7 @@ mod tests {
             InstructionSet::Amd64,
             |at, _| (at == BASE + 0x1000).then(|| block.clone()),
             never,
+            in_functions,
         );
 
         assert_eq!(found.sinks.len(), 2, "{:?}", found.sinks);
@@ -1587,6 +1768,7 @@ mod tests {
             InstructionSet::Arm64,
             |at, _| (at == BASE + 0x1000).then(|| block.clone()),
             never,
+            in_functions,
         );
 
         let copy = found
@@ -1754,6 +1936,7 @@ mod tests {
             InstructionSet::Amd64,
             |at, _| (at == BASE + 0x1000).then(|| block.clone()),
             never,
+            in_functions,
         );
 
         let kinds: Vec<(u64, PrivilegeKind)> = found
@@ -1823,6 +2006,7 @@ mod tests {
             InstructionSet::Amd64,
             |at, _| (at == BASE + 0x1000).then(|| block.clone()),
             never,
+            in_functions,
         );
 
         let kinds: Vec<(&str, PrivilegeKind)> = found
@@ -1877,6 +2061,7 @@ mod tests {
                 None
             },
             never,
+            in_functions,
         );
         assert_eq!(
             asked.first().copied(),
@@ -1909,6 +2094,7 @@ mod tests {
             InstructionSet::Amd64,
             |_, _| Some(Vec::new()),
             never,
+            in_functions,
         );
         assert!(empty.scanned.is_empty(), "{:?}", empty.scanned);
         assert_eq!(empty.unreadable.len(), 1, "{:?}", empty.unreadable);
@@ -1925,6 +2111,7 @@ mod tests {
             InstructionSet::Amd64,
             |at, _| Some(vec![insn(at, "", "nop", Flow::Fallthrough, Vec::new())]),
             never,
+            in_functions,
         );
         assert_eq!(stuck.unreadable.len(), 1, "{:?}", stuck.unreadable);
         assert_eq!(stuck.unreadable[0].bytes, 0x100);
@@ -1940,7 +2127,14 @@ mod tests {
     #[test]
     fn an_unreadable_window_is_recorded_rather_than_skipped_in_silence() {
         let image = image();
-        let found = scan(&image, &[], InstructionSet::Amd64, |_, _| None, never);
+        let found = scan(
+            &image,
+            &[],
+            InstructionSet::Amd64,
+            |_, _| None,
+            never,
+            in_functions,
+        );
         assert!(
             found.scanned.is_empty(),
             "nothing was covered, and nothing claims to have been: {:?}",
@@ -1980,6 +2174,7 @@ mod tests {
             InstructionSet::Amd64,
             |at, want| (at != BASE + 0x11000).then(|| filler(at, want)),
             never,
+            in_functions,
         );
         assert_eq!(hole.scanned.len(), 2, "{:?}", hole.scanned);
         assert_eq!(hole.scanned[0].start, BASE + 0x1000);
@@ -2017,6 +2212,7 @@ mod tests {
                 None
             },
             never,
+            in_functions,
         );
         let furthest = asked.iter().copied().max().unwrap_or_default();
         assert!(
@@ -2065,6 +2261,7 @@ mod tests {
                 Some(block)
             },
             never,
+            in_functions,
         );
 
         let sink = &found.sinks[0];
@@ -2087,6 +2284,274 @@ mod tests {
         assert_eq!(
             sink.call_site_count, found.privileged_count,
             "the fixture emits one of each per pair, so the two counts agree — which is what says              both are counting rather than both being capped"
+        );
+    }
+
+    /// **An executable section is not all instructions, and the answer says which is which**
+    /// (issue [#303](https://github.com/glslang/windbg-mcp/issues/303)).
+    ///
+    /// A linear decode of `.text` walks the jump tables, string literals and `TraceLogging`
+    /// metadata a compiler puts there and reports what those bytes happen to spell -- and four of
+    /// x86's one-byte port-I/O opcodes are ASCII letters, so a string reads as `insb`/`outsd`. The
+    /// two read identically as rows: measured on `docs/samples/081226-2187-01.dmp`,
+    /// `kdstub+0x7fed` is a real `tdcall` inside `HcTdxVmcall` and `tpm+0x43fbd` is the fifth byte
+    /// of `tpm!TraceLoggingMetadata`, and only the image's own unwind table tells them apart --
+    /// `.fnent` answers `BeginAddress = 0x7fe0` for the first and *"No function entry"* for the
+    /// second.
+    ///
+    /// So the standing travels on every row, the count of the uncovered ones travels beside the
+    /// total, and the rendering puts them under **two headings**. Each of the three is asserted
+    /// here, because each is a channel a reader may be served alone: a structured client reads the
+    /// rows, a budget-conscious one reads the counts, and a text client reads the headings.
+    #[test]
+    fn a_finding_no_unwind_entry_covers_is_counted_apart_and_rendered_apart() {
+        let image = image();
+        let block = vec![
+            privileged_insn(
+                BASE + 0x1000,
+                "0f32",
+                "rdmsr",
+                Flow::Fallthrough,
+                Vec::new(),
+            ),
+            // The two one-byte opcodes that are `n` and `o` in a string literal.
+            privileged_insn(BASE + 0x1002, "6e", "outsb", Flow::Fallthrough, Vec::new()),
+            privileged_insn(BASE + 0x1003, "6f", "outsd", Flow::Fallthrough, Vec::new()),
+            privileged_insn(
+                BASE + 0x1004,
+                "0f30",
+                "wrmsr",
+                Flow::Fallthrough,
+                Vec::new(),
+            ),
+            insn(BASE + 0x1006, "c3", "ret", Flow::Return, Vec::new()),
+        ];
+        // The two in the middle are the ones no entry covers, exactly as the sample dump answers
+        // for them.
+        let covers = |at: u64| match at {
+            a if a == BASE + 0x1002 || a == BASE + 0x1003 => Standing::NoUnwindEntry,
+            _ => Standing::InFunction,
+        };
+        let found = scan(
+            &image,
+            &[],
+            InstructionSet::Amd64,
+            |at, _| (at == BASE + 0x1000).then(|| block.clone()),
+            never,
+            covers,
+        );
+
+        assert_eq!(
+            found.privileged_count, 4,
+            "the total is every privileged instruction decoded, as it always was: {:?}",
+            found.privileged
+        );
+        assert_eq!(
+            found.uncovered_privileged, 2,
+            "and this says how many of them no unwind entry covers: {:?}",
+            found.privileged
+        );
+        assert_eq!(
+            found
+                .privileged
+                .iter()
+                .map(|found| (found.mnemonic.as_str(), found.standing))
+                .collect::<Vec<_>>(),
+            vec![
+                ("rdmsr", Standing::InFunction),
+                ("outsb", Standing::NoUnwindEntry),
+                ("outsd", Standing::NoUnwindEntry),
+                ("wrmsr", Standing::InFunction),
+            ],
+            "the list stays in address order and every row carries its own standing"
+        );
+
+        let report = structured_report("vid", BASE, &found, invented);
+        assert_eq!(report.uncovered_privileged, 2);
+        assert_eq!(
+            report
+                .privileged
+                .iter()
+                .map(|found| found.standing.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "in_function",
+                "no_unwind_entry",
+                "no_unwind_entry",
+                "in_function"
+            ],
+        );
+        // **Omitted from the wire when it is `in_function`**, which is the expected answer for
+        // code: a thousand repetitions of the uninteresting value is bytes a reader pays for and
+        // skips. Asserted on the serialized form, because that is the only place the omission
+        // exists -- the field is `in_function` either way once a client has parsed it.
+        let wire = serde_json::to_string(&report).expect("the report serializes");
+        assert_eq!(
+            wire.matches("no_unwind_entry").count(),
+            2,
+            "the interesting standing is spelled out: {wire}"
+        );
+        assert!(
+            !wire.contains("in_function"),
+            "and the expected one is left out: {wire}"
+        );
+
+        let text = render(&report);
+        assert!(
+            text.contains("Privileged instructions (2):"),
+            "the heading counts the findings in code rather than every finding -- it said 4 while \
+             the two groups were one: {text}"
+        );
+        assert!(
+            text.contains("In bytes no unwind entry covers (2)"),
+            "and the others get a heading of their own: {text}"
+        );
+        // The rows land under the right heading, which is the whole of what a text reader gets
+        // here. Compared by position rather than by presence: both groups are printed, so a
+        // rendering that put all four under the first heading contains every mnemonic too.
+        let split = text
+            .find("In bytes no unwind entry covers")
+            .expect("the second heading is there");
+        let (code, data) = text.split_at(split);
+        assert!(
+            code.contains("rdmsr") && code.contains("wrmsr"),
+            "the real findings are above it: {code}"
+        );
+        assert!(
+            !code.contains("outsb") && !code.contains("outsd"),
+            "and the data is not: {code}"
+        );
+        assert!(
+            data.contains("outsb") && data.contains("outsd"),
+            "the data is below it: {data}"
+        );
+        assert!(
+            !text.contains("Not placed against an unwind table"),
+            "the table answered, so nothing says it could not: {text}"
+        );
+    }
+
+    /// **A finding the unwind table cannot be asked about is not called data.**
+    ///
+    /// x86 has no unwind table at all, so there is nothing to ask, and a target whose entry layout
+    /// this build does not decode -- or an engine whose query failed -- is the same answer. Every
+    /// one of those keeps the ordinary list budget and is counted into neither side of the split:
+    /// a query that did not answer must not make a real `out` look like a byte of a string.
+    ///
+    /// **Mutation-verified**: fold `Standing::Unverified` into the `NoUnwindEntry` arm of `scan`
+    /// and this fails on `uncovered_privileged`, coming back 2 against 0; fold it the other way in
+    /// `render`'s `partition` and the two findings move under the data heading with the
+    /// *"Not placed"* sentence still printed beneath them.
+    #[test]
+    fn a_finding_the_unwind_table_cannot_be_asked_about_is_not_called_data() {
+        let image = image();
+        let block = vec![
+            privileged_insn(BASE + 0x1000, "ee", "out", Flow::Fallthrough, Vec::new()),
+            privileged_insn(BASE + 0x1001, "fa", "cli", Flow::Fallthrough, Vec::new()),
+            insn(BASE + 0x1002, "c3", "ret", Flow::Return, Vec::new()),
+        ];
+        let found = scan(
+            &image,
+            &[],
+            InstructionSet::X86,
+            |at, _| (at == BASE + 0x1000).then(|| block.clone()),
+            never,
+            unplaced,
+        );
+
+        assert_eq!(found.privileged_count, 2);
+        assert_eq!(
+            found.uncovered_privileged, 0,
+            "nothing was placed outside a function, because nothing was placed: {:?}",
+            found.privileged
+        );
+        assert!(
+            found
+                .privileged
+                .iter()
+                .all(|found| found.standing == Standing::Unverified),
+            "{:?}",
+            found.privileged
+        );
+
+        let text = render(&structured_report("vid", BASE, &found, invented));
+        assert!(
+            text.contains("Privileged instructions (2):")
+                && text.contains("out")
+                && text.contains("cli"),
+            "both are reported exactly as they were before the standing existed: {text}"
+        );
+        assert!(
+            !text.contains("In bytes no unwind entry covers"),
+            "and neither is under the data heading: {text}"
+        );
+        assert!(
+            text.contains("Not placed against an unwind table"),
+            "what a reader is told instead is that the question was not answered: {text}"
+        );
+    }
+
+    /// **Neither population can spend the other's list budget.**
+    ///
+    /// One budget in address order is spent by whatever comes first, and what comes first in a
+    /// module like the sample dump's `DTrace` -- 880 privileged findings of which 879 are bytes no
+    /// entry covers -- is the data. So the one real finding at the end would be counted and never
+    /// listed, which is the shape this answer must not take: a reader cannot check a finding that
+    /// is only a number.
+    ///
+    /// **Mutation-verified**: give the two one shared counter in `scan` and the covered finding
+    /// disappears from the list while `privileged_count` still names it.
+    #[test]
+    fn neither_population_can_spend_the_others_list_budget() {
+        let mut image = image();
+        image.size_of_image = 0x40000;
+        image.sections[0].virtual_size = 0x30000;
+        // `DTrace`'s shape: a long run of bytes no entry covers, and one real finding past them.
+        let real = BASE + 0x1000 + 0x20000;
+        let found = scan(
+            &image,
+            &[],
+            InstructionSet::Amd64,
+            |at, want| {
+                Some(
+                    (at..at + want as u64)
+                        .map(|address| {
+                            privileged_insn(address, "fa", "cli", Flow::Fallthrough, Vec::new())
+                        })
+                        .collect(),
+                )
+            },
+            never,
+            |at| {
+                if at == real {
+                    Standing::InFunction
+                } else {
+                    Standing::NoUnwindEntry
+                }
+            },
+        );
+
+        assert!(
+            found.uncovered_privileged > MAX_UNCOVERED_PRIVILEGED,
+            "the fixture finds far more than the sample's budget: {}",
+            found.uncovered_privileged
+        );
+        let (covered, uncovered): (Vec<_>, Vec<_>) = found
+            .privileged
+            .iter()
+            .partition(|found| found.standing != Standing::NoUnwindEntry);
+        assert_eq!(
+            uncovered.len(),
+            MAX_UNCOVERED_PRIVILEGED,
+            "the data is sampled rather than listed"
+        );
+        assert_eq!(
+            covered
+                .iter()
+                .map(|found| found.address)
+                .collect::<Vec<_>>(),
+            vec![real],
+            "and the one real finding is listed, 0x20000 bytes of noise after the cap was reached"
         );
     }
 
@@ -2125,6 +2590,7 @@ mod tests {
                     (at == BASE + 0x1000).then(|| block.clone())
                 },
                 never,
+                in_functions,
             );
             (found, decoded_from)
         };
@@ -2215,6 +2681,7 @@ mod tests {
                 Some(block)
             },
             never,
+            in_functions,
         );
 
         let listed: usize = found.sinks.iter().map(|sink| sink.call_sites.len()).sum();
@@ -2251,7 +2718,14 @@ mod tests {
             .map(|index| import("memcpy", BASE + 0x3000 + (index as u64 * 8)))
             .collect();
 
-        let found = scan(&image, &imports, InstructionSet::Amd64, |_, _| None, never);
+        let found = scan(
+            &image,
+            &imports,
+            InstructionSet::Amd64,
+            |_, _| None,
+            never,
+            in_functions,
+        );
         assert_eq!(
             found.sinks.len(),
             1,
@@ -2277,7 +2751,14 @@ mod tests {
             name: pe::ImportName::Named("memcpy".to_string()),
             slot: BASE + 0x3900,
         });
-        let found = scan(&image, &two, InstructionSet::Amd64, |_, _| None, never);
+        let found = scan(
+            &image,
+            &two,
+            InstructionSet::Amd64,
+            |_, _| None,
+            never,
+            in_functions,
+        );
         assert_eq!(found.sinks.len(), 2, "{:?}", found.sinks);
     }
 
@@ -2297,6 +2778,7 @@ mod tests {
             InstructionSet::Amd64,
             |_, _| panic!("nothing outside the image is read"),
             never,
+            in_functions,
         );
         assert!(found.scanned.is_empty(), "{:?}", found.scanned);
         assert_eq!(
@@ -2324,6 +2806,7 @@ mod tests {
                 polls += 1;
                 (polls > 1).then_some(Halt::Interrupted)
             },
+            in_functions,
         );
         assert_eq!(found.halted, Some(Halt::Interrupted));
     }
