@@ -390,7 +390,7 @@ pub struct Sink {
 ///
 /// **Three outcomes rather than a `bool`**, for the reason `dbgscope`'s own `FunctionExtent` gives:
 /// collapsing them lets a reader take "not answered" for "not code".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Standing {
     /// An unwind entry covers this address: the compiler emitted a function here.
     ///
