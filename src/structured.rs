@@ -3239,13 +3239,17 @@ pub struct PrivilegedInstruction {
 }
 
 /// The `standing` an absent [`PrivilegedInstruction::standing`] means.
+///
+/// Read off `Standing`'s own `#[default]` rather than naming a variant here, so that which value
+/// the wire omits is stated in one place -- the enum -- and these two cannot drift from it or from
+/// each other.
 fn in_function() -> String {
-    crate::hazards::Standing::InFunction.name().to_string()
+    crate::hazards::Standing::default().name().to_string()
 }
 
 /// Whether a `standing` is the one the wire leaves out.
 fn is_in_function(standing: &str) -> bool {
-    standing == crate::hazards::Standing::InFunction.name()
+    standing == crate::hazards::Standing::default().name()
 }
 
 /// One executable range a scan covered.
