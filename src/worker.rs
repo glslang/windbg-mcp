@@ -3099,7 +3099,6 @@ fn execute(
             let transition = held_live_control(&mut sk_live.session)?
                 .step(e, &epoch, guard)
                 .map_err(failed)?;
-            emit(&WorkerMessage::SecureKernelPauseEnded);
             Ok(Output::typed(
                 crate::skdispatch::render_transition(&transition),
                 transition,
@@ -12043,6 +12042,31 @@ mod tests {
              time, not after wait validation returns: {arm}"
         );
         assert_eq!(arm.matches("SecureKernelPauseStarted").count(), 1);
+    }
+
+    #[test]
+    fn a_live_step_keeps_the_pause_timer_and_a_continue_ends_it() {
+        let source = include_str!("worker.rs");
+        let step = source
+            .split_once("EngineOp::SkLiveStep { epoch, guard } =>")
+            .expect("the live-step dispatch arm exists")
+            .1
+            .split_once("EngineOp::SkLiveContinue { epoch } =>")
+            .expect("the live-continue dispatch arm follows it")
+            .0;
+        let continued = source
+            .split_once("EngineOp::SkLiveContinue { epoch } =>")
+            .expect("the live-continue dispatch arm exists")
+            .1
+            .split_once("EngineOp::Launch { command_line } =>")
+            .expect("the next dispatch arm exists")
+            .0;
+
+        assert!(
+            !step.contains("SecureKernelPauseEnded"),
+            "single-step keeps vmwp under debugger control and must preserve the absolute pause timer: {step}"
+        );
+        assert_eq!(continued.matches("SecureKernelPauseEnded").count(), 1);
     }
 
     fn kind(class: u32, qualifier: u32) -> Option<DebuggeeType> {
