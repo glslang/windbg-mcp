@@ -413,6 +413,8 @@ pub struct Scan {
     pub framework: Option<crate::framework::Framework>,
     /// Libraries whose imports could not be named at all, carried through from the import table.
     pub unnamed_libraries: Vec<String>,
+    /// Where the imports were named from; the caller that read them sets it.
+    pub imports_named_from: crate::structured::ImportsNamedFrom,
     /// Why the scan stopped early, when it did.
     pub halted: Option<Halt>,
     /// True when the byte cap stopped it rather than the code running out.
@@ -619,9 +621,50 @@ pub fn scan(
         // be -- it is how a driver *loads*, not something it does to a caller's buffer.
         framework: crate::framework::client_of(imports),
         unnamed_libraries: Vec::new(),
+        imports_named_from: crate::structured::ImportsNamedFrom::ImportDirectory,
         halted: covered.halted,
         cap_hit: covered.cap_hit,
     }
+}
+
+/// Imports named from the addresses their import-address-table slots are bound to, and how many
+/// slots named nothing.
+///
+/// For a driver whose import directory the loader freed; see
+/// [`crate::structured::ImportsNamedFrom`] for why naming the bound address names the import.
+/// `symbol_for` is the engine's `module!name` and displacement for an address, and `library_for`
+/// the library name the module holding an address gives itself in its export directory. A slot is
+/// named only where the address is the **start** of a symbol and a module there names its library:
+/// an address part-way into a function is not an export, and a name filed under no library could
+/// not match a list keyed by library and name -- so either is counted, never guessed.
+///
+/// Engine-free, so it is tested off a target: the worker hands it the two closures.
+pub fn imports_from_bound_slots(
+    slots: &[pe::IatSlot],
+    mut symbol_for: impl FnMut(u64) -> Option<(String, u64)>,
+    mut library_for: impl FnMut(u64) -> Option<String>,
+) -> (Vec<pe::Import>, usize) {
+    let mut imports = Vec::new();
+    let mut unnamed = 0;
+    for slot in slots {
+        let name = symbol_for(slot.value)
+            .filter(|(_, displacement)| *displacement == 0)
+            .and_then(|(symbol, _)| {
+                symbol
+                    .split_once('!')
+                    .map(|(_, name)| name.to_string())
+                    .filter(|name| !name.is_empty())
+            });
+        match (name, library_for(slot.value)) {
+            (Some(name), Some(library)) => imports.push(pe::Import {
+                library,
+                name: pe::ImportName::Named(name),
+                slot: slot.slot,
+            }),
+            _ => unnamed += 1,
+        }
+    }
+    (imports, unnamed)
 }
 
 /// The IAT slot an instruction transfers control through, when it transfers through one.
@@ -835,6 +878,7 @@ pub fn structured_report(
             crate::framework::client_report(framework, true, crate::framework::Table::Unread)
         }),
         unnamed_libraries: scan.unnamed_libraries.clone(),
+        imports_named_from: scan.imports_named_from.clone(),
         stopped: scan.halted.map(|halt| match halt {
             Halt::Deadline => structured::WalkHalt::Deadline,
             Halt::Interrupted => structured::WalkHalt::Interrupted,
@@ -917,12 +961,19 @@ pub fn render(report: &crate::structured::DriverHazards) -> String {
     // because it is a different fact with a different remedy: the scan ran to the end and part of
     // the driver was simply not there. Without it, a dump missing one page prints "Privileged
     // instructions: none" and nothing anywhere says a page was missing.
+    //
+    // **Two remedies, because the line now reaches a live kernel.** Until a freed import directory
+    // stopped refusing the scan outright, a live HEVD never got this far; now it does, with five of
+    // its six `PAGE` pages absent, and the dump remedy alone told that reader to look for an image
+    // the target already has. Measured: one IOCTL down HEVD's dispatch brought one page in.
     if !report.unreadable.is_empty() {
         let bytes: u64 = report.unreadable.iter().map(|range| range.bytes).sum();
         out.push_str(&format!(
             "  INCOMPLETE: {bytes} bytes of this driver's code could not be read, so what is\n           \
              below is what was found rather than what is there. On a dump the image is what\n           \
-             supplies those bytes.\n"
+             supplies those bytes; on a live kernel a pageable section is resident only in the\n           \
+             pages its last run touched, so running the driver brings more of it in, and a\n           \
+             discardable one is gone.\n"
         ));
     }
     if report.stopped.is_some() || report.cap_hit {
@@ -946,7 +997,12 @@ pub fn render(report: &crate::structured::DriverHazards) -> String {
         // start -- so qualifying one and not the other is worse than qualifying neither, which is
         // what this was: a reader would learn that an unqualified negative means every import was
         // shown, and a bound import table would then be the case that quietly breaks the lesson.
-        let unasked = if report.ordinal_imports > 0 || !report.unnamed_libraries.is_empty() {
+        // **Asked of `shortfall`, which owns the import-side rule**, rather than a second copy of
+        // it here: the copy named two channels and the address table's unnamed slots are a third.
+        let unasked = if matches!(
+            report.shortfall(),
+            Some(crate::structured::Shortfall::Imports | crate::structured::Shortfall::Both)
+        ) {
             " (of the imports it was shown)"
         } else {
             ""
@@ -1060,6 +1116,23 @@ pub fn render(report: &crate::structured::DriverHazards) -> String {
             report.ordinal_imports
         ));
     }
+    if let crate::structured::ImportsNamedFrom::ImportAddressTable {
+        discarded_section,
+        unnamed_slots,
+    } = &report.imports_named_from
+    {
+        out.push_str(&format!(
+            "  Imports named from the import address table: the import directory is in `{}`,\n           \
+             which the loader discarded, so each is the export its slot is bound to.\n",
+            crate::structured::renderable(discarded_section)
+        ));
+        if *unnamed_slots > 0 {
+            out.push_str(&format!(
+                "  Not nameable (bound to no export): {unnamed_slots} slot(s), so the sinks above are a\n           \
+                 lower bound.\n"
+            ));
+        }
+    }
     if !report.unnamed_libraries.is_empty() {
         out.push_str(&format!(
             "  Not nameable (bound imports): {}\n",
@@ -1162,6 +1235,7 @@ mod tests {
             ],
             export_directory: (0, 0),
             import_directory: (0x2000, 40),
+            iat_directory: (0, 0),
         }
     }
 
@@ -1408,6 +1482,93 @@ mod tests {
             "a bound library earns the same qualification an ordinal does: {bound}"
         );
         assert!(!bound.contains("by ordinal"), "{bound}");
+    }
+
+    /// Imports are named from what their address-table slots are bound to: a slot at the start
+    /// of a symbol, in a module that names its library, is that export, and anything else is
+    /// counted rather than guessed.
+    #[test]
+    fn imports_are_named_from_the_exports_their_slots_are_bound_to() {
+        let slots = [
+            pe::IatSlot {
+                slot: BASE + 0x3000,
+                value: 0xa000,
+            },
+            // Eight bytes into a function: not an export, whatever the symbol is.
+            pe::IatSlot {
+                slot: BASE + 0x3008,
+                value: 0xa108,
+            },
+            // A symbol, but in no module that names its library.
+            pe::IatSlot {
+                slot: BASE + 0x3010,
+                value: 0xb000,
+            },
+            // A module, but no symbol at all.
+            pe::IatSlot {
+                slot: BASE + 0x3018,
+                value: 0xa200,
+            },
+        ];
+        let symbol_for = |address: u64| match address {
+            0xa000 => Some(("nt!ExAllocatePoolWithTag".to_string(), 0)),
+            0xa108 => Some(("nt!ExFreePoolWithTag".to_string(), 8)),
+            0xb000 => Some(("elsewhere!Thing".to_string(), 0)),
+            _ => None,
+        };
+        let library_for =
+            |address: u64| (address & 0xf000 == 0xa000).then(|| "ntoskrnl.exe".to_string());
+        let (imports, unnamed) = imports_from_bound_slots(&slots, symbol_for, library_for);
+        assert_eq!(
+            imports,
+            vec![pe::Import {
+                library: "ntoskrnl.exe".to_string(),
+                name: pe::ImportName::Named("ExAllocatePoolWithTag".to_string()),
+                slot: BASE + 0x3000,
+            }]
+        );
+        assert_eq!(unnamed, 3, "every slot that named nothing is counted");
+    }
+
+    /// A scan whose imports came from the address table says so, and a slot that named nothing
+    /// qualifies its negative exactly as an ordinal or a bound library does.
+    #[test]
+    fn imports_named_from_the_address_table_are_rendered_as_such() {
+        let image = image();
+        let mut named = scan(
+            &image,
+            &[import("KeQueryPerformanceCounter", BASE + 0x3008)],
+            InstructionSet::Amd64,
+            |_, _| None,
+            never,
+            in_functions,
+        );
+        named.imports_named_from = crate::structured::ImportsNamedFrom::ImportAddressTable {
+            discarded_section: "INIT".to_string(),
+            unnamed_slots: 0,
+        };
+        let whole = render(&structured_report("vid", BASE, &named, invented));
+        assert!(
+            whole.contains("Imports named from the import address table")
+                && whole.contains("`INIT`"),
+            "{whole}"
+        );
+        assert!(
+            whole.contains("Sensitive imports: none on the list\n"),
+            "every slot named is a whole table, so the negative stands unqualified: {whole}"
+        );
+        assert!(!whole.contains("bound to no export"), "{whole}");
+
+        named.imports_named_from = crate::structured::ImportsNamedFrom::ImportAddressTable {
+            discarded_section: "INIT".to_string(),
+            unnamed_slots: 2,
+        };
+        let short = render(&structured_report("vid", BASE, &named, invented));
+        assert!(
+            short.contains("Not nameable (bound to no export): 2 slot(s)")
+                && short.contains("none on the list (of the imports it was shown)"),
+            "a slot that named nothing qualifies the negative: {short}"
+        );
     }
 
     /// A call site is matched to an import by the **slot it goes through**, never by a name.
@@ -2185,10 +2346,64 @@ mod tests {
         assert_eq!(hole.unreadable.len(), 1, "{:?}", hole.unreadable);
         assert_eq!(hole.unreadable[0].start, BASE + 0x11000);
         assert_eq!(
+            hole.unreadable[0].bytes, 0x1000,
+            "a window that would not read is retried a page at a time, so only the page that \
+             failed is lost: {:?}",
+            hole.unreadable
+        );
+        assert_eq!(
             hole.scanned[1].start,
             hole.unreadable[0].start + hole.unreadable[0].bytes,
             "the run after the hole starts after it, not at the section: {:?}",
             hole.scanned
+        );
+    }
+
+    /// A section with one absent page loses that page and no more, though the whole section is
+    /// one window.
+    ///
+    /// HEVD's shape on a live kernel: its handlers are a 22 KiB pageable section, resident in the
+    /// pages its last run touched. A read fails if **any** byte of it is absent, which is how the
+    /// engine answers -- so one window over the section failed as a whole, and every call site in
+    /// the driver was reported unread. This decoder fails a read that touches the absent page, as
+    /// the engine does, rather than only a read that starts on it.
+    #[test]
+    fn a_section_with_one_absent_page_loses_only_that_page() {
+        let mut image = image();
+        image.size_of_image = 0x10000;
+        image.sections[0].virtual_size = 0x5672;
+        let absent = BASE + 0x3000..BASE + 0x4000;
+        let filler = |at: u64, want: usize| {
+            vec![insn(
+                at,
+                &"90".repeat(want),
+                "nop",
+                Flow::Fallthrough,
+                Vec::new(),
+            )]
+        };
+        let found = scan(
+            &image,
+            &[],
+            InstructionSet::Amd64,
+            |at, want| {
+                let touches = at < absent.end && at + want as u64 > absent.start;
+                (!touches).then(|| filler(at, want))
+            },
+            never,
+            in_functions,
+        );
+        assert_eq!(found.unreadable.len(), 1, "{:?}", found.unreadable);
+        assert_eq!(found.unreadable[0].start, absent.start);
+        assert_eq!(found.unreadable[0].bytes, 0x1000, "{:?}", found.unreadable);
+        assert_eq!(found.scanned.len(), 2, "{:?}", found.scanned);
+        assert_eq!(found.scanned[0].start, BASE + 0x1000);
+        assert_eq!(found.scanned[1].start, absent.end);
+        assert_eq!(
+            found.scanned.iter().map(|run| run.bytes).sum::<u64>(),
+            0x5672 - 0x1000,
+            "every resident byte is decoded: {:?}",
+            found.scanned
         );
     }
 

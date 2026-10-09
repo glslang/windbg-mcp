@@ -94,6 +94,14 @@ pub const MAX_RANGES: usize = 256;
 /// calls rather than hundreds.
 const WINDOW: u64 = 64 * 1024;
 
+/// The granule a window that would not read is retried in: the unit a page is present or absent in.
+const PAGE: u64 = 0x1000;
+
+/// One more than the longest x86 instruction. A page-sized retry with less than this left before
+/// the page ends could hand the decoder a fragment of one instruction and nothing whole, which
+/// ends a section -- so that retry takes the next page with it.
+const MAX_INSTRUCTION: u64 = 16;
+
 /// Decodes an image's executable sections in address order, handing each instruction to `visit`.
 ///
 /// `decode` takes an address and a length and answers the instructions in it, or `None` where the
@@ -104,6 +112,14 @@ const WINDOW: u64 = 64 * 1024;
 /// report a capped list beside an *exact* count, and a count is only exact if the walk saw every
 /// instruction — so stopping when the list fills would turn the one number that is a fact into a
 /// second sample of itself. What bounds the work is the byte cap, which is a different budget.
+///
+/// **A window that would not read is retried a page at a time before any of it is given up.** A
+/// window is one read, and one absent page fails all of it -- which on a live kernel is the
+/// ordinary state of a pageable section, resident in the pages its last run touched and nowhere
+/// else. Measured on HEVD on a live ARM64 kernel: its handlers are a 22 KiB `PAGE` section, one
+/// window, so a single paged-out page reported every call site in the driver as unread. Retried,
+/// what is resident is decoded and only the absent pages are recorded, and the walk returns to
+/// full windows past the span that failed.
 ///
 /// **Windows overlap by nothing and that is deliberate.** A window boundary can fall inside an
 /// instruction, so the last instruction of a window may be decoded from a truncated tail and the
@@ -188,6 +204,8 @@ pub fn walk_code(
         // counting only the bytes that read — a shape that cannot say where the hole was, and
         // whose `start` is wrong for everything after it.
         let mut run: Option<(u64, u64)> = None;
+        // Where a window that would not read ends, while it is being retried page by page.
+        let mut retrying_until: Option<u64> = None;
         // A section's first instruction follows nothing: whatever a visitor was carrying belongs
         // to the previous section's code and must not cross into this one.
         visit(Step::Break);
@@ -222,8 +240,25 @@ pub fn walk_code(
                 close(&mut run, &mut covered.scanned);
                 break 'sections;
             }
-            let want = WINDOW.min(end - at).min(budget);
+            let rest_of_page = (at | (PAGE - 1)).saturating_add(1) - at;
+            let retrying = matches!(retrying_until, Some(until) if at < until);
+            let window = if retrying {
+                if rest_of_page < MAX_INSTRUCTION {
+                    rest_of_page + PAGE
+                } else {
+                    rest_of_page
+                }
+            } else {
+                WINDOW
+            };
+            let want = window.min(end - at).min(budget);
             let Some(block) = decode(at, want as usize) else {
+                // **Retried before it is recorded**, a page at a time over the span that failed,
+                // where a page is smaller than what was asked -- see the function's doc.
+                if !retrying && want > rest_of_page.max(MAX_INSTRUCTION) {
+                    retrying_until = Some(at.saturating_add(want));
+                    continue;
+                }
                 // A window that would not read is skipped rather than ending the walk — a driver
                 // whose `.text` is partly absent still answers for the rest of it — but it is
                 // **recorded**. Left silent, a dump missing one page reports a driver with no
@@ -335,6 +370,7 @@ mod tests {
                 .collect(),
             export_directory: (0, 0),
             import_directory: (0, 0),
+            iat_directory: (0, 0),
         }
     }
 
@@ -385,6 +421,7 @@ mod tests {
             }],
             export_directory: (0, 0),
             import_directory: (0, 0),
+            iat_directory: (0, 0),
         };
         let mut seen = 0usize;
         let covered = walk_code(

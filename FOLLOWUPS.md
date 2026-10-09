@@ -76,7 +76,6 @@ line is simply open.
 - [Item 68](#68-windbg-mcp-whether-a-device-can-have-no-security-descriptor-at-all) — [windbg-mcp] Whether a device can have no security descriptor at all
 - [Item 71](#71-windbg-mcp-driver_surface-does-not-say-which-control-code-reaches-which-sink) — [windbg-mcp] `driver_surface` does not say which control code reaches which sink
 - [Item 72](#72-windbg-mcp-the-driver-tools-name-a-module-refresh-they-could-run-themselves) — [windbg-mcp] The driver tools name a module refresh they could run themselves
-- [Item 73](#73-windbg-mcp-a-drivers-import-directory-can-be-in-a-section-the-loader-freed) — [windbg-mcp] A driver's import directory can be in a section the loader freed
 - [Item 74](#74-windbg-mcp-the-driver-tools-report-no-pool-tags) — [windbg-mcp] The driver tools report no pool tags
 - [Item 87](#87-windbg-mcp-a-code-materialised-in-the-previous-block-is-lost-at-the-join) — [windbg-mcp] A code materialised in the previous block is lost at the join
 - [Item 91](#91-windbg-mcp-a-refusal-that-returns-through-a-shared-epilogue-is-not-recognised) — [windbg-mcp] A refusal that returns through a shared epilogue is not recognised
@@ -1179,44 +1178,6 @@ call to make.
 
 **Where it picks up.** `unattributed_image` and `scan_of` in `src/worker.rs`, `modules`'s own
 `refresh` in the same file, and item 54 for the bound it needs.
-
-## 73. [windbg-mcp] A driver's import directory can be in a section the loader freed
-
-**Repo:** `windbg-mcp`.
-
-`driver_hazards` cannot answer for **HEVD** on a live kernel, and the reason is structural rather
-than incidental. Its import directory is at RVA `0x8a4a0`, inside `INIT`, whose characteristics
-carry `IMAGE_SCN_MEM_DISCARDABLE` (`0x62000020`) -- Windows frees those pages once `DriverEntry`
-returns. The bytes are not paged out; they are gone. `mountmgr` keeps its directory in `.idata` and
-is unaffected, which is why every measurement before HEVD was clean.
-
-The tool now says so precisely, and says it having been **measured**: an executable image path plus
-`.reload /f` leaves `dd HEVD+0x8a4a0 L4` reading `????????` on a live target, because the engine
-substitutes an image file's bytes where a *capture* has none and a live target's freed pages are
-mapped-and-invalid instead. The same driver in a **dump** scans fine, where the file does supply it.
-
-What that costs is not small: HEVD imports **six** names on this tool's own sink list --
-`ExAllocatePoolWithTag`, `IoCreateSymbolicLink`, `ProbeForRead`, `ProbeForWrite`, `ZwCreateFile`,
-`ZwWriteFile` -- and Driver Buddy Revolutions, reading the same bytes from the file, reports 20
-`ProbeForRead` and 4 `ProbeForWrite` call sites. The canonical vulnerable driver is the one this
-cannot answer about.
-
-- **Why deferred:** the fix is for the tool to read the image **file** itself rather than asking the
-  engine for bytes nobody has, and that needs a file the *host* can open. The module row carries
-  `\??\C:\HEVD\bin\HEVD.sys`, which is a path on the **target**, and a kernel debugger has no
-  file transport. So this is a new input (an image path argument, or a symbol-store lookup by the
-  module's timestamp and `SizeOfImage`) rather than a change to the parse -- `src/pe.rs` already
-  takes a `read(addr, len)` closure and would need nothing.
-- **What would close it:** `driver_hazards` accepting an image file to read the PE structures from
-  when the target's copy will not answer, with the result saying which source each half came from.
-  The code scan still wants target memory -- relocations and the IAT are applied there and a file's
-  are not -- so this is the *headers and imports* half only, which is exactly the half that fails.
-- **How it was found:** running Driver Buddy Revolutions and Ghidra over the same image as an
-  independent oracle (`tools/ghidra_oracle/`), then tracing the failing read to a section and
-  reading its characteristics (2026-09-14).
-
-**Where it picks up.** `hazards_at` in `src/worker.rs`, `pe_failure` beside it for the message this
-already produces, and `pe::Section::discardable`.
 
 ## 74. [windbg-mcp] The driver tools report no pool tags
 

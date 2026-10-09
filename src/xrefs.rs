@@ -415,6 +415,7 @@ mod tests {
             ],
             export_directory: (0, 0),
             import_directory: (0, 0),
+            iat_directory: (0, 0),
         }
     }
 

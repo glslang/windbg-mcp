@@ -9166,7 +9166,7 @@ fn hazards_at(
     // this wiring between the closure and it is not, needing an engine and an import table large
     // enough to be stopped part-way through. Said rather than left to look tested.
     let stopped_by: std::cell::Cell<Option<walk::Halt>> = std::cell::Cell::new(None);
-    let table = pe::read_imports(&image, read, || {
+    let read_from_directory = pe::read_imports(&image, read, || {
         let halt = if matches!(e.interrupted(), Ok(true)) {
             Some(walk::Halt::Interrupted)
         } else if Instant::now() >= deadline {
@@ -9176,20 +9176,44 @@ fn hazards_at(
         };
         stopped_by.set(halt);
         halt.is_some()
-    })
-    .map_err(|why| {
-        // The headers parsed, so this end **can** say where the address was -- and whether the
-        // loader kept it.
-        let discarded = match why {
-            pe::PeError::Unreadable { at, .. } => u32::try_from(at.saturating_sub(base))
-                .ok()
-                .and_then(|rva| image.section_at(rva))
-                .filter(|section| section.discardable())
-                .map(|section| section.name.clone()),
-            _ => None,
-        };
-        pe_failure(module, &why, stopped_by.get(), discarded.as_deref())
-    })?;
+    });
+    let (table, imports_named_from) = match read_from_directory {
+        Ok(table) => (table, structured::ImportsNamedFrom::ImportDirectory),
+        Err(why) => {
+            // The headers parsed, so this end **can** say where the address was -- and whether the
+            // loader kept it.
+            let discarded = match why {
+                pe::PeError::Unreadable { at, .. } => u32::try_from(at.saturating_sub(base))
+                    .ok()
+                    .and_then(|rva| image.section_at(rva))
+                    .filter(|section| section.discardable())
+                    .map(|section| section.name.clone()),
+                _ => None,
+            };
+            // **A freed import directory is not the end of the imports.** The address table the
+            // driver's calls go through is kept, and on a live target each slot holds what its
+            // import was bound to -- so the imports are named from that, and the answer says so.
+            // Only where that cannot be read either is the directory's failure the answer.
+            match discarded {
+                Some(section) => match imports_from_address_table(e, &image, read) {
+                    Some((imports, unnamed_slots)) => (
+                        pe::ImportTable {
+                            imports,
+                            unnamed_libraries: Vec::new(),
+                        },
+                        structured::ImportsNamedFrom::ImportAddressTable {
+                            discarded_section: section,
+                            unnamed_slots,
+                        },
+                    ),
+                    None => {
+                        return Err(pe_failure(module, &why, stopped_by.get(), Some(&section)));
+                    }
+                },
+                None => return Err(pe_failure(module, &why, stopped_by.get(), None)),
+            }
+        }
+    };
 
     // **One predicate, read by the walk and by the classification below.** `walk_code` polls it
     // between 64 KiB windows, which bounds the *decode*; the unwind query runs per finding and a
@@ -9217,6 +9241,7 @@ fn hazards_at(
         |at| covers.standing(e, at, stop),
     );
     scan.unnamed_libraries = table.unnamed_libraries;
+    scan.imports_named_from = imports_named_from;
 
     let mut attributor = Attributor::default();
     let stopped = std::cell::Cell::new(None);
@@ -10826,6 +10851,47 @@ fn smaller_extent(header: u32, loaded: u32) -> u32 {
 /// The two kinds are kept apart because their remedies are: bytes that would not read are an image
 /// the session cannot reach — on a dump, the ordinary answer for anything the capture left out —
 /// while a structure that does not hold together is an image that is not what it claims to be.
+/// The imports of a driver whose import directory the loader freed, named from its import address
+/// table, and how many slots named nothing -- or `None` where the table cannot be read or declares
+/// no slots, which leaves the directory's own failure as the answer.
+///
+/// One export-directory read per **exporting module** rather than per slot: a driver's imports
+/// come from a handful of modules, and over a serial link each read is a round trip. Not polled
+/// against the call's clock: the table is bounded like the import table, and each slot is two
+/// lookups the engine answers from what it holds.
+fn imports_from_address_table(
+    e: &DebugEngine,
+    image: &pe::Image,
+    read: impl FnMut(u64, usize) -> Option<Vec<u8>>,
+) -> Option<(Vec<pe::Import>, usize)> {
+    let slots = pe::read_import_address_table(image, read).ok()?;
+    if slots.is_empty() {
+        return None;
+    }
+    let mut libraries: HashMap<u64, Option<String>> = HashMap::new();
+    Some(hazards::imports_from_bound_slots(
+        &slots,
+        |address| e.symbol_for(address),
+        |address| {
+            let module = e.module_at(address).ok().flatten()?;
+            libraries
+                .entry(module.base)
+                .or_insert_with(|| export_library_name(e, module.base, module.size))
+                .clone()
+        },
+    ))
+}
+
+/// The library name the module at `base` gives itself in its export directory: `ntoskrnl.exe` for
+/// the kernel, whatever file it was loaded from.
+fn export_library_name(e: &DebugEngine, base: u64, size: u32) -> Option<String> {
+    let read = |at: u64, len: usize| {
+        within_module(base, size, at, len).then(|| e.read_memory(at, len).ok())?
+    };
+    let image = pe::read_image(base, read).ok()?;
+    pe::read_export_library_name(&image, read).ok().flatten()
+}
+
 fn pe_failure(
     module: &str,
     why: &pe::PeError,
@@ -10869,9 +10935,11 @@ fn pe_failure(
                  image rather than paged out of it, and no reload brings them back -- measured, \
                  an executable image path and `.reload /f` leave them unreadable, because the \
                  engine substitutes a file's bytes where a *capture* has none and a live target's \
-                 freed pages are mapped-and-invalid instead. A driver that links its import \
-                 directory into `{section}` therefore cannot be scanned from memory at all; the \
-                 same driver in a **dump** can, where the image file does supply it."
+                 freed pages are mapped-and-invalid instead. Where that happens the imports are \
+                 named from the import address table, which the loader keeps; this driver's \
+                 could not be read or declared none either, so its imports cannot be named from \
+                 memory. The same driver in a **dump** can be scanned, where the image file does \
+                 supply them."
             )
         }
         (pe::PeError::Unreadable { .. }, None) => " On a **dump** the image file is what supplies \
