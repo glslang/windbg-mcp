@@ -268,6 +268,10 @@ impl Recorder {
     /// not an allocation this trace saw made, so it records nothing. One whose call or value would
     /// not read still takes its call off the stack, so the next return pairs with the right one.
     pub fn returned(&mut self, site: usize, thread: u64, value: Option<u64>) -> BreakpointAction {
+        // A hit of its own, counted as one whatever became of the call it belongs to.
+        if value.is_none() {
+            self.unreadable += 1;
+        }
         let Some(calls) = self.pending.get_mut(&(thread, site)) else {
             return BreakpointAction::Go;
         };
@@ -285,12 +289,8 @@ impl Recorder {
                 arguments,
                 address: Some(value),
             }),
-            // Counted when its arguments would not read.
-            (None, _) => BreakpointAction::Go,
-            (Some(_), None) => {
-                self.unreadable += 1;
-                BreakpointAction::Go
-            }
+            // Each unreadable hit is counted where it happened.
+            _ => BreakpointAction::Go,
         }
     }
 
@@ -562,6 +562,17 @@ mod tests {
             "the outer return pairs with the outer call"
         );
         assert_eq!(recorder.unreadable_hits(), 1);
+    }
+
+    /// **Each unreadable hit is counted once**: a call whose arguments would not read and whose
+    /// return value would not either is two hits that read nothing, not one.
+    #[test]
+    fn an_unreadable_call_and_its_unreadable_return_are_two_hits() {
+        let mut recorder = trace(8);
+        recorder.entry(0, 0xa, None);
+        recorder.returned(0, 0xa, None);
+        assert_eq!(recorder.unreadable_hits(), 2);
+        assert_eq!(recorder.pending(), 0);
     }
 
     /// A hit that cannot say which thread it was on gives up on every call waiting at its site,
