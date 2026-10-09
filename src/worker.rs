@@ -2846,6 +2846,15 @@ fn execute(
     {
         return Err(refusal);
     }
+    // **Before anything else this op does**, a pool trace forgets the breakpoints of its that are
+    // gone: this op may set one, and the engine hands a removed breakpoint's id to the next, so an
+    // id still mapped here would make the caller's new breakpoint the trace's. Only while there is
+    // a target to ask -- an engine with none is not one whose breakpoints were removed.
+    if let Some(trace) = pool_trace.as_ref()
+        && matches!(e.has_target(), Ok(true))
+    {
+        trace.forget_removed(e);
+    }
     // Before the open rather than after it, so a failed one still records what was attempted: this
     // decides whether a later call may ask the host OS about a process id, and the answer for a
     // half-opened trace is the same as for a whole one. `OnceLock`, because a worker holds one
@@ -9337,11 +9346,36 @@ pub(crate) struct PoolTrace {
     locations: Vec<structured::CodeLocation>,
 }
 
-/// The registers a call's first three integer arguments arrive in, and the one it returns in.
-fn call_registers(e: &DebugEngine) -> ([&'static str; 3], &'static str) {
-    match e.processor_type() {
-        Ok(0xaa64) => (["x0", "x1", "x2"], "x0"),
-        _ => (["rcx", "rdx", "r8"], "rax"),
+impl PoolTrace {
+    /// Forgets this trace's breakpoints that the engine no longer holds where the trace set them --
+    /// see [`crate::pooltrace::Recorder::forget_removed`]. A listing that fails forgets nothing:
+    /// an engine that did not answer has not said a breakpoint is gone.
+    fn forget_removed(&self, e: &DebugEngine) {
+        let Ok(held) = e.breakpoints() else {
+            return;
+        };
+        self.recorder.borrow_mut().forget_removed(|id, at| {
+            held.iter()
+                .any(|breakpoint| breakpoint.id == id && breakpoint.address == Some(at))
+        });
+    }
+}
+
+/// The registers a call's first three integer arguments arrive in, and the one it returns in, or
+/// `None` for an architecture that does not pass them in registers.
+///
+/// **x86 is the `None`, and that is a refusal rather than a fallback.** Its kernel calls are
+/// `__stdcall`, so the arguments are on the stack and nothing in a register is one: read as x64's,
+/// every hit would record three unrelated values as a size, a tag and a pool type. Tracing it
+/// means reading the stack at the call, which is `FOLLOWUPS.md` item 121.
+fn call_registers(
+    set: dbgscope::dbgeng::InstructionSet,
+) -> Option<([&'static str; 3], &'static str)> {
+    use dbgscope::dbgeng::InstructionSet;
+    match set {
+        InstructionSet::Amd64 => Some((["rcx", "rdx", "r8"], "rax")),
+        InstructionSet::Arm64 => Some((["x0", "x1", "x2"], "x0")),
+        InstructionSet::X86 | InstructionSet::Other(_) => None,
     }
 }
 
@@ -9372,6 +9406,18 @@ fn arm_pool_trace(
                 .to_string(),
         ));
     }
+    let set = e.instruction_set();
+    let Some((arguments, returned)) = call_registers(set) else {
+        return Err(Failed::categorised(
+            structured::ErrorCategory::InvalidArgument,
+            format!(
+                "a pool trace reads an allocator's arguments from the registers x64 and ARM64 \
+                 pass them in, and this target is machine {}, which passes them on the stack. \
+                 Nothing was armed.",
+                machine_label(set)
+            ),
+        ));
+    };
     let (base, loaded_size) = loaded_module_named(e, module)?;
     let scan = scan_driver(e, module, base, loaded_size, deadline)?;
     // A scan stopped part-way found some call sites and not others, and a trace armed on part of a
@@ -9483,7 +9529,6 @@ fn arm_pool_trace(
     let recorder = std::rc::Rc::new(std::cell::RefCell::new(recorder));
     if !set.is_empty() {
         let shared = std::rc::Rc::clone(&recorder);
-        let (arguments, returned) = call_registers(e);
         let callback: dbgscope::dbgeng::BreakpointCallback =
             Box::new(move |hit: &dbgscope::dbgeng::BreakpointHit<'_>| {
                 use crate::pooltrace::Phase;
@@ -9496,7 +9541,10 @@ fn arm_pool_trace(
                 let Ok(mut recorder) = shared.try_borrow_mut() else {
                     return BreakpointAction::Default;
                 };
-                let Some(phase) = recorder.phase_of(id) else {
+                let Ok(address) = hit.address() else {
+                    return BreakpointAction::Default;
+                };
+                let Some(phase) = recorder.phase_at(id, address) else {
                     return BreakpointAction::Default;
                 };
                 let engine = hit.engine();
@@ -9568,7 +9616,7 @@ fn disarm_pool_trace(e: &DebugEngine, trace: Option<PoolTrace>) -> bool {
     let held = e.breakpoints().unwrap_or_default();
     let recorder = trace.recorder.borrow();
     for (id, phase) in recorder.armed() {
-        let expected = expected_address(recorder.sites(), phase);
+        let expected = recorder.address_of(phase);
         if held
             .iter()
             .any(|breakpoint| breakpoint.id == id && breakpoint.address == expected)
@@ -9578,17 +9626,6 @@ fn disarm_pool_trace(e: &DebugEngine, trace: Option<PoolTrace>) -> bool {
     }
     let _ = e.clear_breakpoint_callback();
     true
-}
-
-/// Where a trace breakpoint was set.
-fn expected_address(
-    sites: &[crate::pooltrace::Site],
-    phase: crate::pooltrace::Phase,
-) -> Option<u64> {
-    match phase {
-        crate::pooltrace::Phase::Entry(index) => sites.get(index).map(|site| site.call),
-        crate::pooltrace::Phase::Return(index) => sites.get(index).and_then(|site| site.returns_to),
-    }
 }
 
 /// What the session's pool trace has recorded, and with `stop`, disarms it.
@@ -9605,16 +9642,9 @@ fn read_pool_trace(
     };
     let report = {
         let recorder = trace.recorder.borrow();
-        let held = e.breakpoints().unwrap_or_default();
-        let missing_breakpoints = recorder
-            .armed()
-            .filter(|&(id, phase)| {
-                let expected = expected_address(recorder.sites(), phase);
-                !held
-                    .iter()
-                    .any(|breakpoint| breakpoint.id == id && breakpoint.address == expected)
-            })
-            .count();
+        // Counted as they were forgotten, which every op does first -- this one included, so
+        // nothing removed before this read is still waiting to be noticed.
+        let missing_breakpoints = recorder.lost();
         let allocations = recorder
             .allocations()
             .iter()
@@ -14102,6 +14132,47 @@ mod tests {
              symbol fetch there blocks the session's one thread with no poll able to run. Use \
              `resolve_within` with what `remaining` reports."
         );
+    }
+
+    /// **The trace's ownership checks are applied where they bite**, which the recorder's own
+    /// tests cannot say: `phase_at` and `forget_removed` are right in `src/pooltrace.rs` whatever
+    /// calls them, and the defect review found on #473 was a callback that asked about the id
+    /// alone. So what is checked here is that the callback still hands over the hit's address, and
+    /// that every op still forgets the trace's removed breakpoints before it runs -- the second is
+    /// what keeps a `set_breakpoint` that reuses one of their ids from becoming the trace's.
+    #[test]
+    fn a_pool_trace_checks_ownership_in_its_callback_and_before_every_op() {
+        let armed = bodies_of(&["arm_pool_trace"], 4_000);
+        assert!(
+            armed.contains("hit.address()") && armed.contains("phase_at(id, address)"),
+            "the trace's callback no longer checks a hit's address, so an id the engine reused for \
+             somebody else's breakpoint is taken for the trace's"
+        );
+        let execute = bodies_of(&["execute"], 4_000);
+        assert!(
+            execute.contains("trace.forget_removed(e)"),
+            "ops no longer forget the trace's removed breakpoints first, so a breakpoint set on \
+             one of their ids is recorded and let through rather than stopping"
+        );
+    }
+
+    /// **A pool trace reads arguments from registers only where the architecture passes them
+    /// there.** x86's kernel calls are `__stdcall`, so its registers hold no argument at the call;
+    /// the trace is refused there (`FOLLOWUPS.md` item 121) rather than falling through to x64's,
+    /// which is what the first version did for anything that was not ARM64.
+    #[test]
+    fn a_pool_trace_reads_registers_only_where_arguments_arrive_in_them() {
+        use dbgscope::dbgeng::InstructionSet;
+        assert_eq!(
+            call_registers(InstructionSet::Amd64),
+            Some((["rcx", "rdx", "r8"], "rax"))
+        );
+        assert_eq!(
+            call_registers(InstructionSet::Arm64),
+            Some((["x0", "x1", "x2"], "x0"))
+        );
+        assert_eq!(call_registers(InstructionSet::X86), None);
+        assert_eq!(call_registers(InstructionSet::Other(0x1c4)), None);
     }
 
     /// **A traced allocation's arguments are read by its allocator's layout**, which is the one

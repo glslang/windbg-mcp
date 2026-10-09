@@ -93,6 +93,7 @@ line is simply open.
 - [Item 114](#114-dbgscope-a-big-pool-entry-in-no-region-the-walk-discovers) — [dbgscope] A big-pool entry in no region the walk discovers
 - [Item 116](#116-windbg-mcp-the-kd-facade-answers-windbg-with-fabricated-state-it-cannot-tell-apart-from-guest-state) — [windbg-mcp] The KD facade answers WinDbg with fabricated state it cannot tell apart from guest state
 - [Item 117](#117-windbg-mcp-the-kd-facade-pipe-has-only-the-default-acl-no-client-authentication-and-no-break-in) — [windbg-mcp] The KD facade pipe has only the default ACL, no client authentication and no break-in
+- [Item 121](#121-windbg-mcp-tracing-pool-allocations-on-an-x86-kernel) — [windbg-mcp] Tracing pool allocations on an x86 kernel
 
 ## 2. [dbgscope] Typed write primitives
 
@@ -2455,6 +2456,43 @@ failure replies without losing the retained stop. A stopped-state break-in is lo
 and the managed reconnect and absolute-pause windows are bounded. A real running-state break-in
 and the decoder fuzz target remain open, so this item is not closed.
 
+## 121. [windbg-mcp] Tracing pool allocations on an x86 kernel
+
+`pool_trace` reads an allocator's arguments from registers at the call and its result from the
+return register after it -- `rcx`, `rdx`, `r8` and `rax` on x64, `x0`–`x2` and `x0` on ARM64
+(`worker::call_registers`). An x86 kernel passes neither way: its exports are `__stdcall`, so the
+arguments are on the stack, and read as x64's registers every hit would record three unrelated
+values as a size, a tag and a pool type. So an x86 target is **refused** before anything is scanned
+or armed, rather than traced wrongly. Raised by review on
+[#473](https://github.com/glslang/windbg-mcp/pull/473), where the first version fell through to
+x64's registers for anything that was not ARM64.
+
+- **What it would take.** A second reader for the call, not a change to the first. The breakpoint
+  is on the `call` instruction, so the return address is not yet pushed and the arguments start at
+  `[esp]`; the result is in `eax` at the return, by which time `__stdcall` has popped them.
+- **The layout stops being a list of positions**, which is the part that is easy to get wrong.
+  `crate::pooltrace::Layout` names arguments by index because on x64 and ARM64 an index is a
+  register. On x86 it is a stack offset, and the offsets depend on the widths before it:
+  `ExAllocatePool2`'s `POOL_FLAGS` is a `ULONG64` and takes **two** slots, so its size is at
+  `[esp+8]` and its tag at `[esp+12]`, where `ExAllocatePoolWithTag`'s `POOL_TYPE` takes one and
+  puts them at `[esp+4]` and `[esp+8]`. The layout needs byte offsets per architecture, or a width
+  per argument.
+- **The cost moves too.** A register read is microseconds; this is a 16-byte memory read per call,
+  measured at about 1 ms for 8 uncached bytes over the ARM64 bench's serial link -- small beside a
+  trap's ~25 ms, but it is a read that can fail, and a hit whose stack will not read belongs in
+  `unreadable_hits` like one whose registers will not.
+- **Unmeasured and needing a target:** whether the hazard scan finds an x86 driver's call sites at
+  all -- `call dword ptr [__imp_…]` names its slot by absolute address, which `called_slot` reads,
+  but nothing has run it against a 32-bit kernel.
+- **Why deferred:** there is no x86 kernel to measure against. The ARM64 bench's debuggee is
+  Windows 11, which ships no x86 edition, so the target is a 32-bit Windows 10 guest -- and
+  `ExAllocatePool2` exists there only from 2004 on -- which no bench here is recorded as having.
+  Building the reader without one would ship a stack layout nobody has checked.
+
+**Where it picks up.** `call_registers` and the refusal in `arm_pool_trace` (`src/worker.rs`),
+`Layout` and `layout_of` in `src/pooltrace.rs`, and the callback in `arm_pool_trace`, which is where
+an x86 entry would read the stack instead of three registers.
+
 ## Where these items came from
 
 Each cluster above, and what filing it measured. Items named here as *"now in `DONE.md`"* have
@@ -2597,6 +2635,9 @@ live-control tools being default-on, running client-supplied programs, and holdi
 with no bound (118); and the distance from one guarded `t` to a debugging session, filed as one
 ordered ladder rather than a defect per rung (119). The review itself is private, under
 `target/private/`, because it cites the bench's runners and logs.
+Item 121 came from review round 1 on [#473](https://github.com/glslang/windbg-mcp/pull/473)
+(2026-10-09), the pool allocation trace, which read x64's argument registers on any target that was
+not ARM64; the round refused x86 and filed the reader it would need.
 Item 120, now in [`DONE.md`](./DONE.md), came from checking that review against the stated product
 goal the same day: the standalone KD role and the MCP live-control session were alternative owners,
 so the server could not create, observe or release the WinDbg-facing session it presented to an
