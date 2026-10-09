@@ -2106,7 +2106,14 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// lifecycle bounds because the server now owns the facade rather than asking an external runner
 /// to own them. Refusing MCP `interrupt` on that WinDbg-owned lifecycle later added 172 B, bringing
 /// the current surface to 119,803 B and leaving 3,197 B (2.6%).
-const MODEL_VISIBLE_CEILING: usize = 123_000;
+///
+/// **123,000 -> 126,000 for the pool allocation trace** (2026-10-09). The surface moves
+/// 119,658 -> 122,592 B across 76 -> 78 tools -- the golden's figures, which had moved from the
+/// 119,803 above by then. `pool_trace` is 1,883 B and `pool_trace_read` 1,051: one arms a driver's
+/// allocator call sites and the other reads what they recorded, two tools rather than one because
+/// the recording happens during a run neither call is waiting on. That left 408 B, so the ceiling
+/// moves with them and leaves 3,408 B (2.7%).
+const MODEL_VISIBLE_CEILING: usize = 126_000;
 
 /// Ceiling on the whole `tools/list` payload — the serialized result, not the sum of its tools, so
 /// the array's own punctuation and every result-level field are inside it. 216,839 bytes as of
@@ -2257,7 +2264,14 @@ const MODEL_VISIBLE_CEILING: usize = 123_000;
 /// state/output types add 1,228 B across `open_sk_live_control`, `session_status` and the seven
 /// existing opener closures, and one byte is the array comma. The managed-KD `interrupt` refusal
 /// later adds 172 B, for a current payload of 337,540 B and 7,460 B (2.2%) of headroom.
-const WIRE_CEILING: usize = 345_000;
+///
+/// **345,000 -> 355,000 for the pool allocation trace** (2026-10-09). The payload moves 338,315 ->
+/// 346,428 B -- the golden's figure, which had moved from the 337,540 above by then. No shared type
+/// was inlined anywhere it was not before: no other tool's row moved, and the 8,113 B are the two
+/// new tools' 4,458 and 3,653 plus two array commas. Each is under `driver_hazards`' 5,872, and for
+/// the same reason -- a result carrying a `CodeLocation` per call site, plus the error closure every
+/// outcome carries. The new ceiling leaves 8,572 B (2.4%).
+const WIRE_CEILING: usize = 355_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,308
 /// bytes (2026-10-05), because its `inputSchema` pulls the whole `StepAction`/`Check` vocabulary
@@ -3433,6 +3447,10 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
         ),
         ("pool_census", json!({}), "error"),
         ("pool_diagnostics", json!({}), "error"),
+        // Both well-formed, so both take the session refusal; the live-kernel refusal is
+        // `a_pool_trace_is_refused_on_a_dump`'s.
+        ("pool_trace", json!({ "module": "mydriver" }), "error"),
+        ("pool_trace_read", json!({}), "error"),
         ("heap_list", json!({}), "error"),
         ("heap_allocations", json!({}), "error"),
         (
@@ -4551,7 +4569,7 @@ fn a_listener_serves_the_narrowed_surface_it_was_started_with() {
     // was typed — `session` is added whatever it said.
     let log = listener.stderr();
     assert!(
-        log.contains("serving 13 of 76 tools (session, crash)"),
+        log.contains("serving 13 of 78 tools (session, crash)"),
         "the listener does not report the surface it ended up with: {log}"
     );
 }
@@ -4583,7 +4601,7 @@ fn two_clients_on_one_listener_are_served_two_surfaces() {
     let local_token = server.token.clone();
     assert!(
         server.wait_for_stderr(
-            "serving 20 of 76 tools (session, inspect) — except bench serves 13 of 76 tools \
+            "serving 20 of 78 tools (session, inspect) — except bench serves 13 of 78 tools \
              (session, crash)",
             Duration::from_secs(30)
         ),
@@ -14316,6 +14334,55 @@ fn a_pool_walk_takes_this_servers_deadline_not_the_walkers_default() {
         (70.0..=76.0).contains(&seconds),
         "the worker derived a {seconds}s walk budget; the 90s call timeout less the 15s headroom \
          the reply needs is ~75s. 120s means the walker's default, 15s means no patience arrived."
+    );
+    server.tool_text("end_session", json!({ "session_id": session }), TARGET_STEP);
+}
+
+/// **A pool trace is refused on a dump, before it touches anything.**
+///
+/// It records allocations as the target runs, and a dump never runs -- so armed on one it would set
+/// a breakpoint on every allocator call site in the image, answer with a list of them, and record
+/// nothing however long the caller waited. The refusal comes before the scan, so nothing is armed:
+/// the session holds no breakpoint afterwards, and there is no trace to read.
+///
+/// **Mutation-verified**: with the live-kernel check backed out, the first assertion fails -- the
+/// call answers as a success, `0 call site(s) armed`, since `nt` imports no allocator of its own.
+/// That is the answer a caller would misread as a driver that allocates nothing.
+#[test]
+fn a_pool_trace_is_refused_on_a_dump() {
+    let Some(dump) = target_tier() else { return };
+    let mut server = Server::started();
+    let session = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
+
+    let refused = server.call_tool(
+        "pool_trace",
+        json!({ "session_id": session, "module": "nt" }),
+        TARGET_STEP,
+    );
+    assert!(
+        is_tool_error(&refused),
+        "a dump never runs, so a trace armed on one records nothing: {refused:#}"
+    );
+    assert_eq!(
+        refused["result"]["structuredContent"]["error"]["category"], "invalid_argument",
+        "{refused:#}"
+    );
+
+    let held = server.tool_data("breakpoints", json!({ "session_id": session }), TARGET_STEP);
+    assert_eq!(
+        held["breakpoints"].as_array().map(Vec::len),
+        Some(0),
+        "the refusal armed something on its way out: {held:#}"
+    );
+
+    let unread = server.call_tool(
+        "pool_trace_read",
+        json!({ "session_id": session }),
+        TARGET_STEP,
+    );
+    assert_eq!(
+        unread["result"]["structuredContent"]["error"]["category"], "invalid_argument",
+        "a session that was never armed has no trace to read: {unread:#}"
     );
     server.tool_text("end_session", json!({ "session_id": session }), TARGET_STEP);
 }

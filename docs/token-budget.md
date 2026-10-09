@@ -337,7 +337,7 @@ None of these is a bug. They are recorded because they were invisible, and
    when the surface did).
 
    So the third lever is the one taken: `--tools` (`src/toolset.rs`) advertises a named subset. A
-   caller that is reading a crash dump stops paying for nine TTD tools and ten allocator ones —
+   caller that is reading a crash dump stops paying for nine TTD tools and twelve allocator ones —
    and, since item 41, for the sentences the tools it keeps used to spend on pointing at them.
    Where the bytes sit, and what each profile costs:
 
@@ -346,20 +346,20 @@ None of these is a bug. They are recorded because they were invisible, and
 
    | group | tools | bytes | share |
    |---|---:|---:|---:|
-   | `allocator` | 10 | 16,906 | 14.1% |
-   | `ioctl` | 11 | 16,088 | 13.4% |
-   | `securekernel` | 12 | 19,013 | 15.9% |
-   | `exec` | 10 | 15,087 | 12.6% |
-   | `session` | 10 | 14,208 | 11.9% |
-   | `inspect` | 10 | 13,485 | 11.3% |
-   | `batch` | 1 | 10,308 | 8.6% |
-   | `crash` | 3 | 7,473 | 6.2% |
-   | `ttd` | 9 | 7,090 | 5.9% |
+   | `allocator` | 12 | 19,840 | 16.2% |
+   | `ioctl` | 11 | 16,088 | 13.1% |
+   | `securekernel` | 12 | 19,013 | 15.5% |
+   | `exec` | 10 | 15,087 | 12.3% |
+   | `session` | 10 | 14,208 | 11.6% |
+   | `inspect` | 10 | 13,485 | 11.0% |
+   | `batch` | 1 | 10,308 | 8.4% |
+   | `crash` | 3 | 7,473 | 6.1% |
+   | `ttd` | 9 | 7,090 | 5.8% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 64 | 100,645 |
-   | `all` | 76 | 119,658 |
+   | *(absent)* | 66 | 103,579 |
+   | `all` | 78 | 122,592 |
    | `session,inspect,exec,crash` | 33 | 49,332 |
    | `session,inspect,crash` | 23 | 34,092 |
    | `crash` | 13 | 20,515 |

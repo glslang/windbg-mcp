@@ -236,6 +236,21 @@
   `Unreadable` is the walk's own limit (a Verifier guard page reads that way) and says nothing
   about whether the allocator freed anything. `pool_chunk` also
   reports the **neighbouring** chunks, which is what tells you what a reclaim would land next to. `pool_diagnostics` returns the walk's own diagnostics filtered by substring: a real walk emits tens of thousands across a hundred-plus categories, so any per-call summary truncates and the one line explaining a specific heap is never in the truncated head — filter by a heap address or a phrase to reach it.
+- The **pool trace** (`pool_trace`, `pool_trace_read`) records allocations rather than walking
+  them, so it needs a **live** kernel and a target that runs. It traps only the traced driver's own
+  call sites, two breakpoint stops per allocation, each a round trip over the KD link — about 25 ms
+  on 115200-baud serial — so it suits a driver's handful of allocations rather than a hot path.
+  The call sites are the ones `driver_hazards` finds for `ExAllocatePool`, `ExAllocatePool2`,
+  `ExAllocatePool3`, `ExAllocatePoolWithTag` and `ExAllocatePoolWithQuotaTag`. An allocator off
+  that list is not traced — `ExAllocatePoolWithTagPriority` among them — and neither are the two
+  `Mm` allocators the scan does list, which allocate outside the pool; nor is a call through a
+  pointer the scan cannot follow to the import. A site in pageable code that is not
+  resident when the trace is armed cannot be read, so it is neither found nor armed — the arm result
+  reports those bytes, and running the driver then arming again finds what it brought in. A call
+  already in flight when the trace is armed returns to a breakpoint with no call pending and is not
+  recorded. And DbgEng prints `Breakpoint N hit` for every hit, including the ones the trace lets
+  through, so the stop that ends a run carries one line per breakpoint stop: about 37 KB for a full
+  1,024-allocation trace.
 - The **user Segment Heap** tools share that typed decoder. They discover roots by following
   `ntdll`'s process heap list, which is what `GetProcessHeaps` walks. They reach it through the
   process heap's PDB-typed `UserContext`, and check every entry against the heap it names. They do

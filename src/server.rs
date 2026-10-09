@@ -1869,6 +1869,33 @@ pub struct XrefsArgs {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct PoolTraceArgs {
+    /// The driver to trace, by the name the module inventory lists it under, e.g. "HEVD".
+    pub module: String,
+    /// How many allocations to record before the target is stopped (default 64, at most 1024).
+    #[serde(default)]
+    pub max_allocations: Option<u32>,
+    /// Which session to act on. Omit for the current one; pass an opener's handle to route to that
+    /// session and be refused if its target was replaced or closed.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PoolTraceReadArgs {
+    /// Disarm the trace after reading it: remove its breakpoints and stop recording (default
+    /// false).
+    #[serde(default)]
+    pub stop: Option<bool>,
+    /// Which session to act on. Omit for the current one; pass an opener's handle to route to that
+    /// session and be refused if its target was replaced or closed.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DriverHazardsArgs {
     /// The driver to scan, by the name the module inventory lists it under, e.g. "mydriver". The
     /// image must be readable in this session: on a dump that means the engine can obtain the
@@ -3381,6 +3408,82 @@ impl WindbgServer {
             .run(
                 args.session_id.as_deref(),
                 pool_op(PoolOp::diagnostics(args.filter, args.refresh, args.limit)),
+            )
+            .await;
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
+    /// Trace one driver's pool allocations as the target runs: a breakpoint on every call to a
+    /// pool allocator in the driver's code (`ExAllocatePool2`, `ExAllocatePoolWithTag` and their
+    /// family) and one after it, recording each allocation's size, tag, flags or pool type, the
+    /// address it returned and the thread that made it, and letting the target run on.
+    /// Needs a live kernel target. Arming records nothing by itself: resume the target and make the
+    /// driver allocate. The target stops when `max_allocations` are recorded, and arming again
+    /// replaces the trace.
+    /// Each allocation is two breakpoint stops, so only this driver's calls are trapped, never the
+    /// allocator's every caller — on a serial link a stop is about 25 ms.
+    /// A call site in pageable code that is not resident cannot be found or armed: the result
+    /// says how much of the driver's code could not be read, and running the driver and arming
+    /// again finds what it brought in.
+    #[rmcp::tool(
+        annotations(
+            title = "Trace a driver's pool allocations",
+            read_only_hint = false,
+            // It patches breakpoints into the target's code, a write to the debuggee by any other
+            // name -- the reason `clear_breakpoints` says the same.
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<Outcome<structured::PoolTraceArmed>>()
+    )]
+    async fn pool_trace(
+        &self,
+        Parameters(args): Parameters<PoolTraceArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::PoolTraceArm {
+                    module: args.module,
+                    limit: args
+                        .max_allocations
+                        .map_or(crate::pooltrace::DEFAULT_ALLOCATIONS, |limit| {
+                            limit as usize
+                        }),
+                    patience_ms: 0,
+                },
+            )
+            .await;
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
+    /// What the session's pool trace has recorded: each allocation in the order it completed —
+    /// its allocator, call site, size, tag, flags or pool type, the address it returned and the
+    /// thread — and counts of what was not recorded: allocations after the trace filled, calls
+    /// made and not yet returned, and breakpoints of the trace that something else removed.
+    /// Pass `stop` to disarm the trace as well, removing its breakpoints.
+    #[rmcp::tool(
+        annotations(
+            title = "Read a pool trace",
+            // Not with `stop`, which removes the trace's breakpoints from the target's code.
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<Outcome<structured::PoolTrace>>()
+    )]
+    async fn pool_trace_read(
+        &self,
+        Parameters(args): Parameters<PoolTraceReadArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::PoolTraceRead {
+                    stop: args.stop.unwrap_or(false),
+                },
             )
             .await;
         engine_result_for(args.session_id.as_deref(), out)
@@ -6858,6 +6961,22 @@ const SUMMARY_NOTES: &[SummaryNote] = &[
 /// here reads as a sentence about the tool and may be the only home a sentence about one of its
 /// arguments has.
 const TOOL_NOTES: &[ToolNote] = &[
+    ToolNote {
+        tool: "pool_trace",
+        names: &["continue_async", "pool_trace_read"],
+        note: "Arm it, then `continue_async` and make the driver allocate; `pool_trace_read` \
+               reads what was recorded, and disarms the trace with `stop`.",
+    },
+    ToolNote {
+        tool: "pool_trace",
+        names: &["driver_hazards"],
+        note: "The call sites are the ones `driver_hazards` finds for the pool allocators.",
+    },
+    ToolNote {
+        tool: "pool_trace_read",
+        names: &["pool_chunk"],
+        note: "Each address is what `pool_chunk` places, with what borders it.",
+    },
     ToolNote {
         tool: "xrefs_to",
         names: &["reachable_from_dispatch"],

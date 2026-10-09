@@ -42,7 +42,7 @@ already does the job.
 | Transaction | `debug_batch` — an ordered sequence with assertions and a rollback the engine runs, not the client |
 | TTD nav | `step_back` (`t-`), `step_over_back` (`p-`), `reverse_go` (`g-`), `goto_position` (`!tt`) |
 | TTD analysis | `ttd_calls`, `ttd_memory`, `ttd_events`, `index_trace`, `record_trace` |
-| Kernel pool | `pool_find_tag`, `pool_chunk`, `pool_census`, `pool_diagnostics` |
+| Kernel pool | `pool_find_tag`, `pool_chunk`, `pool_census`, `pool_diagnostics`; live: `pool_trace`, `pool_trace_read` |
 | User Segment Heap | `heap_list`, `heap_allocations`, `heap_chunk`, `heap_census`, `heap_diagnostics` |
 | Secure Kernel | Capture: `open_sk_capture`, `sk_modules`, `sk_read_memory`, `sk_symbol`. Live control: `open_sk_live_control`, `sk_live_arm`, `sk_live_wait`, `sk_live_registers`, `sk_live_read_memory`, `sk_live_step`, `sk_live_continue`. WinDbg facade: `open_sk_kd`. Each route has its own session and refuses ordinary debugger tools; `end_session` still applies |
 | Server | `server_log` — the server's own records: the supervisor's, plus your own sessions' workers, tagged by session |
@@ -65,6 +65,15 @@ gone. Save what you are about to overwrite with an `eval` step's `capture`, and 
 is" stays *inside* the transaction instead of splitting it in two; a `refresh` there is bounded by
 the step's share of the batch budget rather than by the walker's own, and says how much of the pool
 it reached.
+
+**To see what a driver allocates as it runs, trace it rather than walking the pool after.**
+`pool_trace` arms a breakpoint on each of one driver's calls to a pool allocator and one after it,
+and records each call's size, tag, flags or pool type, returned address and thread while the
+target runs on. It needs a live kernel. Arm it, `continue_async`, make the driver work, then
+`wait_for_stop` and `pool_trace_read`; the target stops itself when the trace is full, and
+`stop: true` disarms it. Each address is one `pool_chunk` can place. A call site in pageable code
+that is not resident is neither found nor armed, and the arm result says how many bytes that was:
+drive the driver once and arm again.
 
 Three edges to keep in mind. If a step overruns far enough to consume the reserve too, cleanup is
 skipped and the result says `rollback: INCOMPLETE` — believe it rather than the intent. If a step

@@ -6,7 +6,7 @@ how much of that surface a run serves, and four behaviours the table has no room
 ## Serving fewer tools (`--tools`)
 
 The default serves every ordinary group and omits the `securekernel` extra. Explicit `--tools all`
-serves all seventy-six tools. Their definitions are paid before the model has asked anything, once
+serves all seventy-eight tools. Their definitions are paid before the model has asked anything, once
 per conversation. Every
 figure on this page is a measurement of 2026-10-09 rather than an invariant: any edit to a tool's
 description moves it, so re-derive before quoting one. The tables below are checked against a
@@ -23,8 +23,8 @@ windbg-mcp.exe --tools session,inspect,crash
 
 | `--tools` | Tools | Model context |
 |---|---:|---:|
-| *(absent)* — ordinary groups | 64 | 100,645 B |
-| `all` | 76 | 119,658 B |
+| *(absent)* — ordinary groups | 66 | 103,579 B |
+| `all` | 78 | 122,592 B |
 | `session,inspect,exec,crash` | 33 | 49,332 B |
 | `session,inspect,crash` | 23 | 34,092 B |
 | `crash` | 13 | 20,515 B |
@@ -62,7 +62,7 @@ is written into the command line the SCM stores, and read back at every start). 
 
 A `--listen` server names its clients, and **a client may be served a surface of its own** — which
 is what lets one listener hold a local model that can fit twenty-three tools beside a hosted client
-that can hold seventy-six, against the same debug sessions:
+that can hold seventy-eight, against the same debug sessions:
 
 ```pwsh
 setx WINDBG_MCP_LISTEN_TOKEN_BENCH "<a long random string>"
