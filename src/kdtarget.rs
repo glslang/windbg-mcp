@@ -2122,10 +2122,13 @@ mod tests {
             service_pause_bound(Duration::from_secs(600)),
             Duration::from_secs(570)
         );
+        let minimum = Duration::from_millis(crate::skdispatch::MIN_PAUSE_MS);
+        let service = service_pause_bound(minimum);
         assert_eq!(
-            service_pause_bound(Duration::from_millis(crate::skdispatch::MIN_PAUSE_MS)),
-            crate::skdispatch::CLEANUP_SETTLE
+            minimum.saturating_sub(service),
+            crate::skdispatch::CLEANUP_RESERVE
         );
+        assert!(crate::skdispatch::CLEANUP_RESERVE > crate::skdispatch::CLEANUP_SETTLE);
         assert_eq!(
             service_pause_bound(Duration::from_millis(1)),
             Duration::from_micros(500)
