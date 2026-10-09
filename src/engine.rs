@@ -5133,6 +5133,13 @@ async fn reader(
                             "worker confirmed target release".into(),
                         ))
                     });
+                    // The caller may have timed out before it reached `release`'s ordinary
+                    // cancellation path. A confirmed late live-controller release is equally
+                    // terminal, so wake its pause timer before that task retains this closed
+                    // session (and the registry behind it) for the rest of the pause window.
+                    if session.kind == SessionKind::SecureKernelLive {
+                        sessions.end_secure_kernel_pause(&session);
+                    }
                 }
                 // A failed send means the receiver is gone: the caller's timeout fired and
                 // nobody is left to act on this result. For an ordinary call that is fine —
@@ -7907,6 +7914,54 @@ mod tests {
                 kernel.kill();
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_late_live_release_drops_its_pause_timer_reference() {
+        let live = secure_kernel_live_double("late-live-release", SessionState::Open, 4100);
+        let (jobs, _queue) = mpsc::unbounded_channel();
+        let live = Arc::new(Session {
+            tx: jobs,
+            ..Arc::into_inner(live).unwrap()
+        });
+        let sessions = registry_of(std::slice::from_ref(&live));
+        let baseline = Arc::strong_count(&live);
+        sessions.begin_secure_kernel_pause(&live, 60_000);
+        let generation = live.secure_kernel_pause.lock().unwrap().generation;
+        assert_eq!(Arc::strong_count(&live), baseline + 1);
+
+        let answer = sessions
+            .submit(&live, Call::new(EngineOp::EndSession), 42, None)
+            .unwrap();
+        drop(answer);
+        live.preserve_live_control("caller timed out");
+        let (messages, rx) = mpsc::unbounded_channel();
+        let reading = tokio::spawn(reader(
+            Arc::downgrade(&live),
+            rx,
+            live.waiters.clone(),
+            sessions.clone(),
+        ));
+        messages
+            .send(WorkerMessage::Done {
+                id: 42,
+                result: Ok(Output::released("confirmed release", Some(true))),
+            })
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while live.secure_kernel_pause.lock().unwrap().cancel.is_some()
+                || Arc::strong_count(&live) != baseline
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a confirmed late release should cancel and drop its pause timer promptly");
+        assert!(!sessions.claim_secure_kernel_pause_expiry(&live, generation, 60_000));
+        assert!(live.released.load(Ordering::SeqCst));
+        assert!(matches!(live.state(), SessionState::Closed(_)));
+        reading.abort();
     }
 
     #[tokio::test]
