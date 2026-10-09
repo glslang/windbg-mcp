@@ -1454,6 +1454,7 @@ impl<P: ControlProvider> LiveControl<P> {
     /// Consume an owned stop and arm one architectural trap-flag step. The first step can reuse
     /// the hardware-breakpoint guard. Every later step must name and prove the instruction at the
     /// current RIP. A caller may admit a bounded destination set for a branch.
+    #[cfg(test)]
     pub(crate) fn step(
         &mut self,
         dispatcher: &mut impl EventDispatcher,

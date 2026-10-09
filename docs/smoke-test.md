@@ -216,14 +216,16 @@ so the config carries no boot address.
 It must carry disposable true, and it must omit vmwp_pid, dispatcher_vnd, partition_id,
 expected_cr3 and kernel_base: discovering those is part of the gate. Set the server-side
 WINDBG_MCP_SK_LIVE_POLICY as well. The ignored test opens the managed KD tool, waits for the
-generated pipe, launches installed kd with a one-command-per-line `lm m securekernel`, `t`, `r`,
-`q` file, verifies module enumeration, the returned RIP and registers, and waits until a marker
-immediately before `q` proves that the observable commands completed. Some installed kd builds
-retain their pipe after `q`, and one does not publish `quit:` until the server closes it; the
-harness therefore closes that test-owned peer at the marker before it requires the managed session
-to enter reconnecting, and releases the controller
-through MCP. It then runs the bounded external audit and requires three healthy same-PID samples,
-no enabled debug-register breakpoint and unchanged Secure Kernel text.
+generated pipe, launches installed kd with a one-command-per-line `lm m securekernel`, `t`, `r`
+file, verifies module enumeration, the returned RIP and registers, then closes that test-owned
+pipe client by the PID authenticated and reported by the server (then reaps its launcher tree) and
+requires the managed session to enter reconnecting. A fresh peer runs `q` after a marker on the same
+parsed command line. Some installed kd builds retain their pipe after `q`, and one does not publish
+`quit:` until the server closes it, so the harness releases the controller through MCP and requires
+that untouched peer to publish its exact `quit:` record and exit successfully once teardown closes
+the server side. Kernel process state supplies the exit observation because `Child::try_wait` can
+lag a Windows process exit. The harness then runs the bounded external audit and requires three
+healthy same-PID samples, no enabled debug-register breakpoint and unchanged Secure Kernel text.
 
 **The sample they open follows the host.** Four dumps are checked in (below), and the two crashes
 a *memory* read is asserted against are paired with the architecture the tests are running on — so
