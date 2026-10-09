@@ -4686,7 +4686,7 @@ mod tests {
 
     #[test]
     fn ordinary_step_wait_continue_reuses_then_ends_one_pause_window() {
-        let source = include_str!("skdispatch.rs");
+        let source = include_str!("skdispatch.rs").replace("\r\n", "\n");
         let wait = source
             .split_once("pub(crate) fn wait_for_stop(\n")
             .expect("the ordinary wait exists")
@@ -4749,7 +4749,7 @@ mod tests {
 
     #[test]
     fn ordinary_stopped_operations_spend_only_the_retained_service_interval() {
-        let source = include_str!("skdispatch.rs");
+        let source = include_str!("skdispatch.rs").replace("\r\n", "\n");
         for (method, bounded_call) in [
             ("pub(crate) fn step(\n", "self.step_until("),
             (
