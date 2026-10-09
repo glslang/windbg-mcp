@@ -378,6 +378,15 @@ mod tests {
                 "{error:#}"
             );
         }
+
+        let minimum = PolicyFile {
+            disposable_vm_ids: vec!["51749a1f-f939-44f5-b251-1251ef5b64a3".to_string()],
+            transport_commands: vec![command],
+            profile_roots: vec![directory],
+            kit_roots: Vec::new(),
+            max_pause_ms: Some(crate::skdispatch::MIN_PAUSE_MS),
+        };
+        assert!(Policy::from_file(minimum).is_ok());
     }
 
     #[test]

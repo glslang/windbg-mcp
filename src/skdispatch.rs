@@ -51,14 +51,18 @@ const COMPLETION_KICK_AFTER: Duration = Duration::from_secs(12);
 const POWERSHELL_WAIT: Duration = Duration::from_secs(60);
 const LIVE_MEMORY_WAIT: Duration = Duration::from_secs(60);
 pub(crate) const CLEANUP_SETTLE: Duration = Duration::from_secs(5);
-/// Smallest pause window that leaves both a service interval and the mandatory cleanup settle.
-pub(crate) const MIN_PAUSE_MS: u64 = CLEANUP_SETTLE.as_millis() as u64 * 2;
+/// Controller restoration, event completion and handler removal run before the mandatory settle.
+/// Keep their reserve larger than the settle itself instead of making every minimum-bound cleanup
+/// fail as soon as any preceding teardown work consumes time.
+pub(crate) const CLEANUP_RESERVE: Duration = Duration::from_secs(30);
+/// Smallest pause window that leaves equal service and bounded controller-cleanup intervals.
+pub(crate) const MIN_PAUSE_MS: u64 = CLEANUP_RESERVE.as_millis() as u64 * 2;
 const POLL: Duration = Duration::from_millis(20);
 const EVENT_TYPE_VECTOR_1: u64 = 0x0100_0002;
 
 /// Stop accepting work early enough to preserve a bounded controller-cleanup interval.
 pub(crate) fn service_pause_bound(max_pause: Duration) -> Duration {
-    let cleanup_reserve = (max_pause / 2).min(Duration::from_secs(30));
+    let cleanup_reserve = (max_pause / 2).min(CLEANUP_RESERVE);
     max_pause.saturating_sub(cleanup_reserve)
 }
 
