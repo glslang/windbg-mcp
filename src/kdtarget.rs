@@ -34,6 +34,7 @@ use windows_sys::Win32::System::Threading::{
 use crate::kdapi::{Amd64Context, Amd64ContextValues, ManipulateRequest, Version64};
 use crate::kdwire::{Decoder, Frame, TargetLink};
 use crate::skcontrol::{RegisterName, RegisterValue};
+use crate::skdispatch::service_pause_bound;
 use crate::sklive::{ArmMode, BreakpointGuard, InstructionGuard, StepGuard, StopRecord};
 
 pub(crate) const TARGET_FLAG: &str = "--sk-kd-target";
@@ -1276,11 +1277,6 @@ async fn run_async(
     }
 }
 
-fn service_pause_bound(max_pause: Duration) -> Duration {
-    let cleanup_reserve = (max_pause / 2).min(Duration::from_secs(30));
-    max_pause.saturating_sub(cleanup_reserve)
-}
-
 fn record_cleanup_deadline(
     activity: &crate::skdispatch::WaitActivity,
     max_pause: Duration,
@@ -2125,6 +2121,10 @@ mod tests {
         assert_eq!(
             service_pause_bound(Duration::from_secs(600)),
             Duration::from_secs(570)
+        );
+        assert_eq!(
+            service_pause_bound(Duration::from_millis(crate::skdispatch::MIN_PAUSE_MS)),
+            crate::skdispatch::CLEANUP_SETTLE
         );
         assert_eq!(
             service_pause_bound(Duration::from_millis(1)),

@@ -787,9 +787,9 @@ pub struct Session {
     /// is thinking, for ever. This is the only signal left that nobody is coming back
     /// ([#162](https://github.com/glslang/windbg-mcp/issues/162)).
     last_used: Mutex<Instant>,
-    /// Generation of the ordinary Secure Kernel controller's absolute pause window. Starting or
-    /// ending a window advances it, so a timer from an earlier arm can never release a later one.
-    secure_kernel_pause_generation: AtomicU64,
+    /// Ordinary Secure Kernel pause generation and cancellation handle. Ending an interval wakes
+    /// its timer immediately, so stale timers retain neither this session nor the registry.
+    secure_kernel_pause: Mutex<SecureKernelPause>,
     /// How far the opener got, as [`OpenPhase`]. Separate from the state on purpose.
     phase: AtomicU8,
     /// Whether *some* teardown got a successful `EndSession` out of this worker.
@@ -854,6 +854,12 @@ pub struct Session {
     /// which the registry does not call and cannot see — a worker dying moves a session from a
     /// task that holds nothing but the session itself.
     rec: crate::record::Recorder,
+}
+
+#[derive(Debug, Default)]
+struct SecureKernelPause {
+    generation: u64,
+    cancel: Option<oneshot::Sender<()>>,
 }
 
 /// A call that has been submitted and not yet answered: where its answer goes, and where the
@@ -3304,26 +3310,49 @@ impl Sessions {
         claimed.len()
     }
 
-    /// Arm the absolute pause window reported by an ordinary Secure Kernel controller.
+    /// Arm cleanup early enough to finish within the absolute pause window reported by the worker.
     fn begin_secure_kernel_pause(&self, session: &Arc<Session>, max_pause_ms: u64) {
-        let generation = session
-            .secure_kernel_pause_generation
-            .fetch_add(1, Ordering::AcqRel)
-            + 1;
+        let (generation, cancelled) = {
+            let mut pause = session
+                .secure_kernel_pause
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(cancel) = pause.cancel.take() {
+                let _ = cancel.send(());
+            }
+            pause.generation = pause.generation.wrapping_add(1);
+            let (cancel, cancelled) = oneshot::channel();
+            pause.cancel = Some(cancel);
+            (pause.generation, cancelled)
+        };
+        let service_pause =
+            crate::skdispatch::service_pause_bound(Duration::from_millis(max_pause_ms));
         let session = Arc::clone(session);
         let sessions = self.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(max_pause_ms)).await;
-            sessions
-                .expire_secure_kernel_pause(session, generation, max_pause_ms)
-                .await;
+            tokio::select! {
+                _ = tokio::time::sleep(service_pause) => {
+                    sessions
+                        .expire_secure_kernel_pause(session, generation, max_pause_ms)
+                        .await;
+                }
+                _ = cancelled => {}
+            }
         });
     }
 
     fn end_secure_kernel_pause(&self, session: &Session) {
-        session
-            .secure_kernel_pause_generation
-            .fetch_add(1, Ordering::AcqRel);
+        let cancel = {
+            let mut pause = session
+                .secure_kernel_pause
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            pause.generation = pause.generation.wrapping_add(1);
+            pause.cancel.take()
+        };
+        if let Some(cancel) = cancel {
+            let _ = cancel.send(());
+        }
     }
 
     async fn expire_secure_kernel_pause(
@@ -3337,8 +3366,8 @@ impl Sessions {
         }
 
         tracing::warn!(
-            "session {}: absolute live Secure Kernel pause bound of {max_pause_ms}ms expired; \
-             starting fail-closed teardown",
+            "session {}: service portion of the {max_pause_ms}ms absolute live Secure Kernel \
+             pause bound ended; starting fail-closed teardown in its cleanup reserve",
             session.id
         );
         let outcome = self
@@ -3361,18 +3390,20 @@ impl Sessions {
         max_pause_ms: u64,
     ) -> bool {
         let _registry = self.registry();
+        let mut pause = session
+            .secure_kernel_pause
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         if session.kind != SessionKind::SecureKernelLive
-            || session
-                .secure_kernel_pause_generation
-                .load(Ordering::Acquire)
-                != generation
+            || pause.generation != generation
             || !session.state().is_live()
         {
             return false;
         }
+        pause.cancel.take();
         session.set_state(SessionState::Closed(format!(
-            "released after the operator's absolute live Secure Kernel pause bound of \
-             {max_pause_ms}ms expired"
+            "released when the service portion of the operator's absolute live Secure Kernel \
+             pause bound of {max_pause_ms}ms ended"
         )));
         true
     }
@@ -3742,7 +3773,7 @@ impl Sessions {
             created: Instant::now(),
             owner: crate::client::current(),
             last_used: Mutex::new(Instant::now()),
-            secure_kernel_pause_generation: AtomicU64::new(0),
+            secure_kernel_pause: Mutex::new(SecureKernelPause::default()),
             state: Mutex::new((SessionState::Opening, Instant::now())),
             tx,
             // Job ids start *past* the opener's, which is reserved — see [`OPENER_JOB`].
@@ -8090,7 +8121,7 @@ mod tests {
         let live = secure_kernel_live_double("live-pause", SessionState::Open, 4100);
         let sessions = registry_of(std::slice::from_ref(&live));
         sessions.begin_secure_kernel_pause(&live, 60_000);
-        let generation = live.secure_kernel_pause_generation.load(Ordering::Acquire);
+        let generation = live.secure_kernel_pause.lock().unwrap().generation;
 
         // Ordinary requests restamp this clock. The pause claim deliberately does not read it.
         *live.last_used.lock().unwrap() = Instant::now();
@@ -8106,11 +8137,30 @@ mod tests {
         let live = secure_kernel_live_double("live-step", SessionState::Open, 4100);
         let sessions = registry_of(std::slice::from_ref(&live));
         sessions.begin_secure_kernel_pause(&live, 60_000);
-        let generation = live.secure_kernel_pause_generation.load(Ordering::Acquire);
+        let generation = live.secure_kernel_pause.lock().unwrap().generation;
 
         sessions.end_secure_kernel_pause(&live);
         assert!(!sessions.claim_secure_kernel_pause_expiry(&live, generation, 60_000));
         assert_eq!(live.state(), SessionState::Open);
+    }
+
+    #[tokio::test]
+    async fn a_released_pause_drops_its_timer_session_reference() {
+        let live = secure_kernel_live_double("live-timer", SessionState::Open, 4100);
+        let sessions = registry_of(std::slice::from_ref(&live));
+        let baseline = Arc::strong_count(&live);
+
+        sessions.begin_secure_kernel_pause(&live, 60_000);
+        assert_eq!(Arc::strong_count(&live), baseline + 1);
+        sessions.end_secure_kernel_pause(&live);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Arc::strong_count(&live) != baseline {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the cancelled pause timer should release its session promptly");
     }
 
     /// [`dormant`] with a transcript, for the one test that is about what gets recorded.
@@ -8138,7 +8188,7 @@ mod tests {
             created: Instant::now(),
             owner: crate::client::current(),
             last_used: Mutex::new(Instant::now()),
-            secure_kernel_pause_generation: AtomicU64::new(0),
+            secure_kernel_pause: Mutex::new(SecureKernelPause::default()),
             state: Mutex::new((state, Instant::now())),
             tx,
             next_id: AtomicU64::new(1),

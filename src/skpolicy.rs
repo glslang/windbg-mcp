@@ -101,10 +101,12 @@ impl Policy {
             })
             .collect::<Result<Vec<_>>>()?;
         if let Some(max_pause_ms) = file.max_pause_ms
-            && (max_pause_ms == 0 || max_pause_ms > crate::kdtarget::MAX_MANAGED_TIMEOUT_MS)
+            && !(crate::skdispatch::MIN_PAUSE_MS..=crate::kdtarget::MAX_MANAGED_TIMEOUT_MS)
+                .contains(&max_pause_ms)
         {
             bail!(
-                "Secure Kernel policy max_pause_ms must be in 1..={}",
+                "Secure Kernel policy max_pause_ms must be in {}..={}",
+                crate::skdispatch::MIN_PAUSE_MS,
                 crate::kdtarget::MAX_MANAGED_TIMEOUT_MS
             );
         }
@@ -358,7 +360,11 @@ mod tests {
         let command = format!("\"{}\" --fixture", executable.display());
         let directory = std::env::temp_dir().canonicalize().unwrap();
 
-        for max_pause_ms in [0, crate::kdtarget::MAX_MANAGED_TIMEOUT_MS + 1] {
+        for max_pause_ms in [
+            0,
+            crate::skdispatch::MIN_PAUSE_MS - 1,
+            crate::kdtarget::MAX_MANAGED_TIMEOUT_MS + 1,
+        ] {
             let file = PolicyFile {
                 disposable_vm_ids: vec!["51749a1f-f939-44f5-b251-1251ef5b64a3".to_string()],
                 transport_commands: vec![command.clone()],

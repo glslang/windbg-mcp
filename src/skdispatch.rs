@@ -50,9 +50,17 @@ const NATIVE_SETTLE_WAIT: u32 = 1_000;
 const COMPLETION_KICK_AFTER: Duration = Duration::from_secs(12);
 const POWERSHELL_WAIT: Duration = Duration::from_secs(60);
 const LIVE_MEMORY_WAIT: Duration = Duration::from_secs(60);
-const CLEANUP_SETTLE: Duration = Duration::from_secs(5);
+pub(crate) const CLEANUP_SETTLE: Duration = Duration::from_secs(5);
+/// Smallest pause window that leaves both a service interval and the mandatory cleanup settle.
+pub(crate) const MIN_PAUSE_MS: u64 = CLEANUP_SETTLE.as_millis() as u64 * 2;
 const POLL: Duration = Duration::from_millis(20);
 const EVENT_TYPE_VECTOR_1: u64 = 0x0100_0002;
+
+/// Stop accepting work early enough to preserve a bounded controller-cleanup interval.
+pub(crate) fn service_pause_bound(max_pause: Duration) -> Duration {
+    let cleanup_reserve = (max_pause / 2).min(Duration::from_secs(30));
+    max_pause.saturating_sub(cleanup_reserve)
+}
 
 fn completion_wait_deadline(outer: Option<Instant>) -> Instant {
     outer.unwrap_or_else(|| {
@@ -339,14 +347,37 @@ impl Session {
         })
     }
 
-    pub(crate) fn wait_for_stop(&mut self, engine: &DebugEngine) -> Result<StopRecord> {
+    /// Wait under the policy pause bound and report the instant the owned callback is retained.
+    ///
+    /// The notice is deliberately emitted from the engine thread at the retention boundary,
+    /// before adapter cleanup or provider validation can stall. The dispatcher keeps the matching
+    /// absolute recovery deadline so a later `EndSession` spends only the reserved cleanup time.
+    pub(crate) fn wait_for_stop(
+        &mut self,
+        engine: &DebugEngine,
+        mut retained: impl FnMut(),
+    ) -> Result<StopRecord> {
         self.ensure_preparation_succeeded()?;
-        let control = self
-            .control
-            .as_mut()
-            .context("live Secure Kernel control has not completed target discovery")?;
-        let mut dispatcher = self.dispatcher.bind(engine);
-        control.wait_for_stop(&mut dispatcher)
+        let max_pause = Duration::from_millis(self.max_pause_ms);
+        let activity = WaitActivity::for_kd(
+            Duration::from_millis(u64::from(DEBUG_WAIT)),
+            service_pause_bound(max_pause),
+            max_pause,
+        );
+        self.dispatcher.wait_activity = Some(activity.clone());
+        let result = (|| {
+            let control = self
+                .control
+                .as_mut()
+                .context("live Secure Kernel control has not completed target discovery")?;
+            let mut dispatcher = self
+                .dispatcher
+                .bind_with_retention_notice(engine, &mut retained);
+            control.wait_for_stop(&mut dispatcher)
+        })();
+        activity.finish();
+        self.dispatcher.wait_activity = None;
+        result
     }
 
     /// Wait while exposing only the lifetime of the owned DbgEng wait to a transport thread.
@@ -775,7 +806,7 @@ pub(crate) fn run_acceptance(args: &[String], engine: &DebugEngine) -> Result<()
             }],
             request.arm_mode,
         )?;
-        let hardware_stop = session.wait_for_stop(engine)?;
+        let hardware_stop = session.wait_for_stop(engine, || {})?;
         session.step(
             engine,
             &hardware_stop.epoch,
@@ -784,7 +815,7 @@ pub(crate) fn run_acceptance(args: &[String], engine: &DebugEngine) -> Result<()
                 expected_rips: Vec::new(),
             },
         )?;
-        let single_step_stop = session.wait_for_stop(engine)?;
+        let single_step_stop = session.wait_for_stop(engine, || {})?;
         session.continue_from(engine, &single_step_stop.epoch)?;
         session.close(engine)?;
         Ok(AcceptanceResult {
@@ -938,6 +969,19 @@ impl VmwpDispatcherState {
         VmwpDispatcher {
             engine,
             state: self,
+            retention_notice: None,
+        }
+    }
+
+    fn bind_with_retention_notice<'a>(
+        &'a mut self,
+        engine: &'a DebugEngine,
+        retention_notice: &'a mut dyn FnMut(),
+    ) -> VmwpDispatcher<'a> {
+        VmwpDispatcher {
+            engine,
+            state: self,
+            retention_notice: Some(retention_notice),
         }
     }
 
@@ -1235,6 +1279,7 @@ impl VmwpDispatcherState {
 pub(crate) struct VmwpDispatcher<'a> {
     engine: &'a DebugEngine,
     state: &'a mut VmwpDispatcherState,
+    retention_notice: Option<&'a mut dyn FnMut()>,
 }
 
 const WAIT_ARMED: u8 = 0;
@@ -2094,6 +2139,9 @@ impl EventDispatcher for VmwpDispatcher<'_> {
             .wait_activity
             .as_ref()
             .and_then(|activity| activity.mark_stop_retained(retained_at));
+        if let Some(notice) = self.retention_notice.take() {
+            notice();
+        }
         self.retain_current_event(event_pointer, event_site, &event, pause_deadline)?;
         self.state.vm_paused = false;
         self.state.confirm_retained_provider_stop(targets)?;
@@ -4518,6 +4566,29 @@ mod tests {
         assert_eq!(
             activity.mark_stop_retained(retained_at + Duration::from_secs(1)),
             Some(deadline)
+        );
+    }
+
+    #[test]
+    fn ordinary_pause_notice_precedes_all_retention_cleanup() {
+        let source = include_str!("skdispatch.rs");
+        let flow = source
+            .split_once("let retained_at = Instant::now();")
+            .expect("the retained-stop boundary exists")
+            .1
+            .split_once("self.state.vm_paused = false;")
+            .expect("the post-retention flow exists")
+            .0;
+        let notice = flow
+            .find("self.retention_notice.take()")
+            .expect("the ordinary pause notice is present");
+        let cleanup = flow
+            .find("self.retain_current_event")
+            .expect("retention cleanup is present");
+
+        assert!(
+            notice < cleanup,
+            "the supervisor deadline must be armed before retention cleanup or provider I/O"
         );
     }
 

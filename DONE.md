@@ -8757,12 +8757,13 @@ validated. The full record is the
 created the cost rather than by a reviewer, because the arithmetic is unarguable and the remedy is
 not.
 
-**The eleven `securekernel` tools are 15,573 B of model-visible surface**, measured 2026-10-04
+**At the time, the eleven `securekernel` tools were 15,573 B of model-visible surface**, measured 2026-10-04
 against a 113,516 B surface: **13.7%** of the default tool cost, paid once per conversation by every
 caller. Four tools need a Hyper-V standard checkpoint of a VBS guest, the Windows SDK's saved-state
 provider and the `securekernel.exe` that guest was running; seven more need an exact disposable VBS
 VM, two operator-supplied live providers and a build-matched `vmwp` profile. Almost nobody driving a
-crash dump has either setup.
+crash dump has either setup. These are the pre-implementation figures; the current 12-tool
+measurement is recorded in the implementation status below.
 
 `--tools` is the lever that exists for exactly this, and its shape is the problem: it is opt-**out**,
 so a caller who wants no capture tools has to name every group it *does* want, and the default a
@@ -8786,7 +8787,7 @@ needs a story for the client that asks for `all`.
   leaves the default surface as it is — which is the thing being complained about, so it helps the
   operator who already knows and nobody else.
 - **Nothing, and say so in the docs.** Still on the table, and it does not need the measurement
-  below: 7.3% of the surface is not obviously noise, but the surface is 26k tokens against context
+  below: 13.7% of the surface is not obviously noise, but the surface is 26k tokens against context
   windows that are now much larger than they were when item 24 measured it — and *that* comparison is
   one nobody here has re-taken, needs no model and no bench, and would settle whether this item is
   about anything at all.
@@ -8799,7 +8800,7 @@ tasks it *is* for — `tools/local_model_eval.py` is the only thing in this repo
 - **The grid has no arm for this question.** Its surfaces are `full`, `lean`
   (`session,inspect,crash`) and `min` (`crash`), narrowed **toward** `crash` — so what it measures is
   what a *small* surface costs, and three of its six tasks cannot be answered on the 11-tool one at
-  all. This item asks the opposite: what the extra 7,529 B on the **full** surface costs. That needs a
+  all. This item asks the opposite: what the extra 15,573 B on the **full** surface costs. That needs a
   new arm — every tool *except* `securekernel` — which is a plan change and a fourth credential rather
   than a run. An earlier draft of this item said "the grid already varies the surface", which is true
   and beside the point.

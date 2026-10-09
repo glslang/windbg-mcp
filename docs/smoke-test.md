@@ -217,10 +217,11 @@ It must carry disposable true, and it must omit vmwp_pid, dispatcher_vnd, partit
 expected_cr3 and kernel_base: discovering those is part of the gate. Set the server-side
 WINDBG_MCP_SK_LIVE_POLICY as well. The ignored test opens the managed KD tool, waits for the
 generated pipe, launches installed kd with a one-command-per-line `lm m securekernel`, `t`, `r`,
-`q` file, verifies module enumeration, the returned RIP and registers, and waits until the
-transcript proves that `q` completed. Some installed kd builds retain their pipe after printing
-`quit:`; the harness then closes that test-owned peer before it requires the managed session to
-enter reconnecting, and releases the controller
+`q` file, verifies module enumeration, the returned RIP and registers, and waits until a marker
+immediately before `q` proves that the observable commands completed. Some installed kd builds
+retain their pipe after `q`, and one does not publish `quit:` until the server closes it; the
+harness therefore closes that test-owned peer at the marker before it requires the managed session
+to enter reconnecting, and releases the controller
 through MCP. It then runs the bounded external audit and requires three healthy same-PID samples,
 no enabled debug-register breakpoint and unchanged Secure Kernel text.
 
