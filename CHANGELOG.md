@@ -19,7 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Reading gives each allocation's allocator, call site, size, tag (as the debugger prints it and as
   `pool_find_tag` takes it), `POOL_FLAGS` or `POOL_TYPE`, returned address and thread, and counts
   what was not recorded; `stop: true` disarms it, removing only breakpoints still at the addresses
-  it set. It rests on dbgscope's breakpoint callback
+  it set. x64 and ARM64 only: an x86 kernel passes the arguments on the stack and is refused
+  (`FOLLOWUPS.md` item 121). It rests on dbgscope's breakpoint callback
   ([dbgscope#195](https://github.com/glslang/dbgscope/pull/195)), which returns a `DEBUG_STATUS_*`
   through the error half of a windows-rs `Result<()>` because the generated trait gives an
   implementer no other way to. Measured on the ARM64 bench's live HEVD over serial KD, 2026-10-09:

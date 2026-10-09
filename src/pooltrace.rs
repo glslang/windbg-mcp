@@ -128,10 +128,15 @@ struct Pending {
 pub struct Recorder {
     sites: Vec<Site>,
     breakpoints: HashMap<u32, Phase>,
+    /// Breakpoints this trace set and has since found gone, and forgotten.
+    lost: usize,
     /// Calls in flight, by the thread that made them and the site they were made at. A call
     /// returns on the thread that made it, to the instruction after it -- so this pair names the
-    /// one call a return belongs to.
-    pending: HashMap<(u64, usize), Pending>,
+    /// calls a return can belong to, and of those it is the **latest**: a second call at one site
+    /// on one thread is one an interrupt or a DPC made while the first was still inside the
+    /// allocator, and it returns first. So each pair holds a stack rather than a slot, which would
+    /// let the inner call overwrite the outer and leave the outer's return with nothing to pair.
+    pending: HashMap<(u64, usize), Vec<Pending>>,
     allocations: Vec<Allocation>,
     limit: usize,
     next_sequence: u64,
@@ -150,6 +155,7 @@ impl Recorder {
         Self {
             sites,
             breakpoints: HashMap::new(),
+            lost: 0,
             pending: HashMap::new(),
             allocations: Vec::new(),
             limit: limit.clamp(1, MAX_ALLOCATIONS),
@@ -165,10 +171,50 @@ impl Recorder {
         self.breakpoints.insert(id, phase);
     }
 
-    /// What breakpoint `id` is to this trace, or `None` for one it did not set -- which the
-    /// callback answers [`BreakpointAction::Default`], leaving it exactly as it was.
-    pub fn phase_of(&self, id: u32) -> Option<Phase> {
-        self.breakpoints.get(&id).copied()
+    /// What a hit on breakpoint `id` at `address` is to this trace, or `None` for one it did not
+    /// set -- which the callback answers [`BreakpointAction::Default`], leaving it exactly as it
+    /// was.
+    ///
+    /// **The id and the address, because an id alone is not this trace's.** The engine hands a
+    /// removed breakpoint's id to the next one set, so a breakpoint of the trace's that something
+    /// else cleared can come back as the caller's own -- and a hit on it, taken for an allocation,
+    /// would be answered *go* rather than stopping where the caller asked. [`Self::forget_removed`]
+    /// drops an id the moment it is seen gone, between operations; this is the check that holds
+    /// within one, where a single command can clear a breakpoint and set another.
+    pub fn phase_at(&self, id: u32, address: u64) -> Option<Phase> {
+        self.breakpoints
+            .get(&id)
+            .copied()
+            .filter(|&phase| self.address_of(phase) == Some(address))
+    }
+
+    /// Where the breakpoint for `phase` was set.
+    pub fn address_of(&self, phase: Phase) -> Option<u64> {
+        match phase {
+            Phase::Entry(index) => self.sites.get(index).map(|site| site.call),
+            Phase::Return(index) => self.sites.get(index).and_then(|site| site.returns_to),
+        }
+    }
+
+    /// Forgets every breakpoint of this trace's that `held` says is no longer at the address the
+    /// trace set it at, so its id means nothing here when the engine hands it to the next
+    /// breakpoint. Each one forgotten is counted, since its site has recorded nothing since.
+    pub fn forget_removed(&mut self, held: impl Fn(u32, u64) -> bool) {
+        let gone: Vec<u32> = self
+            .breakpoints
+            .iter()
+            .filter(|&(&id, &phase)| !self.address_of(phase).is_some_and(|at| held(id, at)))
+            .map(|(&id, _)| id)
+            .collect();
+        self.lost += gone.len();
+        for id in gone {
+            self.breakpoints.remove(&id);
+        }
+    }
+
+    /// Breakpoints this trace set that something else removed.
+    pub fn lost(&self) -> usize {
+        self.lost
     }
 
     /// The breakpoints this trace set, with what each is.
@@ -198,15 +244,15 @@ impl Recorder {
                 address: None,
             });
         }
-        // The pending slot is taken whether or not the trace is full, so the return finds its
-        // call either way and is counted rather than mistaken for an orphan.
-        self.pending.insert(
-            (thread, site),
-            Pending {
+        // Pending whether or not the trace is full, so the return finds its call either way and is
+        // counted rather than mistaken for an orphan.
+        self.pending
+            .entry((thread, site))
+            .or_default()
+            .push(Pending {
                 sequence,
                 arguments,
-            },
-        );
+            });
         BreakpointAction::Go
     }
 
@@ -215,9 +261,15 @@ impl Recorder {
     /// A return with no call pending -- the trace armed while a call was already in flight -- is
     /// not an allocation this trace saw made, so it records nothing.
     pub fn returned(&mut self, site: usize, thread: u64, value: u64) -> BreakpointAction {
-        let Some(pending) = self.pending.remove(&(thread, site)) else {
+        let Some(calls) = self.pending.get_mut(&(thread, site)) else {
             return BreakpointAction::Go;
         };
+        let Some(pending) = calls.pop() else {
+            return BreakpointAction::Go;
+        };
+        if calls.is_empty() {
+            self.pending.remove(&(thread, site));
+        }
         self.record(Allocation {
             sequence: pending.sequence,
             site,
@@ -269,7 +321,7 @@ impl Recorder {
 
     /// Calls seen at entry and not yet at their return.
     pub fn pending(&self) -> usize {
-        self.pending.len()
+        self.pending.values().map(Vec::len).sum()
     }
 }
 
@@ -303,9 +355,65 @@ mod tests {
     #[test]
     fn a_breakpoint_the_trace_did_not_set_is_not_its_own() {
         let recorder = trace(8);
-        assert_eq!(recorder.phase_of(10), Some(Phase::Entry(0)));
-        assert_eq!(recorder.phase_of(11), Some(Phase::Return(0)));
-        assert_eq!(recorder.phase_of(99), None);
+        assert_eq!(recorder.phase_at(10, 0x1000), Some(Phase::Entry(0)));
+        assert_eq!(recorder.phase_at(11, 0x1004), Some(Phase::Return(0)));
+        assert_eq!(recorder.phase_at(99, 0x1000), None);
+    }
+
+    /// **An id the trace was given is not the trace's once it is somewhere else** -- the engine
+    /// reuses a removed breakpoint's id for the next one set, and a hit on the caller's own
+    /// breakpoint taken for an allocation would be answered *go* instead of stopping.
+    #[test]
+    fn a_reused_id_at_another_address_is_not_the_traces() {
+        let recorder = trace(8);
+        assert_eq!(
+            recorder.phase_at(10, 0x5000),
+            None,
+            "id 10 was the trace's entry at 0x1000; at 0x5000 it is somebody else's breakpoint"
+        );
+    }
+
+    /// **A breakpoint found gone is forgotten**, so an id reused at the *same* address -- the
+    /// caller clearing the trace's breakpoint and setting their own on that instruction -- is not
+    /// taken for the trace's either. It is counted, because its site records nothing from then.
+    #[test]
+    fn a_breakpoint_found_gone_is_forgotten_and_counted() {
+        let mut recorder = trace(8);
+        // 10 and 12 are still where the trace set them; 11 is not held at all.
+        recorder.forget_removed(|id, at| matches!((id, at), (10, 0x1000) | (12, 0x2000)));
+        assert_eq!(recorder.lost(), 1);
+        assert_eq!(recorder.phase_at(11, 0x1004), None, "11 is forgotten");
+        assert_eq!(recorder.phase_at(10, 0x1000), Some(Phase::Entry(0)));
+        assert_eq!(recorder.armed().count(), 2);
+        // A breakpoint moved is gone from where the trace set it, whatever its id says.
+        recorder.forget_removed(|id, at| matches!((id, at), (12, 0x2000)));
+        assert_eq!(recorder.lost(), 2);
+        assert_eq!(recorder.phase_at(10, 0x1000), None);
+    }
+
+    /// **Calls nested at one site on one thread unwind innermost first.** The second is one an
+    /// interrupt or a DPC made while the first was still in the allocator; it returns first, and
+    /// the outer return must still find the outer call.
+    #[test]
+    fn calls_nested_at_one_site_on_one_thread_pair_innermost_first() {
+        let mut recorder = trace(8);
+        recorder.entry(0, 0xa, [0x200, 0x40, 0]);
+        recorder.entry(0, 0xa, [0x200, 0x80, 0]);
+        assert_eq!(recorder.pending(), 2);
+        recorder.returned(0, 0xa, 0x2000);
+        recorder.returned(0, 0xa, 0x1000);
+        assert_eq!(recorder.pending(), 0);
+        let allocations = recorder.allocations();
+        assert_eq!(
+            (allocations[0].arguments[1], allocations[0].address),
+            (0x80, Some(0x2000)),
+            "the inner call returned first, with its own address"
+        );
+        assert_eq!(
+            (allocations[1].arguments[1], allocations[1].address),
+            (0x40, Some(0x1000)),
+            "and the outer one was not lost to it"
+        );
     }
 
     /// A return is paired with the call its thread made at that site, whatever ran in between.
