@@ -250,7 +250,11 @@
   resident when the trace is armed cannot be read, so it is neither found nor armed — the arm result
   reports those bytes, and running the driver then arming again finds what it brought in. A call
   already in flight when the trace is armed returns to a breakpoint with no call pending and is not
-  recorded. And DbgEng prints `Breakpoint N hit` for every hit, including the ones the trace lets
+  recorded. The trace's breakpoints are the ones `breakpoints` lists with the command
+  `$$ pool_trace <n>` — a comment, which the engine runs as nothing — and that mark, not the id,
+  is how it tells its own from a breakpoint that was given one of their ids after something
+  cleared it: clearing one stops its site recording, and any breakpoint set afterwards, on the same
+  instruction or not, is the caller's and stops. And DbgEng prints `Breakpoint N hit` for every hit, including the ones the trace lets
   through, so the stop that ends a run carries one line per breakpoint stop: about 37 KB for a full
   1,024-allocation trace.
 - The **user Segment Heap** tools share that typed decoder. They discover roots by following

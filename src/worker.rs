@@ -2846,15 +2846,6 @@ fn execute(
     {
         return Err(refusal);
     }
-    // **Before anything else this op does**, a pool trace forgets the breakpoints of its that are
-    // gone: this op may set one, and the engine hands a removed breakpoint's id to the next, so an
-    // id still mapped here would make the caller's new breakpoint the trace's. Only while there is
-    // a target to ask -- an engine with none is not one whose breakpoints were removed.
-    if let Some(trace) = pool_trace.as_ref()
-        && matches!(e.has_target(), Ok(true))
-    {
-        trace.forget_removed(e);
-    }
     // Before the open rather than after it, so a failed one still records what was attempted: this
     // decides whether a later call may ask the host OS about a process id, and the answer for a
     // half-opened trace is the same as for a whole one. `OnceLock`, because a worker holds one
@@ -9346,21 +9337,6 @@ pub(crate) struct PoolTrace {
     locations: Vec<structured::CodeLocation>,
 }
 
-impl PoolTrace {
-    /// Forgets this trace's breakpoints that the engine no longer holds where the trace set them --
-    /// see [`crate::pooltrace::Recorder::forget_removed`]. A listing that fails forgets nothing:
-    /// an engine that did not answer has not said a breakpoint is gone.
-    fn forget_removed(&self, e: &DebugEngine) {
-        let Ok(held) = e.breakpoints() else {
-            return;
-        };
-        self.recorder.borrow_mut().forget_removed(|id, at| {
-            held.iter()
-                .any(|breakpoint| breakpoint.id == id && breakpoint.address == Some(at))
-        });
-    }
-}
-
 /// The registers a call's first three integer arguments arrive in, and the one it returns in, or
 /// `None` for an architecture that does not pass them in registers.
 ///
@@ -9379,6 +9355,41 @@ fn call_registers(
     }
 }
 
+/// Numbers each trace's marker, so no two traces this worker arms share one -- a breakpoint an
+/// earlier trace left behind is not the current one's.
+static TRACE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Where an arm that was stopped part-way was stopped, if it was: the same two reasons a scan
+/// halts for, asked at the steps after the scan.
+fn arm_halted(e: &DebugEngine, deadline: Instant) -> Option<walk::Halt> {
+    if matches!(e.interrupted(), Ok(true)) {
+        Some(walk::Halt::Interrupted)
+    } else if Instant::now() >= deadline {
+        Some(walk::Halt::Deadline)
+    } else {
+        None
+    }
+}
+
+/// An arm refused because it was stopped -- `step` says where, `left` what it left behind.
+fn arm_refusal(halt: walk::Halt, module: &str, step: &str, left: &str) -> Failed {
+    let (category, why) = match halt {
+        walk::Halt::Deadline => (
+            structured::ErrorCategory::Timeout,
+            "its caller's time ran out",
+        ),
+        walk::Halt::Interrupted => (structured::ErrorCategory::Interrupted, "it was interrupted"),
+    };
+    Failed::categorised(
+        category,
+        format!(
+            "arming the pool trace on `{module}` stopped {step}, because {why}, so no trace was \
+             armed: armed on part of the driver, it would record as though the rest allocated \
+             nothing.{left}"
+        ),
+    )
+}
+
 /// Arms a trace of `module`'s pool allocations: a breakpoint on every call to a pool allocator in
 /// its readable code and one after it, and a callback that records each call and lets the target
 /// run on, stopping it once `limit` allocations are recorded. Replaces any trace the session held.
@@ -9390,6 +9401,14 @@ fn call_registers(
 /// traced through its import address table, as `driver_hazards` reads it, and a site in code that
 /// could not be read -- pageable code not resident -- is neither found nor armed. That is reported
 /// as `unread_bytes`, because arming again once the driver has run finds what it brought in.
+///
+/// **Each breakpoint carries the trace's marker as its command** -- a `$$` comment, which the
+/// engine runs as nothing -- because that, and not its id, is what makes it the trace's. See
+/// [`crate::pooltrace::Recorder::phase_of`].
+///
+/// **Stopped part-way, it arms nothing.** The deadline and an interrupt are asked after the scan
+/// as well as during it: before the previous trace is disarmed, so a stopped arm leaves that one
+/// as it was, and before each breakpoint, so one stopped while setting them removes what it set.
 fn arm_pool_trace(
     e: &DebugEngine,
     module: &str,
@@ -9406,33 +9425,28 @@ fn arm_pool_trace(
                 .to_string(),
         ));
     }
-    let set = e.instruction_set();
-    let Some((arguments, returned)) = call_registers(set) else {
+    let instruction_set = e.instruction_set();
+    let Some((arguments, returned)) = call_registers(instruction_set) else {
         return Err(Failed::categorised(
             structured::ErrorCategory::InvalidArgument,
             format!(
                 "a pool trace reads an allocator's arguments from the registers x64 and ARM64 \
                  pass them in, and this target is machine {}, which passes them on the stack. \
                  Nothing was armed.",
-                machine_label(set)
+                machine_label(instruction_set)
             ),
         ));
     };
     let (base, loaded_size) = loaded_module_named(e, module)?;
     let scan = scan_driver(e, module, base, loaded_size, deadline)?;
-    // A scan stopped part-way found some call sites and not others, and a trace armed on part of a
-    // driver records as though the rest allocated nothing. Refused; nothing has been touched yet.
+    // A scan stopped part-way found some call sites and not others. Refused; nothing has been
+    // touched yet.
     if let Some(halt) = scan.halted {
-        return Err(Failed::categorised(
-            match halt {
-                walk::Halt::Deadline => structured::ErrorCategory::Timeout,
-                walk::Halt::Interrupted => structured::ErrorCategory::Interrupted,
-            },
-            format!(
-                "the scan for `{module}`'s call sites stopped before it finished, so no trace was \
-                 armed: armed on part of the driver, it would record as though the rest allocated \
-                 nothing."
-            ),
+        return Err(arm_refusal(
+            halt,
+            module,
+            "while scanning for its call sites",
+            "",
         ));
     }
 
@@ -9447,6 +9461,14 @@ fn arm_pool_trace(
         }
         unarmed_call_sites += sink.call_site_count.saturating_sub(sink.call_sites.len());
         for &call in &sink.call_sites {
+            if let Some(halt) = arm_halted(e, deadline) {
+                return Err(arm_refusal(
+                    halt,
+                    module,
+                    "while decoding its call sites",
+                    "",
+                ));
+            }
             // The call instruction, decoded again for two things the scan does not keep: where it
             // returns to, which is its own length past it, and whether it returns at all -- a jump
             // to the allocator is a tail call, and the allocator returns to someone else.
@@ -9475,29 +9497,65 @@ fn arm_pool_trace(
             });
         }
     }
+    let mut attributor = Attributor::default();
+    let mut locations = Vec::with_capacity(sites.len());
+    for site in &sites {
+        if let Some(halt) = arm_halted(e, deadline) {
+            return Err(arm_refusal(
+                halt,
+                module,
+                "while locating its call sites",
+                "",
+            ));
+        }
+        locations.push(attributor.locate(e, site.call));
+    }
 
-    let replaced = disarm_pool_trace(e, slot.take());
-    // Said by a failure below as well: by then the trace this replaced is gone either way.
+    // The last point at which stopping leaves everything as it was, the previous trace included.
+    if let Some(halt) = arm_halted(e, deadline) {
+        return Err(arm_refusal(halt, module, "before setting a breakpoint", ""));
+    }
+    // A trace that will not disarm is not replaced: the new one would share its callback slot,
+    // and the old one's breakpoints would stop the target as nobody's.
+    let replaced = match slot.as_ref() {
+        Some(previous) => {
+            disarm_pool_trace(e, previous)?;
+            *slot = None;
+            true
+        }
+        None => false,
+    };
+    // Said by every failure below: by then the trace this replaced is gone either way.
     let and_before = if replaced {
         " The trace this session held before it is disarmed too."
     } else {
         ""
     };
     let unread_bytes = scan.unreadable.iter().map(|range| range.bytes).sum();
-    let mut attributor = Attributor::default();
-    let locations: Vec<structured::CodeLocation> = sites
-        .iter()
-        .map(|site| attributor.locate(e, site.call))
-        .collect();
-    let mut recorder = crate::pooltrace::Recorder::new(sites, limit);
+    let marker = format!(
+        "$$ pool_trace {}",
+        TRACE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+    );
+    let mut recorder = crate::pooltrace::Recorder::new(sites, limit, marker.clone());
 
     // Every breakpoint this trace sets, so a failure part-way removes what it had set rather than
-    // leaving breakpoints armed that no trace owns.
+    // leaving breakpoints armed that no trace owns -- and says which it could not.
     let mut set: Vec<u32> = Vec::new();
-    let undo = |set: &[u32]| {
-        for &id in set {
-            let _ = e.remove_breakpoint(id);
-        }
+    let undo = |set: &[u32]| -> String {
+        let stuck: Vec<u32> = set
+            .iter()
+            .copied()
+            .filter(|&id| e.remove_breakpoint(id).is_err())
+            .collect();
+        let left = if stuck.is_empty() {
+            " The breakpoints it had set were removed.".to_string()
+        } else {
+            format!(
+                " Breakpoint(s) {stuck:?} it had set could not be removed and are still set, as \
+                 ordinary breakpoints: clear them."
+            )
+        };
+        left + and_before
     };
     let planned: Vec<(u64, crate::pooltrace::Phase)> = recorder
         .sites()
@@ -9511,16 +9569,26 @@ fn arm_pool_trace(
         })
         .collect();
     for (address, phase) in planned {
-        match e.set_breakpoint(&BreakpointSpec::code(BreakpointAt::Address(address))) {
+        if let Some(halt) = arm_halted(e, deadline) {
+            return Err(arm_refusal(
+                halt,
+                module,
+                "while setting its breakpoints",
+                &undo(&set),
+            ));
+        }
+        let spec =
+            BreakpointSpec::code(BreakpointAt::Address(address)).with_command(marker.clone());
+        match e.set_breakpoint(&spec) {
             Ok(armed) => {
                 set.push(armed.breakpoint.id);
                 recorder.arm(armed.breakpoint.id, phase);
             }
             Err(why) => {
-                undo(&set);
                 return Err(Failed::from(format!(
                     "a breakpoint at {address:#x} could not be set ({why}), so no trace was \
-                     armed and the breakpoints set before it were removed.{and_before}"
+                     armed.{}",
+                    undo(&set)
                 )));
             }
         }
@@ -9528,6 +9596,14 @@ fn arm_pool_trace(
 
     let recorder = std::rc::Rc::new(std::cell::RefCell::new(recorder));
     if !set.is_empty() {
+        if let Some(halt) = arm_halted(e, deadline) {
+            return Err(arm_refusal(
+                halt,
+                module,
+                "before its callback was registered",
+                &undo(&set),
+            ));
+        }
         let shared = std::rc::Rc::clone(&recorder);
         let callback: dbgscope::dbgeng::BreakpointCallback =
             Box::new(move |hit: &dbgscope::dbgeng::BreakpointHit<'_>| {
@@ -9536,40 +9612,46 @@ fn arm_pool_trace(
                 let Ok(id) = hit.id() else {
                     return BreakpointAction::Default;
                 };
+                let engine = hit.engine();
+                // The breakpoint's own command, read back from the engine: the marker in it is what
+                // makes the breakpoint this trace's, not its id. A listing that fails claims
+                // nothing, so the breakpoint stops as any other would.
+                let command = engine
+                    .breakpoints()
+                    .ok()
+                    .and_then(|held| held.into_iter().find(|breakpoint| breakpoint.id == id))
+                    .and_then(|breakpoint| breakpoint.command);
                 // Never contended -- reads run on this thread, not inside a wait -- but a trace
                 // that cannot be borrowed has no opinion, rather than a panic in a callback.
                 let Ok(mut recorder) = shared.try_borrow_mut() else {
                     return BreakpointAction::Default;
                 };
-                let Ok(address) = hit.address() else {
+                let Some(phase) = recorder.phase_of(id, command.as_deref()) else {
                     return BreakpointAction::Default;
                 };
-                let Some(phase) = recorder.phase_at(id, address) else {
-                    return BreakpointAction::Default;
+                let (site, at_call) = match phase {
+                    Phase::Entry(site) => (site, true),
+                    Phase::Return(site) => (site, false),
                 };
-                let engine = hit.engine();
-                let thread = engine.current_thread_data_offset();
-                match phase {
-                    Phase::Entry(site) => {
-                        let read = |index: usize| engine.integer_register(arguments[index]);
-                        match (thread, read(0), read(1), read(2)) {
-                            (Ok(thread), Ok(a), Ok(b), Ok(c)) => {
-                                recorder.entry(site, thread, [a, b, c])
-                            }
-                            _ => recorder.unreadable(),
-                        }
-                    }
-                    Phase::Return(site) => match (thread, engine.integer_register(returned)) {
-                        (Ok(thread), Ok(value)) => recorder.returned(site, thread, value),
-                        _ => recorder.unreadable(),
-                    },
+                let Ok(thread) = engine.current_thread_data_offset() else {
+                    return recorder.threadless(site);
+                };
+                if at_call {
+                    let read = |index: usize| engine.integer_register(arguments[index]).ok();
+                    let read = match (read(0), read(1), read(2)) {
+                        (Some(a), Some(b), Some(c)) => Some([a, b, c]),
+                        _ => None,
+                    };
+                    recorder.entry(site, thread, read)
+                } else {
+                    recorder.returned(site, thread, engine.integer_register(returned).ok())
                 }
             });
         if let Err(why) = e.set_breakpoint_callback(callback) {
-            undo(&set);
             return Err(Failed::from(format!(
-                "the breakpoint callback could not be registered ({why}), so no trace was armed \
-                 and its breakpoints were removed.{and_before}"
+                "the breakpoint callback could not be registered ({why}), so no trace was \
+                 armed.{}",
+                undo(&set)
             )));
         }
     }
@@ -9604,28 +9686,42 @@ fn arm_pool_trace(
     Ok(Output::typed(render_pool_trace_armed(&report), report))
 }
 
-/// Removes a trace's breakpoints and callback, and answers whether there was one.
+/// Removes a trace's breakpoints and unregisters its callback.
 ///
-/// **Only breakpoints still its own.** An id is the engine's, and one removed by something else can
-/// be handed to the next breakpoint set -- so each is removed only while it is still at the address
-/// this trace set it at, as `skdispatch` removes the breakpoint it owns.
-fn disarm_pool_trace(e: &DebugEngine, trace: Option<PoolTrace>) -> bool {
-    let Some(trace) = trace else {
-        return false;
-    };
-    let held = e.breakpoints().unwrap_or_default();
-    let recorder = trace.recorder.borrow();
-    for (id, phase) in recorder.armed() {
-        let expected = recorder.address_of(phase);
-        if held
-            .iter()
-            .any(|breakpoint| breakpoint.id == id && breakpoint.address == expected)
-        {
-            let _ = e.remove_breakpoint(id);
-        }
+/// **Its breakpoints are the ones carrying its marker**, found by listing rather than by the ids it
+/// was given, which the engine may since have handed to somebody else's.
+///
+/// **An `Err` leaves the trace armed**, and says what is left: a listing that failed removed
+/// nothing, and a breakpoint that would not go still records. Reported as disarmed, a surviving
+/// breakpoint would stop the next run as nobody's.
+fn disarm_pool_trace(e: &DebugEngine, trace: &PoolTrace) -> Result<(), Failed> {
+    let module = &trace.module;
+    let marker = trace.recorder.borrow().marker().to_string();
+    let held = e.breakpoints().map_err(|why| {
+        Failed::from(format!(
+            "the session's breakpoints could not be listed ({why}), so the pool trace on \
+             `{module}` is still armed: none of its breakpoints were removed."
+        ))
+    })?;
+    let stuck: Vec<u32> = held
+        .iter()
+        .filter(|breakpoint| breakpoint.command.as_deref() == Some(marker.as_str()))
+        .map(|breakpoint| breakpoint.id)
+        .filter(|&id| e.remove_breakpoint(id).is_err())
+        .collect();
+    if !stuck.is_empty() {
+        return Err(Failed::from(format!(
+            "breakpoint(s) {stuck:?} of the pool trace on `{module}` could not be removed, so the \
+             trace is still armed and still records at them; the rest of its breakpoints are \
+             removed."
+        )));
     }
-    let _ = e.clear_breakpoint_callback();
-    true
+    e.clear_breakpoint_callback().map_err(|why| {
+        Failed::from(format!(
+            "the pool trace on `{module}` has no breakpoints left, but its callback could not be \
+             unregistered ({why}), so the trace is still held."
+        ))
+    })
 }
 
 /// What the session's pool trace has recorded, and with `stop`, disarms it.
@@ -9640,11 +9736,19 @@ fn read_pool_trace(
             "this session holds no pool trace to read.".to_string(),
         ));
     };
+    let held = e.breakpoints().map_err(failed)?;
     let report = {
         let recorder = trace.recorder.borrow();
-        // Counted as they were forgotten, which every op does first -- this one included, so
-        // nothing removed before this read is still waiting to be noticed.
-        let missing_breakpoints = recorder.lost();
+        // Set by the trace and no longer held with its marker: removed, or replaced by somebody
+        // else's breakpoint that the engine gave the same id.
+        let missing_breakpoints = recorder
+            .armed()
+            .filter(|&(id, _)| {
+                !held.iter().any(|breakpoint| {
+                    breakpoint.id == id && breakpoint.command.as_deref() == Some(recorder.marker())
+                })
+            })
+            .count();
         let allocations = recorder
             .allocations()
             .iter()
@@ -9658,12 +9762,14 @@ fn read_pool_trace(
             full: recorder.full(),
             dropped: recorder.dropped(),
             pending: recorder.pending(),
+            unpaired_calls: recorder.unpaired(),
             unreadable_hits: recorder.unreadable_hits(),
             missing_breakpoints,
         }
     };
     if stop {
-        disarm_pool_trace(e, slot.take());
+        disarm_pool_trace(e, trace)?;
+        *slot = None;
     }
     Ok(Output::typed(render_pool_trace(&report), report))
 }
@@ -9771,6 +9877,12 @@ fn render_pool_trace(report: &structured::PoolTrace) -> String {
             .then(|| format!("{} more made after it filled, not recorded", report.dropped)),
         (report.pending > 0)
             .then(|| format!("{} call(s) made and not yet returned", report.pending)),
+        (report.unpaired_calls > 0).then(|| {
+            format!(
+                "{} call(s) given up on while waiting for their return, so not recorded",
+                report.unpaired_calls
+            )
+        }),
         (report.unreadable_hits > 0).then(|| {
             format!(
                 "{} hit(s) whose registers could not be read",
@@ -14134,25 +14246,23 @@ mod tests {
         );
     }
 
-    /// **The trace's ownership checks are applied where they bite**, which the recorder's own
-    /// tests cannot say: `phase_at` and `forget_removed` are right in `src/pooltrace.rs` whatever
-    /// calls them, and the defect review found on #473 was a callback that asked about the id
-    /// alone. So what is checked here is that the callback still hands over the hit's address, and
-    /// that every op still forgets the trace's removed breakpoints before it runs -- the second is
-    /// what keeps a `set_breakpoint` that reuses one of their ids from becoming the trace's.
+    /// **The trace's ownership check is applied where it bites**, which the recorder's own tests
+    /// cannot say: `phase_of` is right in `src/pooltrace.rs` whatever calls it, and the defect
+    /// review found twice on #473 was a callback asking about something other than the breakpoint
+    /// itself. So what is checked here is that the trace writes its marker into each breakpoint it
+    /// sets, and that the callback reads the hit breakpoint's command back and asks with that.
     #[test]
-    fn a_pool_trace_checks_ownership_in_its_callback_and_before_every_op() {
+    fn a_pool_trace_marks_its_breakpoints_and_its_callback_reads_the_mark() {
         let armed = bodies_of(&["arm_pool_trace"], 4_000);
         assert!(
-            armed.contains("hit.address()") && armed.contains("phase_at(id, address)"),
-            "the trace's callback no longer checks a hit's address, so an id the engine reused for \
-             somebody else's breakpoint is taken for the trace's"
+            armed.contains(".with_command(marker.clone())"),
+            "the trace no longer marks the breakpoints it sets, so nothing tells them from one that \
+             reused an id of theirs"
         );
-        let execute = bodies_of(&["execute"], 4_000);
         assert!(
-            execute.contains("trace.forget_removed(e)"),
-            "ops no longer forget the trace's removed breakpoints first, so a breakpoint set on \
-             one of their ids is recorded and let through rather than stopping"
+            armed.contains("phase_of(id, command.as_deref())"),
+            "the trace's callback no longer asks with the hit breakpoint's own command, so an id \
+             the engine reused for somebody else's breakpoint is taken for the trace's"
         );
     }
 

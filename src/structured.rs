@@ -3520,6 +3520,11 @@ pub struct PoolTrace {
     pub dropped: u64,
     /// Calls seen made and not yet seen return: allocations in flight when the target stopped.
     pub pending: usize,
+    /// Calls given up on while waiting for their return, so not recorded: the oldest, past a bound
+    /// on how many the trace holds -- a call whose return breakpoint is gone, or that an exception
+    /// unwound past, never returns to it -- or ones at a site where a hit could not say which
+    /// thread it was on.
+    pub unpaired_calls: u64,
     /// Hits whose registers could not be read, counted rather than recorded.
     pub unreadable_hits: u64,
     /// Breakpoints this trace set that the session no longer holds -- removed by something else,
