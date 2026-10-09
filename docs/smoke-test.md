@@ -189,14 +189,17 @@ it. It needs the Windows SDK's `vmsavedstatedumpprovider.dll` on the host and **
 nothing** — a checkpoint reads the same copied off the host as on it, which is what gate S0 of
 `FOLLOWUPS.md` item 103 measured. What it asserts is the *shape* of the answer — a decode, or the
 reason there is none, never neither — because whether the capture has VTL1 in it is a property of
-somebody's guest rather than of this server. The figures are in that item.
+somebody's guest rather than of this server. `WINDBG_MCP_SK_LIVE_POLICY` must admit the canonical
+Windows SDK root in `kit_roots`; a request cannot select an unadmitted provider. The figures are in
+that item.
 
 **The live Secure Kernel tier is a different, explicitly disposable gate.**
 `WINDBG_MCP_SMOKE_SK_LIVE` names a private JSON file containing `profile`, `control_transport`,
 `live_transport`, `dispatcher_vnd`, `vm_id`, `partition_id`, `expected_cr3`,
 `instruction_address` and `instruction_bytes`; `vp` and `read_size` are optional. The file must also
 carry `"disposable": true`. `vmwp_pid` is an optional mismatch assertion; the server resolves the
-current PID from `vm_id` before it reserves and starts the worker. The ignored test opens a separate
+current PID from `vm_id` before it reserves and starts the worker. Startup policy also fixes the
+absolute `max_pause_ms`; calls cannot extend or replace it. The ignored test opens a separate
 live-control session, observes an
 exact DR0 VTL1 CPL0 stop, checks the retained registers and a stopped virtual-memory read, consumes
 the epoch to single-step, consumes the next epoch to restore and continue, then requires teardown
@@ -214,8 +217,10 @@ It must carry disposable true, and it must omit vmwp_pid, dispatcher_vnd, partit
 expected_cr3 and kernel_base: discovering those is part of the gate. Set the server-side
 WINDBG_MCP_SK_LIVE_POLICY as well. The ignored test opens the managed KD tool, waits for the
 generated pipe, launches installed kd with a one-command-per-line `lm m securekernel`, `t`, `r`,
-`q` file, verifies module enumeration, the returned RIP and registers, observes reconnecting after
-kd quits, then releases the controller
+`q` file, verifies module enumeration, the returned RIP and registers, and waits until the
+transcript proves that `q` completed. Some installed kd builds retain their pipe after printing
+`quit:`; the harness then closes that test-owned peer before it requires the managed session to
+enter reconnecting, and releases the controller
 through MCP. It then runs the bounded external audit and requires three healthy same-PID samples,
 no enabled debug-register breakpoint and unchanged Secure Kernel text.
 
@@ -985,7 +990,7 @@ was [`FOLLOWUPS.md`](../FOLLOWUPS.md) item 29; the three tests under [Two client
 everything](#two-clients-two-of-everything) below are what closed it:
 
 - *It will not start without a token*, and says which variable is missing. The listener exposes
-  every tool here, including the ones that write to a live kernel; a quiet default would be a
+  every tool on its configured surface, including ones that write to a live kernel; a quiet default would be a
   server nobody knows is open.
 - *An unauthenticated request is refused, told nothing about what is here, and **costs the server
   nothing***. The last clause is the one worth a test: the bearer check runs before the lease is

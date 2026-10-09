@@ -1338,6 +1338,13 @@ pub enum WorkerMessage {
     /// Current lifecycle state of the server-managed Secure Kernel KD facade. It belongs to the
     /// session rather than one request, so status remains observable while the serving job runs.
     SecureKernelKdPhase { phase: SecureKernelKdPhase },
+    /// An ordinary live-control wait retained a stop and began an absolute, operator-fixed pause
+    /// window. This is session state rather than a request result: the supervisor must enforce it
+    /// even if the caller keeps sending requests or disappears after receiving the stop.
+    SecureKernelPauseStarted { max_pause_ms: u64 },
+    /// The ordinary controller released the retained stop for a step or continue before the pause
+    /// window expired.
+    SecureKernelPauseEnded,
     /// An [`EngineOp::Resume`]'s target is moving: `Execute` returned and the engine reports it
     /// running. The pump that will answer that op is about to start.
     ///

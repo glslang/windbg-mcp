@@ -219,8 +219,11 @@ failure ending the worker's idle image target cannot relabel the proved VTL1 rel
 
 The opt-in smoke test reads its private inputs from `WINDBG_MCP_SMOKE_SK_LIVE`, whose JSON
 must explicitly say `"disposable": true`. It drives the seven calls above through the built MCP
-binary. `WINDBG_MCP_SK_LIVE_POLICY` must admit the VM, exact provider command templates and profile
-root before the server starts. The profile, privileged provider and bench evidence remain outside
+binary. `WINDBG_MCP_SK_LIVE_POLICY` must admit the VM, exact provider command templates, profile
+root and an absolute `max_pause_ms` bound before the server starts. The same file admits canonical
+`kit_roots` for capture provider loading. The live request cannot choose the pause bound, and
+ordinary request activity does not extend a retained stop: expiry invokes the same fail-closed
+teardown as `end_session`. The profile, privileged provider and bench evidence remain outside
 version control.
 
 On 2026-10-03 that MCP test completed the full bind, arm, stop, inspect, step, second-stop,

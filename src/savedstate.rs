@@ -93,6 +93,7 @@ const DLL: &str = "vmsavedstatedumpprovider.dll";
 /// declares the functions and mentions the enum nowhere — checked on 10.0.26100.0, where a search
 /// for `REGISTER_ID` in it finds nothing at all.
 const HEADER: &str = "VmSavedStateDumpDefs.h";
+pub(crate) const DEFAULT_KIT_ROOT: &str = r"C:\Program Files (x86)\Windows Kits\10";
 
 /// A Windows Kits installation: where the provider and its header are.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,8 +110,17 @@ impl Kit {
     /// ids unknown, and the header without the DLL has nothing to call.
     pub(crate) fn find(root: Option<&Path>, version: Option<&str>) -> Result<Kit, String> {
         let root = root
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10"));
+            .unwrap_or_else(|| Path::new(DEFAULT_KIT_ROOT))
+            .canonicalize()
+            .map_err(|error| format!("canonicalizing Windows Kit root: {error}"))?;
+        if let Some(version) = version {
+            let mut components = Path::new(version).components();
+            if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+                || components.next().is_some()
+            {
+                return Err("kit version must be one directory name, not a path".to_string());
+            }
+        }
         let mut versions: Vec<String> = match version {
             Some(one) => vec![one.to_string()],
             None => {
@@ -129,6 +139,18 @@ impl Kit {
             let dll = root.join("bin").join(candidate).join(ARCH).join(DLL);
             let header = root.join("Include").join(candidate).join("um").join(HEADER);
             if dll.is_file() && header.is_file() {
+                let dll = dll
+                    .canonicalize()
+                    .map_err(|error| format!("canonicalizing {}: {error}", dll.display()))?;
+                let header = header
+                    .canonicalize()
+                    .map_err(|error| format!("canonicalizing {}: {error}", header.display()))?;
+                if !dll.starts_with(&root) || !header.starts_with(&root) {
+                    return Err(format!(
+                        "Windows Kit version {candidate} resolves outside admitted root {}",
+                        root.display()
+                    ));
+                }
                 return Ok(Kit {
                     dll,
                     header,

@@ -169,7 +169,7 @@ pub struct Credentials {
     by_token: HashMap<String, String>,
     /// Name to the surface that client is served, for the clients configured with one of their
     /// own. **Absent is not "every tool"** — it is "whatever this run serves", which is the run's
-    /// `--tools` and usually every tool. Keeping the two apart is what lets a listener started
+    /// `--tools` and, absent that flag, the ordinary groups. Keeping the two apart is what lets a listener started
     /// with a narrow `--tools` still have a client that was given a wider spec, and what makes an
     /// entry with no `tools` field mean exactly what it meant before there was one.
     surfaces: HashMap<String, crate::toolset::Toolset>,

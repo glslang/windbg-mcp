@@ -348,7 +348,7 @@ impl ManagedRequest {
         let mut build = None;
         let mut instruction_address = None;
         let mut instruction_bytes = None;
-        let mut arm_mode = ArmMode::Redirect;
+        let mut arm_mode = ArmMode::Natural;
         let mut connect_timeout = DEFAULT_CONNECT_TIMEOUT;
         let mut idle_timeout = DEFAULT_IDLE_TIMEOUT;
         let mut max_pause = DEFAULT_MAX_PAUSE;
@@ -456,6 +456,7 @@ impl ManagedRequest {
                 vmwp_pid,
                 dispatcher_vnd,
                 target,
+                max_pause_ms: max_pause.as_millis() as u64,
                 allow_transition_cr3: false,
                 additional_vps: Vec::new(),
             },

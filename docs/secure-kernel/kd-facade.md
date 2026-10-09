@@ -74,15 +74,21 @@ the server starts. The JSON file fixes all authority that a client may select:
     "\"C:\\Python313\\python.exe\" \"D:\\windbg-mcp-private\\control.py\" --vm-id 51749a1f-f939-44f5-b251-1251ef5b64a3 --partition-id {partition_id} --vp {vp}",
     "\"C:\\Python313\\python.exe\" \"D:\\windbg-mcp-private\\memory.py\" --vm-id 51749a1f-f939-44f5-b251-1251ef5b64a3 --partition-id {partition_id} --vp {vp} --cr3 {cr3}"
   ],
-  "profile_roots": ["D:\\windbg-mcp-private\\profiles"]
+  "profile_roots": ["D:\\windbg-mcp-private\\profiles"],
+  "kit_roots": ["C:\\Program Files (x86)\\Windows Kits\\10"],
+  "max_pause_ms": 600000
 }
 ```
 
 Every executable path is canonicalized at startup, and the complete tokenized provider command
 must equal an allow-listed template. This prevents an allowed interpreter from being reused with a
 different script or `-c` payload. Profiles must be files below an allowed root, and the VM GUID
-must be in the disposable allow-list. The request cannot widen this policy. An invalid or absent
-policy fails before a VM lookup or worker spawn.
+must be in the disposable allow-list. Windows Kit roots are canonicalized too; capture provider
+loading is disabled when none is admitted. `max_pause_ms` is the absolute bound for each retained
+ordinary live-control stop and each managed-KD stop. The request cannot choose or widen it. An
+invalid or absent policy fails before a VM lookup, provider load or worker spawn.
+A capture-only deployment may omit the three live-authority arrays and `max_pause_ms`; a live
+deployment must provide all three arrays together and a pause bound.
 
 Call `open_sk_kd` with the exact-build dispatcher profile, the two provider command templates, VM
 GUID and selected VP. The profile carries the initial guarded instruction as a Secure Kernel RVA;
@@ -104,8 +110,8 @@ kd -k com:pipe,port=\\.\pipe\<generated-name>,resets=0 -cf <commands.txt>
 enters a bounded reconnect window. `end_session` cancels a connect or active wait, then runs the
 ordinary proved controller teardown. Expiry of the connect, idle or absolute-pause bound also runs
 that teardown immediately; `released` means it completed. The worker is preserved only if it
-cannot prove restoration and release. The absolute pause bound defaults to 600 seconds, independent
-of KD traffic, and includes response I/O plus controller restoration and native-event release. Each
+cannot prove restoration and release. The absolute pause bound comes from startup policy, is
+independent of KD traffic, and includes response I/O plus controller restoration and native-event release. Each
 stop reserves the smaller of 30 seconds or half of that bound for deadline-aware cleanup; the KD
 service stops accepting work at the start of that reserve. A peer that stops consuming output
 therefore cannot consume the time needed to restore and release the stop. `end_session` is also
@@ -133,7 +139,8 @@ The standalone role now resolves PID, VND and partition in its worker and accept
 CR3 and Secure Kernel base. The optional values above, including the paired initial address and
 bytes, are assertions for migration and diagnosis. The pipe remains operator-named in this compatibility role; the managed opener is the
 route that generates it and applies startup policy. The version build comes from the exact-build
-profile; `--build` is only an optional mismatch assertion. The arm mode defaults to redirect.
+profile; `--build` is only an optional mismatch assertion. The arm mode defaults to natural guest
+execution; select redirect explicitly when intentionally moving RIP to the guard.
 
 1. The role opens the controller session and runs the provider handshake, arms slot 0 on the initial
    instruction in the chosen mode, and waits for that stop. No pipe exists yet.
@@ -234,9 +241,10 @@ having no way to tell them apart.
 
 The four protocol modules retain focused unit tests over inline packet vectors, including malformed
 framing, short manipulate requests, both context APIs and the AMD64 special-register record. The ignored WINDBG_MCP_SMOKE_SK_KD tier opens the managed
-session over MCP, observes its phases, launches installed kd with a t, r, q command file, then
-releases the reconnecting session through MCP and runs the bounded external health/register/text
-audit. Its private config is forbidden from carrying a boot address, VND, partition ID, CR3,
+session over MCP, observes its phases, and launches installed kd with a t, r, q command file. Once
+the transcript proves `q` completed, the harness closes a kd process that still retains its pipe,
+then requires the managed session to enter reconnecting before releasing it through MCP and running
+the bounded external health/register/text audit. Its private config is forbidden from carrying a boot address, VND, partition ID, CR3,
 kernel base or vmwp PID. The tier still requires the disposable bench and is not part of ordinary
 CI; docs/smoke-test.md has the runbook.
 

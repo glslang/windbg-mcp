@@ -227,7 +227,7 @@ fn main() -> Result<()> {
     // error, not a surface that quietly serves something else.
     let tools = match toolset::Toolset::requested(&args) {
         Some(surface) => surface.map_err(|e| anyhow::anyhow!(e))?,
-        None => toolset::Toolset::all(),
+        None => toolset::Toolset::default(),
     };
 
     tokio::runtime::Builder::new_multi_thread()

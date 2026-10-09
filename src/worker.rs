@@ -3073,6 +3073,8 @@ fn execute(
             let stop = held_live_control(&mut sk_live.session)?
                 .wait_for_stop(e)
                 .map_err(failed)?;
+            let max_pause_ms = held_live_control(&mut sk_live.session)?.max_pause_ms();
+            emit(&WorkerMessage::SecureKernelPauseStarted { max_pause_ms });
             Ok(Output::typed(crate::skdispatch::render_stop(&stop), stop))
         }
 
@@ -3095,6 +3097,7 @@ fn execute(
             let transition = held_live_control(&mut sk_live.session)?
                 .step(e, &epoch, guard)
                 .map_err(failed)?;
+            emit(&WorkerMessage::SecureKernelPauseEnded);
             Ok(Output::typed(
                 crate::skdispatch::render_transition(&transition),
                 transition,
@@ -3105,6 +3108,7 @@ fn execute(
             let transition = held_live_control(&mut sk_live.session)?
                 .continue_from(e, &epoch)
                 .map_err(failed)?;
+            emit(&WorkerMessage::SecureKernelPauseEnded);
             Ok(Output::typed(
                 crate::skdispatch::render_transition(&transition),
                 transition,
@@ -12013,6 +12017,7 @@ mod tests {
                 vp: 0,
                 expected_cr3: Some(crate::skcontrol::HexU64(0x1000)),
             },
+            max_pause_ms: 600_000,
             allow_transition_cr3: false,
             additional_vps: Vec::new(),
         }))

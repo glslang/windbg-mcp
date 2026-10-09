@@ -156,6 +156,7 @@ engine — it adds a target and leaves the current one alone. The entry records 
 - [Item 81](#81-windbg-mcp--dbgscope-changes_debug_target-reads-a-name-and-a-wrapper-does-not-say-one--done-2026-09-25) — [windbg-mcp + dbgscope] `changes_debug_target` reads a name, and a wrapper does not say one — done (2026-09-25)
 - [Item 102](#102-windbg-mcp-a-debug_batch-runs-its-rollback-against-whatever-target-it-ends-up-holding--done-2026-09-26) — [windbg-mcp] A `debug_batch` runs its rollback against whatever target it ends up holding — done (2026-09-26)
 - [Item 103](#103-windbg-mcp-h5b--expose-the-secure-kernel-reads-without-forcing-them-through-dbgeng--done-2026-10-02) — [windbg-mcp] H5b — expose the Secure Kernel reads, without forcing them through DbgEng — done (2026-10-02)
+- [Item 106](#106-windbg-mcp-a-tool-group-every-caller-pays-for-and-few-can-use--done-2026-10-09) — [windbg-mcp] A tool group every caller pays for and few can use — done (2026-10-09)
 - [Item 107](#107-windbg-mcp-a-misspelt-tool-argument-is-silently-ignored-and-the-call-answers-status-ok--done-2026-10-02) — [windbg-mcp] A misspelt tool argument is silently ignored, and the call answers `status: ok` — done (2026-10-02)
 - [Item 92](#92-windbg-mcp-an-a64-conditional-compare-chain-is-a-compare-chain-the-walk-does-not-read--done-2026-10-02) — [windbg-mcp] An A64 conditional-compare chain is a compare chain the walk does not read — done (2026-10-02)
 - [Item 109](#109-windbg-mcp-the-server-can-walk-a-call-graph-forward-and-find-calls-to-imports-and-cannot-answer-who-calls-this-address--done-2026-10-04) — [windbg-mcp] The server can walk a call graph forward and find calls to imports, and cannot answer "who calls this address" — done (2026-10-04)
@@ -165,6 +166,7 @@ engine — it adds a target and leaves the current one alone. The entry records 
 - [Item 69](#69-windbg-mcp-record-what-the-ace-kind-rules-were-measured-against--done-2026-10-05) — [windbg-mcp] Record what the ACE-kind rules were measured against — done (2026-10-05)
 - [Item 115](#115-windbg-mcp-the-secure-kernel-kd-facade-shipped-unrecorded--done-2026-10-07) — [windbg-mcp] The Secure Kernel KD facade shipped unrecorded — done (2026-10-07)
 - [Item 120](#120-windbg-mcp-the-secure-kernel-kd-facade-is-not-an-mcp-managed-session--done-2026-10-07) — [windbg-mcp] The Secure Kernel KD facade is an MCP-managed session — done (2026-10-07)
+- [Item 118](#118-windbg-mcp-live-control-is-on-by-default-runs-client-supplied-programs-and-has-no-bound-on-a-paused-guest--done-2026-10-09) — [windbg-mcp] Live control is on by default, runs client-supplied programs, and has no bound on a paused guest — done (2026-10-09)
 - [Item 119](#119-windbg-mcp-what-a-vtl1-debugger-still-cannot-do--done-2026-10-07) — [windbg-mcp] The VTL1 capability matrix is live-derived — done (2026-10-07)
 - [Item 73](#73-windbg-mcp-a-drivers-import-directory-can-be-in-a-section-the-loader-freed--done-2026-10-09-dbgscope196) — [windbg-mcp] A driver's import directory can be in a section the loader freed — done (2026-10-09, dbgscope#196)
 
@@ -8749,6 +8751,93 @@ validated. The full record is the
    than the primary. It is what found the head independently in H4, and the two agreeing is what
    made either believable.
 
+## 106. [windbg-mcp] A tool group every caller pays for and few can use — **done** (2026-10-09)
+
+**Repo:** `windbg-mcp`. **Origin:** item 103's gate S3, 2026-09-27 — raised by the change that
+created the cost rather than by a reviewer, because the arithmetic is unarguable and the remedy is
+not.
+
+**The eleven `securekernel` tools are 15,573 B of model-visible surface**, measured 2026-10-04
+against a 113,516 B surface: **13.7%** of the default tool cost, paid once per conversation by every
+caller. Four tools need a Hyper-V standard checkpoint of a VBS guest, the Windows SDK's saved-state
+provider and the `securekernel.exe` that guest was running; seven more need an exact disposable VBS
+VM, two operator-supplied live providers and a build-matched `vmwp` profile. Almost nobody driving a
+crash dump has either setup.
+
+`--tools` is the lever that exists for exactly this, and its shape is the problem: it is opt-**out**,
+so a caller who wants no capture tools has to name every group it *does* want, and the default a
+client gets when it says nothing is the widest one. That was the right default while every group was
+something most callers might reach for; a research capability behind a three-part setup is the first
+group for which it is not.
+
+**What *not* to do, and it is the obvious thing.** Dropping the group from the default surface makes
+`--tools` mean two things — a selection, and an exception list — and breaks the property
+`mcp_smoke::every_tool_belongs_to_exactly_one_group` exists for: that the groups **add up** to the
+surface, in both directions, so a tool added and forgotten is still served. A surface where some
+groups are in the default and some are not needs that test rewritten around a second concept, and it
+needs a story for the client that asks for `all`.
+
+**Three shapes worth weighing, and the measurement to take first.**
+
+- **An `extra` marker on a group**, so the default is *every group that is not marked*, and `all`
+  means all. Smallest change, one new concept, and the join test becomes "the marked groups plus the
+  default ones are the surface".
+- **A spec that subtracts** (`--tools all,-securekernel`). No change to what a group is, and it
+  leaves the default surface as it is — which is the thing being complained about, so it helps the
+  operator who already knows and nobody else.
+- **Nothing, and say so in the docs.** Still on the table, and it does not need the measurement
+  below: 7.3% of the surface is not obviously noise, but the surface is 26k tokens against context
+  windows that are now much larger than they were when item 24 measured it — and *that* comparison is
+  one nobody here has re-taken, needs no model and no bench, and would settle whether this item is
+  about anything at all.
+
+**The measurement that would settle it is not available here, and saying which of two reasons that
+is matters.** The question is whether a model served the wider surface is measurably worse at the
+tasks it *is* for — `tools/local_model_eval.py` is the only thing in this repo that can answer it
+(`.claude/skills/eval-bench`). Two things stand between the item and that answer:
+
+- **The grid has no arm for this question.** Its surfaces are `full`, `lean`
+  (`session,inspect,crash`) and `min` (`crash`), narrowed **toward** `crash` — so what it measures is
+  what a *small* surface costs, and three of its six tasks cannot be answered on the 11-tool one at
+  all. This item asks the opposite: what the extra 7,529 B on the **full** surface costs. That needs a
+  new arm — every tool *except* `securekernel` — which is a plan change and a fourth credential rather
+  than a run. An earlier draft of this item said "the grid already varies the surface", which is true
+  and beside the point.
+- **And the model side is not on this bench.** The ollama arms need the weights somewhere with the
+  compute for them, which for this project is a **Mac**, with the listener here behind an ssh forward
+  (`docs/local-model.md`'s second row — the arrangement every published figure came from). The
+  checked-in plan says so itself rather than this paragraph asserting it: all three models on its
+  **ollama** rows are `-mlx` builds, and MLX runs on Apple silicon. (Its third row is
+  `backend: claude-code`, which is hosted and names no local weights — so the constraint is on the
+  ollama arms, which are the ones this question needs.) The Windows debugging
+  host has no compute for local models at all, so *row one of that table is not an option here*,
+  whatever the product supports. A grid run is hours, so this is a two-machine arrangement to
+  schedule rather than an afternoon.
+
+**So the honest status is blocked, and deciding it without the measurement is a legitimate outcome
+rather than a lesser one.** The case for an `extra` marker does not rest on the eval: the setup this
+group needs is three-part (a checkpoint, the SDK, a VBS guest), which is a stronger statement about
+the audience than any accuracy delta would be, and the cost is arithmetic that is already taken. What
+the eval would add is the *size* of the harm, which decides how much machinery the remedy is worth —
+so if it runs, run it **after** deciding the shape, to price the change rather than to authorise it.
+
+**Where it picks up:** `GROUPS` and `Toolset::parse` in `src/toolset.rs`, the join test in
+`tests/mcp_smoke.rs`, `docs/tool-surface.md`'s table, and the two ceilings in `tests/mcp_smoke.rs`
+whose doc comments record what each raise bought. If the eval arm is ever added it is a surface in
+`tools/eval_plan.json` plus a credential in whatever `EVAL_TOKENS` names — and note that plan's
+`"tools": 51` label for `full`, which was the count when it was written and is 67 now: the records
+carry the served surface, so the label is a reader's hint rather than a measurement, and a new arm is
+the moment to re-derive it.
+
+**Implementation status, 2026-10-09:** the first shape landed. `securekernel` is marked as an
+extra group: an omitted `--tools` serves the 64 ordinary tools, while explicit `--tools all` serves
+all 76 tools. The join test still proves that the default and extra groups partition the complete
+surface, and smoke coverage proves the default omission and explicit opt-in. The current measured
+surfaces are 100,645 B for the default and 119,658 B for all tools, so the opt-in removes 19,013 B
+from an ordinary client's model-visible surface. Item 118 made the setup boundary itself decisive;
+the unavailable model evaluation therefore was not required to authorise this small representation
+change.
+
 ## 107. [windbg-mcp] A misspelt tool argument is silently ignored, and the call answers `status: ok` — **done** (2026-10-02)
 
 **Repo:** `windbg-mcp`. **Origin:** hit live, 2026-09-29, during item 103's S5o gate. Three
@@ -9540,6 +9629,81 @@ Stage 8 remains a separate read-only MCP-view feature with the same single execu
   private `run_k4_stop_step.py`; the in-worker equivalents start beside `verify_vmwp_build`,
   `register_handler` and the dispatcher pause helpers. `SetInterrupt` remains the only cross-thread
   DbgEng call.
+
+## 118. [windbg-mcp] Live control is on by default, runs client-supplied programs, and has no bound on a paused guest — **done** (2026-10-09)
+
+**Repo:** `windbg-mcp`. **Origin:** the 2026-10-07 review (item 115's origin), reading the
+live-control surface the KD facade sits on. Item 106 tracks what the `securekernel` group *costs*;
+this is about what it *admits*.
+
+`securekernel` is in the default surface (`toolset.rs`; a run with no `--tools` serves every
+tool), so a `--listen` client gets `open_sk_live_control` unless its per-client spec removes it,
+and a non-loopback bind only logs a warning. That tool's `control_transport` and `live_transport`
+are split on whitespace and handed to `Command::new` (`skcontrol.rs`, `livesrc.rs`), the first at
+open and the second at the first arm; `open_sk_capture`'s `kit` and `kit_version` are joined into a
+path and `LoadLibraryExW`'d in the worker (`savedstate.rs`), with no canonicalisation and no
+signature check, under a tool annotated non-destructive. The always-served `launch` tool already
+grants a client the same power, so this is a statement about which clients a listener admits
+rather than a new class — but the live tools are the ones that pause a VM and forge a descriptor
+in its worker process. No pause budget bounds how long that lasts: after arm the VM is paused and
+`vmwp` is debugger-stopped, and after a step `vmwp` stays stopped. Under stdio no timer covers
+either. Under `--listen` the 30-minute idle release does cover a session nobody is calling:
+`release_idle` submits `EndSession`, and a teardown that proves out resumes the VM (`engine.rs`,
+`skdispatch.rs`'s `finish_teardown`; the first draft of this entry said no timer covered it, which
+Codex corrected in round 4). What remains is that any admitted request restamps the clock, the
+interval is settable to 0, and a client that keeps calling holds the guest as long as it likes.
+Between `sk_live_continue`
+and the next arm or close the temporary handler stays registered in `vmwp` with the adapter's
+breakpoints removed, and what `vmwp` does with a vector-1 event in that window is not measured.
+The session reservation does not stop a plain `attach_process` to the same `vmwp`, and the KD
+role takes no reservation. Redirect mode is the default and its restore covers RIP, RSP, RFLAGS
+and the debug registers, so the GPR and memory effects of a stepped instruction persist;
+`sk_live_step` has none of the `rep`/`mov ss`/`lss` refusals the facade applies to `t`. The three
+control modules emit no tracing, so a forged descriptor, a `.dvalloc`, an `eq` and a provider
+write leave no record unless `WINDBG_MCP_TRANSCRIPT` is set. The live smoke's
+`target_left_running == true` assertion reads a literal in the released `Output` (`worker.rs`),
+and the first draft of this entry called that a constant; it is not vacuous, because that path is
+reached only after `Session::close` proved restoration and detach, every failure returning
+`recovery_required` first (Codex, round 4). What the assertion still does not check is VM
+health, the `vmwp` PID, debug-register state or guest text; the external wrapper does.
+
+- **Why deferred:** the group being default-on is item 106's decision and is blocked there; the
+  transport allow-list changes the operator contract in `live-control-provider.md`; the pause
+  budget needs a live run to pick a number. None of the three is one afternoon alone, and all
+  three are smaller than the review that found them.
+- **What would close it:** a policy the operator fixes server-side at startup and no request can
+  choose — the group opt-in, the disposable VM ids a controller may bind, the executables a
+  transport may name, the roots a profile and a kit may come from — because `SkLiveOpenArgs`
+  lets the request pick the profile and both transports, and the smoke test's
+  `disposable: true` lives in its private config and is never forwarded to the opener, so a
+  gate or allow-list carried in the request or in a client-chosen profile is the client's to
+  satisfy (the first draft of this remedy proposed exactly that; Codex, round 5); a pause
+  budget on the session whose expiry is the existing recovery path; natural mode as the default
+  arm; the facade's
+  instruction-class guard shared with `sk_live_step`; `tracing` at `info` on every mutation in
+  `skdispatch.rs`, `sklive.rs` and `skcontrol.rs`.
+- **Where it picks up:** `server.rs`'s `open_sk_live_control` handler; `skdispatch::Session::open`
+  and `release`; `sklive::LiveControl::restore`; `toolset.rs`'s group table.
+
+**Implementation status, 2026-10-07:** `WINDBG_MCP_SK_LIVE_POLICY` is loaded once when the
+session registry starts. Without it both live Secure Kernel openers are disabled. Its canonical
+server-side allow-lists cover disposable VM ids, exact transport command templates and profile
+roots, and the request cannot expand them. The KD session has an absolute pause bound, and the instruction-class
+guard is shared by KD stepping and `sk_live_step`. The ordinary live-control pause budget, natural
+mode default, mutation tracing, kit policy and the wider tool-group decision remain open.
+
+**Final implementation status, 2026-10-09:** all closing conditions are now implemented.
+`securekernel` is an explicit extra group. The startup policy accepts live authority only as one
+complete set (disposable VM ids, exact transport commands, canonical profile roots and a fixed
+pause budget), and separately allows canonical capture-kit roots; requests cannot expand either.
+Capture DLLs and headers are canonicalised and must remain beneath an allowed kit root. A live
+session starts its supervisor-owned absolute timer only after it actually retains a stop; client
+activity cannot extend it, a successful continue or step invalidates it, and expiry uses the
+existing fail-closed session-release and recovery path. Natural mode is the default in the MCP and
+standalone entry points, the shared instruction guard remains in force, and every control-path
+mutation is recorded at `info` on the `windbg_mcp::secure_kernel_mutation` target. The pause value
+is deliberately an operator startup choice, bounded by the server's managed-timeout ceiling,
+rather than a request field or an unmeasured built-in constant.
 
 ## 119. [windbg-mcp] What a VTL1 debugger still cannot do — **done** (2026-10-07)
 

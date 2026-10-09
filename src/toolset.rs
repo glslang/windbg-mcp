@@ -1,15 +1,16 @@
 //! Which of this server's seventy-six tools a run advertises.
 //!
 //! The tool surface is paid **once per conversation, before anything is debugged**, and it is
-//! 119,826 bytes — roughly 30k tokens (measured 2026-10-08; every figure here moves with any edit
+//! 119,658 bytes — roughly 30k tokens (measured 2026-10-09; every figure here moves with any edit
 //! to a description, so re-derive rather than cite). Seven tenths of that is prose, and the prose is what tells
 //! a model how to drive the tools, so there is no strip here the way there was in
 //! [`crate::schema`]: `FOLLOWUPS.md` item 24 measured it and the only honest lever left is the one
 //! this module is — **not offering every tool to every caller**.
 //!
-//! Nothing changes for a client that says nothing. `--tools` is the whole interface and the default
-//! is every tool. A narrowed surface costs a description one thing only: the sentences pointing at
-//! tools it no longer has (`FOLLOWUPS.md` item 41, `TOOL_NOTES` in [`crate::server`]), which is why
+//! A client that says nothing gets every ordinary group. A group marked `extra` is served only
+//! when a spec names it, and explicit `--tools all` still means the complete interface. A narrowed
+//! surface costs a description one thing only: the sentences pointing at tools it no longer has
+//! (`FOLLOWUPS.md` item 41, `TOOL_NOTES` in [`crate::server`]), which is why
 //! the bytes below do not add up to what a spec actually serves — see the note under the table.
 //!
 //! # What a group is
@@ -30,11 +31,11 @@
 //!   ioctl           11   16,088  driver objects, IRP stacks, reachability, hazards, IOCTL maps,
 //!                                  references to an address, device security and the
 //!                                  whole-driver survey
-//!   securekernel    12   19,181  captured and live VTL1 inspection and execution control
+//!   securekernel    12   19,013  captured and live VTL1 inspection and execution control
 //! ```
 //!
-//! Those bytes are a measurement of **2026-10-08** and move with any edit to a description — the
-//! whole surface they are shares of is 76 tools and 119,826 B, which is what the rows above sum to.
+//! Those bytes are a measurement of **2026-10-09** and move with any edit to a description — the
+//! whole surface they are shares of is 76 tools and 119,658 B, which is what the rows above sum to.
 //! Re-derive rather than quoting them.
 //!
 //! **Those are shares of the whole surface, and they do not sum to a narrowed one.** `crash` reads
@@ -47,8 +48,8 @@
 //!
 //! Not a convenience: every other tool here routes by a `session_id`, and this server is the only
 //! thing that can issue one. A surface with `registers` and no opener cannot be used at all, so a
-//! spec that leaves one out is asking for something that does not exist. On its own it is 12,910
-//! bytes (2026-10-02), and that is the floor of any usable surface — `--tools crash` is thirteen tools, not three,
+//! spec that leaves one out is asking for something that does not exist. On its own it is 14,208
+//! bytes (2026-10-09), and that is the floor of any usable surface — `--tools crash` is thirteen tools, not three,
 //! and the startup line says so rather than leaving the addition to be discovered.
 //!
 //! # Who a surface belongs to
@@ -59,7 +60,7 @@
 //!
 //! A listener names its clients already ([`crate::client`]), and they do not have one budget
 //! between them: the arrangement this exists for is a local model that can hold twenty-three tools
-//! and a hosted client that can hold seventy-four, pointed at the same Windows box and the same debug
+//! and a hosted client that can hold seventy-six, pointed at the same Windows box and the same debug
 //! sessions and told apart by their bearer tokens. So a client may be configured with a spec of
 //! its own — `WINDBG_MCP_TOOLS_<NAME>`, or a `tools` field in the credential file — and is served
 //! that instead of the run's. The run's `--tools` is the **default**, not a ceiling: a client's
@@ -82,7 +83,7 @@ use std::collections::BTreeSet;
 /// The flag, on this server's own command line.
 pub const FLAG: &str = "--tools";
 
-/// The spec that means what a run with no `--tools` at all serves.
+/// The spec that explicitly serves every ordinary and extra group.
 pub const ALL: &str = "all";
 
 /// The group every surface has, whatever was asked for. See the module docs.
@@ -91,6 +92,7 @@ const ALWAYS: &str = "session";
 struct Group {
     name: &'static str,
     tools: &'static [&'static str],
+    extra: bool,
 }
 
 /// Every tool this server has, in exactly one group.
@@ -102,6 +104,7 @@ struct Group {
 const GROUPS: &[Group] = &[
     Group {
         name: ALWAYS,
+        extra: false,
         tools: &[
             "open_dump",
             "open_trace",
@@ -117,6 +120,7 @@ const GROUPS: &[Group] = &[
     },
     Group {
         name: "inspect",
+        extra: false,
         tools: &[
             "registers",
             "current_location",
@@ -132,6 +136,7 @@ const GROUPS: &[Group] = &[
     },
     Group {
         name: "exec",
+        extra: false,
         tools: &[
             "go",
             "step_over",
@@ -147,6 +152,7 @@ const GROUPS: &[Group] = &[
     },
     Group {
         name: "ttd",
+        extra: false,
         tools: &[
             "record_trace",
             "index_trace",
@@ -161,6 +167,7 @@ const GROUPS: &[Group] = &[
     },
     Group {
         name: "ioctl",
+        extra: false,
         tools: &[
             "decode_ioctl",
             "driver_object",
@@ -177,6 +184,7 @@ const GROUPS: &[Group] = &[
     },
     Group {
         name: "allocator",
+        extra: false,
         tools: &[
             "pool_find_tag",
             "pool_chunk",
@@ -192,14 +200,17 @@ const GROUPS: &[Group] = &[
     },
     Group {
         name: "crash",
+        extra: false,
         tools: &["crash_triage", "exception_triage", "decode_error_reporting"],
     },
     Group {
         name: "batch",
+        extra: false,
         tools: &["debug_batch"],
     },
     Group {
         name: "securekernel",
+        extra: true,
         tools: &[
             "open_sk_capture",
             "sk_modules",
@@ -219,16 +230,14 @@ const GROUPS: &[Group] = &[
 
 /// The tools a run advertises.
 ///
-/// `None` is every tool, and is not the same as a set that happens to hold all of them: it is the
-/// answer for a run that was never asked to narrow anything, so a tool added to `src/server.rs` and
-/// forgotten here is still served by default.
+/// `None` is every tool. The default is an explicit set because extra groups are opt-in.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Toolset {
     included: Option<BTreeSet<&'static str>>,
 }
 
 impl Toolset {
-    /// Every tool, which is what a run with no `--tools` serves.
+    /// Every tool, selected explicitly with `--tools all`.
     pub fn all() -> Self {
         Self { included: None }
     }
@@ -458,10 +467,8 @@ impl Toolset {
             },
             self.summary(),
             match chosen {
-                Chosen::ForTheRun => format!(
-                    "It was started with `{FLAG}`; widen that spec, or drop it to serve every \
-                     tool."
-                ),
+                Chosen::ForTheRun =>
+                    format!("Widen `{FLAG}`, or use `{FLAG} {ALL}` to serve every tool."),
                 // **Both sources, because only one of them exists on any given host.** The
                 // command edits the credential file a *service* reads and refuses outright where
                 // no service is installed — so naming it alone is advice a foreground listener's
@@ -477,6 +484,21 @@ impl Toolset {
                 ),
             }
         )
+    }
+}
+
+impl Default for Toolset {
+    /// Every ordinary group. Extra groups must be named explicitly.
+    fn default() -> Self {
+        Self {
+            included: Some(
+                GROUPS
+                    .iter()
+                    .filter(|group| !group.extra)
+                    .flat_map(|group| group.tools.iter().copied())
+                    .collect(),
+            ),
+        }
     }
 }
 
@@ -525,13 +547,21 @@ mod tests {
     }
 
     #[test]
-    fn no_flag_means_every_tool() {
-        let all = Toolset::all();
-        assert!(all.includes("debug_batch"));
-        assert!(all.includes("ttd_calls"));
-        // Even one this table has never heard of, which is the point of `None`.
-        assert!(all.includes("a_tool_added_tomorrow"));
+    fn no_flag_omits_extra_groups() {
+        let default = Toolset::default();
+        assert!(default.includes("debug_batch"));
+        assert!(default.includes("ttd_calls"));
+        assert!(!default.includes("open_sk_live_control"));
+        assert!(!default.includes("a_tool_added_tomorrow"));
         assert_eq!(Toolset::requested(&["--listen".into()][..]), None);
+    }
+
+    #[test]
+    fn all_includes_extra_groups() {
+        let all = Toolset::all();
+        assert!(all.includes("open_sk_live_control"));
+        // `None` keeps an explicitly-all surface forward-compatible with a newly added tool.
+        assert!(all.includes("a_tool_added_tomorrow"));
     }
 
     #[test]
@@ -646,7 +676,7 @@ mod tests {
 
         let run = surface.refusal("debug_batch", "bench", Chosen::ForTheRun);
         assert!(run.contains("this run advertises"), "{run}");
-        assert!(run.contains("It was started with `--tools`"), "{run}");
+        assert!(run.contains("use `--tools all`"), "{run}");
         assert!(!run.contains("bench"), "a run's surface is nobody's: {run}");
 
         let own = surface.refusal("debug_batch", "bench", Chosen::ForThisClient);

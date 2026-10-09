@@ -6,7 +6,8 @@ the machine DbgEng needs — a Mac driving a Windows VM, say.
 
 **`--tools` works here exactly as it does on stdio**, and matters more: the client at the far end
 may be a local model whose window is bought in RAM. `--listen 127.0.0.1:8765 --tools
-session,inspect,crash` serves 23 tools and 33,187 B of model context instead of 63 and 95,792 — the
+session,inspect,crash` serves 23 tools and 34,092 B of model context instead of the default 64 and
+100,645 B — the
 README has the table, and [`local-model.md`](./local-model.md) is the runbook it was measured for.
 It is this listener's **default**: a client may be given a surface of its own, which is what lets
 one server hold a local model and a hosted client at once — see [A tool surface per
@@ -296,9 +297,9 @@ setx WINDBG_MCP_TOOLS_BENCH        "session,inspect,crash"    # …and what it i
 ```
 
 This is what lets one listener serve a local model that can hold twenty-three tools beside a hosted
-client that can hold seventy-four, against the same debug sessions on the same box. A client with no spec of
-its own is served whatever the run serves — `--tools` on the listener's command line, or every tool
-if it has none — so **the run's flag is the default rather than a ceiling**: a client's own spec
+client that can hold seventy-six, against the same debug sessions on the same box. A client with no spec of
+its own is served whatever the run serves — `--tools` on the listener's command line, or the
+ordinary groups if it has none — so **the run's flag is the default rather than a ceiling**: a client's own spec
 replaces it, wider or narrower, because an intersection would produce a surface neither of you
 named. `session` is added to every spec, here as on the command line.
 
@@ -574,7 +575,7 @@ service reading it at the same moment.
 
 ```text
 added the client `ci` (sha256:076C14953E1DE5EF) — it is served whatever `windbg-mcp` serves —
-`--tools` on the command line the SCM stores, or every tool if that has none.
+`--tools` on the command line the SCM stores, or the ordinary groups if that has none.
 `windbg-mcp` now holds: `ci` (sha256:076C14953E1DE5EF), `local` (sha256:701E4CF334890225).
 
 Its token is in C:\ProgramData\windbg-mcp\ci.token — the same SYSTEM-and-Administrators
@@ -675,7 +676,7 @@ session goes on being served what it had when it connected, whatever this file s
 the sessionless revision is identified on every request and is never behind.
 
 A client with no `--tools` of its own is served whatever `windbg-mcp` serves — `--tools` on the
-command line the SCM stores, or every tool if that has none.
+command line the SCM stores, or the ordinary groups if that has none.
 
 This shell configures no listener credentials of its own (nothing in the
 `WINDBG_MCP_LISTEN_TOKEN` variables), so there is no second set here to list — though a

@@ -580,6 +580,13 @@ impl<R: BufRead, W: Write> ControlSession<R, W> {
             bail!("provider returned the wrong reply to begin_arm");
         }
         self.phase = Phase::Arming;
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            vm_id = %self.target.vm_id,
+            partition_id = ?self.target.partition_id,
+            vp = self.target.vp,
+            "control provider entered its guarded register-write epoch"
+        );
         Ok(())
     }
 
@@ -592,6 +599,13 @@ impl<R: BufRead, W: Write> ControlSession<R, W> {
             bail!("provider returned the wrong reply to finish_arm");
         }
         self.phase = Phase::Running;
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            vm_id = %self.target.vm_id,
+            partition_id = ?self.target.partition_id,
+            vp = self.target.vp,
+            "control provider committed its guarded register writes"
+        );
         Ok(())
     }
 
@@ -612,6 +626,14 @@ impl<R: BufRead, W: Write> ControlSession<R, W> {
             bail!("provider changed the held-event identity")
         }
         self.phase = Phase::Stopped(event);
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            vm_id = %self.target.vm_id,
+            partition_id = ?self.target.partition_id,
+            vp = self.target.vp,
+            epoch = %self.epoch,
+            "control provider retained the dispatcher stop"
+        );
         Ok(())
     }
 
@@ -660,6 +682,7 @@ impl<R: BufRead, W: Write> ControlSession<R, W> {
             bail!("write_registers requires at least one guarded write");
         }
         let names: Vec<_> = writes.iter().map(|write| write.name).collect();
+        let audit_writes = writes.clone();
         self.validate_register_names(&names, true)?;
         let response = self.exchange(Operation::WriteRegisters { writes })?;
         let ReplyValue::RegistersWritten { values } = response else {
@@ -668,6 +691,18 @@ impl<R: BufRead, W: Write> ControlSession<R, W> {
         if let Err(error) = validate_values(&names, &values) {
             self.poisoned = true;
             return Err(error);
+        }
+        for write in audit_writes {
+            tracing::info!(
+                target: "windbg_mcp::secure_kernel_mutation",
+                vm_id = %self.target.vm_id,
+                partition_id = ?self.target.partition_id,
+                vp = self.target.vp,
+                register = ?write.name,
+                expected = ?write.expected,
+                value = ?write.value,
+                "control provider verified a VTL1 register write"
+            );
         }
         Ok(values)
     }
@@ -680,6 +715,13 @@ impl<R: BufRead, W: Write> ControlSession<R, W> {
             bail!("provider returned the wrong reply to release")
         }
         self.phase = Phase::Running;
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            vm_id = %self.target.vm_id,
+            partition_id = ?self.target.partition_id,
+            vp = self.target.vp,
+            "control provider released the retained stop"
+        );
         Ok(())
     }
 
@@ -1113,6 +1155,12 @@ impl ControlProcess {
                 .spawn()
                 .with_context(|| format!("spawning the control provider {program:?} failed"))?
         };
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            provider = %program,
+            pid = ?child.id(),
+            "started the operator-authorized Secure Kernel control provider"
+        );
         let mut child = ChildGuard(Some(child));
         let stdin = child
             .0
@@ -1176,6 +1224,10 @@ impl ControlProcess {
         self.child
             .terminate_now()
             .context("terminating the timed-out control provider")?;
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            "terminated a timed-out Secure Kernel control provider"
+        );
         self.session_mut()
             .writer
             .synchronize()

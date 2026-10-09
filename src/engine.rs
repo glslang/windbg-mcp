@@ -787,6 +787,9 @@ pub struct Session {
     /// is thinking, for ever. This is the only signal left that nobody is coming back
     /// ([#162](https://github.com/glslang/windbg-mcp/issues/162)).
     last_used: Mutex<Instant>,
+    /// Generation of the ordinary Secure Kernel controller's absolute pause window. Starting or
+    /// ending a window advances it, so a timer from an earlier arm can never release a later one.
+    secure_kernel_pause_generation: AtomicU64,
     /// How far the opener got, as [`OpenPhase`]. Separate from the state on purpose.
     phase: AtomicU8,
     /// Whether *some* teardown got a successful `EndSession` out of this worker.
@@ -1922,6 +1925,25 @@ impl Sessions {
             Err(error) => Err(format!(
                 "live Secure Kernel startup policy is invalid: {error}"
             )),
+        }
+    }
+
+    /// Applies startup policy before a capture worker can load an SDK provider DLL.
+    pub(crate) fn authorize_secure_kernel_capture(
+        &self,
+        kit: Option<&std::path::Path>,
+        version: Option<&str>,
+    ) -> Result<std::path::PathBuf, String> {
+        match self.secure_kernel_policy.as_ref() {
+            Ok(Some(policy)) => policy
+                .authorize_capture_kit(kit, version)
+                .map_err(|error| format!("{error:#}")),
+            Ok(None) => Err(format!(
+                "Secure Kernel capture provider loading is disabled; set {} to an operator-owned \
+                 policy file before starting the server",
+                crate::skpolicy::POLICY_ENV
+            )),
+            Err(error) => Err(format!("Secure Kernel startup policy is invalid: {error}")),
         }
     }
 
@@ -3282,6 +3304,79 @@ impl Sessions {
         claimed.len()
     }
 
+    /// Arm the absolute pause window reported by an ordinary Secure Kernel controller.
+    fn begin_secure_kernel_pause(&self, session: &Arc<Session>, max_pause_ms: u64) {
+        let generation = session
+            .secure_kernel_pause_generation
+            .fetch_add(1, Ordering::AcqRel)
+            + 1;
+        let session = Arc::clone(session);
+        let sessions = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(max_pause_ms)).await;
+            sessions
+                .expire_secure_kernel_pause(session, generation, max_pause_ms)
+                .await;
+        });
+    }
+
+    fn end_secure_kernel_pause(&self, session: &Session) {
+        session
+            .secure_kernel_pause_generation
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    async fn expire_secure_kernel_pause(
+        &self,
+        session: Arc<Session>,
+        generation: u64,
+        max_pause_ms: u64,
+    ) {
+        if !self.claim_secure_kernel_pause_expiry(&session, generation, max_pause_ms) {
+            return;
+        }
+
+        tracing::warn!(
+            "session {}: absolute live Secure Kernel pause bound of {max_pause_ms}ms expired; \
+             starting fail-closed teardown",
+            session.id
+        );
+        let outcome = self
+            .release(
+                &session,
+                Call::supervisor(EngineOp::EndSession),
+                END_SESSION_TIMEOUT,
+            )
+            .await;
+        note_release("Secure Kernel pause expiry", &session, &outcome);
+    }
+
+    /// Claims one current pause under the same registry lock used to admit calls and reclamation.
+    /// Keeping the generation check and close together makes a late timer harmless after either a
+    /// step/continue or a later stop has replaced the interval it belonged to.
+    fn claim_secure_kernel_pause_expiry(
+        &self,
+        session: &Session,
+        generation: u64,
+        max_pause_ms: u64,
+    ) -> bool {
+        let _registry = self.registry();
+        if session.kind != SessionKind::SecureKernelLive
+            || session
+                .secure_kernel_pause_generation
+                .load(Ordering::Acquire)
+                != generation
+            || !session.state().is_live()
+        {
+            return false;
+        }
+        session.set_state(SessionState::Closed(format!(
+            "released after the operator's absolute live Secure Kernel pause bound of \
+             {max_pause_ms}ms expired"
+        )));
+        true
+    }
+
     async fn release_every_worker(&self, teardown: Teardown) {
         self.release_workers_of(teardown, None).await
     }
@@ -3647,6 +3742,7 @@ impl Sessions {
             created: Instant::now(),
             owner: crate::client::current(),
             last_used: Mutex::new(Instant::now()),
+            secure_kernel_pause_generation: AtomicU64::new(0),
             state: Mutex::new((SessionState::Opening, Instant::now())),
             tx,
             // Job ids start *past* the opener's, which is reserved — see [`OPENER_JOB`].
@@ -4838,6 +4934,26 @@ async fn reader(
                 } else {
                     tracing::warn!(
                         "session {}: a non-KD worker reported Secure Kernel KD phase {phase:?}",
+                        session.id
+                    );
+                }
+            }
+            WorkerMessage::SecureKernelPauseStarted { max_pause_ms } => {
+                if session.kind == SessionKind::SecureKernelLive {
+                    sessions.begin_secure_kernel_pause(&session, max_pause_ms);
+                } else {
+                    tracing::warn!(
+                        "session {}: a non-live-control worker reported a Secure Kernel pause",
+                        session.id
+                    );
+                }
+            }
+            WorkerMessage::SecureKernelPauseEnded => {
+                if session.kind == SessionKind::SecureKernelLive {
+                    sessions.end_secure_kernel_pause(&session);
+                } else {
+                    tracing::warn!(
+                        "session {}: a non-live-control worker reported a Secure Kernel resume",
                         session.id
                     );
                 }
@@ -7969,6 +8085,34 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn secure_kernel_pause_expiry_is_absolute_and_ignores_client_activity() {
+        let live = secure_kernel_live_double("live-pause", SessionState::Open, 4100);
+        let sessions = registry_of(std::slice::from_ref(&live));
+        sessions.begin_secure_kernel_pause(&live, 60_000);
+        let generation = live.secure_kernel_pause_generation.load(Ordering::Acquire);
+
+        // Ordinary requests restamp this clock. The pause claim deliberately does not read it.
+        *live.last_used.lock().unwrap() = Instant::now();
+        assert!(sessions.claim_secure_kernel_pause_expiry(&live, generation, 60_000));
+        assert!(matches!(
+            live.state(),
+            SessionState::Closed(ref why) if why.contains("absolute live Secure Kernel pause bound")
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_released_pause_invalidates_its_expiry_timer() {
+        let live = secure_kernel_live_double("live-step", SessionState::Open, 4100);
+        let sessions = registry_of(std::slice::from_ref(&live));
+        sessions.begin_secure_kernel_pause(&live, 60_000);
+        let generation = live.secure_kernel_pause_generation.load(Ordering::Acquire);
+
+        sessions.end_secure_kernel_pause(&live);
+        assert!(!sessions.claim_secure_kernel_pause_expiry(&live, generation, 60_000));
+        assert_eq!(live.state(), SessionState::Open);
+    }
+
     /// [`dormant`] with a transcript, for the one test that is about what gets recorded.
     fn dormant_recording(
         id: &str,
@@ -7994,6 +8138,7 @@ mod tests {
             created: Instant::now(),
             owner: crate::client::current(),
             last_used: Mutex::new(Instant::now()),
+            secure_kernel_pause_generation: AtomicU64::new(0),
             state: Mutex::new((state, Instant::now())),
             tx,
             next_id: AtomicU64::new(1),
