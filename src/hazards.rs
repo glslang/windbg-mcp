@@ -627,41 +627,44 @@ pub fn scan(
     }
 }
 
-/// Imports named from the addresses their import-address-table slots are bound to, and how many
+/// Imports named from the exports their import-address-table slots are bound to, and how many
 /// slots named nothing.
 ///
 /// For a driver whose import directory the loader freed; see
 /// [`crate::structured::ImportsNamedFrom`] for why naming the bound address names the import.
-/// `symbol_for` is the engine's `module!name` and displacement for an address, and `library_for`
-/// the library name the module holding an address gives itself in its export directory. A slot is
-/// named only where the address is the **start** of a symbol and a module there names its library:
-/// an address part-way into a function is not an export, and a name filed under no library could
-/// not match a list keyed by library and name -- so either is counted, never guessed.
+/// `exported_at` answers, for a bound address, the library the exporting module gives itself and
+/// the names that module exports at that address -- read from its **export table**, not from
+/// symbols, because a symbol at an exported address need not be the export's name. A slot whose
+/// address no module exports is counted, never guessed.
 ///
-/// Engine-free, so it is tested off a target: the worker hands it the two closures.
+/// **Where several names share the address, the one on the sink list is taken where there is one.**
+/// The slot is one import and only one of those names was imported, but they are one function: a
+/// call through the slot reaches the same code whichever name it was linked against, so a
+/// sensitive alias is the right name for it rather than an arbitrary one that hides it.
+///
+/// Engine-free, so it is tested off a target: the worker reads the exports and hands them in.
 pub fn imports_from_bound_slots(
     slots: &[pe::IatSlot],
-    mut symbol_for: impl FnMut(u64) -> Option<(String, u64)>,
-    mut library_for: impl FnMut(u64) -> Option<String>,
+    mut exported_at: impl FnMut(u64) -> Option<(String, Vec<String>)>,
 ) -> (Vec<pe::Import>, usize) {
     let mut imports = Vec::new();
     let mut unnamed = 0;
     for slot in slots {
-        let name = symbol_for(slot.value)
-            .filter(|(_, displacement)| *displacement == 0)
-            .and_then(|(symbol, _)| {
-                symbol
-                    .split_once('!')
-                    .map(|(_, name)| name.to_string())
-                    .filter(|name| !name.is_empty())
-            });
-        match (name, library_for(slot.value)) {
-            (Some(name), Some(library)) => imports.push(pe::Import {
+        let named = exported_at(slot.value).and_then(|(library, names)| {
+            let name = names
+                .iter()
+                .find(|name| sink_kind(name).is_some())
+                .or_else(|| names.first())?
+                .clone();
+            Some((library, name))
+        });
+        match named {
+            Some((library, name)) => imports.push(pe::Import {
                 library,
                 name: pe::ImportName::Named(name),
                 slot: slot.slot,
             }),
-            _ => unnamed += 1,
+            None => unnamed += 1,
         }
     }
     (imports, unnamed)
@@ -1484,50 +1487,53 @@ mod tests {
         assert!(!bound.contains("by ordinal"), "{bound}");
     }
 
-    /// Imports are named from what their address-table slots are bound to: a slot at the start
-    /// of a symbol, in a module that names its library, is that export, and anything else is
-    /// counted rather than guessed.
+    /// Imports are named from the exports their address-table slots are bound to: by the export
+    /// table, choosing a sensitive alias where an address has one, and counting anything else
+    /// rather than guessing.
     #[test]
     fn imports_are_named_from_the_exports_their_slots_are_bound_to() {
-        let slots = [
-            pe::IatSlot {
-                slot: BASE + 0x3000,
-                value: 0xa000,
-            },
-            // Eight bytes into a function: not an export, whatever the symbol is.
-            pe::IatSlot {
-                slot: BASE + 0x3008,
-                value: 0xa108,
-            },
-            // A symbol, but in no module that names its library.
-            pe::IatSlot {
-                slot: BASE + 0x3010,
-                value: 0xb000,
-            },
-            // A module, but no symbol at all.
-            pe::IatSlot {
-                slot: BASE + 0x3018,
-                value: 0xa200,
-            },
-        ];
-        let symbol_for = |address: u64| match address {
-            0xa000 => Some(("nt!ExAllocatePoolWithTag".to_string(), 0)),
-            0xa108 => Some(("nt!ExFreePoolWithTag".to_string(), 8)),
-            0xb000 => Some(("elsewhere!Thing".to_string(), 0)),
-            _ => None,
+        let slot = |index: u64, value| pe::IatSlot {
+            slot: BASE + 0x3000 + index * 8,
+            value,
         };
-        let library_for =
-            |address: u64| (address & 0xf000 == 0xa000).then(|| "ntoskrnl.exe".to_string());
-        let (imports, unnamed) = imports_from_bound_slots(&slots, symbol_for, library_for);
+        let slots = [
+            slot(0, 0xa000),
+            // Not an address the module exports: part-way into a function, or not a function.
+            slot(1, 0xa108),
+            // In no module at all.
+            slot(2, 0xb000),
+            // Two names at one address, one of them a sink: the sink is the name.
+            slot(3, 0xc000),
+            // Two names, neither a sink: the first the table lists.
+            slot(4, 0xd000),
+        ];
+        let exported_at = |address: u64| {
+            let names: &[&str] = match address {
+                0xa000 => &["ExAllocatePoolWithTag"],
+                0xc000 => &["AnAliasOfTheAllocator", "ExAllocatePool2"],
+                0xd000 => &["RtlInitUnicodeString", "AnotherName"],
+                _ => return None,
+            };
+            Some((
+                "ntoskrnl.exe".to_string(),
+                names.iter().map(|name| name.to_string()).collect(),
+            ))
+        };
+        let (imports, unnamed) = imports_from_bound_slots(&slots, exported_at);
+        let named = |index: u64, name: &str| pe::Import {
+            library: "ntoskrnl.exe".to_string(),
+            name: pe::ImportName::Named(name.to_string()),
+            slot: BASE + 0x3000 + index * 8,
+        };
         assert_eq!(
             imports,
-            vec![pe::Import {
-                library: "ntoskrnl.exe".to_string(),
-                name: pe::ImportName::Named("ExAllocatePoolWithTag".to_string()),
-                slot: BASE + 0x3000,
-            }]
+            vec![
+                named(0, "ExAllocatePoolWithTag"),
+                named(3, "ExAllocatePool2"),
+                named(4, "RtlInitUnicodeString"),
+            ]
         );
-        assert_eq!(unnamed, 3, "every slot that named nothing is counted");
+        assert_eq!(unnamed, 2, "every slot that named nothing is counted");
     }
 
     /// A scan whose imports came from the address table says so, and a slot that named nothing
