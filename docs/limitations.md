@@ -248,7 +248,9 @@
   `Mm` allocators the scan does list, which allocate outside the pool; nor is a call through a
   pointer the scan cannot follow to the import. A site in pageable code that is not
   resident when the trace is armed cannot be read, so it is neither found nor armed — the arm result
-  reports those bytes, and running the driver then arming again finds what it brought in. A call
+  reports those bytes, and running the driver then arming again finds what it brought in. A driver
+  with more than the 4 MiB of code the scan reads of any image is refused rather than armed from
+  its first 4 MiB. A call
   already in flight when the trace is armed returns to a breakpoint with no call pending and is not
   recorded. The trace's breakpoints are the ones `breakpoints` lists with the command
   `$$ pool_trace <n>` — a comment, which the engine runs as nothing — and that mark, not the id,

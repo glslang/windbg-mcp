@@ -9390,6 +9390,35 @@ fn arm_refusal(halt: walk::Halt, module: &str, step: &str, left: &str) -> Failed
     )
 }
 
+/// Why a scan that read only part of a driver cannot be armed from, or `None` for one that read all
+/// of it -- unreadable pages aside, which are reported rather than refused, since running the
+/// driver brings them in. **Two ways to read part of one**, and the second is the easy one to
+/// miss because the scan reports it as an answer rather than a stop: a deadline or an interrupt
+/// halting it, and the [`crate::codewalk::MAX_SCAN_BYTES`] it reads of any image. Armed from
+/// either, the trace would record as though the rest of the driver allocated nothing.
+fn refusal_for_a_partial_scan(
+    module: &str,
+    halted: Option<walk::Halt>,
+    cap_hit: bool,
+) -> Option<Failed> {
+    if let Some(halt) = halted {
+        return Some(arm_refusal(
+            halt,
+            module,
+            "while scanning for its call sites",
+            "",
+        ));
+    }
+    cap_hit.then(|| {
+        Failed::from(format!(
+            "`{module}` has more code than the {} MiB the scan for its call sites reads of an \
+             image, so no trace was armed: armed on part of the driver, it would record as \
+             though the rest allocated nothing.",
+            crate::codewalk::MAX_SCAN_BYTES / (1024 * 1024)
+        ))
+    })
+}
+
 /// Arms a trace of `module`'s pool allocations: a breakpoint on every call to a pool allocator in
 /// its readable code and one after it, and a callback that records each call and lets the target
 /// run on, stopping it once `limit` allocations are recorded. Replaces any trace the session held.
@@ -9439,15 +9468,9 @@ fn arm_pool_trace(
     };
     let (base, loaded_size) = loaded_module_named(e, module)?;
     let scan = scan_driver(e, module, base, loaded_size, deadline)?;
-    // A scan stopped part-way found some call sites and not others. Refused; nothing has been
-    // touched yet.
-    if let Some(halt) = scan.halted {
-        return Err(arm_refusal(
-            halt,
-            module,
-            "while scanning for its call sites",
-            "",
-        ));
+    // Refused before anything is touched.
+    if let Some(refusal) = refusal_for_a_partial_scan(module, scan.halted, scan.cap_hit) {
+        return Err(refusal);
     }
 
     let mut sites = Vec::new();
@@ -14263,6 +14286,33 @@ mod tests {
             armed.contains("phase_of(id, command.as_deref())"),
             "the trace's callback no longer asks with the hit breakpoint's own command, so an id \
              the engine reused for somebody else's breakpoint is taken for the trace's"
+        );
+    }
+
+    /// **A trace is not armed from a scan that read part of the driver**, for either of the two
+    /// reasons one does. The byte cap is the one review found missing on #473: the scan reports it
+    /// as `cap_hit` beside an answer, not as a halt, so a check for halts alone armed the prefix.
+    #[test]
+    fn a_pool_trace_is_not_armed_from_part_of_a_driver() {
+        assert!(refusal_for_a_partial_scan("drv", None, false).is_none());
+        let capped = refusal_for_a_partial_scan("drv", None, true)
+            .expect("a scan that reached its byte cap read only part of the driver");
+        assert!(
+            capped.message.contains("more code than"),
+            "{}",
+            capped.message
+        );
+        let stopped = refusal_for_a_partial_scan("drv", Some(walk::Halt::Deadline), false)
+            .expect("a scan its deadline stopped read only part of the driver");
+        assert_eq!(stopped.category, Some(structured::ErrorCategory::Timeout));
+
+        // And the arm hands it the scan's own cap rather than deciding without it, which the
+        // assertions above cannot say: the function is right whatever calls it.
+        assert!(
+            bodies_of(&["arm_pool_trace"], 4_000)
+                .contains("refusal_for_a_partial_scan(module, scan.halted, scan.cap_hit)"),
+            "the arm no longer asks about the scan's byte cap, so a driver past it is armed from \
+             its first 4 MiB"
         );
     }
 
