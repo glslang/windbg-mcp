@@ -119,12 +119,19 @@ fn wait_for_process_attach(
 
 /// One complete live-control session. Both halves remain on the worker engine thread; each method
 /// creates only a short-lived borrow tying the dispatcher state to that thread's engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PauseWindow {
+    service_deadline: Instant,
+    recovery_deadline: Instant,
+}
+
 pub(crate) struct Session {
     control: Option<LiveControl<crate::skcontrol::ControlProcess>>,
     dispatcher: VmwpDispatcherState,
     pending: Option<PendingControl>,
     preparation_failed: Option<String>,
     max_pause_ms: u64,
+    pause_window: Option<PauseWindow>,
     _reservation: VmReservation,
 }
 
@@ -204,6 +211,7 @@ impl Session {
                 }),
                 preparation_failed: None,
                 max_pause_ms: request.max_pause_ms,
+                pause_window: None,
                 _reservation: reservation,
             },
             Vec::new(),
@@ -359,11 +367,18 @@ impl Session {
     ) -> Result<StopRecord> {
         self.ensure_preparation_succeeded()?;
         let max_pause = Duration::from_millis(self.max_pause_ms);
-        let activity = WaitActivity::for_kd(
-            Duration::from_millis(u64::from(DEBUG_WAIT)),
-            service_pause_bound(max_pause),
-            max_pause,
-        );
+        let activity = match self.pause_window {
+            Some(window) => WaitActivity::for_kd_until(
+                Duration::from_millis(u64::from(DEBUG_WAIT)),
+                window.service_deadline,
+                window.recovery_deadline,
+            ),
+            None => WaitActivity::for_kd(
+                Duration::from_millis(u64::from(DEBUG_WAIT)),
+                service_pause_bound(max_pause),
+                max_pause,
+            ),
+        };
         self.dispatcher.wait_activity = Some(activity.clone());
         let result = (|| {
             let control = self
@@ -375,6 +390,28 @@ impl Session {
                 .bind_with_retention_notice(engine, &mut retained);
             control.wait_for_stop(&mut dispatcher)
         })();
+        if activity.retained_since().is_some()
+            && let (Some(service_deadline), Some(recovery_deadline)) =
+                (activity.pause_deadline(), activity.recovery_deadline())
+        {
+            let retained = PauseWindow {
+                service_deadline,
+                recovery_deadline,
+            };
+            self.pause_window = Some(match self.pause_window {
+                Some(original) => PauseWindow {
+                    service_deadline: original.service_deadline.min(retained.service_deadline),
+                    recovery_deadline: original.recovery_deadline.min(retained.recovery_deadline),
+                },
+                None => retained,
+            });
+            self.dispatcher.recovery_deadline = Some(
+                self.dispatcher
+                    .recovery_deadline
+                    .map(|deadline| deadline.min(recovery_deadline))
+                    .unwrap_or(recovery_deadline),
+            );
+        }
         activity.finish();
         self.dispatcher.wait_activity = None;
         result
@@ -456,6 +493,7 @@ impl Session {
             .context("live Secure Kernel control has not completed target discovery")?;
         let mut dispatcher = self.dispatcher.bind(engine);
         let epoch = control.continue_from_until(&mut dispatcher, epoch, deadline)?;
+        self.pause_window = None;
         Ok(LiveTransition {
             phase: control.phase(),
             epoch,
@@ -493,6 +531,9 @@ impl Session {
 
     /// End ordinary stopped work before the absolute deadline's cleanup reserve begins.
     fn stopped_service_deadline(&self) -> Result<Instant> {
+        if let Some(window) = self.pause_window {
+            return Ok(window.service_deadline);
+        }
         let recovery_deadline = self
             .dispatcher
             .recovery_deadline
@@ -544,9 +585,16 @@ impl Session {
     }
 
     fn close_inner(&mut self, engine: &DebugEngine, deadline: Option<Instant>) -> Result<()> {
-        let deadline = deadline.or(self.dispatcher.recovery_deadline);
+        let deadline = [
+            deadline,
+            self.dispatcher.recovery_deadline,
+            self.pause_window.map(|window| window.recovery_deadline),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         let mut dispatcher = self.dispatcher.bind(engine);
-        if let Some(control) = self.control.as_mut() {
+        let result = if let Some(control) = self.control.as_mut() {
             match deadline {
                 Some(deadline) => control.close_until(&mut dispatcher, deadline),
                 None => control.close(&mut dispatcher),
@@ -556,7 +604,11 @@ impl Session {
                 Some(deadline) => dispatcher.teardown_until(deadline),
                 None => dispatcher.teardown(),
             }
+        };
+        if result.is_ok() {
+            self.pause_window = None;
         }
+        result
     }
 }
 
@@ -1316,6 +1368,8 @@ struct WaitActivityState {
     managed_job: Option<u64>,
     pause_bound: Option<Duration>,
     recovery_bound: Option<Duration>,
+    absolute_pause_deadline: Option<Instant>,
+    absolute_recovery_deadline: Option<Instant>,
     retained_since: Mutex<Option<Instant>>,
 }
 
@@ -1354,6 +1408,19 @@ impl WaitActivity {
         )
     }
 
+    fn for_kd_until(
+        idle_timeout: Duration,
+        pause_deadline: Instant,
+        recovery_deadline: Instant,
+    ) -> Self {
+        debug_assert!(pause_deadline <= recovery_deadline);
+        let mut activity = Self::with_options(idle_timeout, None, None, None);
+        let state = Arc::get_mut(&mut activity.0).expect("a new wait activity is uniquely owned");
+        state.absolute_pause_deadline = Some(pause_deadline);
+        state.absolute_recovery_deadline = Some(recovery_deadline);
+        activity
+    }
+
     fn with_options(
         idle_timeout: Duration,
         pause_bound: Option<Duration>,
@@ -1373,19 +1440,23 @@ impl WaitActivity {
             managed_job,
             pause_bound,
             recovery_bound,
+            absolute_pause_deadline: None,
+            absolute_recovery_deadline: None,
             retained_since: Mutex::new(None),
         }))
     }
 
     fn mark_stop_retained(&self, since: Instant) -> Option<Instant> {
-        let bound = self.0.pause_bound?;
         let mut retained = self
             .0
             .retained_since
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let since = *retained.get_or_insert(since);
-        Some(since.checked_add(bound).unwrap_or(since))
+        self.0.absolute_pause_deadline.or_else(|| {
+            let bound = self.0.pause_bound?;
+            Some(since.checked_add(bound).unwrap_or(since))
+        })
     }
 
     pub(crate) fn retained_since(&self) -> Option<Instant> {
@@ -1397,11 +1468,17 @@ impl WaitActivity {
     }
 
     fn pause_deadline(&self) -> Option<Instant> {
+        if let Some(deadline) = self.0.absolute_pause_deadline {
+            return Some(deadline);
+        }
         let since = self.retained_since()?;
         Some(since.checked_add(self.0.pause_bound?).unwrap_or(since))
     }
 
     fn recovery_deadline(&self) -> Option<Instant> {
+        if let Some(deadline) = self.0.absolute_recovery_deadline {
+            return Some(deadline);
+        }
         let since = self.retained_since()?;
         Some(since.checked_add(self.0.recovery_bound?).unwrap_or(since))
     }
@@ -1446,13 +1523,16 @@ impl WaitActivity {
     }
 
     pub(crate) fn remaining_idle(&self) -> Duration {
-        self.0.idle_timeout.saturating_sub(
+        let idle = self.0.idle_timeout.saturating_sub(
             self.0
                 .last_traffic
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .elapsed(),
-        )
+        );
+        self.pause_deadline()
+            .map(|deadline| idle.min(deadline.saturating_duration_since(Instant::now())))
+            .unwrap_or(idle)
     }
 
     fn enter(&self) -> Result<WaitActivityGuard> {
@@ -4585,6 +4665,66 @@ mod tests {
     }
 
     #[test]
+    fn a_post_step_wait_is_capped_by_the_original_absolute_pause_window() {
+        let now = Instant::now();
+        let service_deadline = now + Duration::from_secs(2);
+        let recovery_deadline = now + Duration::from_secs(4);
+        let activity = WaitActivity::for_kd_until(
+            Duration::from_secs(60),
+            service_deadline,
+            recovery_deadline,
+        );
+
+        assert!(activity.remaining_idle() <= Duration::from_secs(2));
+        assert_eq!(
+            activity.mark_stop_retained(now + Duration::from_secs(1)),
+            Some(service_deadline)
+        );
+        assert_eq!(activity.pause_deadline(), Some(service_deadline));
+        assert_eq!(activity.recovery_deadline(), Some(recovery_deadline));
+    }
+
+    #[test]
+    fn ordinary_step_wait_continue_reuses_then_ends_one_pause_window() {
+        let source = include_str!("skdispatch.rs");
+        let wait = source
+            .split_once("pub(crate) fn wait_for_stop(\n")
+            .expect("the ordinary wait exists")
+            .1
+            .split_once("pub(crate) fn wait_for_stop_interruptible(")
+            .expect("the interruptible wait follows it")
+            .0;
+        let step = source
+            .split_once("pub(crate) fn step_until(\n")
+            .expect("the ordinary step exists")
+            .1
+            .split_once("pub(crate) fn continue_from(\n")
+            .expect("continue follows it")
+            .0;
+        let continued = source
+            .split_once("fn continue_from_until(\n")
+            .expect("the ordinary continue exists")
+            .1
+            .split_once("pub(crate) fn read_memory(")
+            .expect("the stopped read follows it")
+            .0;
+
+        assert!(
+            wait.contains("WaitActivity::for_kd_until(")
+                && wait.contains("self.pause_window = Some("),
+            "a wait after step must reuse and retain the original absolute pause window: {wait}"
+        );
+        assert!(
+            !step.contains("self.pause_window = None"),
+            "step must not end the original absolute pause window: {step}"
+        );
+        assert!(
+            continued.contains("self.pause_window = None"),
+            "a successful true continue must end the absolute pause window: {continued}"
+        );
+    }
+
+    #[test]
     fn ordinary_pause_notice_precedes_all_retention_cleanup() {
         let source = include_str!("skdispatch.rs");
         let flow = source
@@ -4759,6 +4899,7 @@ mod tests {
             pending: None,
             preparation_failed: Some("partition discovery failed".into()),
             max_pause_ms: 600_000,
+            pause_window: None,
             // No kernel object is needed for a state-only test.
             _reservation: VmReservation(std::ptr::null_mut()),
         };
