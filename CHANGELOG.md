@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`pool_trace` and `pool_trace_read`: one driver's pool allocations, recorded as a live kernel
+  runs.** Arming puts a breakpoint on each of the driver's calls to a pool allocator — the call
+  sites `driver_hazards` finds, through the import address table where the loader freed the import
+  directory — and one on the instruction after it, and registers a breakpoint callback that reads
+  the arguments at the call and the result at the return, pairs them by thread and site, and
+  answers the engine *go*. So only that driver's calls trap, never the allocator's every caller,
+  and the target runs on until the trace is full, when the callback answers *break* instead.
+  Reading gives each allocation's allocator, call site, size, tag (as the debugger prints it and as
+  `pool_find_tag` takes it), `POOL_FLAGS` or `POOL_TYPE`, returned address and thread, and counts
+  what was not recorded; `stop: true` disarms it, removing only breakpoints still at the addresses
+  it set. It rests on dbgscope's breakpoint callback
+  ([dbgscope#195](https://github.com/glslang/dbgscope/pull/195)), which returns a `DEBUG_STATUS_*`
+  through the error half of a windows-rs `Result<()>` because the generated trait gives an
+  implementer no other way to. Measured on the ARM64 bench's live HEVD over serial KD, 2026-10-09:
+  two `ExAllocatePoolWithTag` sites armed in 0.3–1.7 s, four `CREATE_ARW_HELPER_OBJECT` IOCTLs from the
+  guest, and eight allocations recorded — 0x10 and 0x20 bytes alternating, tag `Hack`,
+  `NonPagedPoolNx`, one thread per IOCTL — with the eighth stopping the target at its return. The
+  limits are in `docs/limitations.md`.
+
 - **The Secure Kernel KD facade of 0.22.0 is recorded** (`FOLLOWUPS.md` item 115, now in
   `DONE.md`). [#463](https://github.com/glslang/windbg-mcp/pull/463) shipped
   `windbg-mcp --sk-kd-target` with no entry here and no page anywhere: a serial KD packet facade

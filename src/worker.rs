@@ -1379,15 +1379,9 @@ fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
     let _ = LIMITATION.set(limitation);
     // Published before `Ready`, so the request reader can never be handed work it cannot interrupt.
     let _ = INTERRUPT.set(engine.interrupt_handle());
-    // The Secure Kernel capture this worker holds, if its session is one — `FOLLOWUPS.md` item 103
-    // gate S3. A local of this thread rather than a `static`, which is what keeps it out of the
-    // `Send`/`Sync` question entirely: the provider's handles are raw pointers, every call on them
-    // is made from here, and there is nowhere else in this process that could reach them.
-    let mut sk: Option<crate::sksession::Session> = None;
-    // The live counterpart. It owns the provider child, the build-guarded adapter state and any
-    // managed KD facade layered over them. Every method receives this thread's engine by
-    // reference, so none can escape this thread.
-    let mut sk_live = SecureKernelLiveState::default();
+    // What this session holds between ops -- see [`HeldBetweenOps`]. A local of this thread rather than a
+    // `static`, which is what keeps it out of the `Send`/`Sync` question entirely.
+    let mut held = HeldBetweenOps::default();
     emit(&WorkerMessage::Ready {
         build: crate::BUILD_VERSION.to_string(),
     });
@@ -1404,11 +1398,11 @@ fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
                     let _ = ack.send(false);
                     continue;
                 }
-                let released_live_control = if let Some(session) = sk_live.session.as_mut() {
+                let released_live_control = if let Some(session) = held.sk_live.session.as_mut() {
                     match catch_unwind(AssertUnwindSafe(|| session.close(&engine))) {
                         Ok(Ok(())) => {
-                            sk_live.session = None;
-                            sk_live.kd = None;
+                            held.sk_live.session = None;
+                            held.sk_live.kd = None;
                             KD_ACTIVE.store(false, Ordering::SeqCst);
                             LIVE_CONTROL_ACTIVE.store(false, Ordering::SeqCst);
                             true
@@ -1527,8 +1521,7 @@ fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
                 request.op,
                 queued,
                 request.handle_bound,
-                &mut sk,
-                &mut sk_live,
+                &mut held,
             )
         }));
         let panicked = result.is_err();
@@ -2786,6 +2779,22 @@ fn apply_symbol_path(e: &DebugEngine, setting: &SymbolPathSetting) -> Result<(),
     }
 }
 
+/// What one engine thread holds for its session between ops, every piece of it reached only from
+/// that thread.
+#[derive(Default)]
+struct HeldBetweenOps {
+    /// The Secure Kernel capture this worker holds, if its session is one -- `FOLLOWUPS.md` item 103
+    /// gate S3. The provider's handles are raw pointers, and every call on them is made from here.
+    sk: Option<crate::sksession::Session>,
+    /// The live counterpart. It owns the provider child, the build-guarded adapter state and any
+    /// managed KD facade layered over them. Every method receives this thread's engine by
+    /// reference, so none can escape this thread.
+    sk_live: SecureKernelLiveState,
+    /// The pool trace this session has armed, if any: its recorder is shared with a breakpoint
+    /// callback the engine calls on this thread.
+    pool_trace: Option<PoolTrace>,
+}
+
 /// Live Secure Kernel state owned together because the KD facade borrows the same controller.
 #[derive(Default)]
 struct SecureKernelLiveState {
@@ -2801,9 +2810,13 @@ fn execute(
     op: EngineOp,
     queued: Duration,
     handle_bound: bool,
-    sk: &mut Option<crate::sksession::Session>,
-    sk_live: &mut SecureKernelLiveState,
+    held: &mut HeldBetweenOps,
 ) -> Result<Output, Failed> {
+    let HeldBetweenOps {
+        sk,
+        sk_live,
+        pool_trace,
+    } = held;
     // **How much of the caller's patience is gone by the time a bound is armed** — the queue wait
     // *plus* whatever this op has already spent getting to the point of arming one. Every budget
     // armed in an arm below is sized from this rather than from `queued`; the messages that report
@@ -3405,6 +3418,34 @@ fn execute(
                 )),
             }
         }
+        EngineOp::PoolTraceArm {
+            module,
+            limit,
+            patience_ms,
+        } => {
+            // The scan behind it is `driver_hazards`' own, so it takes that op's budget and its
+            // refusal when there is none: a trace armed from a scan that never ran would arm
+            // nothing and say so as if the driver allocated nowhere.
+            let patience = Duration::from_millis(u64::from(patience_ms));
+            match walk_budget(patience, spent()) {
+                Some(budget) => {
+                    arm_pool_trace(e, &module, limit, Instant::now() + budget, pool_trace)
+                }
+                None => Err(Failed::categorised(
+                    structured::ErrorCategory::NotRun,
+                    format!(
+                        "This pool trace was not armed: it reached the engine with {}s of its \
+                         caller's timeout left, which is not enough to scan a driver for its \
+                         call sites. Nothing was armed. It waited {}s behind other work on this \
+                         session; issue it when the session is idle, or raise the server's call \
+                         timeout (WINDBG_MCP_CALL_TIMEOUT_SECS).",
+                        patience.saturating_sub(queued).as_secs(),
+                        queued.as_secs(),
+                    ),
+                )),
+            }
+        }
+        EngineOp::PoolTraceRead { stop } => read_pool_trace(e, stop, pool_trace),
         EngineOp::DriverHazards {
             module,
             patience_ms,
@@ -9075,33 +9116,34 @@ fn hazards_of(
     //
     // It also removes this path's last command, which is why the deadline no longer has to be
     // spent before the image is read.
+    let (base, loaded_size) = loaded_module_named(e, module)?;
+    hazards_at(e, module, base, loaded_size, deadline)
+}
+
+/// The one loaded module named exactly `module`: its base and the size the loader mapped.
+fn loaded_module_named(e: &DebugEngine, module: &str) -> Result<(u64, u32), Failed> {
     let loaded = e.modules().map_err(failed)?;
     let mut matched = loaded
         .iter()
         .filter(|candidate| candidate.name.eq_ignore_ascii_case(module));
-    let (base, loaded_size) = match (matched.next(), matched.next()) {
-        (Some(one), None) => (one.base, one.size),
-        (None, _) => {
-            return Err(Failed::categorised(
-                structured::ErrorCategory::Debugger,
-                format!(
-                    "no loaded module is named `{module}`. Names here are the ones `modules` \
-                     lists — the `nt` in `nt!KeBugCheckEx` — and this matches one exactly rather \
-                     than as a pattern."
-                ),
-            ));
-        }
-        (Some(_), Some(_)) => {
-            return Err(Failed::categorised(
-                structured::ErrorCategory::InvalidArgument,
-                format!(
-                    "`{module}` matches more than one loaded module, and a scan is about one \
-                     image. Name it exactly; `modules` with a filter lists what is loaded."
-                ),
-            ));
-        }
-    };
-    hazards_at(e, module, base, loaded_size, deadline)
+    match (matched.next(), matched.next()) {
+        (Some(one), None) => Ok((one.base, one.size)),
+        (None, _) => Err(Failed::categorised(
+            structured::ErrorCategory::Debugger,
+            format!(
+                "no loaded module is named `{module}`. Names here are the ones `modules` \
+                 lists — the `nt` in `nt!KeBugCheckEx` — and this matches one exactly rather \
+                 than as a pattern."
+            ),
+        )),
+        (Some(_), Some(_)) => Err(Failed::categorised(
+            structured::ErrorCategory::InvalidArgument,
+            format!(
+                "`{module}` matches more than one loaded module, and a scan is about one \
+                 image. Name it exactly; `modules` with a filter lists what is loaded."
+            ),
+        )),
+    }
 }
 
 /// The scan itself, over an extent a caller has already resolved.
@@ -9118,13 +9160,13 @@ fn hazards_of(
 /// the collision was not attempted. So this is not the fix for a bug anybody has seen -- it is
 /// declining to ask a question whose answer was already in hand, which costs nothing and removes
 /// the need to know.
-fn hazards_at(
+fn scan_driver(
     e: &DebugEngine,
     module: &str,
     base: u64,
     loaded_size: u32,
     deadline: Instant,
-) -> Result<structured::DriverHazards, Failed> {
+) -> Result<hazards::Scan, Failed> {
     // The headers, then the imports. Both read through one closure, and a read that does not
     // answer is `PeError::Unreadable` naming what could not be read rather than a zero parsed as a
     // structure — which on a dump is the ordinary case for anything outside the read-only
@@ -9255,7 +9297,19 @@ fn hazards_at(
     );
     scan.unnamed_libraries = table.unnamed_libraries;
     scan.imports_named_from = imports_named_from;
+    Ok(scan)
+}
 
+/// What a driver's image says it can do, as the report `driver_hazards` answers with: the scan of
+/// [`scan_driver`], each address located.
+fn hazards_at(
+    e: &DebugEngine,
+    module: &str,
+    base: u64,
+    loaded_size: u32,
+    deadline: Instant,
+) -> Result<structured::DriverHazards, Failed> {
+    let scan = scan_driver(e, module, base, loaded_size, deadline)?;
     let mut attributor = Attributor::default();
     let stopped = std::cell::Cell::new(None);
     let stop = || attribution_stop(e, deadline);
@@ -9271,6 +9325,468 @@ fn hazards_at(
     // stop is the one that happened.
     report.stopped = report.stopped.or_else(|| stopped.get());
     Ok(report)
+}
+
+/// A pool allocation trace this session holds: what [`arm_pool_trace`] armed, recording as the
+/// target runs.
+pub(crate) struct PoolTrace {
+    module: String,
+    /// Shared with the breakpoint callback, which the engine calls on this thread.
+    recorder: std::rc::Rc<std::cell::RefCell<crate::pooltrace::Recorder>>,
+    /// Each site's call, located once when armed and reused by every read.
+    locations: Vec<structured::CodeLocation>,
+}
+
+/// The registers a call's first three integer arguments arrive in, and the one it returns in.
+fn call_registers(e: &DebugEngine) -> ([&'static str; 3], &'static str) {
+    match e.processor_type() {
+        Ok(0xaa64) => (["x0", "x1", "x2"], "x0"),
+        _ => (["rcx", "rdx", "r8"], "rax"),
+    }
+}
+
+/// Arms a trace of `module`'s pool allocations: a breakpoint on every call to a pool allocator in
+/// its readable code and one after it, and a callback that records each call and lets the target
+/// run on, stopping it once `limit` allocations are recorded. Replaces any trace the session held.
+///
+/// **A live kernel only.** It records as the target runs, and the pool allocators are kernel code:
+/// a dump never runs, and a user-mode process never calls them.
+///
+/// **The call sites are the hazard scan's**, so a driver whose import directory the loader freed is
+/// traced through its import address table, as `driver_hazards` reads it, and a site in code that
+/// could not be read -- pageable code not resident -- is neither found nor armed. That is reported
+/// as `unread_bytes`, because arming again once the driver has run finds what it brought in.
+fn arm_pool_trace(
+    e: &DebugEngine,
+    module: &str,
+    limit: usize,
+    deadline: Instant,
+    slot: &mut Option<PoolTrace>,
+) -> Result<Output, Failed> {
+    if !matches!(e.debuggee_type(), Ok(kind) if kind.is_live_kernel()) {
+        return Err(Failed::categorised(
+            structured::ErrorCategory::InvalidArgument,
+            "a pool trace needs a live kernel target: it records allocations as the target runs, \
+             and the pool allocators are kernel code -- a dump never runs, and a user-mode \
+             process never calls them."
+                .to_string(),
+        ));
+    }
+    let (base, loaded_size) = loaded_module_named(e, module)?;
+    let scan = scan_driver(e, module, base, loaded_size, deadline)?;
+    // A scan stopped part-way found some call sites and not others, and a trace armed on part of a
+    // driver records as though the rest allocated nothing. Refused; nothing has been touched yet.
+    if let Some(halt) = scan.halted {
+        return Err(Failed::categorised(
+            match halt {
+                walk::Halt::Deadline => structured::ErrorCategory::Timeout,
+                walk::Halt::Interrupted => structured::ErrorCategory::Interrupted,
+            },
+            format!(
+                "the scan for `{module}`'s call sites stopped before it finished, so no trace was \
+                 armed: armed on part of the driver, it would record as though the rest allocated \
+                 nothing."
+            ),
+        ));
+    }
+
+    let mut sites = Vec::new();
+    // Found and not armed. The scan counts every call site and lists a capped sample of them, so
+    // a driver past the cap has calls no breakpoint is on -- said, rather than traced as though
+    // those calls allocated nothing.
+    let mut unarmed_call_sites = 0;
+    for sink in &scan.sinks {
+        if crate::pooltrace::layout_of(&sink.name).is_none() {
+            continue;
+        }
+        unarmed_call_sites += sink.call_site_count.saturating_sub(sink.call_sites.len());
+        for &call in &sink.call_sites {
+            // The call instruction, decoded again for two things the scan does not keep: where it
+            // returns to, which is its own length past it, and whether it returns at all -- a jump
+            // to the allocator is a tail call, and the allocator returns to someone else.
+            let Some(instruction) = e
+                .decode_range(call, 16)
+                .ok()
+                .and_then(|block| block.into_iter().next())
+                .filter(|instruction| instruction.address == call)
+            else {
+                unarmed_call_sites += 1;
+                continue;
+            };
+            let length = (instruction.bytes.len() / 2) as u64;
+            let returns_to = match instruction.flow {
+                dbgscope::dbgeng::Flow::Call(_) if length > 0 => Some(call + length),
+                dbgscope::dbgeng::Flow::Jmp(_) => None,
+                _ => {
+                    unarmed_call_sites += 1;
+                    continue;
+                }
+            };
+            sites.push(crate::pooltrace::Site {
+                allocator: sink.name.clone(),
+                call,
+                returns_to,
+            });
+        }
+    }
+
+    let replaced = disarm_pool_trace(e, slot.take());
+    // Said by a failure below as well: by then the trace this replaced is gone either way.
+    let and_before = if replaced {
+        " The trace this session held before it is disarmed too."
+    } else {
+        ""
+    };
+    let unread_bytes = scan.unreadable.iter().map(|range| range.bytes).sum();
+    let mut attributor = Attributor::default();
+    let locations: Vec<structured::CodeLocation> = sites
+        .iter()
+        .map(|site| attributor.locate(e, site.call))
+        .collect();
+    let mut recorder = crate::pooltrace::Recorder::new(sites, limit);
+
+    // Every breakpoint this trace sets, so a failure part-way removes what it had set rather than
+    // leaving breakpoints armed that no trace owns.
+    let mut set: Vec<u32> = Vec::new();
+    let undo = |set: &[u32]| {
+        for &id in set {
+            let _ = e.remove_breakpoint(id);
+        }
+    };
+    let planned: Vec<(u64, crate::pooltrace::Phase)> = recorder
+        .sites()
+        .iter()
+        .enumerate()
+        .flat_map(|(index, site)| {
+            std::iter::once((site.call, crate::pooltrace::Phase::Entry(index))).chain(
+                site.returns_to
+                    .map(|after| (after, crate::pooltrace::Phase::Return(index))),
+            )
+        })
+        .collect();
+    for (address, phase) in planned {
+        match e.set_breakpoint(&BreakpointSpec::code(BreakpointAt::Address(address))) {
+            Ok(armed) => {
+                set.push(armed.breakpoint.id);
+                recorder.arm(armed.breakpoint.id, phase);
+            }
+            Err(why) => {
+                undo(&set);
+                return Err(Failed::from(format!(
+                    "a breakpoint at {address:#x} could not be set ({why}), so no trace was \
+                     armed and the breakpoints set before it were removed.{and_before}"
+                )));
+            }
+        }
+    }
+
+    let recorder = std::rc::Rc::new(std::cell::RefCell::new(recorder));
+    if !set.is_empty() {
+        let shared = std::rc::Rc::clone(&recorder);
+        let (arguments, returned) = call_registers(e);
+        let callback: dbgscope::dbgeng::BreakpointCallback =
+            Box::new(move |hit: &dbgscope::dbgeng::BreakpointHit<'_>| {
+                use crate::pooltrace::Phase;
+                use dbgscope::dbgeng::BreakpointAction;
+                let Ok(id) = hit.id() else {
+                    return BreakpointAction::Default;
+                };
+                // Never contended -- reads run on this thread, not inside a wait -- but a trace
+                // that cannot be borrowed has no opinion, rather than a panic in a callback.
+                let Ok(mut recorder) = shared.try_borrow_mut() else {
+                    return BreakpointAction::Default;
+                };
+                let Some(phase) = recorder.phase_of(id) else {
+                    return BreakpointAction::Default;
+                };
+                let engine = hit.engine();
+                let thread = engine.current_thread_data_offset();
+                match phase {
+                    Phase::Entry(site) => {
+                        let read = |index: usize| engine.integer_register(arguments[index]);
+                        match (thread, read(0), read(1), read(2)) {
+                            (Ok(thread), Ok(a), Ok(b), Ok(c)) => {
+                                recorder.entry(site, thread, [a, b, c])
+                            }
+                            _ => recorder.unreadable(),
+                        }
+                    }
+                    Phase::Return(site) => match (thread, engine.integer_register(returned)) {
+                        (Ok(thread), Ok(value)) => recorder.returned(site, thread, value),
+                        _ => recorder.unreadable(),
+                    },
+                }
+            });
+        if let Err(why) = e.set_breakpoint_callback(callback) {
+            undo(&set);
+            return Err(Failed::from(format!(
+                "the breakpoint callback could not be registered ({why}), so no trace was armed \
+                 and its breakpoints were removed.{and_before}"
+            )));
+        }
+    }
+
+    let report = structured::PoolTraceArmed {
+        module: module.to_string(),
+        base: structured::addr(base),
+        sites: recorder
+            .borrow()
+            .sites()
+            .iter()
+            .zip(&locations)
+            .map(|(site, location)| structured::TraceSite {
+                allocator: site.allocator.clone(),
+                call_site: location.clone(),
+                returns: site.returns_to.is_some(),
+            })
+            .collect(),
+        limit: recorder.borrow().limit(),
+        replaced,
+        unread_bytes,
+        unarmed_call_sites,
+        imports_named_from: scan.imports_named_from.clone(),
+    };
+    if !set.is_empty() {
+        *slot = Some(PoolTrace {
+            module: module.to_string(),
+            recorder,
+            locations,
+        });
+    }
+    Ok(Output::typed(render_pool_trace_armed(&report), report))
+}
+
+/// Removes a trace's breakpoints and callback, and answers whether there was one.
+///
+/// **Only breakpoints still its own.** An id is the engine's, and one removed by something else can
+/// be handed to the next breakpoint set -- so each is removed only while it is still at the address
+/// this trace set it at, as `skdispatch` removes the breakpoint it owns.
+fn disarm_pool_trace(e: &DebugEngine, trace: Option<PoolTrace>) -> bool {
+    let Some(trace) = trace else {
+        return false;
+    };
+    let held = e.breakpoints().unwrap_or_default();
+    let recorder = trace.recorder.borrow();
+    for (id, phase) in recorder.armed() {
+        let expected = expected_address(recorder.sites(), phase);
+        if held
+            .iter()
+            .any(|breakpoint| breakpoint.id == id && breakpoint.address == expected)
+        {
+            let _ = e.remove_breakpoint(id);
+        }
+    }
+    let _ = e.clear_breakpoint_callback();
+    true
+}
+
+/// Where a trace breakpoint was set.
+fn expected_address(
+    sites: &[crate::pooltrace::Site],
+    phase: crate::pooltrace::Phase,
+) -> Option<u64> {
+    match phase {
+        crate::pooltrace::Phase::Entry(index) => sites.get(index).map(|site| site.call),
+        crate::pooltrace::Phase::Return(index) => sites.get(index).and_then(|site| site.returns_to),
+    }
+}
+
+/// What the session's pool trace has recorded, and with `stop`, disarms it.
+fn read_pool_trace(
+    e: &DebugEngine,
+    stop: bool,
+    slot: &mut Option<PoolTrace>,
+) -> Result<Output, Failed> {
+    let Some(trace) = slot.as_ref() else {
+        return Err(Failed::categorised(
+            structured::ErrorCategory::InvalidArgument,
+            "this session holds no pool trace to read.".to_string(),
+        ));
+    };
+    let report = {
+        let recorder = trace.recorder.borrow();
+        let held = e.breakpoints().unwrap_or_default();
+        let missing_breakpoints = recorder
+            .armed()
+            .filter(|&(id, phase)| {
+                let expected = expected_address(recorder.sites(), phase);
+                !held
+                    .iter()
+                    .any(|breakpoint| breakpoint.id == id && breakpoint.address == expected)
+            })
+            .count();
+        let allocations = recorder
+            .allocations()
+            .iter()
+            .map(|allocation| traced_allocation(recorder.sites(), &trace.locations, allocation))
+            .collect();
+        structured::PoolTrace {
+            module: trace.module.clone(),
+            armed: !stop,
+            allocations,
+            limit: recorder.limit(),
+            full: recorder.full(),
+            dropped: recorder.dropped(),
+            pending: recorder.pending(),
+            unreadable_hits: recorder.unreadable_hits(),
+            missing_breakpoints,
+        }
+    };
+    if stop {
+        disarm_pool_trace(e, slot.take());
+    }
+    Ok(Output::typed(render_pool_trace(&report), report))
+}
+
+/// One recorded allocation, as the wire type: its arguments read by the allocator's layout.
+fn traced_allocation(
+    sites: &[crate::pooltrace::Site],
+    locations: &[structured::CodeLocation],
+    allocation: &crate::pooltrace::Allocation,
+) -> structured::TracedAllocation {
+    let site = &sites[allocation.site];
+    let layout = crate::pooltrace::layout_of(&site.allocator);
+    let argument = |index: usize| allocation.arguments.get(index).copied().unwrap_or_default();
+    let raw_tag = layout
+        .and_then(|layout| layout.tag)
+        .map(|index| argument(index) as u32);
+    let (pool_flags, pool_type) = match layout.map(|layout| layout.kind) {
+        Some(crate::pooltrace::KindArgument::Flags) => (Some(format!("{:#x}", argument(0))), None),
+        Some(crate::pooltrace::KindArgument::Type) => (None, Some(argument(0) as u32)),
+        None => (None, None),
+    };
+    structured::TracedAllocation {
+        sequence: allocation.sequence,
+        allocator: site.allocator.clone(),
+        call_site: locations[allocation.site].clone(),
+        thread: structured::addr(allocation.thread),
+        size: layout
+            .map(|layout| argument(layout.size))
+            .unwrap_or_default(),
+        tag: raw_tag.map(dbgscope::pool::tag_label),
+        raw_tag: raw_tag.map(dbgscope::pool::raw_tag_hex),
+        pool_flags,
+        pool_type,
+        address: allocation.address.map(structured::addr),
+    }
+}
+
+/// What was armed, for the text half of the answer. Names no tool: it is built here, in the
+/// worker, which has never heard of the client's surface.
+fn render_pool_trace_armed(report: &structured::PoolTraceArmed) -> String {
+    let mut out = format!(
+        "Pool trace on {} at {}: {} call site(s) armed, recording up to {} allocation(s).\n",
+        report.module,
+        report.base,
+        report.sites.len(),
+        report.limit
+    );
+    if report.replaced {
+        out.push_str("  It replaced the trace this session held, which is disarmed.\n");
+    }
+    for site in &report.sites {
+        let at = match (&site.call_site.module, &site.call_site.rva) {
+            (Some(module), Some(rva)) => format!("{module}+{rva}"),
+            _ => site.call_site.address.clone(),
+        };
+        let returns = if site.returns {
+            ""
+        } else {
+            "  (jumps to it: traced at the call, no address)"
+        };
+        out.push_str(&format!("  {:<28} {at}{returns}\n", site.allocator));
+    }
+    if report.sites.is_empty() {
+        out.push_str(
+            "  No call to a pool allocator was found in code that could be read, so nothing is \
+             armed.\n",
+        );
+    }
+    if report.unarmed_call_sites > 0 {
+        out.push_str(&format!(
+            "  {} call(s) to a pool allocator were found and not armed -- past the scan's cap on \
+             the sites it lists, or not decoding again as a call -- so their allocations are not \
+             recorded.\n",
+            report.unarmed_call_sites
+        ));
+    }
+    if report.unread_bytes > 0 {
+        out.push_str(&format!(
+            "  {} byte(s) of the driver's code could not be read, so any call site in them is not \
+             armed. On a live kernel that is pageable code not resident: running the driver brings \
+             it in, and arming again then finds what it holds.\n",
+            report.unread_bytes
+        ));
+    }
+    if !report.sites.is_empty() {
+        out.push_str(
+            "  Nothing is recorded until the target runs: each allocation is recorded as it is \
+             made, and the target stops when the trace is full.\n",
+        );
+    }
+    out
+}
+
+/// What a trace recorded, for the text half of the answer. Names no tool, for the same reason.
+fn render_pool_trace(report: &structured::PoolTrace) -> String {
+    let mut out = format!(
+        "Pool trace on {}: {} allocation(s) of up to {}{}.\n",
+        report.module,
+        report.allocations.len(),
+        report.limit,
+        if report.full { ", FULL" } else { "" }
+    );
+    for note in [
+        (report.dropped > 0)
+            .then(|| format!("{} more made after it filled, not recorded", report.dropped)),
+        (report.pending > 0)
+            .then(|| format!("{} call(s) made and not yet returned", report.pending)),
+        (report.unreadable_hits > 0).then(|| {
+            format!(
+                "{} hit(s) whose registers could not be read",
+                report.unreadable_hits
+            )
+        }),
+        (report.missing_breakpoints > 0).then(|| {
+            format!(
+                "{} of its breakpoints are no longer held, so their sites have recorded nothing \
+                 since",
+                report.missing_breakpoints
+            )
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        out.push_str(&format!("  {note}\n"));
+    }
+    if !report.allocations.is_empty() {
+        let mut rows = String::from("seq  size        tag   address             call site\n");
+        for allocation in &report.allocations {
+            let at = match (&allocation.call_site.module, &allocation.call_site.rva) {
+                (Some(module), Some(rva)) => format!("{module}+{rva}"),
+                _ => allocation.call_site.address.clone(),
+            };
+            rows.push_str(&format!(
+                "{:<4} {:<#11x} {:<5} {:<19} {at}\n",
+                allocation.sequence,
+                allocation.size,
+                allocation
+                    .tag
+                    .as_deref()
+                    .map(|tag| structured::renderable(tag).into_owned())
+                    .unwrap_or_else(|| "-".to_string()),
+                allocation.address.as_deref().unwrap_or("-"),
+            ));
+        }
+        out.push_str(&fenced(&rows));
+    }
+    out.push_str(if report.armed {
+        "  The trace is still armed.\n"
+    } else {
+        "  The trace is disarmed: its breakpoints are removed.\n"
+    });
+    out
 }
 
 /// The image's own unwind table, asked one address at a time
@@ -12915,7 +13431,14 @@ mod tests {
     }
 
     /// The functions a driver scan's work is spread across, in flow order.
-    const SCAN: &[&str] = &["driver_hazards", "scan_of", "hazards_of", "hazards_at"];
+    const SCAN: &[&str] = &[
+        "driver_hazards",
+        "scan_of",
+        "hazards_of",
+        "loaded_module_named",
+        "hazards_at",
+        "scan_driver",
+    ];
 
     /// Every function a deadline-carrying target resolution now spans.
     ///
@@ -13579,6 +14102,71 @@ mod tests {
              symbol fetch there blocks the session's one thread with no poll able to run. Use \
              `resolve_within` with what `remaining` reports."
         );
+    }
+
+    /// **A traced allocation's arguments are read by its allocator's layout**, which is the one
+    /// place the first argument becomes flags or a pool type and the third becomes a tag or nothing.
+    ///
+    /// What each register holds is the calling convention's; what it *means* differs between the
+    /// allocators, and getting it wrong is silent -- a `POOL_FLAGS` mask printed as a `POOL_TYPE`
+    /// is a plausible small number. The values are the ones measured on the bench's HEVD:
+    /// `NonPagedPoolNx` and the tag `Hack`, whose register holds `kcaH` read as a little-endian
+    /// word. The tag is truncated to its 32 bits because only those are the argument; the register's
+    /// upper half is whatever the caller left there.
+    #[test]
+    fn a_traced_allocations_arguments_are_read_by_its_allocators_layout() {
+        let site = |allocator: &str| crate::pooltrace::Site {
+            allocator: allocator.to_string(),
+            call: 0x1000,
+            returns_to: Some(0x1004),
+        };
+        let sites = [
+            site("ExAllocatePool2"),
+            site("ExAllocatePoolWithTag"),
+            site("ExAllocatePool"),
+        ];
+        let at = structured::CodeLocation {
+            address: structured::addr(0x1000),
+            module: Some("drv".to_string()),
+            rva: Some("0x1000".to_string()),
+            attribution_failed: false,
+        };
+        let locations = [at.clone(), at.clone(), at];
+        let read = |index: usize, arguments: [u64; 3]| {
+            traced_allocation(
+                &sites,
+                &locations,
+                &crate::pooltrace::Allocation {
+                    sequence: 0,
+                    site: index,
+                    thread: 0xa,
+                    arguments,
+                    address: Some(0xffff_c386_c12c_0770),
+                },
+            )
+        };
+
+        let flags = read(0, [0x40, 0x20, 0xdead_beef_6b63_6148]);
+        assert_eq!(flags.pool_flags.as_deref(), Some("0x40"));
+        assert_eq!(flags.pool_type, None, "a flags mask is not a pool type");
+        assert_eq!(flags.size, 0x20);
+        assert_eq!(
+            (flags.tag.as_deref(), flags.raw_tag.as_deref()),
+            (Some("Hack"), Some("0x4861636b")),
+            "the tag is the argument's low 32 bits, whatever is above them"
+        );
+
+        let typed = read(1, [0x200, 0x10, 0x6b63_6148]);
+        assert_eq!(typed.pool_type, Some(0x200));
+        assert_eq!(typed.pool_flags, None, "a pool type is not a flags mask");
+
+        let untagged = read(2, [0, 0x10, 0x6b63_6148]);
+        assert_eq!(
+            (untagged.tag, untagged.raw_tag),
+            (None, None),
+            "`ExAllocatePool` takes no tag, so its third register is not one"
+        );
+        assert_eq!(untagged.pool_type, Some(0));
     }
 
     /// Every read the PE parser makes is confined to the module the loader mapped.

@@ -1,7 +1,7 @@
-//! Which of this server's seventy-six tools a run advertises.
+//! Which of this server's seventy-eight tools a run advertises.
 //!
 //! The tool surface is paid **once per conversation, before anything is debugged**, and it is
-//! 119,658 bytes — roughly 30k tokens (measured 2026-10-09; every figure here moves with any edit
+//! 122,592 bytes — roughly 30k tokens (measured 2026-10-09; every figure here moves with any edit
 //! to a description, so re-derive rather than cite). Seven tenths of that is prose, and the prose is what tells
 //! a model how to drive the tools, so there is no strip here the way there was in
 //! [`crate::schema`]: `FOLLOWUPS.md` item 24 measured it and the only honest lever left is the one
@@ -16,12 +16,13 @@
 //! # What a group is
 //!
 //! A group is *an activity*, not a subsystem: the tools you reach for while doing one kind of
-//! debugging. A caller reading a crash dump has no use for the nine TTD tools or the ten allocator
-//! ones, and pays 23,958 bytes for them at the start of every conversation.
+//! debugging. A caller reading a crash dump has no use for the nine TTD tools or the twelve
+//! allocator ones, and pays 26,930 bytes for them at the start of every conversation.
 //!
 //! ```text
 //!   group        tools   bytes   what it is for
-//!   allocator       10   16,906  pool and heap walks, and `walk_memory`
+//!   allocator       12   19,840  pool and heap walks, a driver's pool allocation trace, and
+//!                                  `walk_memory`
 //!   inspect         10   13,485  registers, stacks, memory, modules, symbols, location, raw commands
 //!   session         10   14,208  opening a target, ending it, and watching this server
 //!   exec            10   15,087  breakpoints and execution control
@@ -35,7 +36,7 @@
 //! ```
 //!
 //! Those bytes are a measurement of **2026-10-09** and move with any edit to a description — the
-//! whole surface they are shares of is 76 tools and 119,658 B, which is what the rows above sum to.
+//! whole surface they are shares of is 78 tools and 122,592 B, which is what the rows above sum to.
 //! Re-derive rather than quoting them.
 //!
 //! **Those are shares of the whole surface, and they do not sum to a narrowed one.** `crash` reads
@@ -60,7 +61,7 @@
 //!
 //! A listener names its clients already ([`crate::client`]), and they do not have one budget
 //! between them: the arrangement this exists for is a local model that can hold twenty-three tools
-//! and a hosted client that can hold seventy-six, pointed at the same Windows box and the same debug
+//! and a hosted client that can hold seventy-eight, pointed at the same Windows box and the same debug
 //! sessions and told apart by their bearer tokens. So a client may be configured with a spec of
 //! its own — `WINDBG_MCP_TOOLS_<NAME>`, or a `tools` field in the credential file — and is served
 //! that instead of the run's. The run's `--tools` is the **default**, not a ceiling: a client's
@@ -190,6 +191,8 @@ const GROUPS: &[Group] = &[
             "pool_chunk",
             "pool_census",
             "pool_diagnostics",
+            "pool_trace",
+            "pool_trace_read",
             "heap_list",
             "heap_allocations",
             "heap_chunk",
@@ -572,7 +575,7 @@ mod tests {
         assert!(set.includes("end_session"));
         assert!(!set.includes("ttd_calls"));
         assert!(!set.includes("debug_batch"));
-        assert_eq!(set.summary(), "13 of 76 tools (session, crash)");
+        assert_eq!(set.summary(), "13 of 78 tools (session, crash)");
     }
 
     #[test]
@@ -583,7 +586,7 @@ mod tests {
         assert!(!set.includes("disassemble"));
         assert_eq!(
             set.summary(),
-            "12 of 76 tools (session, backtrace, registers)"
+            "12 of 78 tools (session, backtrace, registers)"
         );
     }
 
@@ -695,7 +698,7 @@ mod tests {
         // Both name the tool and what is served, because those do not depend on who chose it.
         for said in [&run, &own] {
             assert!(said.contains("`debug_batch`"), "{said}");
-            assert!(said.contains("13 of 76 tools (session, crash)"), "{said}");
+            assert!(said.contains("13 of 78 tools (session, crash)"), "{said}");
         }
     }
 

@@ -2,7 +2,7 @@
   "schemaDialects": [
     "https://json-schema.org/draft/2020-12/schema"
   ],
-  "toolCount": 76,
+  "toolCount": 78,
   "tools": [
     {
       "hints": {
@@ -1540,6 +1540,79 @@
         "tag"
       ],
       "title": "Find pool chunks by tag"
+    },
+    {
+      "hints": {
+        "destructive": true,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "pool_trace",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/PoolTraceArmed",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
+      "params": [
+        "max_allocations: integer|null/uint32",
+        "module: string",
+        "session_id: string|null"
+      ],
+      "required": [
+        "module"
+      ],
+      "title": "Trace a driver's pool allocations"
+    },
+    {
+      "hints": {
+        "destructive": true,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "pool_trace_read",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/PoolTrace",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
+      "params": [
+        "session_id: string|null",
+        "stop: boolean|null"
+      ],
+      "required": [],
+      "title": "Read a pool trace"
     },
     {
       "hints": {

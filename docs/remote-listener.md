@@ -6,8 +6,8 @@ the machine DbgEng needs — a Mac driving a Windows VM, say.
 
 **`--tools` works here exactly as it does on stdio**, and matters more: the client at the far end
 may be a local model whose window is bought in RAM. `--listen 127.0.0.1:8765 --tools
-session,inspect,crash` serves 23 tools and 34,092 B of model context instead of the default 64 and
-100,645 B — the
+session,inspect,crash` serves 23 tools and 34,092 B of model context instead of the default 66 and
+103,579 B — the
 README has the table, and [`local-model.md`](./local-model.md) is the runbook it was measured for.
 It is this listener's **default**: a client may be given a surface of its own, which is what lets
 one server hold a local model and a hosted client at once — see [A tool surface per

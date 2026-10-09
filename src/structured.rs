@@ -3466,6 +3466,96 @@ pub enum ImportsNamedFrom {
     },
 }
 
+/// What `pool_trace` armed: one driver's pool-allocator call sites, each with a breakpoint on the
+/// call and one after it.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PoolTraceArmed {
+    /// The driver traced, and where it is loaded.
+    pub module: String,
+    pub base: String,
+    /// Every call site armed, one per call to a pool allocator in code that could be read.
+    pub sites: Vec<TraceSite>,
+    /// How many allocations the trace records before it stops the target.
+    pub limit: usize,
+    /// Whether this replaced a trace the session already had, which is disarmed first.
+    pub replaced: bool,
+    /// Bytes of the driver's code that could not be read, so any call site in them was neither
+    /// found nor armed. On a live kernel that is pageable code not resident -- the driver running
+    /// brings it in, and arming again then finds what it holds.
+    pub unread_bytes: u64,
+    /// Calls to a pool allocator the scan found and this did not arm: past the scan's cap on the
+    /// call sites it lists, or not decoding again as a call or a jump. Their allocations are not
+    /// recorded.
+    pub unarmed_call_sites: usize,
+    /// Where the driver's imports were named from, as in `driver_hazards`.
+    pub imports_named_from: ImportsNamedFrom,
+}
+
+/// One armed call site.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TraceSite {
+    /// The pool allocator the call reaches, as the driver imports it.
+    pub allocator: String,
+    pub call_site: CodeLocation,
+    /// False for a site that **jumps** to the allocator: it never returns there, so it is traced
+    /// at the call alone and its allocations carry no address.
+    pub returns: bool,
+}
+
+/// What a pool trace has recorded so far.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PoolTrace {
+    /// The driver traced.
+    pub module: String,
+    /// Whether the trace is still armed after this call.
+    pub armed: bool,
+    /// The allocations, in the order they completed.
+    pub allocations: Vec<TracedAllocation>,
+    /// How many allocations the trace records before it stops the target.
+    pub limit: usize,
+    /// Whether the limit was reached. The allocation that reached it stopped the target; later
+    /// ones were let through and counted in `dropped`.
+    pub full: bool,
+    /// Allocations made after the trace filled, counted rather than recorded.
+    pub dropped: u64,
+    /// Calls seen made and not yet seen return: allocations in flight when the target stopped.
+    pub pending: usize,
+    /// Hits whose registers could not be read, counted rather than recorded.
+    pub unreadable_hits: u64,
+    /// Breakpoints this trace set that the session no longer holds -- removed by something else,
+    /// such as clearing every breakpoint -- so the sites they were on have recorded nothing since.
+    pub missing_breakpoints: usize,
+}
+
+/// One allocation a pool trace saw made.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TracedAllocation {
+    /// The order the call was made in, from zero, across the trace.
+    pub sequence: u64,
+    pub allocator: String,
+    pub call_site: CodeLocation,
+    /// The thread that made it: on a kernel, its `KTHREAD`.
+    pub thread: String,
+    /// The bytes asked for.
+    pub size: u64,
+    /// The tag as the debugger prints it, where the allocator takes one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    /// The same tag as its four bytes in memory order: what `pool_find_tag` takes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_tag: Option<String>,
+    /// `POOL_FLAGS`, for `ExAllocatePool2` and `ExAllocatePool3`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_flags: Option<String>,
+    /// `POOL_TYPE`, for the older allocators.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_type: Option<u32>,
+    /// What the allocator returned -- the address `pool_chunk` places. Absent for a site traced
+    /// at the call alone; zero where the allocation failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+}
+
 /// Which half of a hazard scan came up short, since the two are read from different things.
 ///
 /// **A value rather than a sentence**, because the sentence is the part that was wrong: one shared

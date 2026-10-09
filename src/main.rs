@@ -42,6 +42,7 @@ mod kdwire;
 mod listen;
 mod livesrc;
 mod logbridge;
+mod pooltrace;
 mod progress;
 mod proto;
 mod record;

@@ -543,6 +543,23 @@ pub enum EngineOp {
         query: PoolOp,
         patience_ms: u32,
     },
+    /// Arm a trace of one driver's pool allocations: a breakpoint on each pool-allocator call site
+    /// in its readable code and one after it, and a breakpoint callback that records each call as
+    /// the target runs. Replaces a trace the session already holds. Records nothing by itself --
+    /// the allocations are made during whatever run comes next.
+    PoolTraceArm {
+        /// The driver, as `modules` names it.
+        module: String,
+        /// How many allocations to record before stopping the target.
+        limit: usize,
+        /// The scan that finds the call sites is a whole-image decode, bounded like
+        /// [`Self::DriverHazards`]'s.
+        patience_ms: u32,
+    },
+    /// What the session's pool trace has recorded, and with `stop`, disarm it.
+    PoolTraceRead {
+        stop: bool,
+    },
     /// A user-mode Segment Heap query, with the same queue-aware deadline and interrupt
     /// semantics as [`Self::Pool`].
     Heap {
@@ -689,6 +706,7 @@ impl EngineOp {
             | Self::Walk(WalkOp { patience_ms, .. })
             | Self::Reachability(ReachabilityOp { patience_ms, .. })
             | Self::DriverHazards { patience_ms, .. }
+            | Self::PoolTraceArm { patience_ms, .. }
             | Self::Xrefs { patience_ms, .. }
             | Self::IoctlMap { patience_ms, .. }
             | Self::IrpStack { patience_ms, .. }

@@ -130,14 +130,14 @@ Seventy-six tools in nine `--tools` groups; the rows below split some of those g
 | TTD nav | `ttd` | `step_back` (`t-`), `step_over_back` (`p-`), `reverse_go` (`g-`), `goto_position` (`!tt`) |
 | TTD analysis | `ttd` | `ttd_calls`, `ttd_memory`, `ttd_events`, `index_trace`, `record_trace` |
 | Driver IOCTL | `ioctl` | `decode_ioctl`, `driver_object`, `device_object`, `irp_stack`, `ioctl_trace`, `reachable_from_dispatch`, `driver_hazards`, `ioctl_map` — the control codes a dispatch routine accepts, recovered from its own code and decoded; `xrefs_to` — which sites in an image call or branch to one address, read off decoded control flow, with module+RVA and section on each; `device_security` — who may open a device: its descriptor as principals and access masks, `FILE_DEVICE_SECURE_OPEN`, and the symbolic links that reach it; `driver_surface` — one driver in one call: its dispatch table, its devices with the gate on each (no symbolic links), `ioctl_map`'s answer and `driver_hazards`', each section reporting its own status |
-| Kernel pool | `allocator` | `pool_find_tag`, `pool_chunk`, `pool_census`, `pool_diagnostics` |
+| Kernel pool | `allocator` | `pool_find_tag`, `pool_chunk`, `pool_census`, `pool_diagnostics`; `pool_trace` — one driver's pool allocations recorded as a live kernel runs, from breakpoints on that driver's own call sites, so no other caller of the allocator stops the target; `pool_trace_read` — what it recorded: size, tag, flags or pool type, the address returned and the thread |
 | User Segment Heap | `allocator` | `heap_list`, `heap_allocations`, `heap_chunk`, `heap_census`, `heap_diagnostics` |
 | Structure walk | `allocator` | `walk_memory` |
 | Raw     | `inspect` | `execute` — run any debugger command, returns full text output |
 | Secure Kernel (extra) | `securekernel` | Capture: `open_sk_capture`, `sk_modules`, `sk_read_memory`, `sk_symbol`. Live selected-VP control: `open_sk_live_control`, `sk_live_arm`, `sk_live_wait`, `sk_live_registers`, `sk_live_read_memory`, `sk_live_step`, `sk_live_continue`, plus the managed `open_sk_kd` facade. This extra group is omitted by default; name it or use `--tools all`. Capture needs an admitted Windows SDK saved-state provider root; live control needs startup policy, an operator-supplied privileged provider and an exact-build `vmwp` profile. |
 
 The ordinary eight groups are served by default; the `securekernel` extra is opt-in. Explicit
-`--tools all` serves all seventy-six. `--tools session,inspect,crash` cuts the surface to twenty-three
+`--tools all` serves all seventy-eight. `--tools session,inspect,crash` cuts the surface to twenty-three
 tools, and a `--listen` client can be given a different surface from the run's default. The exact
 byte figures are **not restated here**: they live in the
 [`docs/tool-surface.md`](docs/tool-surface.md) tables, which

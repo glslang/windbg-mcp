@@ -415,6 +415,24 @@
       "wire": 8545
     },
     {
+      "annotations": 133,
+      "description": 1144,
+      "inputSchema": 688,
+      "modelVisible": 1883,
+      "name": "pool_trace",
+      "outputSchema": 2411,
+      "wire": 4458
+    },
+    {
+      "annotations": 117,
+      "description": 491,
+      "inputSchema": 504,
+      "modelVisible": 1051,
+      "name": "pool_trace_read",
+      "outputSchema": 2454,
+      "wire": 3653
+    },
+    {
       "annotations": 90,
       "description": 655,
       "inputSchema": 2057,
@@ -686,15 +704,15 @@
     }
   ],
   "totals": {
-    "annotations": 8305,
-    "description": 44939,
-    "inputSchema": 70695,
+    "annotations": 8555,
+    "description": 46574,
+    "inputSchema": 71887,
     "instructions": 2022,
-    "modelVisible": 119658,
-    "outputSchema": 208149,
-    "payload": 338315,
-    "tools": 76,
-    "wire": 338228,
+    "modelVisible": 122592,
+    "outputSchema": 213014,
+    "payload": 346428,
+    "tools": 78,
+    "wire": 346339,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10308
   }
