@@ -2075,6 +2075,33 @@ impl HijackContext {
     }
 }
 
+impl VmwpDispatcher<'_> {
+    fn begin_disarm_inner(
+        &mut self,
+        targets: &[TargetIdentity],
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        targets
+            .first()
+            .context("running disarm requires at least one selected VP")?;
+        if self.state.targets != targets
+            || !matches!(self.state.phase, DispatcherPhase::ReadyForStop)
+            || self.state.retained_event.is_some()
+            || !self.state.attached
+            || self.state.breakpoint.is_none()
+        {
+            bail!("running disarm requires the armed target set with no retained event");
+        }
+
+        // Suspend-VM can block behind an attached DbgEng target even when no native event exists.
+        // Stop vmwp with the ordinary watchdog, remove the exact owned breakpoint, and detach
+        // before asking Hyper-V to pause. Reattach only after that pause proves provider-write
+        // quiescence; teardown still owns the registered callback and scratch allocation.
+        self.settle_native_completion(deadline)?;
+        self.pause_armed_without_event_inner(targets, deadline)
+    }
+}
+
 impl EventDispatcher for VmwpDispatcher<'_> {
     fn begin_arm(
         &mut self,
@@ -2117,24 +2144,11 @@ impl EventDispatcher for VmwpDispatcher<'_> {
     }
 
     fn begin_disarm(&mut self, targets: &[TargetIdentity]) -> Result<()> {
-        targets
-            .first()
-            .context("running disarm requires at least one selected VP")?;
-        if self.state.targets != targets
-            || !matches!(self.state.phase, DispatcherPhase::ReadyForStop)
-            || self.state.retained_event.is_some()
-            || !self.state.attached
-            || self.state.breakpoint.is_none()
-        {
-            bail!("running disarm requires the armed target set with no retained event");
-        }
+        self.begin_disarm_inner(targets, None)
+    }
 
-        // Suspend-VM can block behind an attached DbgEng target even when no native event exists.
-        // Stop vmwp with the ordinary watchdog, remove the exact owned breakpoint, and detach
-        // before asking Hyper-V to pause. Reattach only after that pause proves provider-write
-        // quiescence; teardown still owns the registered callback and scratch allocation.
-        self.settle_native_completion(None)?;
-        self.pause_armed_without_event(targets)
+    fn begin_disarm_until(&mut self, targets: &[TargetIdentity], deadline: Instant) -> Result<()> {
+        self.begin_disarm_inner(targets, Some(deadline))
     }
 
     fn finish_arm(&mut self) -> Result<()> {
@@ -2676,10 +2690,6 @@ impl VmwpDispatcher<'_> {
         self.state.claim_vm_pause(targets)?;
         run_vm_action_until(&target.vm_id, VmAction::Pause, deadline)?;
         self.state.confirm_vm_pause()
-    }
-
-    fn pause_armed_without_event(&mut self, targets: &[TargetIdentity]) -> Result<()> {
-        self.pause_armed_without_event_inner(targets, None)
     }
 
     fn pause_armed_without_event_inner(
