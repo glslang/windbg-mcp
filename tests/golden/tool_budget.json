@@ -429,8 +429,8 @@
       "inputSchema": 504,
       "modelVisible": 1051,
       "name": "pool_trace_read",
-      "outputSchema": 2454,
-      "wire": 3653
+      "outputSchema": 2537,
+      "wire": 3736
     },
     {
       "annotations": 90,
@@ -709,10 +709,10 @@
     "inputSchema": 71887,
     "instructions": 2022,
     "modelVisible": 122592,
-    "outputSchema": 213014,
-    "payload": 346428,
+    "outputSchema": 213097,
+    "payload": 346511,
     "tools": 78,
-    "wire": 346339,
+    "wire": 346422,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10308
   }

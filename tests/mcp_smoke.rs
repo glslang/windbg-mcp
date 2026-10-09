@@ -2266,11 +2266,11 @@ const MODEL_VISIBLE_CEILING: usize = 126_000;
 /// later adds 172 B, for a current payload of 337,540 B and 7,460 B (2.2%) of headroom.
 ///
 /// **345,000 -> 355,000 for the pool allocation trace** (2026-10-09). The payload moves 338,315 ->
-/// 346,428 B -- the golden's figure, which had moved from the 337,540 above by then. No shared type
-/// was inlined anywhere it was not before: no other tool's row moved, and the 8,113 B are the two
-/// new tools' 4,458 and 3,653 plus two array commas. Each is under `driver_hazards`' 5,872, and for
+/// 346,511 B -- the golden's figure, which had moved from the 337,540 above by then. No shared type
+/// was inlined anywhere it was not before: no other tool's row moved, and the 8,196 B are the two
+/// new tools' 4,458 and 3,736 plus two array commas. Each is under `driver_hazards`' 5,872, and for
 /// the same reason -- a result carrying a `CodeLocation` per call site, plus the error closure every
-/// outcome carries. The new ceiling leaves 8,572 B (2.4%).
+/// outcome carries. The new ceiling leaves 8,489 B (2.4%).
 const WIRE_CEILING: usize = 355_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,308
