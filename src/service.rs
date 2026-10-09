@@ -266,14 +266,20 @@ fn launch_arguments(addr: SocketAddr, tools: Option<&str>) -> Vec<OsString> {
         OsString::from(crate::listen::LISTEN_FLAG),
         OsString::from(addr.to_string()),
     ];
-    // Written through only when the install asked for one, so a service installed without it has
-    // the same command line it always had — and `--tools all` is not spelled out, because the
-    // absence already means it.
+    // Written through only when the install asked for one. Absence deliberately selects the
+    // ordinary default; a complete surface is stored explicitly as `--tools all`.
     if let Some(spec) = tools {
         args.push(OsString::from(crate::toolset::FLAG));
         args.push(OsString::from(spec));
     }
     args
+}
+
+fn configured_toolset(args: &[String]) -> Result<crate::toolset::Toolset> {
+    match crate::toolset::Toolset::requested(args) {
+        Some(surface) => surface.map_err(|error| anyhow::anyhow!(error)),
+        None => Ok(crate::toolset::Toolset::default()),
+    }
 }
 
 /// Where the service reads its bearer token from.
@@ -838,7 +844,7 @@ pub fn edit_client(edit: ClientEdit, name: &str, tools: Option<&str>) -> Result<
             if credentials.is_empty() {
                 bail!(
                     "`{name}` is the only client `{NAME}` has, and a listener with no credentials \
-                     refuses to start — it exposes every tool this server has, including the ones \
+                     refuses to start — it exposes every tool on its configured surface, including ones \
                      that write to a live kernel. Add the replacement first \
                      (`{ADD_CLIENT_FLAG} <name>`), or `{UNINSTALL_FLAG}` if the service is done."
                 );
@@ -898,7 +904,7 @@ pub fn edit_client(edit: ClientEdit, name: &str, tools: Option<&str>) -> Result<
         Some(spec) => format!("it is served `{spec}`"),
         None => format!(
             "it is served whatever `{NAME}` serves — `{}` on the command line the SCM stores, or \
-             every tool if that has none",
+             the ordinary groups if that has none",
             crate::toolset::FLAG
         ),
     };
@@ -1165,8 +1171,8 @@ pub fn list_clients(tools: Option<&str>) -> Result<()> {
         ),
         (Ok((source, clients)), false) if clients.is_empty() => println!(
             "\nAnd a foreground listener started from this shell would refuse to start: there are \
-             no clients in {source} either, and a listener without one exposes every tool this \
-             server has."
+             no clients in {source} either, and a listener without one exposes every tool on its \
+             configured surface."
         ),
         (Ok((source, clients)), installed) => println!(
             "\n{}A foreground listener started from this shell would accept: {} — from {source}. \
@@ -1847,12 +1853,9 @@ fn serve_as_service() -> Result<()> {
 
     // Off the same stored command line as the address, because that is the only place an install's
     // `--tools` survives to: the SCM stores this line once and nothing re-derives it, so an
-    // installer that accepted the flag and did not write it through would serve every tool at every
-    // start and never say why.
-    let tools = match crate::toolset::Toolset::requested(&args) {
-        Some(surface) => surface.map_err(|e| anyhow::anyhow!(e))?,
-        None => crate::toolset::Toolset::all(),
-    };
+    // installer that accepted the flag and did not write it through would serve the ordinary
+    // default at every start and never say why.
+    let tools = configured_toolset(&args)?;
 
     // The stop signal, and the acknowledgement that it has been acted on. A `oneshot` rather than a
     // flag because the SCM's handler runs on its own thread and must return promptly — it may only
@@ -2350,6 +2353,9 @@ mod tests {
         // And the flag the SCM passes is the one `requested` answers `Run` to, which is the join
         // between installing and starting that nothing else checks.
         assert_eq!(requested(&rendered), Some(Role::Run));
+        let default = configured_toolset(&rendered).expect("the service accepts its stored line");
+        assert!(default.includes("open_dump"));
+        assert!(!default.includes("open_sk_capture"));
 
         // The other half of the same join: an install told to narrow the surface has to write that
         // through, because this line is the *only* place the choice survives to. The service reads
@@ -2372,6 +2378,10 @@ mod tests {
         assert!(surface.includes("crash_triage"));
         assert!(surface.includes("open_dump"));
         assert!(!surface.includes("ttd_calls"));
+
+        let complete = render(launch_arguments(addr, Some(crate::toolset::ALL)));
+        let surface = configured_toolset(&complete).expect("the service accepts explicit all");
+        assert!(surface.includes("open_sk_capture"));
     }
 
     /// The file the installer writes is the file the listener reads — asserted end to end, because

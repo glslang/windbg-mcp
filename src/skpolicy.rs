@@ -15,9 +15,16 @@ pub(crate) const POLICY_ENV: &str = "WINDBG_MCP_SK_LIVE_POLICY";
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PolicyFile {
+    #[serde(default)]
     disposable_vm_ids: Vec<String>,
+    #[serde(default)]
     transport_commands: Vec<String>,
+    #[serde(default)]
     profile_roots: Vec<PathBuf>,
+    #[serde(default)]
+    kit_roots: Vec<PathBuf>,
+    #[serde(default)]
+    max_pause_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -25,6 +32,8 @@ pub(crate) struct Policy {
     disposable_vm_ids: BTreeSet<String>,
     transport_commands: BTreeSet<Vec<String>>,
     profile_roots: Vec<String>,
+    kit_roots: Vec<String>,
+    max_pause_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -32,6 +41,7 @@ pub(crate) struct AuthorizedLive {
     pub(crate) profile: PathBuf,
     pub(crate) control_transport: String,
     pub(crate) live_transport: String,
+    pub(crate) max_pause_ms: u64,
 }
 
 impl Policy {
@@ -48,14 +58,23 @@ impl Policy {
     }
 
     fn from_file(file: PolicyFile) -> Result<Self> {
-        if file.disposable_vm_ids.is_empty()
-            || file.transport_commands.is_empty()
-            || file.profile_roots.is_empty()
-        {
+        let live_dimensions = [
+            !file.disposable_vm_ids.is_empty(),
+            !file.transport_commands.is_empty(),
+            !file.profile_roots.is_empty(),
+        ];
+        let has_live_authority = live_dimensions.iter().all(|present| *present);
+        if live_dimensions.iter().any(|present| *present) && !has_live_authority {
             bail!(
-                "Secure Kernel policy must admit at least one disposable VM, transport command \
-                 and profile root"
+                "Secure Kernel live policy must supply disposable_vm_ids, transport_commands and \
+                 profile_roots together"
             );
+        }
+        if has_live_authority && file.max_pause_ms.is_none() {
+            bail!("Secure Kernel live policy must fix max_pause_ms at server startup");
+        }
+        if !has_live_authority && file.kit_roots.is_empty() {
+            bail!("Secure Kernel policy must admit live authority, at least one kit root, or both");
         }
         let mut disposable_vm_ids = BTreeSet::new();
         for vm_id in file.disposable_vm_ids {
@@ -74,10 +93,27 @@ impl Policy {
                 canonical_directory(&path, "profile root").map(|path| normalized_path(&path))
             })
             .collect::<Result<Vec<_>>>()?;
+        let kit_roots = file
+            .kit_roots
+            .into_iter()
+            .map(|path| {
+                canonical_directory(&path, "Windows Kit root").map(|path| normalized_path(&path))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(max_pause_ms) = file.max_pause_ms
+            && (max_pause_ms == 0 || max_pause_ms > crate::kdtarget::MAX_MANAGED_TIMEOUT_MS)
+        {
+            bail!(
+                "Secure Kernel policy max_pause_ms must be in 1..={}",
+                crate::kdtarget::MAX_MANAGED_TIMEOUT_MS
+            );
+        }
         Ok(Self {
             disposable_vm_ids,
             transport_commands,
             profile_roots,
+            kit_roots,
+            max_pause_ms: file.max_pause_ms,
         })
     }
 
@@ -107,11 +143,52 @@ impl Policy {
         }
         let control_transport = self.authorize_transport("control_transport", control_transport)?;
         let live_transport = self.authorize_transport("live_transport", live_transport)?;
+        let max_pause_ms = self.max_pause_ms.context(
+            "Secure Kernel startup policy has no max_pause_ms; live control remains disabled",
+        )?;
         Ok(AuthorizedLive {
             profile,
             control_transport,
             live_transport,
+            max_pause_ms,
         })
+    }
+
+    /// Select a canonical Windows Kit root fixed by startup policy. The worker receives this
+    /// canonical root even when the request omitted `kit`, so provider discovery cannot fall back
+    /// to a path the operator did not admit.
+    pub(crate) fn authorize_capture_kit(
+        &self,
+        requested: Option<&Path>,
+        version: Option<&str>,
+    ) -> Result<PathBuf> {
+        if self.kit_roots.is_empty() {
+            bail!(
+                "Secure Kernel startup policy has no kit_roots; capture provider loading remains disabled"
+            );
+        }
+        if let Some(version) = version {
+            let mut components = Path::new(version).components();
+            if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+                || components.next().is_some()
+            {
+                bail!("kit_version must be one directory name, not a path");
+            }
+        }
+        let requested = requested.unwrap_or_else(|| Path::new(crate::savedstate::DEFAULT_KIT_ROOT));
+        let canonical = canonical_directory(requested, "Windows Kit root")?;
+        let normalized = normalized_path(&canonical);
+        if !self
+            .kit_roots
+            .iter()
+            .any(|root| Path::new(&normalized).starts_with(Path::new(root)))
+        {
+            bail!(
+                "Windows Kit root {} is outside every startup-policy kit root",
+                canonical.display()
+            );
+        }
+        Ok(canonical)
     }
 
     fn authorize_transport(&self, name: &str, command: &str) -> Result<String> {
@@ -223,8 +300,128 @@ mod tests {
             disposable_vm_ids: Vec::new(),
             transport_commands: Vec::new(),
             profile_roots: Vec::new(),
+            kit_roots: Vec::new(),
+            max_pause_ms: None,
         };
         assert!(Policy::from_file(empty).is_err());
+    }
+
+    #[test]
+    fn capture_only_policy_does_not_require_live_provider_authority() {
+        let root = std::env::temp_dir().canonicalize().unwrap();
+        let capture_only = PolicyFile {
+            disposable_vm_ids: Vec::new(),
+            transport_commands: Vec::new(),
+            profile_roots: Vec::new(),
+            kit_roots: vec![root.clone()],
+            max_pause_ms: None,
+        };
+        let policy = Policy::from_file(capture_only).unwrap();
+        assert_eq!(
+            policy.authorize_capture_kit(Some(&root), None).unwrap(),
+            root
+        );
+    }
+
+    #[test]
+    fn partial_live_authority_is_rejected_at_startup() {
+        let partial = PolicyFile {
+            disposable_vm_ids: vec!["51749a1f-f939-44f5-b251-1251ef5b64a3".to_string()],
+            transport_commands: Vec::new(),
+            profile_roots: Vec::new(),
+            kit_roots: vec![std::env::temp_dir()],
+            max_pause_ms: Some(600_000),
+        };
+        assert!(Policy::from_file(partial).is_err());
+    }
+
+    #[test]
+    fn live_authority_requires_an_operator_fixed_pause_bound() {
+        let executable = std::env::current_exe().unwrap();
+        let command = format!("\"{}\" --fixture", executable.display());
+        let directory = std::env::temp_dir().canonicalize().unwrap();
+        let file = PolicyFile {
+            disposable_vm_ids: vec!["51749a1f-f939-44f5-b251-1251ef5b64a3".to_string()],
+            transport_commands: vec![command],
+            profile_roots: vec![directory],
+            kit_roots: Vec::new(),
+            max_pause_ms: None,
+        };
+
+        let error = Policy::from_file(file).unwrap_err();
+        assert!(error.to_string().contains("max_pause_ms"), "{error:#}");
+    }
+
+    #[test]
+    fn startup_pause_bound_uses_the_managed_timeout_domain() {
+        let executable = std::env::current_exe().unwrap();
+        let command = format!("\"{}\" --fixture", executable.display());
+        let directory = std::env::temp_dir().canonicalize().unwrap();
+
+        for max_pause_ms in [0, crate::kdtarget::MAX_MANAGED_TIMEOUT_MS + 1] {
+            let file = PolicyFile {
+                disposable_vm_ids: vec!["51749a1f-f939-44f5-b251-1251ef5b64a3".to_string()],
+                transport_commands: vec![command.clone()],
+                profile_roots: vec![directory.clone()],
+                kit_roots: Vec::new(),
+                max_pause_ms: Some(max_pause_ms),
+            };
+            let error = Policy::from_file(file).unwrap_err();
+            assert!(
+                error.to_string().contains("max_pause_ms must be in"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_kit_must_resolve_beneath_an_operator_root() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let admitted = std::env::temp_dir().join(format!(
+            "windbg-mcp-policy-kit-admitted-{}-{unique}",
+            std::process::id()
+        ));
+        let outside = std::env::temp_dir().join(format!(
+            "windbg-mcp-policy-kit-outside-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&admitted).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let canonical = admitted.canonicalize().unwrap();
+        let policy = Policy {
+            disposable_vm_ids: BTreeSet::new(),
+            transport_commands: BTreeSet::new(),
+            profile_roots: Vec::new(),
+            kit_roots: vec![normalized_path(&canonical)],
+            max_pause_ms: None,
+        };
+
+        assert_eq!(
+            policy
+                .authorize_capture_kit(Some(&admitted), Some("10.0.26100.0"))
+                .unwrap(),
+            canonical
+        );
+        assert!(
+            policy
+                .authorize_capture_kit(Some(&outside), None)
+                .unwrap_err()
+                .to_string()
+                .contains("outside every startup-policy kit root")
+        );
+        assert!(
+            policy
+                .authorize_capture_kit(Some(&admitted), Some("..\\outside"))
+                .unwrap_err()
+                .to_string()
+                .contains("one directory name")
+        );
+
+        std::fs::remove_dir_all(admitted).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
     }
 
     #[test]
@@ -236,6 +433,8 @@ mod tests {
             disposable_vm_ids: BTreeSet::new(),
             transport_commands: BTreeSet::from([allowed.clone()]),
             profile_roots: Vec::new(),
+            kit_roots: Vec::new(),
+            max_pause_ms: None,
         };
         assert!(policy.transport_commands.contains(&allowed));
 
@@ -261,6 +460,8 @@ mod tests {
             disposable_vm_ids: BTreeSet::new(),
             transport_commands: BTreeSet::from([allowed]),
             profile_roots: Vec::new(),
+            kit_roots: Vec::new(),
+            max_pause_ms: None,
         };
 
         let launch = policy
@@ -292,6 +493,8 @@ mod tests {
             disposable_vm_ids: BTreeSet::from(["51749a1f-f939-44f5-b251-1251ef5b64a3".to_string()]),
             transport_commands: BTreeSet::from([allowed]),
             profile_roots: vec![normalized_path(&directory.canonicalize().unwrap())],
+            kit_roots: Vec::new(),
+            max_pause_ms: Some(600_000),
         };
 
         let authorized = policy
@@ -331,6 +534,8 @@ mod tests {
             disposable_vm_ids: BTreeSet::from(["51749a1f-f939-44f5-b251-1251ef5b64a3".to_string()]),
             transport_commands: BTreeSet::from([allowed]),
             profile_roots: vec![normalized_path(volume_root)],
+            kit_roots: Vec::new(),
+            max_pause_ms: Some(600_000),
         };
 
         let authorized = policy

@@ -1202,7 +1202,7 @@ pub struct SkKdOpenArgs {
     /// Virtual processor to expose. Defaults to VP 0.
     #[serde(default)]
     pub vp: Option<u32>,
-    /// Initial stop mode. Redirect is deterministic; natural waits for guest execution.
+    /// Initial stop mode. Defaults to natural guest execution; redirect must be selected explicitly.
     #[serde(default)]
     pub arm_mode: crate::sklive::ArmMode,
     /// WinDbg connection bound. Defaults to 30 seconds.
@@ -1211,9 +1211,6 @@ pub struct SkKdOpenArgs {
     /// Maximum KD silence while serving. Defaults to 300 seconds.
     #[serde(default)]
     pub idle_timeout_ms: Option<u64>,
-    /// Absolute bound for any WinDbg-held Secure Kernel stop. Defaults to 600 seconds.
-    #[serde(default)]
-    pub max_pause_ms: Option<u64>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1241,8 +1238,8 @@ pub struct SkLiveArmArgs {
     /// addresses; redirect mode accepts only the primary breakpoint.
     #[serde(default)]
     pub additional_breakpoints: Vec<SkLiveBreakpointArgs>,
-    /// How the breakpoint is reached. `redirect` moves RIP to the guarded instruction and later
-    /// restores it; `natural` leaves RIP untouched and preserves real guest progress.
+    /// How the breakpoint is reached. Defaults to `natural`, which leaves RIP untouched and
+    /// preserves real guest progress. `redirect` moves RIP deliberately and later restores it.
     #[serde(default)]
     pub mode: crate::sklive::ArmMode,
     /// Which live Secure Kernel session to arm. Omit for the current one.
@@ -2937,7 +2934,7 @@ impl WindbgServer {
             rec: sessions.recorder(),
             sessions,
             client,
-            surface: crate::toolset::Toolset::all(),
+            surface: crate::toolset::Toolset::default(),
             chosen: crate::toolset::Chosen::ForTheRun,
         }
     }
@@ -3936,13 +3933,22 @@ impl WindbgServer {
                 TargetCreated::No,
             );
         }
+        let authorized_kit = match self.sessions.authorize_secure_kernel_capture(
+            args.kit.as_deref().map(std::path::Path::new),
+            args.kit_version.as_deref(),
+        ) {
+            Ok(kit) => kit,
+            Err(why) => {
+                return open_failure(ErrorCategory::InvalidArgument, why, None, TargetCreated::No);
+            }
+        };
         let what = capture.describe();
         self.opened_capture(
             what,
             EngineOp::OpenSecureKernel(Box::new(crate::sksession::Request {
                 capture,
                 image: PathBuf::from(args.image),
-                kit: args.kit.map(PathBuf::from),
+                kit: Some(authorized_kit),
                 kit_version: args.kit_version,
                 vp: args.vp.unwrap_or(0),
                 vtl: args.vtl.unwrap_or(1),
@@ -4217,6 +4223,7 @@ impl WindbgServer {
                 vmwp_pid,
                 dispatcher_vnd,
                 target,
+                max_pause_ms: authorized.max_pause_ms,
                 allow_transition_cr3: args.allow_transition_cr3,
                 additional_vps: Vec::new(),
             })),
@@ -4243,11 +4250,9 @@ impl WindbgServer {
     ) -> Result<CallToolResult, ErrorData> {
         let connect_timeout_ms = args.connect_timeout_ms.unwrap_or(30_000);
         let idle_timeout_ms = args.idle_timeout_ms.unwrap_or(300_000);
-        let max_pause_ms = args.max_pause_ms.unwrap_or(600_000);
         for (name, value) in [
             ("connect_timeout_ms", connect_timeout_ms),
             ("idle_timeout_ms", idle_timeout_ms),
-            ("max_pause_ms", max_pause_ms),
         ] {
             if let Err(error) = crate::kdtarget::validate_managed_timeout_ms(name, value) {
                 return open_failure(
@@ -4269,6 +4274,7 @@ impl WindbgServer {
                 return open_failure(ErrorCategory::InvalidArgument, why, None, TargetCreated::No);
             }
         };
+        let max_pause_ms = authorized.max_pause_ms;
         let parse_optional = |name: &str, value: Option<&str>| {
             value
                 .map(|value| parse_u64(value).map_err(|why| format!("{name}: {why}")))
@@ -4364,6 +4370,7 @@ impl WindbgServer {
                     vmwp_pid,
                     dispatcher_vnd,
                     target,
+                    max_pause_ms,
                     allow_transition_cr3: false,
                     additional_vps: Vec::new(),
                 },
@@ -9107,16 +9114,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_secure_kernel_kd_timeouts_are_request_errors_before_open() {
+    async fn invalid_secure_kernel_kd_connection_timeouts_are_request_errors_before_open() {
         let server = WindbgServer::new(Sessions::new(Duration::from_secs(1)));
         let too_large = crate::kdtarget::MAX_MANAGED_TIMEOUT_MS + 1;
-        for (name, connect_timeout_ms, idle_timeout_ms, max_pause_ms) in [
-            ("connect_timeout_ms", Some(0), None, None),
-            ("connect_timeout_ms", Some(too_large), None, None),
-            ("idle_timeout_ms", None, Some(0), None),
-            ("idle_timeout_ms", None, Some(too_large), None),
-            ("max_pause_ms", None, None, Some(0)),
-            ("max_pause_ms", None, None, Some(too_large)),
+        for (name, connect_timeout_ms, idle_timeout_ms) in [
+            ("connect_timeout_ms", Some(0), None),
+            ("connect_timeout_ms", Some(too_large), None),
+            ("idle_timeout_ms", None, Some(0)),
+            ("idle_timeout_ms", None, Some(too_large)),
         ] {
             let result = server
                 .open_sk_kd(Parameters(SkKdOpenArgs {
@@ -9132,7 +9137,6 @@ mod tests {
                     arm_mode: crate::sklive::ArmMode::Redirect,
                     connect_timeout_ms,
                     idle_timeout_ms,
-                    max_pause_ms,
                 }))
                 .await
                 .expect("an invalid timeout is a tool error, not a protocol error");

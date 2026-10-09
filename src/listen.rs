@@ -668,8 +668,8 @@ fn credentials() -> Result<crate::client::Credentials> {
     if creds.len() == 0 {
         bail!(
             "neither {TOKEN_FILE_ENV} nor {TOKEN_ENV} is set, and no {TOKEN_ENV}_<NAME> either. \
-             The listener will not start without a bearer token: it exposes every tool this server \
-             has, including the ones that write to a live kernel."
+             The listener will not start without a bearer token: it exposes every tool on its \
+             configured surface, including ones that write to a live kernel."
         );
     }
     Ok(creds)
@@ -730,7 +730,7 @@ pub async fn serve(
         // wrong is not this server's to pay.
         tracing::warn!(
             "listening on {addr}, which is not loopback — anything that can route to it can \
-             reach every tool here with the token. Prefer binding loopback and forwarding \
+             reach every tool on its configured surface with the token. Prefer binding loopback and forwarding \
              (`ssh -L`)."
         );
     }

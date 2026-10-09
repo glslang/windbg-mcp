@@ -341,13 +341,14 @@ None of these is a bug. They are recorded because they were invisible, and
    and, since item 41, for the sentences the tools it keeps used to spend on pointing at them.
    Where the bytes sit, and what each profile costs:
 
-   Both tables are measurements of **2026-10-08** and move with any edit to a description.
+   Both tables are measurements of **2026-10-09** and move with any edit to a description. The
+   `securekernel` row is an extra group: the absent spec omits it, while `all` includes it.
 
    | group | tools | bytes | share |
    |---|---:|---:|---:|
    | `allocator` | 10 | 16,906 | 14.1% |
    | `ioctl` | 11 | 16,088 | 13.4% |
-   | `securekernel` | 12 | 19,181 | 16.0% |
+   | `securekernel` | 12 | 19,013 | 15.9% |
    | `exec` | 10 | 15,087 | 12.6% |
    | `session` | 10 | 14,208 | 11.9% |
    | `inspect` | 10 | 13,485 | 11.3% |
@@ -357,7 +358,8 @@ None of these is a bug. They are recorded because they were invisible, and
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 76 | 119,826 |
+   | *(absent)* | 64 | 100,645 |
+   | `all` | 76 | 119,658 |
    | `session,inspect,exec,crash` | 33 | 49,332 |
    | `session,inspect,crash` | 23 | 34,092 |
    | `crash` | 13 | 20,515 |
@@ -390,11 +392,11 @@ cargo test --test mcp_smoke -- --nocapture tool_surface_stays_within_its_token_b
 
 Two more ride it, both needing no debugger. `every_tool_belongs_to_exactly_one_group` joins
 `src/toolset.rs`'s table to the live `tools/list`, because a tool added to `src/server.rs` and not
-put in a group would vanish from every narrowed surface without a word — the default surface would
-still carry it, so nothing else would notice. And
+put in a group would vanish from the default and every named-group surface without a word — only
+explicit `all` would still carry it. And
 `a_narrowed_tool_surface_serves_only_what_it_was_asked_for` starts a server with `--tools crash` and
 checks the three things that makes true: thirteen tools, a refusal by name for a tool that exists
-and is not served, and a figure under half the whole surface (it prints 19,078 B).
+and is not served, and a figure under half the whole surface (currently 20,515 B).
 
 Beside them, `output_schemas_carry_constraints_not_prose` is the
 assertion that finding 1 stays fixed. It reads `tools/list` off the wire, so it catches the way that

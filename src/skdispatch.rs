@@ -116,6 +116,7 @@ pub(crate) struct Session {
     dispatcher: VmwpDispatcherState,
     pending: Option<PendingControl>,
     preparation_failed: Option<String>,
+    max_pause_ms: u64,
     _reservation: VmReservation,
 }
 
@@ -194,6 +195,7 @@ impl Session {
                     allow_transition_cr3: request.allow_transition_cr3,
                 }),
                 preparation_failed: None,
+                max_pause_ms: request.max_pause_ms,
                 _reservation: reservation,
             },
             Vec::new(),
@@ -209,6 +211,10 @@ impl Session {
                 .map(LiveControl::phase)
                 .unwrap_or(LivePhase::Running)
         }
+    }
+
+    pub(crate) fn max_pause_ms(&self) -> u64 {
+        self.max_pause_ms
     }
 
     pub(crate) fn stopped(&self) -> Option<&StopRecord> {
@@ -551,6 +557,8 @@ pub(crate) struct OpenRequest {
     pub(crate) vmwp_pid: u32,
     pub(crate) dispatcher_vnd: Option<u64>,
     pub(crate) target: TargetRequest,
+    /// Absolute operator-fixed bound for one arm/stop/step lifecycle.
+    pub(crate) max_pause_ms: u64,
     #[serde(default)]
     pub(crate) allow_transition_cr3: bool,
     #[serde(default)]
@@ -595,6 +603,7 @@ impl fmt::Debug for OpenRequest {
             .field("vmwp_pid", &self.vmwp_pid)
             .field("dispatcher_vnd", &self.dispatcher_vnd.map(HexU64))
             .field("target", &self.target)
+            .field("max_pause_ms", &self.max_pause_ms)
             .field("additional_vps", &self.additional_vps.len())
             .finish()
     }
@@ -664,7 +673,7 @@ impl AcceptanceRequest {
         let mut expected_cr3 = None;
         let mut instruction_address = None;
         let mut instruction_bytes = None;
-        let mut arm_mode = ArmMode::Redirect;
+        let mut arm_mode = ArmMode::Natural;
         let mut iter = args.iter();
         while let Some(arg) = iter.next() {
             let value = |iter: &mut std::slice::Iter<'_, String>| {
@@ -732,6 +741,7 @@ impl AcceptanceRequest {
                 vmwp_pid,
                 dispatcher_vnd,
                 target,
+                max_pause_ms: 600_000,
                 allow_transition_cr3: false,
                 additional_vps: Vec::new(),
             },
@@ -983,10 +993,18 @@ impl VmwpDispatcherState {
         // The first command changed debugger state, so cleanup owns that state even
         // when selecting the current thread fails.
         self.threads_frozen = true;
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            "dispatcher froze all vmwp threads for a guarded native call"
+        );
         if let Err(primary) = execute("~# u") {
             let thawed = execute("~* u");
             if thawed.is_ok() {
                 self.threads_frozen = false;
+                tracing::info!(
+                    target: "windbg_mcp::secure_kernel_mutation",
+                    "dispatcher released its vmwp thread freezes after partial setup"
+                );
             }
             return match thawed {
                 Ok(()) => Err(primary),
@@ -996,6 +1014,10 @@ impl VmwpDispatcherState {
                 )),
             };
         }
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            "dispatcher released the current vmwp thread for its guarded native call"
+        );
         Ok(())
     }
 
@@ -1587,6 +1609,17 @@ impl RawSource for DeadlineLiveSource<'_> {
 impl LiveGuestMemory {
     fn open(command: &str, target: &TargetIdentity) -> Result<Self> {
         let source = crate::livesrc::LiveSource::spawn(command)?;
+        let provider = crate::livesrc::split_command(command)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "<empty>".to_string());
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            vm_id = %target.vm_id,
+            vp = target.vp,
+            provider = %provider,
+            "started the operator-authorized Secure Kernel memory provider"
+        );
         let kernel_base = source.kernel_base();
         let shape = source.shape();
         if shape.cr3 != Some(target.expected_cr3.0) {
@@ -1789,6 +1822,10 @@ impl HijackContext {
             return Err(std::io::Error::last_os_error())
                 .context("suspending the stopped vmwp thread for context restoration");
         }
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            "dispatcher added a temporary vmwp thread suspend for context restoration"
+        );
         let restored = (|| {
             // The call can change control, integer and floating-point state. It cannot change
             // segment selectors or debug registers; Windows rejects writing those protected
@@ -1818,6 +1855,10 @@ impl HijackContext {
                      {expected:#04x}, observed {actual:#04x}"
                 );
             }
+            tracing::info!(
+                target: "windbg_mcp::secure_kernel_mutation",
+                "dispatcher restored and verified the hijacked vmwp thread context"
+            );
             Ok(())
         })();
         // SAFETY: balances the successful SuspendThread above, including on every error path.
@@ -1825,6 +1866,10 @@ impl HijackContext {
             Err(std::io::Error::last_os_error())
                 .context("releasing the vmwp thread after context restoration")
         } else {
+            tracing::info!(
+                target: "windbg_mcp::secure_kernel_mutation",
+                "dispatcher released its temporary vmwp thread suspend"
+            );
             Ok(())
         };
         match (restored, resumed) {
@@ -2141,6 +2186,43 @@ impl EventDispatcher for VmwpDispatcher<'_> {
 }
 
 impl VmwpDispatcher<'_> {
+    fn claim_attach(&mut self) {
+        self.state.attached = true;
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            vmwp_pid = self.state.vmwp_pid,
+            "dispatcher began an owned debugger attach to vmwp"
+        );
+    }
+
+    fn set_exception_policy(&self) -> Result<()> {
+        self.engine.execute_command("sxd 6ba").map_err(debugger)?;
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            exception = "0x6ba",
+            "dispatcher changed vmwp's debugger exception policy"
+        );
+        self.engine
+            .execute_command("sxd e06d7363")
+            .map_err(debugger)?;
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            exception = "0xe06d7363",
+            "dispatcher changed vmwp's debugger exception policy"
+        );
+        Ok(())
+    }
+
+    fn thaw_threads(&mut self) -> Result<()> {
+        self.engine.execute_command("~* u").map_err(debugger)?;
+        self.state.threads_frozen = false;
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            "dispatcher released its vmwp thread freezes"
+        );
+        Ok(())
+    }
+
     fn teardown_inner(&mut self, deadline: Option<Instant>) -> Result<()> {
         require_completion_deadline(deadline)?;
         match &self.state.phase {
@@ -2176,8 +2258,7 @@ impl VmwpDispatcher<'_> {
         }
         require_completion_deadline(deadline)?;
         if self.state.threads_frozen {
-            self.engine.execute_command("~* u").map_err(debugger)?;
-            self.state.threads_frozen = false;
+            self.thaw_threads()?;
         }
         require_completion_deadline(deadline)?;
         if self.state.attached {
@@ -2291,8 +2372,7 @@ impl VmwpDispatcher<'_> {
         }
         require_completion_deadline(deadline)?;
         if self.state.threads_frozen {
-            self.engine.execute_command("~* u").map_err(debugger)?;
-            self.state.threads_frozen = false;
+            self.thaw_threads()?;
         }
         require_completion_deadline(deadline)?;
         if self.state.attached {
@@ -2488,13 +2568,10 @@ impl VmwpDispatcher<'_> {
             .engine
             .attach_process_begin(self.state.vmwp_pid)
             .map_err(debugger)?;
-        self.state.attached = true;
+        self.claim_attach();
         wait_for_process_attach(self.engine, pending, self.state.vmwp_pid, deadline)?;
         require_retention_deadline(deadline)?;
-        self.engine.execute_command("sxd 6ba").map_err(debugger)?;
-        self.engine
-            .execute_command("sxd e06d7363")
-            .map_err(debugger)?;
+        self.set_exception_policy()?;
         self.verify_vmwp_build()?;
         self.verify_all_sites()?;
         self.state.phase = DispatcherPhase::ReadyForStop;
@@ -2526,12 +2603,9 @@ impl VmwpDispatcher<'_> {
             .engine
             .attach_process_begin(self.state.vmwp_pid)
             .map_err(debugger)?;
-        self.state.attached = true;
+        self.claim_attach();
         pending.wait().map_err(debugger)?;
-        self.engine.execute_command("sxd 6ba").map_err(debugger)?;
-        self.engine
-            .execute_command("sxd e06d7363")
-            .map_err(debugger)?;
+        self.set_exception_policy()?;
 
         self.verify_vmwp_build()?;
         self.verify_all_sites()?;
@@ -2580,12 +2654,9 @@ impl VmwpDispatcher<'_> {
             .engine
             .attach_process_begin(self.state.vmwp_pid)
             .map_err(debugger)?;
-        self.state.attached = true;
+        self.claim_attach();
         pending.wait().map_err(debugger)?;
-        self.engine.execute_command("sxd 6ba").map_err(debugger)?;
-        self.engine
-            .execute_command("sxd e06d7363")
-            .map_err(debugger)?;
+        self.set_exception_policy()?;
         self.verify_vmwp_build()?;
         self.verify_site(&discovery.entry)?;
         self.set_site_breakpoint(&discovery.entry)?;
@@ -2713,6 +2784,10 @@ impl VmwpDispatcher<'_> {
             // Even when an interrupted call did not return, record that the debugger freeze was
             // released. Keep Discovering in that case so teardown contains vmwp.
             self.state.finish_discovery_call_cleanup(returned);
+            tracing::info!(
+                target: "windbg_mcp::secure_kernel_mutation",
+                "dispatcher released its vmwp thread freezes"
+            );
         }
 
         let mut cleanup_errors = Vec::new();
@@ -2803,6 +2878,12 @@ impl VmwpDispatcher<'_> {
             ))
             .map_err(debugger)?;
         self.state.scratch_allocated = true;
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            address = format_args!("{base:#x}"),
+            size = self.state.profile.scratch_size,
+            "dispatcher allocated vmwp discovery scratch"
+        );
         self.engine.read_memory(base, 8).map_err(debugger)?;
         Ok(())
     }
@@ -2822,12 +2903,9 @@ impl VmwpDispatcher<'_> {
             .engine
             .attach_process_begin(self.state.vmwp_pid)
             .map_err(debugger)?;
-        self.state.attached = true;
+        self.claim_attach();
         pending.wait().map_err(debugger)?;
-        self.engine.execute_command("sxd 6ba").map_err(debugger)?;
-        self.engine
-            .execute_command("sxd e06d7363")
-            .map_err(debugger)?;
+        self.set_exception_policy()?;
         self.verify_vmwp_build()?;
         self.verify_all_sites()?;
         self.state
@@ -2942,6 +3020,12 @@ impl VmwpDispatcher<'_> {
             // A successful command created target-process state. Claim it before the verification
             // read so any read failure still makes recovery and teardown issue the matching free.
             self.state.scratch_allocated = true;
+            tracing::info!(
+                target: "windbg_mcp::secure_kernel_mutation",
+                address = format_args!("{base:#x}"),
+                size = self.state.profile.scratch_size,
+                "dispatcher allocated vmwp callback scratch"
+            );
         }
         self.engine
             .read_memory(
@@ -3023,10 +3107,14 @@ impl VmwpDispatcher<'_> {
         // Registration is already live in vmwp. Record its context before any fallible local
         // restoration so teardown must unregister it rather than free callback scratch directly.
         self.state.record_handler_context(context)?;
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            context = format_args!("{context:#x}"),
+            "dispatcher registered its temporary vmwp exception handler"
+        );
         self.write_u64(stack_handler, saved_handler)?;
         self.write_u64(stack_context, saved_context)?;
-        self.engine.execute_command("~* u").map_err(debugger)?;
-        self.state.threads_frozen = false;
+        self.thaw_threads()?;
         self.state.phase = DispatcherPhase::Fresh;
         Ok(())
     }
@@ -3084,6 +3172,10 @@ impl VmwpDispatcher<'_> {
             .engine
             .execute_and_wait("g", timeout)
             .map_err(debugger)?;
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            "dispatcher resumed vmwp to settle native event completion"
+        );
         if run.target_gone {
             bail!("vmwp left the debugger while settling native event completion");
         }
@@ -3271,15 +3363,12 @@ impl VmwpDispatcher<'_> {
             .engine
             .attach_process_begin(self.state.vmwp_pid)
             .map_err(debugger)?;
-        self.state.attached = true;
+        self.claim_attach();
         wait_for_process_attach(self.engine, pending, self.state.vmwp_pid, deadline)?;
         require_completion_deadline(deadline)?;
         self.verify_vmwp_build()?;
         self.verify_all_sites()?;
-        self.engine.execute_command("sxd 6ba").map_err(debugger)?;
-        self.engine
-            .execute_command("sxd e06d7363")
-            .map_err(debugger)?;
+        self.set_exception_policy()?;
 
         let rsp = self.register("rsp")?;
         let return_address = self.read_u64(rsp)?;
@@ -3331,8 +3420,7 @@ impl VmwpDispatcher<'_> {
             self.set_site_breakpoint(&cleanup)?;
         }
         if self.state.threads_frozen {
-            self.engine.execute_command("~* u").map_err(debugger)?;
-            self.state.threads_frozen = false;
+            self.thaw_threads()?;
         }
         let wait_deadline = completion_wait_deadline(deadline);
         loop {
@@ -3400,7 +3488,7 @@ impl VmwpDispatcher<'_> {
                 .engine
                 .attach_process_begin(self.state.vmwp_pid)
                 .map_err(debugger)?;
-            self.state.attached = true;
+            self.claim_attach();
             wait_for_process_attach(self.engine, pending, self.state.vmwp_pid, deadline)?;
         }
         let callback = self.read_u64(
@@ -3431,6 +3519,11 @@ impl VmwpDispatcher<'_> {
         self.engine
             .execute_command(&format!(".dvfree {scratch:016x} 0"))
             .map_err(debugger)?;
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            address = format_args!("{scratch:#x}"),
+            "dispatcher issued callback scratch release"
+        );
         Ok(())
     }
 
@@ -3462,9 +3555,16 @@ impl VmwpDispatcher<'_> {
                  this controller, so retry end_session to issue the free again"
             );
         }
+        let context = self.state.handler_context;
         self.state.scratch_allocated = false;
         self.state.handler_context = None;
         self.state.unregister = None;
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            context = ?context.map(HexU64),
+            address = format_args!("{scratch:#x}"),
+            "dispatcher verified handler unregistration and callback scratch release"
+        );
         if self.state.attached {
             self.detach_handled()?;
         }
@@ -3491,6 +3591,11 @@ impl VmwpDispatcher<'_> {
                 .engine
                 .execute_and_wait("g", timeout)
                 .map_err(debugger)?;
+            tracing::info!(
+                target: "windbg_mcp::secure_kernel_mutation",
+                expected = format_args!("{expected:#x}"),
+                "dispatcher resumed vmwp toward its owned breakpoint"
+            );
             if run.target_gone {
                 bail!("vmwp left the debugger while an owned breakpoint was pending");
             }
@@ -3599,7 +3704,19 @@ impl VmwpDispatcher<'_> {
             replaced: !set.replaced.is_empty(),
         };
         self.state
-            .claim_created_breakpoint(created, address, original)
+            .claim_created_breakpoint(created, address, original)?;
+        let owned = self
+            .state
+            .breakpoint
+            .as_ref()
+            .expect("breakpoint was claimed");
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            breakpoint_id = owned.id,
+            address = format_args!("{address:#x}"),
+            "dispatcher installed an owned vmwp breakpoint"
+        );
+        Ok(())
     }
 
     fn remove_owned_breakpoint(&mut self) -> Result<()> {
@@ -3608,6 +3725,8 @@ impl VmwpDispatcher<'_> {
             .breakpoint
             .as_ref()
             .context("the adapter owns no breakpoint to remove")?;
+        let owned_id = owned.id;
+        let owned_address = owned.address;
         let still_owned = self
             .engine
             .breakpoints()
@@ -3618,16 +3737,22 @@ impl VmwpDispatcher<'_> {
         if still_owned.address != Some(owned.address) || still_owned.kind != BreakpointKind::Code {
             bail!("the owned breakpoint id was reused or changed");
         }
-        self.engine.remove_breakpoint(owned.id).map_err(debugger)?;
+        self.engine.remove_breakpoint(owned_id).map_err(debugger)?;
         if self
             .engine
-            .read_memory(owned.address, owned.original.len())
+            .read_memory(owned_address, owned.original.len())
             .map_err(debugger)?
             != owned.original
         {
             bail!("original bytes were not restored after breakpoint removal");
         }
         self.state.breakpoint = None;
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            breakpoint_id = owned_id,
+            address = format_args!("{owned_address:#x}"),
+            "dispatcher removed its owned vmwp breakpoint and verified original bytes"
+        );
         Ok(())
     }
 
@@ -3691,6 +3816,11 @@ impl VmwpDispatcher<'_> {
                 retained.system_id
             );
         }
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            thread_id = retained.system_id,
+            "dispatcher reselected its retained vmwp event thread"
+        );
         let actual = self.engine.instruction_pointer().map_err(debugger)?;
         self.state.phase = DispatcherPhase::Holding(event.clone());
         if actual != retained.return_ip {
@@ -3726,6 +3856,12 @@ impl VmwpDispatcher<'_> {
         if self.register(name)? != value {
             bail!("DbgEng did not verify the write to {name}");
         }
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            register = name,
+            value = format_args!("{value:#x}"),
+            "dispatcher verified a vmwp register write"
+        );
         Ok(())
     }
 
@@ -3750,6 +3886,12 @@ impl VmwpDispatcher<'_> {
         if self.read_u64(address)? != value {
             bail!("DbgEng did not verify the write at {address:#x}");
         }
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            address = format_args!("{address:#x}"),
+            value = format_args!("{value:#x}"),
+            "dispatcher verified a vmwp memory write"
+        );
         Ok(())
     }
 
@@ -3759,6 +3901,11 @@ impl VmwpDispatcher<'_> {
             .map_err(debugger)?;
         self.state.attached = false;
         self.state.phase = DispatcherPhase::Detached;
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            vmwp_pid = self.state.vmwp_pid,
+            "dispatcher detached from vmwp with the event handled"
+        );
         Ok(())
     }
 
@@ -3770,7 +3917,7 @@ impl VmwpDispatcher<'_> {
                 .engine
                 .attach_process_begin(self.state.vmwp_pid)
                 .map_err(debugger)?;
-            self.state.attached = true;
+            self.claim_attach();
             wait_for_process_attach(self.engine, pending, self.state.vmwp_pid, deadline)?;
         }
         require_completion_deadline(deadline)?;
@@ -3782,6 +3929,11 @@ impl VmwpDispatcher<'_> {
             bail!("unregistered callback scratch remained readable after .dvfree");
         }
         self.state.scratch_allocated = false;
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            address = format_args!("{scratch:#x}"),
+            "dispatcher freed and verified vmwp callback scratch"
+        );
         self.detach_handled()
     }
 
@@ -3993,7 +4145,20 @@ fn verify_vmwp_pid(vm_id: &str, pid: u32) -> Result<()> {
 }
 
 fn run_vm_action(vm_id: &str, action: VmAction, timeout: Duration) -> Result<()> {
-    run_vm_query(vm_id, action, timeout).map(drop)
+    run_vm_query(vm_id, action, timeout)?;
+    trace_vm_action(vm_id, action);
+    Ok(())
+}
+
+fn trace_vm_action(vm_id: &str, action: VmAction) {
+    if matches!(action, VmAction::Pause | VmAction::Resume) {
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            vm_id,
+            action = ?action,
+            "Hyper-V VM state mutation completed and was verified"
+        );
+    }
 }
 
 fn run_vm_action_until(vm_id: &str, action: VmAction, deadline: Option<Instant>) -> Result<()> {
@@ -4134,7 +4299,9 @@ struct VmTransition {
 impl VmTransition {
     fn immediate(vm_id: String, action: VmAction) -> Self {
         Self::spawn(vm_id, Duration::ZERO, move |vm_id, cancel| {
-            run_vm_query_inner(vm_id, action, POWERSHELL_WAIT, Some(cancel)).map(drop)
+            run_vm_query_inner(vm_id, action, POWERSHELL_WAIT, Some(cancel))?;
+            trace_vm_action(vm_id, action);
+            Ok(())
         })
     }
 
@@ -4448,6 +4615,7 @@ mod tests {
             vmwp_pid: 4242,
             dispatcher_vnd: Some(0x2000_0000_1000),
             target: target_request(),
+            max_pause_ms: 600_000,
             allow_transition_cr3: false,
             additional_vps: vec![AdditionalVp {
                 control_transport: "provider --vp 1".into(),
@@ -4476,6 +4644,7 @@ mod tests {
             .unwrap(),
             pending: None,
             preparation_failed: Some("partition discovery failed".into()),
+            max_pause_ms: 600_000,
             // No kernel object is needed for a state-only test.
             _reservation: VmReservation(std::ptr::null_mut()),
         };

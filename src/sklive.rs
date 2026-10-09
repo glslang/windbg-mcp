@@ -730,9 +730,9 @@ pub(crate) fn validate_breakpoints(breakpoints: &[BreakpointGuard], mode: ArmMod
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ArmMode {
     /// Redirect the saved RIP to the guarded instruction, then restore the complete baseline.
-    #[default]
     Redirect,
     /// Leave RIP untouched and wait for guest control flow to reach the guarded instruction.
+    #[default]
     Natural,
 }
 
@@ -1215,6 +1215,15 @@ impl<P: ControlProvider> LiveControl<P> {
         self.breakpoints = breakpoints;
         self.expected_stop = Some(ExpectedStop::Hardware);
         self.state = State::Running;
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            vm_id = %self.providers[0].target.vm_id,
+            vp = self.providers[0].target.vp,
+            mode = ?mode,
+            breakpoint_count = self.breakpoints.len(),
+            epoch = %next_epoch.1,
+            "live Secure Kernel control armed VTL1 execution breakpoints"
+        );
         Ok(self.commit_epoch(next_epoch))
     }
 
@@ -1430,6 +1439,14 @@ impl<P: ControlProvider> LiveControl<P> {
                 self.expected_stop = None;
                 self.commit_epoch(next_epoch);
                 self.state = State::Stopped(stop.clone());
+                tracing::info!(
+                    target: "windbg_mcp::secure_kernel_mutation",
+                    vm_id = %stop.target.vm_id,
+                    vp = stop.target.vp,
+                    epoch = %stop.epoch,
+                    reason = ?stop.event.reason,
+                    "live Secure Kernel control retained a VTL1 stop"
+                );
                 Ok(stop)
             }
             Err(error) => Err(self.enter_fault(dispatcher, error, Some(observed.event))),
@@ -1540,6 +1557,13 @@ impl<P: ControlProvider> LiveControl<P> {
             cr3: HexU64(stop.registers.low(RegisterName::Cr3)?),
         });
         self.state = State::Running;
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            vm_id = %self.providers[active].target.vm_id,
+            vp = self.providers[active].target.vp,
+            epoch = %next_epoch.1,
+            "live Secure Kernel control armed trap-flag single-step"
+        );
         Ok(self.commit_epoch(next_epoch))
     }
 
@@ -1612,6 +1636,13 @@ impl<P: ControlProvider> LiveControl<P> {
         self.dispatcher_event = None;
         self.expected_stop = None;
         self.state = State::Running;
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            vm_id = %self.providers[active].target.vm_id,
+            vp = self.providers[active].target.vp,
+            epoch = %next_epoch.1,
+            "live Secure Kernel control restored the VTL1 baseline and resumed"
+        );
         Ok(self.commit_epoch(next_epoch))
     }
 
@@ -1846,6 +1877,12 @@ impl<P: ControlProvider> LiveControl<P> {
             return Err(self.enter_fault_inner(dispatcher, error, None, deadline));
         }
         self.state = State::Closed;
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            vm_id = %self.providers[0].target.vm_id,
+            vp = self.providers[0].target.vp,
+            "live Secure Kernel control completed guarded teardown"
+        );
         Ok(())
     }
 
@@ -2012,6 +2049,15 @@ impl<P: ControlProvider> LiveControl<P> {
         if written.name != name || written.status != 0 || written.low.0 != value {
             bail!("provider did not verify the guarded write to {name:?}");
         }
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            vm_id = %self.providers[provider].target.vm_id,
+            vp = self.providers[provider].target.vp,
+            register = ?name,
+            expected = format_args!("{expected:#x}"),
+            value = format_args!("{value:#x}"),
+            "live Secure Kernel control verified a VTL1 register mutation"
+        );
         Ok(())
     }
 
@@ -2337,6 +2383,14 @@ impl<P: ControlProvider> LiveControl<P> {
         };
         self.fault = Some(fault.clone());
         self.state = State::Faulted;
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            vm_id = %self.providers[0].target.vm_id,
+            vp = self.providers[0].target.vp,
+            target_left_paused = fault.target_left_paused,
+            recovery_errors = fault.recovery_errors.len(),
+            "live Secure Kernel control entered fail-closed recovery"
+        );
         anyhow!(
             "live Secure Kernel control faulted: {}; recovery_errors={:?}; target_left_paused={}",
             fault.cause,
@@ -2370,6 +2424,11 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::*;
+
+    #[test]
+    fn natural_guest_execution_is_the_default_arm_mode() {
+        assert_eq!(ArmMode::default(), ArmMode::Natural);
+    }
     use crate::skcontrol::Capability;
 
     const BASE_RIP: u64 = 0xffff_f803_60ab_0035;

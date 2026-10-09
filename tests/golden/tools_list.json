@@ -1291,7 +1291,6 @@
         "expected_cr3: string|null",
         "idle_timeout_ms: integer|null/uint64",
         "live_transport: string",
-        "max_pause_ms: integer|null/uint64",
         "partition_id: string|null",
         "profile: string",
         "vm_id: string",

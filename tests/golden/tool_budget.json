@@ -354,11 +354,11 @@
     {
       "annotations": 121,
       "description": 266,
-      "inputSchema": 2455,
-      "modelVisible": 2772,
+      "inputSchema": 2283,
+      "modelVisible": 2600,
       "name": "open_sk_kd",
       "outputSchema": 4659,
-      "wire": 7583
+      "wire": 7411
     },
     {
       "annotations": 132,
@@ -507,11 +507,11 @@
     {
       "annotations": 127,
       "description": 271,
-      "inputSchema": 2085,
-      "modelVisible": 2408,
+      "inputSchema": 2089,
+      "modelVisible": 2412,
       "name": "sk_live_arm",
       "outputSchema": 1291,
-      "wire": 3857
+      "wire": 3861
     },
     {
       "annotations": 127,
@@ -688,13 +688,13 @@
   "totals": {
     "annotations": 8305,
     "description": 44939,
-    "inputSchema": 70863,
+    "inputSchema": 70695,
     "instructions": 2022,
-    "modelVisible": 119826,
+    "modelVisible": 119658,
     "outputSchema": 208149,
-    "payload": 338483,
+    "payload": 338315,
     "tools": 76,
-    "wire": 338396,
+    "wire": 338228,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10308
   }

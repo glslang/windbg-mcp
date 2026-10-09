@@ -5,9 +5,10 @@ how much of that surface a run serves, and four behaviours the table has no room
 
 ## Serving fewer tools (`--tools`)
 
-All seventy-six tools are served unless you say otherwise, and their definitions cost the model
-**119,826 bytes — about 30k tokens — before it has asked anything**, once per conversation. Every
-figure on this page is a measurement of 2026-10-08 rather than an invariant: any edit to a tool's
+The default serves every ordinary group and omits the `securekernel` extra. Explicit `--tools all`
+serves all seventy-six tools. Their definitions are paid before the model has asked anything, once
+per conversation. Every
+figure on this page is a measurement of 2026-10-09 rather than an invariant: any edit to a tool's
 description moves it, so re-derive before quoting one. The tables below are checked against a
 running server by `every_documented_surface_figure_matches_the_served_surface`; this sentence is
 **not**, which is how it came to say 94,921 while the table beside it said 94,957. Seven
@@ -22,13 +23,15 @@ windbg-mcp.exe --tools session,inspect,crash
 
 | `--tools` | Tools | Model context |
 |---|---:|---:|
-| *(absent)* — every tool | 76 | 119,826 B |
+| *(absent)* — ordinary groups | 64 | 100,645 B |
+| `all` | 76 | 119,658 B |
 | `session,inspect,exec,crash` | 33 | 49,332 B |
 | `session,inspect,crash` | 23 | 34,092 B |
 | `crash` | 13 | 20,515 B |
 
 The spec is a comma-separated list of the group names in the [tool table](../README.md#tools), of
-individual tool names, or `all`.
+individual tool names, or `all`. `securekernel` is marked as an extra: it must be named explicitly
+and is included by `all`.
 Anything else is refused at startup, with the valid names — a surface that quietly serves something
 other than what was asked for is worse than one that will not start.
 
