@@ -3426,6 +3426,9 @@ pub struct DriverHazards {
     /// Libraries whose imports could not be named at all: bound imports, whose names live only in
     /// the table this deliberately never reads.
     pub unnamed_libraries: Vec<String>,
+    /// Where the imports in [`Self::sinks`] were named from: the import directory, or -- where the
+    /// loader had freed that -- the import address table.
+    pub imports_named_from: ImportsNamedFrom,
     /// Why the scan stopped early, when it did.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stopped: Option<WalkHalt>,
@@ -3433,6 +3436,32 @@ pub struct DriverHazards {
     /// answer either way, and this says the remedy is a narrower question rather than more time.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cap_hit: bool,
+}
+
+/// Where a hazard scan's imports were named from.
+///
+/// **A value, because the two sources answer differently.** The import directory names an import
+/// as the image spells it. A driver may link that directory into a **discardable** section -- HEVD's
+/// ARM64 build puts it in `INIT` -- which the loader frees once the driver has started, so on a live
+/// target there is nothing left to name imports from there. The import address table is kept: the
+/// driver's own calls go through it, and each slot holds the address its import was bound to. So
+/// an import is named from that address instead -- the symbol there, filed under the library name
+/// the exporting module's own export directory gives -- which is the export the slot reaches. For
+/// an export sharing its address with another name, that may be the other name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "from", rename_all = "snake_case")]
+pub enum ImportsNamedFrom {
+    /// The import directory: the ordinary case.
+    ImportDirectory,
+    /// The import address table, because the import directory is in `discarded_section`, which the
+    /// loader had freed.
+    ImportAddressTable {
+        discarded_section: String,
+        /// Slots bound to an address that names no export -- no module there, no symbol, or a
+        /// symbol the address is not the start of. Each is an import this could not name, so a
+        /// non-zero count makes `sinks` a lower bound, as `unnamed_libraries` does.
+        unnamed_slots: usize,
+    },
 }
 
 /// Which half of a hazard scan came up short, since the two are read from different things.
@@ -3461,11 +3490,12 @@ impl Shortfall {
         match self {
             Self::Imports => {
                 "some of this driver's imports could not be named, so `sinks` is a lower bound: \
-                 a sensitive import among them is not in this list. Its own `unnamed_libraries` \
-                 and `ordinal_imports` fields say which -- a bound import's names live only in a \
-                 table this deliberately never reads, and an ordinal import's name lives in the \
-                 ordinal and no name in this image, the exporting image not being obliged to \
-                 associate one with it either. The code was decoded in \
+                 a sensitive import among them is not in this list. Its own `unnamed_libraries`, \
+                 `ordinal_imports` and `imports_named_from` fields say which -- a bound import's \
+                 names live only in a table this deliberately never reads, an ordinal import's \
+                 name lives in the ordinal and no name in this image, the exporting image not \
+                 being obliged to associate one with it either, and an address-table slot can be \
+                 bound to an address that names no export. The code was decoded in \
                  full, so `privileged` is not qualified by this."
             }
             Self::Code => {
@@ -3477,7 +3507,8 @@ impl Shortfall {
             }
             Self::Both => {
                 "this scan is short on both sides, and each field says which it is about: \
-                 `unnamed_libraries` and `ordinal_imports` make the set of `sinks` a lower bound, \
+                 `unnamed_libraries`, `ordinal_imports` and `imports_named_from`'s \
+                 `unnamed_slots` make the set of `sinks` a lower bound, \
                  while `stopped`, `cap_hit` and `unreadable` make `privileged` and the sinks' \
                  `call_sites` lower bounds."
             }
@@ -3529,17 +3560,23 @@ impl DriverHazards {
             ordinal_imports,
             unreadable,
             unnamed_libraries,
+            imports_named_from,
             stopped,
             cap_hit,
         } = self;
         // The import walk refuses rather than truncates, so a scan that exists at all has a whole
         // import table behind it -- a clock or a cap can only have cut the **code** short.
         let code = stopped.is_some() || *cap_hit || !unreadable.is_empty();
-        // **Two channels, one side.** A bound library's names were never read; an ordinal import
-        // has no name here to read. Either leaves a sensitive import outside `sinks`, so either
-        // is the import-side shortfall -- and an ordinal count folded into `other_imports`, as it
-        // was, reached this predicate as nothing at all.
-        let imports = !unnamed_libraries.is_empty() || *ordinal_imports > 0;
+        // **Three channels, one side.** A bound library's names were never read; an ordinal import
+        // has no name here to read; an address-table slot bound to an address that names nothing
+        // could not be named either. Each leaves a sensitive import outside `sinks`, so each is the
+        // import-side shortfall -- and an ordinal count folded into `other_imports`, as it was,
+        // reached this predicate as nothing at all.
+        let unnamed_slots = match imports_named_from {
+            ImportsNamedFrom::ImportDirectory => 0,
+            ImportsNamedFrom::ImportAddressTable { unnamed_slots, .. } => *unnamed_slots,
+        };
+        let imports = !unnamed_libraries.is_empty() || *ordinal_imports > 0 || unnamed_slots > 0;
         match (imports, code) {
             (false, false) => None,
             (true, false) => Some(Shortfall::Imports),
@@ -5786,6 +5823,7 @@ mod tests {
             other_imports: 40,
             ordinal_imports: 0,
             unnamed_libraries: Vec::new(),
+            imports_named_from: ImportsNamedFrom::ImportDirectory,
             stopped: None,
             cap_hit: false,
         }
@@ -5872,6 +5910,28 @@ mod tests {
             Some(Shortfall::Imports),
             "an ordinal import is a name this image does not carry, so `sinks` is a lower bound \
              for the same reason a bound library makes it one"
+        );
+
+        // **And the third channel: an address-table slot that named nothing.** Named from the
+        // table because the loader freed the import directory, a scan is short of its imports
+        // exactly when a slot was bound to an address naming no export -- and is not short merely
+        // for having been named that way.
+        let from_the_table = |unnamed_slots| DriverHazards {
+            imports_named_from: ImportsNamedFrom::ImportAddressTable {
+                discarded_section: "INIT".into(),
+                unnamed_slots,
+            },
+            ..whole_scan()
+        };
+        assert_eq!(
+            from_the_table(1).shortfall(),
+            Some(Shortfall::Imports),
+            "a slot bound to no export is an import `sinks` does not have"
+        );
+        assert_eq!(
+            from_the_table(0).shortfall(),
+            None,
+            "every slot named is a whole import table, whichever half it was read from"
         );
 
         let both = DriverHazards {

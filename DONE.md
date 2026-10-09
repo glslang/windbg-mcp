@@ -166,6 +166,7 @@ engine — it adds a target and leaves the current one alone. The entry records 
 - [Item 115](#115-windbg-mcp-the-secure-kernel-kd-facade-shipped-unrecorded--done-2026-10-07) — [windbg-mcp] The Secure Kernel KD facade shipped unrecorded — done (2026-10-07)
 - [Item 120](#120-windbg-mcp-the-secure-kernel-kd-facade-is-not-an-mcp-managed-session--done-2026-10-07) — [windbg-mcp] The Secure Kernel KD facade is an MCP-managed session — done (2026-10-07)
 - [Item 119](#119-windbg-mcp-what-a-vtl1-debugger-still-cannot-do--done-2026-10-07) — [windbg-mcp] The VTL1 capability matrix is live-derived — done (2026-10-07)
+- [Item 73](#73-windbg-mcp-a-drivers-import-directory-can-be-in-a-section-the-loader-freed--done-2026-10-09-dbgscope196) — [windbg-mcp] A driver's import directory can be in a section the loader freed — done (2026-10-09, dbgscope#196)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -9591,3 +9592,75 @@ and explicit refusals. The measured rows now include the initial stop, `lm m sec
 fall-through `t`, virtual reads, `q`, MCP release and the independent 60-second audit. The matrix
 keeps hardware `bp`/`g`, symbol loading, stack walking and asynchronous break-in in their actual
 unmeasured or unavailable states.
+
+## 73. [windbg-mcp] A driver's import directory can be in a section the loader freed — **done** (2026-10-09, dbgscope#196)
+
+**Repo:** `windbg-mcp`.
+
+`driver_hazards` cannot answer for **HEVD** on a live kernel, and the reason is structural rather
+than incidental. Its import directory is at RVA `0x8a4a0`, inside `INIT`, whose characteristics
+carry `IMAGE_SCN_MEM_DISCARDABLE` (`0x62000020`) -- Windows frees those pages once `DriverEntry`
+returns. The bytes are not paged out; they are gone. `mountmgr` keeps its directory in `.idata` and
+is unaffected, which is why every measurement before HEVD was clean.
+
+The tool now says so precisely, and says it having been **measured**: an executable image path plus
+`.reload /f` leaves `dd HEVD+0x8a4a0 L4` reading `????????` on a live target, because the engine
+substitutes an image file's bytes where a *capture* has none and a live target's freed pages are
+mapped-and-invalid instead. The same driver in a **dump** scans fine, where the file does supply it.
+
+What that costs is not small: HEVD imports **six** names on this tool's own sink list --
+`ExAllocatePoolWithTag`, `IoCreateSymbolicLink`, `ProbeForRead`, `ProbeForWrite`, `ZwCreateFile`,
+`ZwWriteFile` -- and Driver Buddy Revolutions, reading the same bytes from the file, reports 20
+`ProbeForRead` and 4 `ProbeForWrite` call sites. The canonical vulnerable driver is the one this
+cannot answer about.
+
+- **Why deferred:** the fix is for the tool to read the image **file** itself rather than asking the
+  engine for bytes nobody has, and that needs a file the *host* can open. The module row carries
+  `\??\C:\HEVD\bin\HEVD.sys`, which is a path on the **target**, and a kernel debugger has no
+  file transport. So this is a new input (an image path argument, or a symbol-store lookup by the
+  module's timestamp and `SizeOfImage`) rather than a change to the parse -- `src/pe.rs` already
+  takes a `read(addr, len)` closure and would need nothing.
+- **What would close it:** `driver_hazards` accepting an image file to read the PE structures from
+  when the target's copy will not answer, with the result saying which source each half came from.
+  The code scan still wants target memory -- relocations and the IAT are applied there and a file's
+  are not -- so this is the *headers and imports* half only, which is exactly the half that fails.
+- **How it was found:** running Driver Buddy Revolutions and Ghidra over the same image as an
+  independent oracle (`tools/ghidra_oracle/`), then tracing the failing read to a section and
+  reading its characteristics (2026-09-14).
+
+**Where it picks up.** `hazards_at` in `src/worker.rs`, `pe_failure` beside it for the message this
+already produces, and `pe::Section::discardable`.
+
+### What landed, and what the proposal got wrong (2026-10-09)
+
+**It closed without the image file the entry said it needed.** The proposal was a new input -- an
+image path, or a symbol-store lookup -- because the import *directory* is gone and a kernel debugger
+has no file transport. Both true, and beside the point: the **import address table** is kept. The
+driver's own calls go through it, so the loader cannot free it, and on a live target each slot holds
+the address its import was bound to. HEVD's is fifteen slots at `.rdata+0`, read on the live ARM64
+kernel as `nt!RtlInitUnicodeString` through `nt!ZwClose`, while its directory at `INIT+0x4c8` read
+`??` -- so the names were on the target all along, one engine lookup per slot away.
+
+So `driver_hazards` (and `driver_surface`, through the same `hazards_at`) now names a freed
+directory's imports from the address table: the symbol at each bound address, filed under the
+library the exporting module's own export directory names -- `ntoskrnl.exe`, which the kernel is
+imported as and not loaded as. The answer says so in a typed field, `imports_named_from`, and a slot
+bound to no export is counted there and makes `sinks` a lower bound. The two parsing halves are
+dbgscope's (`read_import_address_table`, `read_export_library_name`; dbgscope#196).
+
+**What it does not do**, and the part worth knowing before the next change here: a symbol at a bound
+address is the export the slot *reaches*, which for two names sharing one address may be the other
+name than the one imported. No sink on the list is known to be such a pair.
+
+**The imports were half of it, and the other half was not this item's.** Named, the six sinks came
+back with **zero call sites**: every one is in HEVD's `PAGE`, a pageable 22 KiB section that was not
+resident, and the code walk read it as one 64 KiB window, so one absent page lost all of it. That is
+a property of the walk, fixed beside this: a window that will not read is retried a page at a time,
+so what is resident is decoded and only the absent pages are recorded. After one IOCTL down the
+dispatch path (`0x222FFF`, which no handler accepts), one page was resident and the scan found two
+`ExAllocatePoolWithTag` call sites, four `ProbeForRead` and two `ProbeForWrite` -- the rest of
+`PAGE` reported unread, page by page, rather than counted as nothing.
+
+**And the image-file half the entry described as working was not**: `driver_hazards` refused HEVD
+opened as an image target too, because dbgscope's name reader asked for 512 bytes inside a page and
+an image file's section ends at its raw size mid-page. dbgscope#194 fixed that independently.

@@ -35,6 +35,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`driver_hazards` answers for a live driver whose import directory the loader freed**
+  (`FOLLOWUPS.md` item 73, now in `DONE.md`). HEVD links its import directory into `INIT`, which is
+  discarded once the driver starts, so on a live kernel the scan refused outright -- the canonical
+  vulnerable driver was the one it could not answer about. It now names the imports from the
+  **import address table**, which the loader keeps: the export each slot is bound to, filed under
+  the library the exporting module's export directory names (`ntoskrnl.exe`). The answer carries a
+  typed `imports_named_from` saying which half was read and counting any slot bound to no export,
+  which qualifies `sinks` as a lower bound the way a bound library or an ordinal does. Measured on a
+  live ARM64 kernel: refused before; six sinks and nine other imports named after, every slot named.
+  `driver_surface` gets the same through the same scan. Needs dbgscope#196.
+- **A code scan loses only the page that would not read, not the window it was in.** The walk reads
+  64 KiB windows, and one absent page failed all of one -- on a live kernel the ordinary state of a
+  pageable section, resident only where its last run reached. HEVD's handlers are one 22 KiB `PAGE`
+  window, so a single paged-out page reported every call site in the driver as unread. A window
+  that will not read is now retried a page at a time: after one IOCTL down HEVD's dispatch, the
+  live scan finds two `ExAllocatePoolWithTag`, four `ProbeForRead` and two `ProbeForWrite` call
+  sites in the one resident page, and reports the rest unread page by page. The unreadable-code
+  line now names the live remedy beside the dump one.
+
 - **`driver_hazards` said which of its privileged instructions are in code the compiler emitted
   and which are bytes a linear decode read as code**
   ([#303](https://github.com/glslang/windbg-mcp/issues/303)). An executable section is not all
