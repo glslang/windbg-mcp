@@ -37,7 +37,7 @@
 //! can ask for the same thing, and the binding ([`Running`]) that decides *which job* the request
 //! reaches. See `AGENTS.md` and the `DECISIONS.md` entry for the invariant and its boundary.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{BufRead, BufReader, PipeReader, PipeWriter, Write};
 use std::num::NonZeroUsize;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
@@ -9166,7 +9166,9 @@ fn hazards_at(
     // this wiring between the closure and it is not, needing an engine and an import table large
     // enough to be stopped part-way through. Said rather than left to look tested.
     let stopped_by: std::cell::Cell<Option<walk::Halt>> = std::cell::Cell::new(None);
-    let read_from_directory = pe::read_imports(&image, read, || {
+    // One poll for both ways of reading the imports, so a fallback stopped by the clock is reported
+    // as the directory walk's would be.
+    let poll = || {
         let halt = if matches!(e.interrupted(), Ok(true)) {
             Some(walk::Halt::Interrupted)
         } else if Instant::now() >= deadline {
@@ -9176,7 +9178,8 @@ fn hazards_at(
         };
         stopped_by.set(halt);
         halt.is_some()
-    });
+    };
+    let read_from_directory = pe::read_imports(&image, read, poll);
     let (table, imports_named_from) = match read_from_directory {
         Ok(table) => (table, structured::ImportsNamedFrom::ImportDirectory),
         Err(why) => {
@@ -9195,8 +9198,8 @@ fn hazards_at(
             // import was bound to -- so the imports are named from that, and the answer says so.
             // Only where that cannot be read either is the directory's failure the answer.
             match discarded {
-                Some(section) => match imports_from_address_table(e, &image, read) {
-                    Some((imports, unnamed_slots)) => (
+                Some(section) => match imports_from_address_table(e, &image, read, poll) {
+                    Ok(Some((imports, unnamed_slots))) => (
                         pe::ImportTable {
                             imports,
                             unnamed_libraries: Vec::new(),
@@ -9206,8 +9209,13 @@ fn hazards_at(
                             unnamed_slots,
                         },
                     ),
-                    None => {
+                    Ok(None) => {
                         return Err(pe_failure(module, &why, stopped_by.get(), Some(&section)));
+                    }
+                    // Stopped part-way, which is the directory walk's refusal and is reported as
+                    // one: by the clock or by a request, as `stopped_by` recorded.
+                    Err(stopped) => {
+                        return Err(pe_failure(module, &stopped, stopped_by.get(), None));
                     }
                 },
                 None => return Err(pe_failure(module, &why, stopped_by.get(), None)),
@@ -10852,44 +10860,72 @@ fn smaller_extent(header: u32, loaded: u32) -> u32 {
 /// the session cannot reach — on a dump, the ordinary answer for anything the capture left out —
 /// while a structure that does not hold together is an image that is not what it claims to be.
 /// The imports of a driver whose import directory the loader freed, named from its import address
-/// table, and how many slots named nothing -- or `None` where the table cannot be read or declares
-/// no slots, which leaves the directory's own failure as the answer.
+/// table, and how many slots named nothing.
 ///
-/// One export-directory read per **exporting module** rather than per slot: a driver's imports
-/// come from a handful of modules, and over a serial link each read is a round trip. Not polled
-/// against the call's clock: the table is bounded like the import table, and each slot is two
-/// lookups the engine answers from what it holds.
+/// `Ok(None)` where the table cannot be read or declares no slots, which leaves the directory's own
+/// failure as the answer. `Err(PeError::Interrupted)` where `halt` fired: a short table would
+/// understate what the driver holds, so the fallback refuses rather than truncates, exactly as
+/// `read_imports` does.
+///
+/// **Each exporting module's table is read once, for exactly the addresses bound into it.** A
+/// driver's imports come from a handful of modules, and over a serial link a read is a round trip,
+/// so the slots are grouped by the module holding their address first and each module is asked
+/// only about its own. `halt` is polled per slot while grouping and inside every export read.
 fn imports_from_address_table(
     e: &DebugEngine,
     image: &pe::Image,
     read: impl FnMut(u64, usize) -> Option<Vec<u8>>,
-) -> Option<(Vec<pe::Import>, usize)> {
-    let slots = pe::read_import_address_table(image, read).ok()?;
-    if slots.is_empty() {
-        return None;
-    }
-    let mut libraries: HashMap<u64, Option<String>> = HashMap::new();
-    Some(hazards::imports_from_bound_slots(
-        &slots,
-        |address| e.symbol_for(address),
-        |address| {
-            let module = e.module_at(address).ok().flatten()?;
-            libraries
-                .entry(module.base)
-                .or_insert_with(|| export_library_name(e, module.base, module.size))
-                .clone()
-        },
-    ))
-}
-
-/// The library name the module at `base` gives itself in its export directory: `ntoskrnl.exe` for
-/// the kernel, whatever file it was loaded from.
-fn export_library_name(e: &DebugEngine, base: u64, size: u32) -> Option<String> {
-    let read = |at: u64, len: usize| {
-        within_module(base, size, at, len).then(|| e.read_memory(at, len).ok())?
+    mut halt: impl FnMut() -> bool,
+) -> Result<Option<(Vec<pe::Import>, usize)>, pe::PeError> {
+    let Ok(slots) = pe::read_import_address_table(image, read) else {
+        return Ok(None);
     };
-    let image = pe::read_image(base, read).ok()?;
-    pe::read_export_library_name(&image, read).ok().flatten()
+    if slots.is_empty() {
+        return Ok(None);
+    }
+    // Which module holds each bound address, and every address asked of each module.
+    let mut asked: BTreeMap<u64, (u32, BTreeSet<u32>)> = BTreeMap::new();
+    let mut holder: HashMap<u64, u64> = HashMap::new();
+    for slot in &slots {
+        if halt() {
+            return Err(pe::PeError::Interrupted);
+        }
+        let Some(module) = e.module_at(slot.value).ok().flatten() else {
+            continue;
+        };
+        let Ok(rva) = u32::try_from(slot.value.saturating_sub(module.base)) else {
+            continue;
+        };
+        asked
+            .entry(module.base)
+            .or_insert_with(|| (module.size, BTreeSet::new()))
+            .1
+            .insert(rva);
+        holder.insert(slot.value, module.base);
+    }
+    let mut exports: HashMap<u64, pe::ExportsAt> = HashMap::new();
+    for (&base, (size, rvas)) in &asked {
+        let read = |at: u64, len: usize| {
+            within_module(base, *size, at, len).then(|| e.read_memory(at, len).ok())?
+        };
+        let Ok(exporter) = pe::read_image(base, read) else {
+            continue;
+        };
+        match pe::read_exports_at(&exporter, read, rvas, &mut halt) {
+            Ok(Some(found)) => {
+                exports.insert(base, found);
+            }
+            Err(pe::PeError::Interrupted) => return Err(pe::PeError::Interrupted),
+            // A module whose exports will not read names none of its slots, and they are counted.
+            Ok(None) | Err(_) => {}
+        }
+    }
+    Ok(Some(hazards::imports_from_bound_slots(&slots, |value| {
+        let base = *holder.get(&value)?;
+        let found = exports.get(&base)?;
+        let names = found.names.get(&u32::try_from(value - base).ok()?)?;
+        Some((found.library.clone(), names.clone()))
+    })))
 }
 
 fn pe_failure(

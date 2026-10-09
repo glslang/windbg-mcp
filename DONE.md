@@ -9642,15 +9642,20 @@ kernel as `nt!RtlInitUnicodeString` through `nt!ZwClose`, while its directory at
 `??` -- so the names were on the target all along, one engine lookup per slot away.
 
 So `driver_hazards` (and `driver_surface`, through the same `hazards_at`) now names a freed
-directory's imports from the address table: the symbol at each bound address, filed under the
-library the exporting module's own export directory names -- `ntoskrnl.exe`, which the kernel is
-imported as and not loaded as. The answer says so in a typed field, `imports_named_from`, and a slot
-bound to no export is counted there and makes `sinks` a lower bound. The two parsing halves are
-dbgscope's (`read_import_address_table`, `read_export_library_name`; dbgscope#196).
+directory's imports from the address table, by the **export table** of the module each bound address
+is in: the name exported at that address, filed under the library that module's export directory
+gives itself -- `ntoskrnl.exe`, which the kernel is imported as and not loaded as. The answer says so
+in a typed field, `imports_named_from`, and a slot bound to no export is counted there and makes
+`sinks` a lower bound. The parsing is dbgscope's (`read_import_address_table`, `read_exports_at`;
+dbgscope#196).
 
-**What it does not do**, and the part worth knowing before the next change here: a symbol at a bound
-address is the export the slot *reaches*, which for two names sharing one address may be the other
-name than the one imported. No sink on the list is known to be such a pair.
+**Not by symbol lookup, which the first draft used and review on #471 caught.** The engine's name at
+an exported address need not be the export's: HEVD's `__C_specific_handler` slot is bound to an
+address it names `nt!_C_specific_handler`. That one is not a sink, but a sink renamed the same way
+would have gone missing without being counted. Where several names are exported at one address, the
+one on the sink list is taken where there is one -- they are one function, so the call reaches it
+whichever name was linked. Each exporting module's table is read once, for the addresses bound into
+it, and the fallback polls the call's clock and refuses rather than truncates when it fires.
 
 **The imports were half of it, and the other half was not this item's.** Named, the six sinks came
 back with **zero call sites**: every one is in HEVD's `PAGE`, a pageable 22 KiB section that was not

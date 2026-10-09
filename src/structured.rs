@@ -3445,9 +3445,11 @@ pub struct DriverHazards {
 /// ARM64 build puts it in `INIT` -- which the loader frees once the driver has started, so on a live
 /// target there is nothing left to name imports from there. The import address table is kept: the
 /// driver's own calls go through it, and each slot holds the address its import was bound to. So
-/// an import is named from that address instead -- the symbol there, filed under the library name
-/// the exporting module's own export directory gives -- which is the export the slot reaches. For
-/// an export sharing its address with another name, that may be the other name.
+/// an import is named from that address instead, by the **export table** of the module it is in --
+/// its own library name and the export at that address -- and not by a symbol lookup, whose name at
+/// an exported address need not be the export's (measured: `__C_specific_handler` is bound to an
+/// address the engine names `nt!_C_specific_handler`). Where several names share the address, the
+/// one on the sink list is taken where there is one: they are one function.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "from", rename_all = "snake_case")]
 pub enum ImportsNamedFrom {
@@ -3457,8 +3459,8 @@ pub enum ImportsNamedFrom {
     /// loader had freed.
     ImportAddressTable {
         discarded_section: String,
-        /// Slots bound to an address that names no export -- no module there, no symbol, or a
-        /// symbol the address is not the start of. Each is an import this could not name, so a
+        /// Slots bound to an address no module exports -- no module there, its exports would not
+        /// read, or an address it does not export. Each is an import this could not name, so a
         /// non-zero count makes `sinks` a lower bound, as `unnamed_libraries` does.
         unnamed_slots: usize,
     },

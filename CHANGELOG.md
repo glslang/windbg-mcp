@@ -39,8 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`FOLLOWUPS.md` item 73, now in `DONE.md`). HEVD links its import directory into `INIT`, which is
   discarded once the driver starts, so on a live kernel the scan refused outright -- the canonical
   vulnerable driver was the one it could not answer about. It now names the imports from the
-  **import address table**, which the loader keeps: the export each slot is bound to, filed under
-  the library the exporting module's export directory names (`ntoskrnl.exe`). The answer carries a
+  **import address table**, which the loader keeps: the export each slot is bound to, read from the
+  exporting module's own export table rather than from symbols (the symbol at an exported address
+  need not be the export's name -- `__C_specific_handler` resolves as `_C_specific_handler`), filed
+  under the library that table names (`ntoskrnl.exe`). The answer carries a
   typed `imports_named_from` saying which half was read and counting any slot bound to no export,
   which qualifies `sinks` as a lower bound the way a bound library or an ordinal does. Measured on a
   live ARM64 kernel: refused before; six sinks and nine other imports named after, every slot named.
