@@ -3175,6 +3175,13 @@ impl Sessions {
                 "the worker did not confirm register restoration, handler cleanup and handled detach",
             ));
         }
+        // A teardown does not step or continue, so its worker has no reason to emit
+        // `SecureKernelPauseEnded`. Once this attempt is terminal, cancel the ordinary live
+        // controller's expiry task explicitly; unresolved ownership returned above keeps its
+        // enforcement active.
+        if session.kind == SessionKind::SecureKernelLive {
+            self.end_secure_kernel_pause(session);
+        }
         // Recorded **before** `fail_outstanding`, and the order is the whole point: that call is
         // what turns another teardown's wait on this same session into `Lost`, so the flag has to
         // be visible by the time anyone is failed out of it. Reordering these two lines silently
@@ -8161,6 +8168,43 @@ mod tests {
         })
         .await
         .expect("the cancelled pause timer should release its session promptly");
+    }
+
+    #[tokio::test]
+    async fn a_teardown_drops_its_live_pause_timer_reference() {
+        let live = secure_kernel_live_double("live-teardown", SessionState::Open, 4100);
+        live.reach(OpenPhase::Opened);
+        let (tx, mut queue) = mpsc::unbounded_channel();
+        let live = Arc::new(Session {
+            tx,
+            ..Arc::into_inner(live).unwrap()
+        });
+        let sessions = registry_of(std::slice::from_ref(&live));
+        let baseline = Arc::strong_count(&live);
+        sessions.begin_secure_kernel_pause(&live, 60_000);
+        assert_eq!(Arc::strong_count(&live), baseline + 1);
+
+        let responding = Arc::clone(&live);
+        let reply = tokio::spawn(async move {
+            let job = queue.recv().await.unwrap();
+            assert!(matches!(job.op, EngineOp::EndSession));
+            let waiter = responding.waiters.lock().unwrap().remove(&job.id).unwrap();
+            waiter
+                .done
+                .send(Ok(Output::released("confirmed release", Some(true))))
+                .unwrap();
+        });
+        let ended = sessions.end(&live, true).await.unwrap().data.unwrap();
+        reply.await.unwrap();
+        assert_eq!(ended["released"], true);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Arc::strong_count(&live) != baseline {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a completed teardown should cancel its live-pause timer promptly");
     }
 
     /// [`dormant`] with a transcript, for the one test that is about what gets recorded.
