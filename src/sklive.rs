@@ -195,6 +195,9 @@ pub(crate) trait EventDispatcher {
     /// Detach before pausing an armed target that produced no event, then reattach while paused so
     /// provider state and the registered handler can be removed without deadlocking Hyper-V.
     fn begin_disarm(&mut self, targets: &[TargetIdentity]) -> Result<()>;
+    fn begin_disarm_until(&mut self, targets: &[TargetIdentity], _deadline: Instant) -> Result<()> {
+        self.begin_disarm(targets)
+    }
     fn finish_arm(&mut self) -> Result<()>;
     /// Whether every provider whose registers may be accessed is currently quiesced.
     fn provider_writes_quiesced(&self) -> bool;
@@ -1822,11 +1825,18 @@ impl<P: ControlProvider> LiveControl<P> {
                     .any(|provider| provider.baseline.is_some()) =>
             {
                 self.state = State::Arming;
+                let targets = self.targets();
+                for provider in &mut self.providers {
+                    provider.provider.set_outer_deadline(deadline);
+                }
                 let result = (|| {
                     if self.breakpoints.is_empty() {
                         bail!("the armed session has no breakpoint guards");
                     }
-                    dispatcher.begin_disarm(&self.targets())?;
+                    match deadline {
+                        Some(deadline) => dispatcher.begin_disarm_until(&targets, deadline)?,
+                        None => dispatcher.begin_disarm(&targets)?,
+                    }
                     if !dispatcher.provider_writes_quiesced() {
                         bail!("the dispatcher did not prove quiescence for disarming providers");
                     }
@@ -1843,6 +1853,9 @@ impl<P: ControlProvider> LiveControl<P> {
                     dispatcher.finish_arm()?;
                     Ok(())
                 })();
+                for provider in &mut self.providers {
+                    provider.provider.set_outer_deadline(None);
+                }
                 if let Err(error) = result {
                     return Err(self.enter_fault_inner(dispatcher, error, None, deadline));
                 }
@@ -2734,6 +2747,7 @@ mod tests {
         fail_teardown: Option<&'static str>,
         fail_verify: Option<&'static str>,
         release_deadlines: Vec<Option<Instant>>,
+        disarm_deadlines: Vec<Option<Instant>>,
         retained_recovery_deadline: Option<Instant>,
         recovery_deadlines: Vec<Option<Instant>>,
         teardown_deadlines: Vec<Option<Instant>>,
@@ -2758,6 +2772,7 @@ mod tests {
                 fail_teardown: None,
                 fail_verify: None,
                 release_deadlines: Vec::new(),
+                disarm_deadlines: Vec::new(),
                 retained_recovery_deadline: None,
                 recovery_deadlines: Vec::new(),
                 teardown_deadlines: Vec::new(),
@@ -2780,6 +2795,21 @@ mod tests {
         }
 
         fn begin_disarm(&mut self, _targets: &[TargetIdentity]) -> Result<()> {
+            self.disarm_deadlines.push(None);
+            self.actions.push(Action::BeginDisarm);
+            self.provider_writes_quiesced = true;
+            if let Some(reason) = self.fail_begin {
+                bail!("{reason}");
+            }
+            Ok(())
+        }
+
+        fn begin_disarm_until(
+            &mut self,
+            _targets: &[TargetIdentity],
+            deadline: Instant,
+        ) -> Result<()> {
+            self.disarm_deadlines.push(Some(deadline));
             self.actions.push(Action::BeginDisarm);
             self.provider_writes_quiesced = true;
             if let Some(reason) = self.fail_begin {
@@ -3882,6 +3912,42 @@ mod tests {
         assert_eq!(provider.outer_deadline, None);
         assert_eq!(dispatcher.release_deadlines, [Some(deadline)]);
         assert_eq!(dispatcher.teardown_deadlines, [Some(deadline)]);
+        assert_eq!(control.phase(), LivePhase::Closed);
+    }
+
+    #[test]
+    fn bounded_post_step_close_keeps_the_deadline_through_running_disarm() {
+        let mut dispatcher =
+            FakeDispatcher::new([observed(StopReason::HardwareBreakpoint { slot: 0 })]);
+        let mut control = LiveControl::open(FakeProvider::new()).unwrap();
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Redirect)
+            .unwrap();
+        let stopped = control.wait_for_stop(&mut dispatcher).unwrap();
+        control
+            .step_until(
+                &mut dispatcher,
+                &stopped.epoch,
+                straight_step(),
+                Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+        let writes = control.test_provider().write_deadlines.len();
+        let recovery_deadline = Instant::now() + std::time::Duration::from_secs(2);
+
+        control
+            .close_until(&mut dispatcher, recovery_deadline)
+            .unwrap();
+
+        let provider = control.test_provider();
+        assert!(
+            provider.write_deadlines[writes..]
+                .iter()
+                .all(|observed| *observed == Some(recovery_deadline))
+        );
+        assert_eq!(provider.outer_deadline, None);
+        assert_eq!(dispatcher.disarm_deadlines, [Some(recovery_deadline)]);
+        assert_eq!(dispatcher.teardown_deadlines, [Some(recovery_deadline)]);
         assert_eq!(control.phase(), LivePhase::Closed);
     }
 
