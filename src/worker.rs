@@ -3070,11 +3070,13 @@ fn execute(
         }
 
         EngineOp::SkLiveWait => {
-            let stop = held_live_control(&mut sk_live.session)?
-                .wait_for_stop(e)
+            let session = held_live_control(&mut sk_live.session)?;
+            let max_pause_ms = session.max_pause_ms();
+            let stop = session
+                .wait_for_stop(e, || {
+                    emit(&WorkerMessage::SecureKernelPauseStarted { max_pause_ms });
+                })
                 .map_err(failed)?;
-            let max_pause_ms = held_live_control(&mut sk_live.session)?.max_pause_ms();
-            emit(&WorkerMessage::SecureKernelPauseStarted { max_pause_ms });
             Ok(Output::typed(crate::skdispatch::render_stop(&stop), stop))
         }
 
@@ -12021,6 +12023,26 @@ mod tests {
             allow_transition_cr3: false,
             additional_vps: Vec::new(),
         }))
+    }
+
+    #[test]
+    fn ordinary_live_wait_reports_the_pause_from_its_retention_callback() {
+        let source = include_str!("worker.rs");
+        let arm = source
+            .split_once("EngineOp::SkLiveWait =>")
+            .expect("the live-wait dispatch arm exists")
+            .1
+            .split_once("EngineOp::SkLiveRegisters")
+            .expect("the next live dispatch arm exists")
+            .0;
+
+        assert!(
+            arm.contains(".wait_for_stop(e, || {")
+                && arm.contains("emit(&WorkerMessage::SecureKernelPauseStarted"),
+            "the supervisor pause notice must be emitted by the callback invoked at retained-stop \
+             time, not after wait validation returns: {arm}"
+        );
+        assert_eq!(arm.matches("SecureKernelPauseStarted").count(), 1);
     }
 
     fn kind(class: u32, qualifier: u32) -> Option<DebuggeeType> {

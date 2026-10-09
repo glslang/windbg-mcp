@@ -88,7 +88,8 @@ loading is disabled when none is admitted. `max_pause_ms` is the absolute bound 
 ordinary live-control stop and each managed-KD stop. The request cannot choose or widen it. An
 invalid or absent policy fails before a VM lookup, provider load or worker spawn.
 A capture-only deployment may omit the three live-authority arrays and `max_pause_ms`; a live
-deployment must provide all three arrays together and a pause bound.
+deployment must provide all three arrays together and a pause bound of at least 10,000 ms, which
+leaves the mandatory five-second cleanup settle inside the reserved half of the smallest window.
 
 Call `open_sk_kd` with the exact-build dispatcher profile, the two provider command templates, VM
 GUID and selected VP. The profile carries the initial guarded instruction as a Secure Kernel RVA;

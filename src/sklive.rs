@@ -1221,7 +1221,6 @@ impl<P: ControlProvider> LiveControl<P> {
             vp = self.providers[0].target.vp,
             mode = ?mode,
             breakpoint_count = self.breakpoints.len(),
-            epoch = %next_epoch.1,
             "live Secure Kernel control armed VTL1 execution breakpoints"
         );
         Ok(self.commit_epoch(next_epoch))
@@ -1443,7 +1442,6 @@ impl<P: ControlProvider> LiveControl<P> {
                     target: "windbg_mcp::secure_kernel_mutation",
                     vm_id = %stop.target.vm_id,
                     vp = stop.target.vp,
-                    epoch = %stop.epoch,
                     reason = ?stop.event.reason,
                     "live Secure Kernel control retained a VTL1 stop"
                 );
@@ -1561,7 +1559,6 @@ impl<P: ControlProvider> LiveControl<P> {
             target: "windbg_mcp::secure_kernel_mutation",
             vm_id = %self.providers[active].target.vm_id,
             vp = self.providers[active].target.vp,
-            epoch = %next_epoch.1,
             "live Secure Kernel control armed trap-flag single-step"
         );
         Ok(self.commit_epoch(next_epoch))
@@ -1640,7 +1637,6 @@ impl<P: ControlProvider> LiveControl<P> {
             target: "windbg_mcp::secure_kernel_mutation",
             vm_id = %self.providers[active].target.vm_id,
             vp = self.providers[active].target.vp,
-            epoch = %next_epoch.1,
             "live Secure Kernel control restored the VTL1 baseline and resumed"
         );
         Ok(self.commit_epoch(next_epoch))

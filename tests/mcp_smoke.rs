@@ -20362,14 +20362,14 @@ fn a_managed_secure_kernel_kd_session_steps_in_windbg_and_releases_through_mcp()
                 break;
             }
             let transcript = std::fs::read_to_string(&log).unwrap_or_default();
-            if transcript.contains("WINDBG_MCP_KD_SCRIPT_COMPLETE") && transcript.contains("quit:")
-            {
-                // Both installed KD builds on the live bench finish `q` but retain the pipe until
-                // its server closes. Waiting for process exit first therefore spends the server's
+            if transcript.contains("WINDBG_MCP_KD_SCRIPT_COMPLETE") {
+                // The marker proves that lm/t/r completed, and q is the next command in the
+                // already-open command file. Both installed KD builds on the live bench may then
+                // retain the pipe until its server closes; one does not publish `quit:` until that
+                // happens. Waiting for either token or process exit therefore spends the server's
                 // idle bound and observes `released`, never the disconnect's `reconnecting`
-                // phase. Once the transcript proves that `q` completed, this process is only the
-                // test-owned peer: close it, wait for its handles to disappear, then assert the
-                // managed session's reconnect transition below.
+                // phase. This process is now only the test-owned peer: close it, wait for its
+                // handles to disappear, then assert the managed session's reconnect transition.
                 match child.kill() {
                     Ok(()) => {
                         child.wait().expect("wait for lingering kd.exe");
@@ -20378,7 +20378,7 @@ fn a_managed_secure_kernel_kd_session_steps_in_windbg_and_releases_through_mcp()
                         let status = child.try_wait().expect("recheck kd.exe after kill failed");
                         assert!(
                             status.is_some_and(|status| status.success()),
-                            "closing kd.exe after its completed q failed: {error}; status={status:?}"
+                            "closing kd.exe after its completed script failed: {error}; status={status:?}"
                         );
                     }
                 }

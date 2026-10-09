@@ -631,7 +631,6 @@ impl<R: BufRead, W: Write> ControlSession<R, W> {
             vm_id = %self.target.vm_id,
             partition_id = ?self.target.partition_id,
             vp = self.target.vp,
-            epoch = %self.epoch,
             "control provider retained the dispatcher stop"
         );
         Ok(())
@@ -689,6 +688,10 @@ impl<R: BufRead, W: Write> ControlSession<R, W> {
             bail!("provider returned the wrong reply to write_registers")
         };
         if let Err(error) = validate_values(&names, &values) {
+            self.poisoned = true;
+            return Err(error);
+        }
+        if let Err(error) = validate_guarded_writes(&audit_writes, &values) {
             self.poisoned = true;
             return Err(error);
         }
@@ -1385,6 +1388,18 @@ fn validate_values(wanted: &[RegisterName], values: &[RegisterValue]) -> Result<
     Ok(())
 }
 
+fn validate_guarded_writes(writes: &[RegisterWrite], values: &[RegisterValue]) -> Result<()> {
+    for (write, value) in writes.iter().zip(values) {
+        if value.status != 0 || value.low != write.value {
+            bail!(
+                "provider did not verify the guarded write to {:?}",
+                write.name
+            );
+        }
+    }
+    Ok(())
+}
+
 fn unique<T: Eq>(values: &[T], what: &str) -> Result<()> {
     for (index, value) in values.iter().enumerate() {
         if values[..index].contains(value) {
@@ -1666,6 +1681,61 @@ mod tests {
             ControlSession::open(Cursor::new(input.into_bytes()), Vec::new(), target()).unwrap();
         assert_eq!(skipped, ["banner from provider"]);
         session
+    }
+
+    #[test]
+    fn guarded_write_responses_must_confirm_status_and_value_before_success() {
+        for value in [
+            RegisterValue {
+                name: RegisterName::Dr7,
+                status: 1,
+                low: HexU64(0x400),
+                high: HexU64(0),
+            },
+            RegisterValue {
+                name: RegisterName::Dr7,
+                status: 0,
+                low: HexU64(0x401),
+                high: HexU64(0),
+            },
+        ] {
+            let lines = vec![
+                response(
+                    1,
+                    EPOCH_RUNNING,
+                    ReplyValue::Capabilities {
+                        value: capabilities(),
+                    },
+                ),
+                response(2, "arming-0000000000000001", ReplyValue::ArmBegun),
+                response(
+                    3,
+                    "arming-0000000000000001",
+                    ReplyValue::RegistersWritten {
+                        values: vec![value],
+                    },
+                ),
+            ];
+            let mut session = scripted(&lines);
+            session.capabilities().unwrap();
+            session.begin_arm().unwrap();
+
+            let error = session
+                .write_registers(vec![RegisterWrite {
+                    name: RegisterName::Dr7,
+                    expected: HexU64(0x401),
+                    value: HexU64(0x400),
+                }])
+                .unwrap_err();
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("did not verify the guarded write"),
+                "{error:#}"
+            );
+            assert!(session.poisoned);
+        }
     }
 
     #[test]
