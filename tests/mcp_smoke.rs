@@ -12712,6 +12712,51 @@ fn marker_path(what: &str) -> std::path::PathBuf {
     ))
 }
 
+/// The authenticated client PID the managed KD target reported for its latest pipe connection.
+fn secure_kernel_kd_client_pid(stderr: &str) -> u32 {
+    const PREFIX: &str = "accepted Secure Kernel KD client PID ";
+    stderr
+        .lines()
+        .rev()
+        .find_map(|line| line.split_once(PREFIX).map(|(_, after)| after))
+        .and_then(|after| after.split_whitespace().next())
+        .and_then(|pid| pid.parse().ok())
+        .unwrap_or_else(|| panic!("the managed KD target did not report its pipe client PID"))
+}
+
+/// Terminate one narrowly identified Windows process tree. The managed gate uses the PID that the
+/// named pipe authenticated, which need not be the launcher PID returned by `Command::spawn`.
+fn terminate_process_tree(pid: u32, context: &str) {
+    let pid = pid.to_string();
+    let killed = Command::new("taskkill.exe")
+        .args(["/PID", &pid, "/T", "/F"])
+        .output()
+        .unwrap_or_else(|error| panic!("launch taskkill for {context} PID {pid}: {error}"));
+    if !killed.status.success() && process_alive(pid.parse().expect("the PID remains numeric")) {
+        panic!(
+            "taskkill failed for {context} PID {pid}: stdout={} stderr={}",
+            String::from_utf8_lossy(&killed.stdout),
+            String::from_utf8_lossy(&killed.stderr)
+        );
+    }
+}
+
+/// Terminate a test-owned Windows process and every descendant that may have inherited one of its
+/// handles. `Child::kill` only terminates the process itself and is not a process-tree operation.
+fn kill_process_tree(child: &mut Child, context: &str) {
+    if !still_running(child) {
+        child
+            .wait()
+            .unwrap_or_else(|error| panic!("reap exited {context}: {error}"));
+        return;
+    }
+    let pid = child.id();
+    terminate_process_tree(pid, context);
+    child
+        .wait()
+        .unwrap_or_else(|error| panic!("wait for terminated {context} PID {pid}: {error}"));
+}
+
 /// The `session_id` a tool result carries, if it carries one.
 ///
 /// Anchored to the line the openers actually emit (`session_id: sess-…`) rather than to the
@@ -20261,15 +20306,20 @@ fn a_managed_secure_kernel_kd_session_steps_in_windbg_and_releases_through_mcp()
         .to_string();
     assert!(std::path::Path::new(&kd).is_file(), "no kd.exe at {kd}");
     let commands = marker_path("sk-kd-commands").with_extension("txt");
+    let quit_commands = marker_path("sk-kd-quit-commands").with_extension("txt");
     let log = marker_path("sk-kd-windbg").with_extension("log");
+    let quit_log = marker_path("sk-kd-quit-windbg").with_extension("log");
     let symbols = marker_path("sk-kd-empty-symbols");
     std::fs::create_dir(&symbols).expect("create the empty KD symbol directory");
     std::fs::write(
         &commands,
-        b"lm m securekernel\nt\nr\n.echo WINDBG_MCP_KD_SCRIPT_COMPLETE\nq\n",
+        b"lm m securekernel\nt\nr\n.echo WINDBG_MCP_KD_SCRIPT_COMPLETE\n",
     )
     .expect("write the KD command file");
+    std::fs::write(&quit_commands, b".echo WINDBG_MCP_KD_QUIT_PENDING; q\n")
+        .expect("write the KD quit command file");
     let _ = std::fs::remove_file(&log);
+    let _ = std::fs::remove_file(&quit_log);
 
     let open = json!({
         "profile": required("profile"),
@@ -20363,30 +20413,24 @@ fn a_managed_secure_kernel_kd_session_steps_in_windbg_and_releases_through_mcp()
             }
             let transcript = std::fs::read_to_string(&log).unwrap_or_default();
             if transcript.contains("WINDBG_MCP_KD_SCRIPT_COMPLETE") {
-                // The marker proves that lm/t/r completed, and q is the next command in the
-                // already-open command file. Both installed KD builds on the live bench may then
-                // retain the pipe until its server closes; one does not publish `quit:` until that
-                // happens. Waiting for either token or process exit therefore spends the server's
-                // idle bound and observes `released`, never the disconnect's `reconnecting`
-                // phase. This process is now only the test-owned peer: close it, wait for its
-                // handles to disappear, then assert the managed session's reconnect transition.
-                match child.kill() {
-                    Ok(()) => {
-                        child.wait().expect("wait for lingering kd.exe");
-                    }
-                    Err(error) => {
-                        let status = child.try_wait().expect("recheck kd.exe after kill failed");
-                        assert!(
-                            status.is_some_and(|status| status.success()),
-                            "closing kd.exe after its completed script failed: {error}; status={status:?}"
-                        );
-                    }
+                // This first peer has completed every observable debugger assertion. Close the
+                // authenticated pipe client before its launcher, then require the managed
+                // session's reconnect transition. A second peer below owns the q check; separating
+                // those events avoids using q's circular pipe-close behavior as evidence of the
+                // disconnect transition.
+                let client_pid = secure_kernel_kd_client_pid(&server.stderr());
+                let launcher_pid = child.id();
+                terminate_process_tree(client_pid, "the first connected KD client");
+                if client_pid == launcher_pid {
+                    child.wait().expect("wait for the connected KD client");
+                } else {
+                    kill_process_tree(child, "the first KD launcher");
                 }
                 break;
             }
             assert!(
                 Instant::now() < deadline,
-                "kd.exe neither exited nor completed the t/r/q script\n--- WinDbg ---\n{}",
+                "kd.exe neither exited nor completed the lm/t/r script\n--- WinDbg ---\n{}",
                 std::fs::read_to_string(&log).unwrap_or_else(|error| error.to_string())
             );
             std::thread::sleep(Duration::from_millis(100));
@@ -20461,16 +20505,84 @@ fn a_managed_secure_kernel_kd_session_steps_in_windbg_and_releases_through_mcp()
             transcript.to_ascii_lowercase().contains("securekernel"),
             "WinDbg did not enumerate securekernel.exe:\n{transcript}"
         );
+
+        // Reconnect a fresh peer for q itself. This build does not publish `quit:` or exit until
+        // its target closes the pipe, so MCP teardown below supplies that half of the handshake.
+        // q shares one parsed command line with the marker, the harness never kills this peer on
+        // the success path, and its zero exit after MCP closes the server is the post-q evidence.
+        let child = Command::new(&kd)
+            .args(["-k", &connection, "-cf"])
+            .arg(&quit_commands)
+            .arg("-y")
+            .arg(&symbols)
+            .arg("-logo")
+            .arg(&quit_log)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap_or_else(|error| panic!("launching q peer {kd}: {error}"));
+        kd_process = Some(child);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let child = kd_process.as_mut().expect("the q peer was stored");
+            if let Some(status) = child.try_wait().expect("query q peer") {
+                assert!(
+                    status.success(),
+                    "the q peer exited {status}\n--- WinDbg ---\n{}",
+                    std::fs::read_to_string(&quit_log).unwrap_or_else(|error| error.to_string())
+                );
+                break;
+            }
+            if std::fs::read_to_string(&quit_log)
+                .unwrap_or_default()
+                .contains("WINDBG_MCP_KD_QUIT_PENDING")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the reconnected KD peer did not reach its q command\n--- stderr ---\n{}\n--- WinDbg ---\n{}",
+                server.stderr(),
+                std::fs::read_to_string(&quit_log).unwrap_or_else(|error| error.to_string())
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }));
 
-    if let Some(child) = kd_process.as_mut()
+    if run.is_err()
+        && let Some(child) = kd_process.as_mut()
         && child.try_wait().ok().flatten().is_none()
     {
-        let _ = child.kill();
-        let _ = child.wait();
+        kill_process_tree(child, "the failed KD peer");
     }
     let ended = server.call_tool("end_session", json!({ "session_id": id }), TARGET_STEP);
     if run.is_ok() {
+        let child = kd_process.as_mut().expect("the q peer remains owned");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let transcript = std::fs::read_to_string(&quit_log).unwrap_or_default();
+            let quit_completed = transcript.lines().any(|line| line.trim() == "quit:");
+            if quit_completed && !still_running(child) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                if still_running(child) {
+                    kill_process_tree(child, "the timed-out q peer");
+                }
+                panic!(
+                    "q did not complete after MCP closed the server pipe: active={} quit={quit_completed}\n--- WinDbg ---\n{transcript}",
+                    still_running(child)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let status = child.wait().expect("reap the completed q peer");
+        assert!(
+            status.success(),
+            "q peer exited {status} after publishing quit\n--- WinDbg ---\n{}",
+            std::fs::read_to_string(&quit_log).unwrap_or_else(|error| error.to_string())
+        );
         assert_no_error(&ended, "tools/call end_session");
         let ended = &ended["result"]["structuredContent"];
         assert_eq!(ended["status"], "ok", "{ended}");
@@ -20557,7 +20669,9 @@ fn a_managed_secure_kernel_kd_session_steps_in_windbg_and_releases_through_mcp()
         );
     }
     let _ = std::fs::remove_file(commands);
+    let _ = std::fs::remove_file(quit_commands);
     let _ = std::fs::remove_file(log);
+    let _ = std::fs::remove_file(quit_log);
     let _ = std::fs::remove_dir(symbols);
     if let Err(panic) = run {
         resume_unwind(panic);

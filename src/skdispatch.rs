@@ -410,17 +410,8 @@ impl Session {
         epoch: &crate::skcontrol::StopEpoch,
         guard: crate::sklive::StepGuard,
     ) -> Result<LiveTransition> {
-        self.ensure_preparation_succeeded()?;
-        let control = self
-            .control
-            .as_mut()
-            .context("live Secure Kernel control has not completed target discovery")?;
-        let mut dispatcher = self.dispatcher.bind(engine);
-        let epoch = control.step(&mut dispatcher, epoch, guard)?;
-        Ok(LiveTransition {
-            phase: control.phase(),
-            epoch,
-        })
+        let deadline = self.stopped_service_deadline()?;
+        self.step_until(engine, epoch, guard, deadline)
     }
 
     pub(crate) fn step_until(
@@ -448,13 +439,23 @@ impl Session {
         engine: &DebugEngine,
         epoch: &crate::skcontrol::StopEpoch,
     ) -> Result<LiveTransition> {
+        let deadline = self.stopped_service_deadline()?;
+        self.continue_from_until(engine, epoch, deadline)
+    }
+
+    fn continue_from_until(
+        &mut self,
+        engine: &DebugEngine,
+        epoch: &crate::skcontrol::StopEpoch,
+        deadline: Instant,
+    ) -> Result<LiveTransition> {
         self.ensure_preparation_succeeded()?;
         let control = self
             .control
             .as_mut()
             .context("live Secure Kernel control has not completed target discovery")?;
         let mut dispatcher = self.dispatcher.bind(engine);
-        let epoch = control.continue_from(&mut dispatcher, epoch)?;
+        let epoch = control.continue_from_until(&mut dispatcher, epoch, deadline)?;
         Ok(LiveTransition {
             phase: control.phase(),
             epoch,
@@ -462,7 +463,8 @@ impl Session {
     }
 
     pub(crate) fn read_memory(&self, address: u64, size: u32) -> Result<LiveMemoryRead> {
-        self.read_memory_inner(address, size, None)
+        let deadline = self.stopped_service_deadline()?;
+        self.read_memory_inner(address, size, Some(deadline))
     }
 
     pub(crate) fn read_memory_until(
@@ -487,6 +489,19 @@ impl Session {
             .context("live VTL1 memory can be read only while the session is stopped")?;
         self.dispatcher
             .read_memory(stop.epoch.clone(), address, size, deadline)
+    }
+
+    /// End ordinary stopped work before the absolute deadline's cleanup reserve begins.
+    fn stopped_service_deadline(&self) -> Result<Instant> {
+        let recovery_deadline = self
+            .dispatcher
+            .recovery_deadline
+            .context("the live Secure Kernel stop has no retained recovery deadline")?;
+        let max_pause = Duration::from_millis(self.max_pause_ms);
+        let cleanup_reserve = max_pause.saturating_sub(service_pause_bound(max_pause));
+        recovery_deadline
+            .checked_sub(cleanup_reserve)
+            .context("the live Secure Kernel service deadline underflowed")
     }
 
     pub(crate) fn continue_to_breakpoints_until(
@@ -4590,6 +4605,34 @@ mod tests {
             notice < cleanup,
             "the supervisor deadline must be armed before retention cleanup or provider I/O"
         );
+    }
+
+    #[test]
+    fn ordinary_stopped_operations_spend_only_the_retained_service_interval() {
+        let source = include_str!("skdispatch.rs");
+        for (method, bounded_call) in [
+            ("pub(crate) fn step(\n", "self.step_until("),
+            (
+                "pub(crate) fn continue_from(\n",
+                "self.continue_from_until(",
+            ),
+            (
+                "pub(crate) fn read_memory(&self,",
+                "self.read_memory_inner(address, size, Some(deadline))",
+            ),
+        ] {
+            let body = source
+                .split_once(method)
+                .unwrap_or_else(|| panic!("{method:?} exists"))
+                .1
+                .split_once("\n    }")
+                .expect("the method body ends")
+                .0;
+            assert!(
+                body.contains("self.stopped_service_deadline()") && body.contains(bounded_call),
+                "{method:?} must pass the retained service deadline to {bounded_call:?}: {body}"
+            );
+        }
     }
 
     #[test]
