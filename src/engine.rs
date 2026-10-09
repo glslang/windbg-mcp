@@ -3324,8 +3324,11 @@ impl Sessions {
                 .secure_kernel_pause
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            if let Some(cancel) = pause.cancel.take() {
-                let _ = cancel.send(());
+            // A trap-flag step releases one retained event only to arm the next stop. vmwp remains
+            // under debugger control across that interval, so the next retention notice belongs
+            // to the same absolute pause window and must not restart its timer.
+            if pause.cancel.is_some() {
+                return;
             }
             pause.generation = pause.generation.wrapping_add(1);
             let (cancel, cancelled) = oneshot::channel();
@@ -8149,6 +8152,26 @@ mod tests {
         sessions.end_secure_kernel_pause(&live);
         assert!(!sessions.claim_secure_kernel_pause_expiry(&live, generation, 60_000));
         assert_eq!(live.state(), SessionState::Open);
+    }
+
+    #[tokio::test]
+    async fn a_step_retains_the_original_absolute_pause_timer() {
+        let live = secure_kernel_live_double("live-step-chain", SessionState::Open, 4100);
+        let sessions = registry_of(std::slice::from_ref(&live));
+        let baseline = Arc::strong_count(&live);
+        sessions.begin_secure_kernel_pause(&live, 60_000);
+        let generation = live.secure_kernel_pause.lock().unwrap().generation;
+        assert_eq!(Arc::strong_count(&live), baseline + 1);
+
+        // The worker reports the next retained stop after a step. It must neither invalidate the
+        // original expiry claim nor add a replacement timer with a fresh full interval.
+        sessions.begin_secure_kernel_pause(&live, 60_000);
+        assert_eq!(
+            live.secure_kernel_pause.lock().unwrap().generation,
+            generation
+        );
+        assert_eq!(Arc::strong_count(&live), baseline + 1);
+        assert!(sessions.claim_secure_kernel_pause_expiry(&live, generation, 60_000));
     }
 
     #[tokio::test]
