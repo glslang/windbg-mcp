@@ -1,0 +1,6 @@
+# The Secure Kernel fixture carries a lab VM's GUID and live VTL1 addresses from a private run,
+# so it and the tests that use it stay out of the repository. `windbg.test.tsx` covers the same
+# code paths with synthetic payloads, so a clone still exercises them.
+tests/recorded-sk.ts
+tests/sk.test.tsx
+.claude-plugin/types/

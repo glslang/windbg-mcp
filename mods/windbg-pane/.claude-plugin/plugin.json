@@ -1,0 +1,6 @@
+{
+  "name": "windbg-pane",
+  "version": "0.1.0",
+  "description": "A WinDbg-style pane that follows windbg-mcp tool calls: disassembly, registers, stack, memory, breakpoints and a command log.",
+  "types": "./types/index.d.ts"
+}
