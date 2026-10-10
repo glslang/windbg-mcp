@@ -93,6 +93,9 @@ line is simply open.
 - [Item 116](#116-windbg-mcp-the-kd-facade-answers-windbg-with-fabricated-state-it-cannot-tell-apart-from-guest-state) — [windbg-mcp] The KD facade answers WinDbg with fabricated state it cannot tell apart from guest state
 - [Item 117](#117-windbg-mcp-the-kd-facade-pipe-has-only-the-default-acl-no-client-authentication-and-no-break-in) — [windbg-mcp] The KD facade pipe has only the default ACL, no client authentication and no break-in
 - [Item 121](#121-windbg-mcp-tracing-pool-allocations-on-an-x86-kernel) — [windbg-mcp] Tracing pool allocations on an x86 kernel
+- [Item 122](#122-windbg-mcp-a-live-secure-kernel-session-cannot-resolve-names-or-instructions-against-its-own-pinned-image) — [windbg-mcp] A live Secure Kernel session cannot resolve names or instructions against its own pinned image
+- [Item 123](#123-windbg-mcp-sk_live_step-refuses-a-cr3-changing-instruction-instead-of-stepping-over-it) — [windbg-mcp] `sk_live_step` refuses a CR3-changing instruction instead of stepping over it
+- [Item 124](#124-windbg-mcp-nothing-asserts-that-a-live-secure-kernel-read-was-of-memory-vtl0-cannot-reach) — [windbg-mcp] Nothing asserts that a live Secure Kernel read was of memory VTL0 cannot reach
 
 ## 2. [dbgscope] Typed write primitives
 
@@ -2493,6 +2496,172 @@ x64's registers for anything that was not ARM64.
 **Where it picks up.** `call_registers` and the refusal in `arm_pool_trace` (`src/worker.rs`),
 `Layout` and `layout_of` in `src/pooltrace.rs`, and the callback in `arm_pool_trace`, which is where
 an x86 entry would read the stack instead of three registers.
+## 122. [windbg-mcp] A live Secure Kernel session cannot resolve names or instructions against its own pinned image
+
+**Repo:** `windbg-mcp`. **Origin:** a live VTL1 stop/step run against an HVCI image-validation
+address, 2026-10-10.
+
+`SkLiveArmArgs::address` is documented as the "exact VTL1 virtual address to stop before", and
+`SkLiveBreakpointArgs::address` is the same for the additional slots; `SkLiveStepArgs::address` for
+a repeated step likewise. There is no build-relative alternative, so a caller arming a *named*
+Secure Kernel function has to resolve the image base before it can form the argument. The server
+does not need that from the caller: the profile already pins the exact build and carries
+build-relative RVAs of its own for the debugger-data head, block and loaded-module list, and the
+live-memory provider reports the Secure Kernel base — `open_sk_live_control`'s own report says the
+first arm "discovers and validates the partition, provider CR3 and Secure Kernel memory source
+before changing debug registers". Every other per-boot coordinate on that opener is an **optional
+assertion** for exactly this reason: `vmwp_pid`, `dispatcher_vnd`, `partition_id` and
+`expected_cr3` are all discovered by the worker and merely checked if supplied. `address` is the
+one coordinate with no discovered counterpart, which is the inconsistency rather than the hazard.
+
+**The resolution this needs is already built, for the sibling session kind.** `open_sk_capture`
+points an engine at `securekernel.exe` *as a file* at its preferred base
+([`src/sksession.rs`](./src/sksession.rs)), and `sk_symbol` resolves an unqualified symbol in that
+image to an address or names an address back. That is exactly what arming a named Secure Kernel
+function wants. It is unreachable from a live session for one reason: `engine::refuse_op_on_kind`
+sorts ops into `capture_op`, `live_op` and `kd_op`, and `EngineOp::SkSymbol` is a `capture_op`. The
+allow-list is right to exist — it is what stops a tool answering about `vmwp` as though it were the
+guest — but the effect here is that the caller does out of band what the server already does, from
+the same profile-pinned bytes.
+
+`sk_live_step` has the same shape one layer in. A *repeated* step must state `address` and the exact
+instruction `bytes`, and a stop record cannot supply them: its `instruction` field is the
+instruction that was just *stepped*, so feeding it back fails with "the step instruction address ...
+does not match the stopped RIP". The byte guard should stay — it is the interlock against stepping
+blind — but a guard the **server** derives from the pinned image is stronger than one the caller
+asserts, because a caller can assert bytes that are merely self-consistent. As it stands a caller
+stepping a sequence opens a *second* session on the same image to disassemble it, which is how the
+2026-10-10 run finally worked.
+
+The hazard is what resolving it costs the caller. The base is randomised per guest boot, so it is
+per-boot work; reading it means opening the live-memory provider against a partition; and binding a
+partition to a *specific* VM is the privileged `vmwp` walk through `vid!VidGetHvPartitionId`,
+because the provider deliberately refuses to select a partition merely for having a Secure Kernel —
+on a host with two VBS guests that would bind the wrong VTL1. So an argument whose purpose is
+exactness obliges every caller to run the most privileged step in the system to obtain a number the
+worker is about to compute anyway. Measured on 2026-10-10, that step took the VM's own worker
+process down mid-run (Hyper-V event 3040, "could not initialize"), ending the guest.
+
+- **Why deferred:** orchestration, not capability — and it is worth saying plainly, because the
+  first draft of this entry inflated it into a structural question it is not. Every piece is
+  already here. `vmwp` is an ordinary user-mode process on the host and the live worker's engine is
+  **already attached to it**, so nothing about the engine's target forbids resolving symbols
+  alongside it. The pinned image answers a name without reading the guest at all, since that is a
+  PDB and export-table lookup. The instruction bytes for a repeated step do not need a static
+  substitute either: `sk_live_read_memory` already reads live VTL1 memory while the stop is held,
+  which is how the 2026-10-10 run confirmed the live prologue matched the pinned image
+  byte-for-byte — so the server can read what it is about to step and check it against the image it
+  pinned. (A purely static route is a different tool's job; the point of this one is that it is
+  live.) What is genuinely unsettled is narrow: VTL1 maps more than the Secure Kernel image, so a
+  bare name or RVA is unambiguous only for the one image the profile pins, and an arm into `skci`
+  or a trustlet would have to name its module.
+- **What would close it:** a live session able to turn a **name** into a VTL1 address against its
+  own profile-pinned image — whether by admitting `EngineOp::SkSymbol` for `SecureKernelLive` in
+  `refuse_op_on_kind` or by a live-specific equivalent — so that `sk_live_arm` can be given a
+  symbol, or an RVA, instead of an address the caller had to compute; the same resolution used to
+  supply a repeated `sk_live_step`'s instruction, with the byte guard then checked by the server
+  against the pinned image rather than asserted by the caller; both an address and a name supplied
+  at once refused rather than one silently winning; and the live tier's config carrying a
+  build-relative target instead of `instruction_address`, which is currently a required per-boot
+  absolute and so cannot be checked in.
+- **Where it picks up:** `refuse_op_on_kind`'s `capture_op`/`live_op` split in `src/engine.rs`;
+  `SkLiveArmArgs`, `SkLiveBreakpointArgs`, `SkLiveStepArgs` and `SkSymbolArgs` in `src/server.rs`;
+  the image-as-target session in [`src/sksession.rs`](./src/sksession.rs) and its doc section *"The
+  engine's target is the image, and that is why the debugger tools are refused"*; the arm and guard
+  path in `src/sklive.rs`; the required-field list in `secure_kernel_live_tier` and its consuming
+  test in `tests/mcp_smoke.rs`; and the live-tier field list in
+  [`docs/smoke-test.md`](./docs/smoke-test.md).
+
+## 123. [windbg-mcp] `sk_live_step` refuses a CR3-changing instruction instead of stepping over it
+
+**Repo:** `windbg-mcp`. **Origin:** planning a stepped walk through a Secure Kernel syscall entry,
+2026-10-10.
+
+A single-step stop is validated against the CR3 captured when the step was armed: `required` comes
+from `ExpectedStop::SingleStep { cr3, .. }`, and `RegisterSnapshot::from_values` bails with *"the
+stopped CR3 does not match the required address space"* on any mismatch. So an instruction that
+*writes* CR3 cannot be single-stepped at all — the stop it produces is, by construction, in a
+different address space from the one the step began in, and the session faults.
+
+**The requirement is sound and the refusal is the wrong primitive.** It is sound because the live
+memory source reads guest *physical* memory only, so a virtual address is resolved by walking the
+VTL1 page tables from a root (`sk::walk(&reader, root)`), and that walk is what every read at the
+stop goes through — the instruction guard included. A stop in another root would have the server
+reading one address space while the VP executes in another. But the conclusion drawn from it is
+that such an instruction is un-steppable, and it is not: **the server already knows where the next
+instruction starts.** The step request carries the exact instruction `bytes`, and `expected_rips`
+already defaults to address-plus-length from them. So instead of refusing, the step can be
+performed as a *step over* — arm a bounded execution breakpoint at `address + len(bytes)` and
+continue — and the resulting **hardware** stop is explicitly allowed to arrive in a different root,
+where `bind_stop_cr3` → `MemorySource::bind_root` re-walks the space and the session carries on
+correctly on the far side.
+
+The concrete case this was found on is `KiSystemCall64Shadow`, whose fourth instruction is
+`mov cr3,rsp`. A caller wanting to walk a trustlet's entry into the Secure Kernel has to stop three
+instructions in and give up, or hand-build the breakpoint-and-continue dance itself — which is the
+server's own `sk_live_arm` and `sk_live_continue` being used to work around `sk_live_step`.
+
+- **Why deferred:** two API questions rather than a missing mechanism. A step-over consumes a
+  **debug-register slot**, and natural mode has four that `additional_breakpoints` already competes
+  for — so either the step borrows one and the arm budget shrinks while a step is outstanding, or a
+  step-over is refused when no slot is free, and which of those is right is a decision. And the
+  stop it produces is a hardware stop, so a caller that asked to step gets back a stop whose reason
+  is `hardware_breakpoint`; reporting that unchanged would be misleading, and inventing
+  `single_step` for it would be worse. It likely wants a reason of its own.
+- **What would close it:** `sk_live_step` performing a step-over when the instruction it was given
+  changes the address-space root — detected from the instruction bytes it already receives, `0F 22`
+  with `/r` naming CR3, rather than from a caller's assertion — by arming a bounded breakpoint at
+  the computed next address and continuing; the resulting stop reported with a reason that says a
+  step-over happened and names the new root; the borrowed slot released whether the step-over
+  arrives or the bound expires; and the step's existing guarantee kept intact, so the instruction
+  bytes are still verified through the *old* root before the step and the new root is bound only
+  once the stop is accepted.
+- **Where it picks up:** the `ExpectedStop::SingleStep` arm of the stop validation and the step
+  path in `src/sklive.rs`; `bind_stop_cr3`/`bind_stop_cr3_until` and `MemorySource::bind_root` in
+  `src/skdispatch.rs`; `SkLiveStepArgs` in `src/server.rs`; and the slot accounting shared with
+  `SkLiveBreakpointArgs`.
+
+## 124. [windbg-mcp] Nothing asserts that a live Secure Kernel read was of memory VTL0 cannot reach
+
+**Repo:** `windbg-mcp`. **Origin:** reviewing what a passing live VTL1 run actually establishes,
+2026-10-10.
+
+`sk_live_read_memory` returns the bytes and the GPA its VTL1 page-table walk resolved to, and the
+live tier asserts the *shape* of that answer. Nothing anywhere asserts the half that makes it
+interesting: that the normal kernel could not have made the same read. Every green run therefore
+supports "the Secure Kernel can be read" and none of it supports "this memory is protected", which
+is the claim the feature exists to demonstrate and the one a reader will take from it.
+
+**The right axis is physical, not virtual**, which is what makes this cheap. VTL0 and VTL1 are
+separate address spaces, so the same virtual address resolves through different roots — and a
+kernel-looking VA is *valid-looking in both*, so a VTL0 read of it does not fail, it silently
+answers about a different page. What distinguishes them is the **GPA**: VTL1's translation of a
+Secure Kernel address must reach a page that VTL0's translation of the same address does not. The
+read already reports its own half of that comparison; only the VTL0 root is missing.
+
+The same applies to a trustlet's memory, where the protection is the point rather than an
+implementation detail: a stop at the Secure Kernel's syscall entry holds the caller's stack pointer,
+and a read there is of VTL1 user memory that VTL0 is denied by the hypervisor's second-level
+translation — but the run records only that the read succeeded.
+
+- **Why deferred:** it needs a VTL0 root, and the policy's live transport is pinned `--vtl 1` by
+  design, so a session cannot currently obtain one. Letting a live session read VTL0 widens what it
+  can touch, which is a policy decision rather than a test change — and the walk itself lives in
+  `MemorySource`, so the comparison would either be a second bound root or a one-off translation
+  that deliberately does not rebind. There is also a presentation question: a negative result is
+  only meaningful if "not mapped" and "mapped elsewhere" are distinguished, since both are passes
+  for different reasons.
+- **What would close it:** a live read able to report, beside its own GPA, that VTL0's translation
+  of the same virtual address resolves to a different page or to none — or, failing that, an
+  explicit statement in the tier and in `docs/smoke-test.md` that protection is **not** asserted,
+  so a green run is not read as proving it. A bench-side demonstration also exists and is weaker in
+  one specific way worth recording: `target/private/probe_vtl_split.py` (private) walks both roots
+  through hvlib and compares GPAs, which shows the split but from the **host**, where everything is
+  visible by construction; only a VTL0-side reader shows the denial as the guest experiences it.
+- **Where it picks up:** `MemorySource::bind_root`/`walk_space` in `src/skdispatch.rs`;
+  `SkLiveReadArgs` and the read handler in `src/server.rs`; `secure_kernel_live_tier` and its
+  consuming test in `tests/mcp_smoke.rs`; the live-tier claims in
+  [`docs/smoke-test.md`](./docs/smoke-test.md).
 
 ## Where these items came from
 
