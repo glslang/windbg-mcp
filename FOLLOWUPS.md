@@ -2556,8 +2556,12 @@ process down mid-run (Hyper-V event 3040, "could not initialize"), ending the gu
   bare name or RVA is unambiguous only for the one image the profile pins, and an arm into `skci`
   or a trustlet would have to name its module.
 - **What would close it:** a live session able to turn a **name** into a VTL1 address against its
-  own profile-pinned image — whether by admitting `EngineOp::SkSymbol` for `SecureKernelLive` in
-  `refuse_op_on_kind` or by a live-specific equivalent — so that `sk_live_arm` can be given a
+  own profile-pinned image. **Not** by admitting `EngineOp::SkSymbol` for `SecureKernelLive` in
+  `refuse_op_on_kind`, which was this entry's first suggestion and does not work: that dispatch arm
+  calls `held_capture(sk)?` unconditionally, and a live-control session initialises only its own
+  live state and holds no capture, so every lookup would fail before reaching DbgEng. It needs a
+  live-specific symbol path that loads the pinned image and rebases it onto the base the
+  live-memory provider reports — so that `sk_live_arm` can be given a
   symbol, or an RVA, instead of an address the caller had to compute; the same resolution used to
   supply a repeated `sk_live_step`'s instruction, with the byte guard then checked by the server
   against the pinned image rather than asserted by the caller; both an address and a name supplied
@@ -2649,10 +2653,17 @@ translation — but the run records only that the read succeeded.
   can touch, which is a policy decision rather than a test change — and the walk itself lives in
   `MemorySource`, so the comparison would either be a second bound root or a one-off translation
   that deliberately does not rebind. There is also a presentation question: a negative result is
-  only meaningful if "not mapped" and "mapped elsewhere" are distinguished, since both are passes
-  for different reasons.
-- **What would close it:** a live read able to report, beside its own GPA, that VTL0's translation
-  of the same virtual address resolves to a different page or to none — or, failing that, an
+  only meaningful if its three shapes are distinguished — not mapped, mapped elsewhere, and mapped
+  to the same page but denied by the effective VTL permissions — since all three are passes for
+  different reasons and only the third is visible to nothing but an attempted access.
+- **What would close it:** a live read able to report, beside its own GPA, VTL0's **effective
+  access** to the same virtual address. Three outcomes all count as evidence that VTL0 cannot reach
+  it and the criterion must admit all three, because GPA protections are **per VTL** — the TLFS
+  gives a higher VTL `HvCallModifyVtlProtectionMask` over a lower one's access, so the same GPA can
+  be mapped in both with different effective permissions. So: VTL0 has no translation; or it
+  translates to a different page; **or it translates to the same page and is denied by the effective
+  VTL permissions**. A criterion written as "different page or none" would call that third case a
+  failure to prove protection when it is the protection working. Or, failing all of it, an
   explicit statement in the tier and in `docs/smoke-test.md` that protection is **not** asserted,
   so a green run is not read as proving it. A bench-side demonstration also exists and is weaker in
   one specific way worth recording: `target/private/probe_vtl_split.py` (private) walks both roots
