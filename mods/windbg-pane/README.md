@@ -43,6 +43,16 @@ The pane now picks a register bank per target, and **counts anything it leaves o
 (`+n not shown: …`), so a missing class shows up as a number instead of vanishing. If you add a
 target kind, add its bank — and check the count line rather than the grid.
 
+**And a fixture only covers the shapes it happens to contain**, which is the limit of the paragraph
+above. Review of this directory found six more defects in the same class, none of them reachable
+from these recordings: an asynchronous run reports `moved`/`running` with no stop, `wait_for_stop`
+nests its stop under `stop`, `run_to_address` reports an ending or a timeout through `verdict`,
+`goto_position` answers with debugger *text* and no payload at all, and an opener that fails after
+creating a target puts the only handle that reaches it in `error.session_id`. Every one of them
+left stale registers, stack and memory on screen marked current, or hid a session. So when you add
+a branch here, read the field in `src/structured.rs` rather than inferring it from a payload in
+`tests/` — the recordings are evidence of what the server *did* send, never of what it *can*.
+
 Some fixtures are deliberately absent. `tests/recorded-sk.ts` and `tests/sk.test.tsx` hold a lab
 VM's GUID and live VTL1 addresses from a private run and are gitignored; `windbg.test.tsx` covers
 the same code paths with synthetic payloads, so a clone exercises them without the bench.

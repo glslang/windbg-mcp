@@ -276,20 +276,33 @@ const str = (v: unknown, d = ''): string => (typeof v === 'string' ? v : typeof 
 export function finish(v: View, n: number, tool: string, args: Record<string, unknown>, out: Outcome): View {
   const d = out.data
   const opened = OPEN.test(tool) && out.ok && d && typeof d.session_id === 'string' ? (d.session_id as string) : null
-  const sid = opened ?? (typeof args.session_id === 'string' ? args.session_id : v.current)
+  // An opener that fails *after* creating or claiming a target reports the only handle that
+  // reaches it in its structured error, and says in `target` whether something was left behind:
+  // `yes` (loaded, spawned or dialled), `pending` (the wait was abandoned, the open may still
+  // land) or `unknown` (controller ownership unresolved). Openers take no `session_id` argument,
+  // so without reading this the pane falls back to the previous current session — attributing the
+  // failed open to an unrelated target and hiding one that may need `session_status` or
+  // `end_session`. `no` is the clean case and is left alone.
+  const failure = !out.ok && d ? obj(d.error) : null
+  const left = !out.ok && d ? str(d.target) : ''
+  const stranded =
+    failure && typeof failure.session_id === 'string' && left !== '' && left !== 'no'
+      ? (failure.session_id as string)
+      : null
+  const sid = opened ?? stranded ?? (typeof args.session_id === 'string' ? args.session_id : v.current)
   let sessions = v.sessions
   let s: Session | null = null
   if (sid) {
     const found = sessions.find(x => x.id === sid)
-    // A session is invented only by a call that *succeeded*. A failure carrying an unknown,
-    // expired or mistyped `session_id` would otherwise mint one, label it open with no target, and
+    // A session is otherwise invented only by a call that *succeeded*. A failure carrying an
+    // unknown, expired or mistyped `session_id` would mint one, label it open with no target, and
     // — through `current` below — make the pane switch to it, hiding the real session at exactly
     // the moment a stale-handle error needed reading. A failure against a session already known
     // still updates its log, which is all a failure has to say.
     if (found) {
       s = { ...found }
       sessions = sessions.map(x => (x.id === sid ? s! : x))
-    } else if (out.ok) {
+    } else if (out.ok || sid === stranded) {
       s = freshSession(v, sid)
       sessions = [...sessions, s]
     }
@@ -297,6 +310,14 @@ export function finish(v: View, n: number, tool: string, args: Record<string, un
   let note = ''
   if (!out.ok) {
     note = out.error.split(/\r?\n/).find(l => l.trim()) ?? 'failed'
+    if (s && sid === stranded) {
+      // Not 'open': the open failed. What the pane has to carry is that a target exists and this
+      // is the handle for it, which is the difference between recovering and attaching twice.
+      s.kind = str(d?.kind, tool)
+      s.state = left === 'pending' ? 'opening' : left === 'unknown' ? 'unresolved' : 'stranded'
+      s.target = left === 'pending' ? 'open may still land' : 'target left by a failed ' + tool
+      note = 'open failed, ' + (left === 'pending' ? 'may still land' : 'target left') + ' as ' + s.label + ': ' + note
+    }
   } else if (s && d) {
     if (opened) {
       s.kind = str(d.kind, tool)
@@ -410,16 +431,24 @@ export function finish(v: View, n: number, tool: string, args: Record<string, un
     // `run_to_address` reports an ending through `verdict` rather than the boolean.
     const stop = obj(d.stop) ?? d
     const gone = stop.target_gone === true || d.verdict === 'target_gone'
-    if (RUN.test(tool) && ('stopped_at' in stop || gone || d.moved === true || d.running === true)) {
+    // `run_to_address` reports a timeout as a verdict and deliberately omits `stopped_at`, since
+    // echoing the address asked for would say execution got there. The target still ran for the
+    // whole wait, so this is movement with no position — the one combination that reads as "no
+    // movement" if only the position is looked for.
+    const ranOn = d.verdict === 'timeout' || (d.running === true && !('stopped_at' in stop))
+    if (RUN.test(tool) && ('stopped_at' in stop || gone || ranOn || d.moved === true)) {
       s.movedAt = n
       if (gone) {
         s.gone = true
         s.ip = null
         note = 'target ended'
-      } else if (d.running === true && !('stopped_at' in stop)) {
-        // Deliberately no position: the target is still moving, so every earlier read is now
-        // stale and saying where it *was* would be the misreading this exists to prevent.
-        note = 'running' + (typeof d.handle === 'string' ? ', handle ' + d.handle : '')
+      } else if (ranOn) {
+        // Deliberately no position: the target moved, so every earlier read is now stale and
+        // saying where it *was* would be the misreading this exists to prevent.
+        note =
+          d.verdict === 'timeout'
+            ? 'ran on, no stop within the wait'
+            : 'running' + (typeof d.execution === 'string' ? ', execution ' + d.execution : '')
       } else {
         const ip = norm(stop.stopped_at)
         if (ip) { s.ip = ip; s.ipAt = n }
@@ -439,6 +468,14 @@ export function finish(v: View, n: number, tool: string, args: Record<string, un
       s.state = d.released === false ? 'unresolved' : 'closed'
       note = d.released === false ? 'released: false' : 'released'
     }
+  } else if (s && RUN.test(tool)) {
+    // A successful run with no typed payload still moved the target. `goto_position` seeks a TTD
+    // trace by running `!tt`, which answers with debugger text, so there is nothing to fold and
+    // every branch above is skipped — leaving the pane showing the position before the seek and
+    // calling the registers, stack and memory read at it current. The movement is known from the
+    // call succeeding; the new position is not, so it is marked moved and nothing is invented.
+    s.movedAt = n
+    note = 'moved, position not reported'
   }
   const current = opened ?? (sid && sessions.some(x => x.id === sid) ? sid : v.current)
   const log = v.log.map(e =>

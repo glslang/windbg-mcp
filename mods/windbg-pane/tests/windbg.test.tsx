@@ -294,7 +294,7 @@ test('an asynchronous run marks the target moving, and its stop is read from `st
     const [started, n] = begin(v, 'continue_async', a)
     v = finish(started, n, 'continue_async', a, {
       ok: true,
-      data: { status: 'ok', running: true, moved: true, handle: 'run-1' },
+      data: { status: 'ok', running: true, moved: true, execution: 'run-1' },
       error: '',
       ms: 1,
     })
@@ -302,7 +302,7 @@ test('an asynchronous run marks the target moving, and its stop is read from `st
   const moving = v.sessions[0]!
   // The earlier reads are now stale, which is the whole point.
   expect(moving.movedAt).toBeGreaterThan(moving.regsAt)
-  expect(v.log[v.log.length - 1]!.note).toBe('running, handle run-1')
+  expect(v.log[v.log.length - 1]!.note).toBe('running, execution run-1')
 
   // `wait_for_stop` nests the stop under `stop`.
   {
@@ -330,4 +330,116 @@ test('an asynchronous run marks the target moving, and its stop is read from `st
   }
   expect(v.sessions[0]!.gone).toBe(true)
   expect(v.sessions[0]!.ip).toBe(null)
+})
+
+test('a failed opener that left a target keeps its handle in view', () => {
+  // A good session first, so there is a current one the failure could wrongly be attributed to.
+  let v = EMPTY
+  for (const call of RECORDED.slice(0, at('launch'))) {
+    const [started, n] = begin(v, call.tool, call.args)
+    v = finish(started, n, call.tool, call.args, { ok: call.ok, data: call.data, error: '', ms: 1 })
+  }
+  const live = v.current
+
+  // `attach_kernel` dialled the link and then failed. The handle is only in the error.
+  const args = { profile: 'some-profile' }
+  const [started, n] = begin(v, 'attach_kernel', args)
+  const after = finish(started, n, 'attach_kernel', args, {
+    ok: false,
+    data: {
+      status: 'error',
+      target: 'yes',
+      error: { category: 'debugger', message: 'symbols could not be loaded', session_id: 'sess-stranded' },
+    },
+    error: 'symbols could not be loaded',
+    ms: 1,
+  })
+  const stranded = after.sessions.find(x => x.id === 'sess-stranded')
+  expect(stranded).toBeDefined()
+  // Not 'open' — the open failed — but visible, and not attributed to the live session.
+  expect(stranded!.state).toBe('stranded')
+  expect(after.current).toBe('sess-stranded')
+  expect(after.current).not.toBe(live)
+  expect(after.log[after.log.length - 1]!.note).toContain('target left')
+
+  // `pending` says the open may still land; `no` leaves nothing behind and invents nothing.
+  const mk = (target: string, id: string) => {
+    const [st, m] = begin(v, 'attach_kernel', args)
+    return finish(st, m, 'attach_kernel', args, {
+      ok: false,
+      data: { status: 'error', target, error: { category: 'timeout', message: 'timed out', session_id: id } },
+      error: 'timed out',
+      ms: 1,
+    })
+  }
+  expect(mk('pending', 'sess-pending').sessions.find(x => x.id === 'sess-pending')!.state).toBe('opening')
+  expect(mk('unknown', 'sess-unknown').sessions.find(x => x.id === 'sess-unknown')!.state).toBe('unresolved')
+  const clean = mk('no', 'sess-none')
+  expect(clean.sessions.find(x => x.id === 'sess-none')).toBeUndefined()
+  expect(clean.current).toBe(live)
+})
+
+test('movement is folded from a text-only seek and from a run that timed out', () => {
+  const sid = 'sess-moves'
+  let v = EMPTY
+  {
+    const [st, n] = begin(v, 'open_trace', { trace: 't.run' })
+    v = finish(st, n, 'open_trace', { trace: 't.run' }, {
+      ok: true,
+      data: { status: 'ok', kind: 'trace', session_id: sid, target: 't.run' },
+      error: '',
+      ms: 1,
+    })
+  }
+  {
+    const a = { session_id: sid }
+    const [st, n] = begin(v, 'registers', a)
+    v = finish(st, n, 'registers', a, {
+      ok: true,
+      data: { status: 'ok', registers: [{ name: 'rax', value: '0x1' }], instruction_pointer: '0x1000' },
+      error: '',
+      ms: 1,
+    })
+  }
+  expect(v.sessions[0]!.regsAt).toBeGreaterThan(v.sessions[0]!.movedAt)
+
+  // `goto_position` runs `!tt` and answers with debugger text: no payload to fold at all.
+  {
+    const a = { session_id: sid, position: '1A:2B' }
+    const [st, n] = begin(v, 'goto_position', a)
+    v = finish(st, n, 'goto_position', a, { ok: true, data: null, error: '', ms: 1 })
+  }
+  const seeked = v.sessions[0]!
+  expect(seeked.movedAt).toBeGreaterThan(seeked.regsAt)
+  expect(v.log[v.log.length - 1]!.note).toBe('moved, position not reported')
+  // The old position is not invented into a new one.
+  expect(seeked.ip).toBe('1000')
+  expect(seeked.ipAt).toBeLessThan(seeked.movedAt)
+
+  // A fresh read, then a run that times out: the target ran, so that read is stale again.
+  {
+    const a = { session_id: sid }
+    const [st, n] = begin(v, 'registers', a)
+    v = finish(st, n, 'registers', a, {
+      ok: true,
+      data: { status: 'ok', registers: [{ name: 'rax', value: '0x2' }], instruction_pointer: '0x2000' },
+      error: '',
+      ms: 1,
+    })
+  }
+  expect(v.sessions[0]!.regsAt).toBeGreaterThan(v.sessions[0]!.movedAt)
+  {
+    const a = { session_id: sid, address: '0x4000' }
+    const [st, n] = begin(v, 'run_to_address', a)
+    v = finish(st, n, 'run_to_address', a, {
+      ok: true,
+      data: { status: 'ok', verdict: 'timeout', timeout_ms: 5000, output: '' },
+      error: '',
+      ms: 1,
+    })
+  }
+  const timedOut = v.sessions[0]!
+  expect(timedOut.movedAt).toBeGreaterThan(timedOut.regsAt)
+  expect(timedOut.gone).toBe(false)
+  expect(v.log[v.log.length - 1]!.note).toBe('ran on, no stop within the wait')
 })
