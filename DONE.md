@@ -95,6 +95,7 @@ engine — it adds a target and leaves the current one alone. The entry records 
 ## What is in here
 
 - [Item 1](#1-dbgscope-managed-breakpoint-lifecycle-for-run_to_address--done-upstream) — [dbgscope] Managed breakpoint lifecycle for `run_to_address` — done upstream
+- [Item 4](#4-dbgscope-typed-read_register--done-upstream-2026-10-09-adopted-here-2026-10-10) — [dbgscope] Typed `read_register` — done upstream (2026-10-09, adopted here 2026-10-10)
 - [Item 7](#7-dbgscope--windbg-mcp-on-demand-engine-interrupt--done-2026-08-10) — [dbgscope + windbg-mcp] On-demand engine interrupt — done (2026-08-10)
 - [Item 10](#10-windbg-mcp-process-per-session--done-2026-08-02-issue-61) — [windbg-mcp] Process-per-session — done (2026-08-02, issue #61)
 - [Item 12](#12-dbgscope-validate-the-opener-split-against-a-live-kdnet-target--done-2026-08-02) — [dbgscope] Validate the opener split against a live KDNET target — done (2026-08-02)
@@ -188,6 +189,55 @@ type now uses the watchdog-bounded `WaitForEvent(INFINITE)` the live-kernel path
 Nothing changed in this crate: `run_to_address` is a thin wrapper and its `RunToOutcome::Timeout`
 branch simply became reachable. The verdict text it renders was already correct for a target that
 ends up broken in.
+
+## 4. [dbgscope] Typed `read_register` — **done upstream** (2026-10-09, adopted here 2026-10-10)
+
+Filed to generalize the private `instruction_pointer` helper (added for `run_to_address`) into a
+public typed register read, per `DECISIONS.md` D5 step 1. Its own words for the state then:
+*"only the instruction pointer is implemented today"*.
+
+**Nothing was generalized, and both halves of that premise had expired before this closed.**
+`instruction_pointer` stopped being private on 2026-08-12 (dbgscope `d23dd7b`), in the change that
+also added `register_values` — every register the engine knows, as a value — with
+`register_descriptions` following on 2026-08-22 (`f91d961`). From August the bank was readable
+typed, and what was missing was the **shape**: one register, by name, without describing and
+reading the whole bank to use one of them.
+
+**That arrived on 2026-10-09, from a consumer this entry never mentioned.**
+`DebugEngine::integer_register(name)` — one `GetIndexByName`, one `GetValue` — landed in
+[dbgscope#195](https://github.com/glslang/dbgscope/pull/195) (`11a4dd2`) because a **breakpoint
+callback** has to read the program counter inside a hit, where a bank read is the wrong shape and
+the engine is waiting on the answer. `instruction_pointer` is untouched by it and is still its own
+`GetInstructionOffset`, which is right rather than left over: it answers without a name, so it
+works where the name differs by architecture. #195's test picks `pc` or `rip` from
+`processor_type()` for that reason, and asserts the by-name read agrees with it on both CI
+architectures — which is also what says a lower-case x64 register name resolves through
+`GetIndexByName` on a real x64 engine.
+
+**What it refuses is part of what landed.** A register holding no integer comes back as
+`DbgEngError::Register` rather than as a number made of part of it, asserted in #195's test against
+the first float or vector register the target reports, where it reports one. So a caller wanting
+`xmm0` by name still reads the bank and filters: there is no by-name read of a non-integer
+register, nothing has asked for one, and the answer such a caller wants is already typed — which
+is the difference between that gap and the one this item was filed for.
+
+**Adopted here in the two places that read one register by name.** `pool_trace`'s breakpoint
+callback reads a call's argument registers and its return value through it
+([#473](https://github.com/glslang/windbg-mcp/pull/473), 2026-10-09), and the Secure Kernel
+dispatcher now does too: `skdispatch`'s `register` helper called `register_values()` and scanned
+the result case-insensitively for one name, which over KD is a `GetValue` per register — 214 of
+them on the one kernel dbgscope has counted, an ARM64 one — at seventeen call sites: the owned
+event read, identity discovery, handler registration and its cleanup, and the read-back that
+verifies a register write. The names it passes were already dbgeng's own lower-case spelling, so
+the scan it replaced compared that spelling with itself. No register value in this server is read
+out of `r` text any more: `src/batch.rs`'s `? @$ip` asks whether the *engine* still answers and
+reads a pseudo-register, and the `registers` tool hands `r`'s text to the caller beside the values
+rather than reading it.
+
+**The register *write* is still on the text hatch**, which is item 2's half and not this one's:
+`skdispatch::write_register` goes through `execute_command("r {name}={value:016x}")` and verifies
+by reading the register back — this item's read. Item 2 now names that consumer, having been
+filed saying it had none.
 
 ## 7. [dbgscope + windbg-mcp] On-demand engine interrupt — **done** (2026-08-10)
 

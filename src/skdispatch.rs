@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use dbgscope::dbgeng::{
     BreakpointAt, BreakpointKind, BreakpointSpec, DebugEngine, Interruption, PendingTarget,
-    RegisterValue, WaitOutcome,
+    WaitOutcome,
 };
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
 #[cfg(target_arch = "x86_64")]
@@ -3989,18 +3989,19 @@ impl VmwpDispatcher<'_> {
         Ok(())
     }
 
+    /// One register of the held vmwp thread, by the engine's own name for it.
+    ///
+    /// One index lookup and one value, rather than the whole register bank filtered down to one
+    /// name. Every read here is against a **live kernel over KD**, a bank read is one `GetValue`
+    /// per register — 214 on the one kernel dbgscope has counted, an ARM64 one — and seventeen of
+    /// these reads sit along a single hypercall. The x64 bank this dispatcher actually reads is a
+    /// different count and the same shape.
+    ///
+    /// The names passed are the engine's own lowercase spelling, which is what its index lookup
+    /// wants. The case-insensitive match this replaced was against names the engine had just
+    /// handed us, so it was comparing its own spelling with itself.
     fn register(&self, name: &str) -> Result<u64> {
-        let register = self
-            .engine
-            .register_values()
-            .map_err(debugger)?
-            .into_iter()
-            .find(|register| register.name.eq_ignore_ascii_case(name))
-            .with_context(|| format!("DbgEng omitted register {name}"))?;
-        match register.value {
-            RegisterValue::Int(value) => Ok(value),
-            _ => bail!("DbgEng register {name} is not an integer"),
-        }
+        self.engine.integer_register(name).map_err(debugger)
     }
 
     fn write_register(&self, name: &'static str, value: u64) -> Result<()> {
