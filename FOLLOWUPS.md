@@ -3,7 +3,7 @@
 Deferred work on this server and on [`dbgscope`](https://github.com/glslang/dbgscope), one entry per
 item. **The [index](#index) below is the way in**, and each entry then says which repo it belongs to,
 why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design
-rationale (D1–D5) that items 2–6 extend.
+rationale (D1–D5) that items 2, 3, 5 and 6 extend.
 
 **What each item came out of is [at the end](#where-these-items-came-from) rather than here.** That
 record is worth keeping — it is where the shape of a cluster lives, and which measurement produced
@@ -50,7 +50,6 @@ line is simply open.
 
 - [Item 2](#2-dbgscope-typed-write-primitives) — [dbgscope] Typed write primitives — **half landed**
 - [Item 3](#3-windbg-mcp--dbgscope-state-injection-confirmation-path-decisionsmd-d4) — [windbg-mcp + dbgscope] State-injection confirmation path (DECISIONS.md D4)
-- [Item 4](#4-dbgscope-typed-read_register) — [dbgscope] Typed `read_register`
 - [Item 5](#5-windbg-mcp-path-recipe-decode-limits-heuristic-boundary) — [windbg-mcp] Path-recipe decode limits (heuristic boundary)
 - [Item 6](#6-windbg-mcp-concolicsymbolic-buffer-synthesis-decisionsmd-d2--scoped-out) — [windbg-mcp] Concolic/symbolic buffer synthesis (DECISIONS.md D2 — scoped out)
 - [Item 8](#8-windbg-mcp-tasks-extension-iomodelcontextprotocoltasks-sep-2663--measured-and-deferred-2026-09-19) — [windbg-mcp] Tasks extension (`io.modelcontextprotocol/tasks`, SEP-2663) — **measured and deferred** (2026-09-19)
@@ -111,8 +110,15 @@ line is simply open.
   `execute`, and the whole of dbgscope#126 is closed with it. What remains under this item is the
   rest of the first line — `write_virtual` and a typed register write — and nothing about
   breakpoints.
-- **Why the rest is deferred:** primarily needed by the state-injection path (item 3); no consumer
-  without it.
+- **The register half has had a consumer since 2026-10-03** (`500bc36`), which this entry still
+  said it did not; noticed on 2026-10-10 while closing item 4.
+  `skdispatch::write_register` writes `rax`/`rcx`/`rdx`/`r8`/`r9`/`rip` on a held `vmwp` thread
+  through `execute_command("r {name}={value:016x}")`, and verifies each write by reading the
+  register back — typed, since item 4 closed. So the text hatch is down to the write alone there.
+- **Why the rest is deferred:** `write_virtual` is needed primarily by the state-injection path
+  (item 3), which has no consumer without it. The register write has the one above, and is deferred
+  on a different ground: that call site passes six whitelisted names and reads each write back, so
+  nothing it does is blocked on a typed write.
 - **Note:** dbgscope is the right home for these (DECISIONS.md D3 — typed `DebugEngine` methods, not the
   text hatch), mirroring how `run_to_address`/`instruction_pointer` were added.
 
@@ -126,11 +132,6 @@ IO_STACK_LOCATION + SystemBuffer in memory, set `rcx`/`rdx`, and run to the targ
   path (`ioctl_harness.ps1` + `run_to_address`).
 - **Depends on:** item 2 (typed write primitives) and the item-1 breakpoint work; the same path-recipe
   data the drive path uses. Prefer a snapshot-restorable VM when building it.
-
-## 4. [dbgscope] Typed `read_register`
-
-Generalize the private `instruction_pointer` helper (added for `run_to_address`) into a public typed
-register read, per DECISIONS.md D5 step 1. Only the instruction pointer is implemented today.
 
 ## 5. [windbg-mcp] Path-recipe decode limits (heuristic boundary)
 
@@ -2499,7 +2500,8 @@ Each cluster above, and what filing it measured. Items named here as *"now in `D
 closed since this record was written, and the record is kept with them in it: what a cluster was
 filed against is most of why the items left in it are worded the way they are.
 
-Grouped by origin: items 2–6 come from the reachability-confirmation effort (path
+Grouped by origin: items 2–6 — item 4 now in [`DONE.md`](./DONE.md) — come from the
+reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 8–9, 11 and 88 from surveying this server
 against the MCP `2026-07-28` extensions (tasks, apps) and then re-measuring the tasks half of it
 (2026-09-19) — where rmcp and the reference TypeScript SDK turn out to implement two

@@ -1009,3 +1009,17 @@ Landed as one change across both repos, with two refinements to D5 confirmed dur
 
 Typed **read_register** (beyond the private `instruction_pointer`) and the injection/write
 primitives (D4) remain deferred.
+
+### Implementation note (2026-10-09)
+
+**D5 step 1 is complete: the typed register read landed, and not as the generalization above.**
+`instruction_pointer` became public on its own two months later (dbgscope `d23dd7b`, 2026-08-12),
+beside `register_values`, and the by-name read arrived separately as
+`DebugEngine::integer_register(name)` — one `GetIndexByName`, one `GetValue` — in
+[dbgscope#195](https://github.com/glslang/dbgscope/pull/195), added for a breakpoint callback that
+has to read the program counter inside a hit. Adopted here by `pool_trace`'s callback and the
+Secure Kernel dispatcher. A register holding no integer is **refused** rather than truncated, so a
+by-name read of a float or vector register is still the bank read; `FOLLOWUPS.md` item 4, now in
+`DONE.md`, carries what that leaves. D5 step 4's write primitives (D4) remain deferred as item 2,
+which since this landed names a consumer for the register half — a text write verified by this
+read.

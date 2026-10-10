@@ -169,6 +169,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   table, was never named as one of those deliberate additions, and the decoder calls it
   unprivileged.
 
+- **The Secure Kernel dispatcher reads a register by name instead of filtering the bank**
+  (`FOLLOWUPS.md` item 4, now in `DONE.md`). `skdispatch`'s `register` helper called dbgscope's
+  `register_values()` — which describes and reads every register the engine knows, 214 of them on
+  the one kernel dbgscope has counted — and scanned the result case-insensitively for one name, at
+  seventeen call sites over a KD link. It now calls `integer_register(name)`, one `GetIndexByName`
+  and one `GetValue` ([dbgscope#195](https://github.com/glslang/dbgscope/pull/195), already in the
+  pinned revision and already used by `pool_trace`'s callback). The seventeen names are literals in
+  dbgeng's own lower-case spelling, so the case-insensitive scan was comparing that spelling with
+  itself and the engine's own lookup takes them as they are — dbgscope#195's test reads `rip` by
+  name on CI's x64 runners. What changes is the refusal: a register holding no integer, or one the
+  engine holds no value for, is now named and refused by dbgscope rather than by this file.
+
 - **`CLAUDE.md` lives in `.claude/`, so strict plugin validation passes.** The plugin root is the
   repository root (`marketplace.json` names `"."`), and a `CLAUDE.md` at a plugin root is never
   loaded as plugin context — so `claude plugin validate` warns when it finds one, and `--strict`,
