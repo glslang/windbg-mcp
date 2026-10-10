@@ -83,12 +83,15 @@ it is untouched: a session that touches no Rust never loads the code rules at al
 most the narrow ones. Measured after round twelve: **77,169 B** against **6,496 B** —
 a measurement rather than an invariant, since any edit to a rule moves it, and the second of those
 figures was already stale by 30 bytes when first written here, and staler again since
-`measurement-provenance.md` grew the code scope. How many narrow rules fire is
-deliberately not stated: the globs intersect (`examples/README.md` matches two rules, `build.rs` **eleven** — nine code rules, `cargo-and-dependencies.md` and `measurement-provenance.md`; counted from the frontmatter 2026-09-18, and it said nine before that count was taken),
+`measurement-provenance.md` grew the code scope. **Both predate `secure-kernel-live.md`**, and
+rather than restate them from a definition nobody wrote down, here is one that says what it
+counts: a `src/**/*.rs` edit loads the ten code rules plus `measurement-provenance.md`, which is
+**97,109 B** measured 2026-10-10. How many narrow rules fire is
+deliberately not stated: the globs intersect (`examples/README.md` matches two rules, `build.rs` **twelve** — ten code rules, `cargo-and-dependencies.md` and `measurement-provenance.md`; counted from the frontmatter 2026-10-10, and it said eleven for nine code rules before `secure-kernel-live.md` was added),
 and two attempts to give the exact composition were both wrong, one in the commit that fixed the
 other. `/handoff` carries the method and what went wrong with it.
 
-So the *Covers* column is the index. The nine are split by **subject**, not by which files trip
+So the *Covers* column is the index. The ten are split by **subject**, not by which files trip
 them — read it to pick the one you want.
 
 | Rule (`.claude/rules/`) | Loads when you touch | Covers |
@@ -106,6 +109,7 @@ them — read it to pick the one you want.
 | `tool-surface.md` | any `src/` or `tests/` Rust, or `build.rs` | adding a tool: the second file, output schemas carrying no prose, per-client surfaces, `TOOL_NOTES`/`SUMMARY_NOTES` |
 | `listener-clients.md` | any `src/` or `tests/` Rust, or `build.rs` | several clients on one listener: credentials, per-client surfaces, ambient identity, the lease, driving `2026-07-28` by hand |
 | `transcripts.md` | any `src/` or `tests/` Rust, or `build.rs` | `WINDBG_MCP_TRANSCRIPT`, what it records that stderr cannot, and `--render-cast` |
+| `secure-kernel-live.md` | any `src/` or `tests/` Rust, or `build.rs` | driving the seven live tools: the `extra` group, quiet-to-arm against busy-to-stop, CR3 discovered rather than asserted, the step's root, per-VP debug registers, and what a passing run does *not* establish |
 
 | Skill (`.claude/skills/`) | Invoke when |
 |---|---|
