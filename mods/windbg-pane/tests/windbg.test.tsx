@@ -234,3 +234,100 @@ test('a machine frame is recognised only where the shape fits', () => {
   expect(readFrame('4AAD9CB3330200003300000000000000')).toBeUndefined()
   expect(readFrame('0040302010000000' + '00'.repeat(40))).toBeUndefined()
 })
+
+test('a failed call never invents a session, and never steals the current one', () => {
+  // A good session exists, then a call fails against a handle nobody knows.
+  let v = EMPTY
+  for (const call of RECORDED.slice(0, at('launch'))) {
+    const [started, n] = begin(v, call.tool, call.args)
+    v = finish(started, n, call.tool, call.args, { ok: call.ok, data: call.data, error: '', ms: 1 })
+  }
+  const live = v.current
+  expect(live).not.toBe(null)
+
+  const args = { session_id: 'sess-does-not-exist' }
+  const [started, n] = begin(v, 'registers', args)
+  const after = finish(started, n, 'registers', args, {
+    ok: false,
+    data: null,
+    error: 'session handle is unknown or has expired',
+    ms: 1,
+  })
+  // No ghost session, and the pane still points at the one that is real.
+  expect(after.sessions.map(s => s.id)).not.toContain('sess-does-not-exist')
+  expect(after.sessions).toHaveLength(v.sessions.length)
+  expect(after.current).toBe(live)
+  // The failure is still reported.
+  expect(after.log[after.log.length - 1]!.status).toBe('error')
+  expect(after.log[after.log.length - 1]!.note).toBe('session handle is unknown or has expired')
+})
+
+test('an asynchronous run marks the target moving, and its stop is read from `stop`', () => {
+  const sid = 'sess-async'
+  // Open a session so there is something to fold into.
+  let v = EMPTY
+  {
+    const [started, n] = begin(v, 'launch', { command: 'x.exe' })
+    v = finish(started, n, 'launch', { command: 'x.exe' }, {
+      ok: true,
+      data: { status: 'ok', kind: 'launch', session_id: sid, target: 'x.exe' },
+      error: '',
+      ms: 1,
+    })
+  }
+  // A register read, so there is something that can go stale.
+  {
+    const a = { session_id: sid }
+    const [started, n] = begin(v, 'registers', a)
+    v = finish(started, n, 'registers', a, {
+      ok: true,
+      data: { status: 'ok', registers: [{ name: 'rax', value: '0x1' }], instruction_pointer: '0x1000' },
+      error: '',
+      ms: 1,
+    })
+  }
+  expect(v.sessions[0]!.regsAt).toBeGreaterThan(v.sessions[0]!.movedAt)
+
+  // `continue_async` reports `moved`/`running` at the top level and carries no stop.
+  {
+    const a = { session_id: sid }
+    const [started, n] = begin(v, 'continue_async', a)
+    v = finish(started, n, 'continue_async', a, {
+      ok: true,
+      data: { status: 'ok', running: true, moved: true, handle: 'run-1' },
+      error: '',
+      ms: 1,
+    })
+  }
+  const moving = v.sessions[0]!
+  // The earlier reads are now stale, which is the whole point.
+  expect(moving.movedAt).toBeGreaterThan(moving.regsAt)
+  expect(v.log[v.log.length - 1]!.note).toBe('running, handle run-1')
+
+  // `wait_for_stop` nests the stop under `stop`.
+  {
+    const a = { session_id: sid }
+    const [started, n] = begin(v, 'wait_for_stop', a)
+    v = finish(started, n, 'wait_for_stop', a, {
+      ok: true,
+      data: { status: 'ok', running: false, stop: { stopped_at: '0x2000' } },
+      error: '',
+      ms: 1,
+    })
+  }
+  expect(v.sessions[0]!.ip).toBe('2000')
+
+  // `run_to_address` reports an ending through `verdict`, not the boolean.
+  {
+    const a = { session_id: sid }
+    const [started, n] = begin(v, 'run_to_address', a)
+    v = finish(started, n, 'run_to_address', a, {
+      ok: true,
+      data: { status: 'ok', verdict: 'target_gone' },
+      error: '',
+      ms: 1,
+    })
+  }
+  expect(v.sessions[0]!.gone).toBe(true)
+  expect(v.sessions[0]!.ip).toBe(null)
+})

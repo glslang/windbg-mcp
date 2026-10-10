@@ -93,7 +93,7 @@ line is simply open.
 - [Item 116](#116-windbg-mcp-the-kd-facade-answers-windbg-with-fabricated-state-it-cannot-tell-apart-from-guest-state) — [windbg-mcp] The KD facade answers WinDbg with fabricated state it cannot tell apart from guest state
 - [Item 117](#117-windbg-mcp-the-kd-facade-pipe-has-only-the-default-acl-no-client-authentication-and-no-break-in) — [windbg-mcp] The KD facade pipe has only the default ACL, no client authentication and no break-in
 - [Item 121](#121-windbg-mcp-tracing-pool-allocations-on-an-x86-kernel) — [windbg-mcp] Tracing pool allocations on an x86 kernel
-- [Item 122](#122-windbg-mcp-a-live-secure-kernel-session-cannot-resolve-names-or-instructions-against-its-own-pinned-image) — [windbg-mcp] A live Secure Kernel session cannot resolve names or instructions against its own pinned image
+- [Item 122](#122-windbg-mcp-a-live-secure-kernel-session-has-no-image-to-resolve-names-or-instructions-against) — [windbg-mcp] A live Secure Kernel session has no image to resolve names or instructions against
 - [Item 123](#123-windbg-mcp-sk_live_step-refuses-a-cr3-changing-instruction-instead-of-stepping-over-it) — [windbg-mcp] `sk_live_step` refuses a CR3-changing instruction instead of stepping over it
 - [Item 124](#124-windbg-mcp-nothing-asserts-that-a-live-secure-kernel-read-was-of-memory-vtl0-cannot-reach) — [windbg-mcp] Nothing asserts that a live Secure Kernel read was of memory VTL0 cannot reach
 
@@ -2496,7 +2496,7 @@ x64's registers for anything that was not ARM64.
 **Where it picks up.** `call_registers` and the refusal in `arm_pool_trace` (`src/worker.rs`),
 `Layout` and `layout_of` in `src/pooltrace.rs`, and the callback in `arm_pool_trace`, which is where
 an x86 entry would read the stack instead of three registers.
-## 122. [windbg-mcp] A live Secure Kernel session cannot resolve names or instructions against its own pinned image
+## 122. [windbg-mcp] A live Secure Kernel session has no image to resolve names or instructions against
 
 **Repo:** `windbg-mcp`. **Origin:** a live VTL1 stop/step run against an HVCI image-validation
 address, 2026-10-10.
@@ -2505,14 +2505,24 @@ address, 2026-10-10.
 `SkLiveBreakpointArgs::address` is the same for the additional slots; `SkLiveStepArgs::address` for
 a repeated step likewise. There is no build-relative alternative, so a caller arming a *named*
 Secure Kernel function has to resolve the image base before it can form the argument. The server
-does not need that from the caller: the profile already pins the exact build and carries
-build-relative RVAs of its own for the debugger-data head, block and loaded-module list, and the
-live-memory provider reports the Secure Kernel base — `open_sk_live_control`'s own report says the
+does not need the *base* from the caller: the live-memory provider reports it, and the profile
+carries build-relative RVAs of its own for the debugger-data head, block and loaded-module list,
+which it resolves against that base — `open_sk_live_control`'s own report says the
 first arm "discovers and validates the partition, provider CR3 and Secure Kernel memory source
 before changing debug registers". Every other per-boot coordinate on that opener is an **optional
 assertion** for exactly this reason: `vmwp_pid`, `dispatcher_vnd`, `partition_id` and
 `expected_cr3` are all discovered by the worker and merely checked if supplied. `address` is the
 one coordinate with no discovered counterpart, which is the inconsistency rather than the hazard.
+
+**And the image itself is missing, which has to be settled before any of the rest.** A live-control
+profile pins `vmwp_image` and its hash; its optional Secure Kernel section carries a **build number
+and RVAs**, not a file — so there is nothing for a live session to load or compare against.
+`open_sk_capture` sidesteps this by taking its image as a separate required `image` argument. So
+this item's first step is not a symbol lookup at all: it is deciding where an authoritative Secure
+Kernel image comes from for a *live* session and how its identity is validated against the running
+build, which the capture path answers by asking the caller and the live path does not answer at all.
+An earlier draft of this entry said "the profile already pins the exact build" and was wrong: it
+pins a build *number*, which identifies no file.
 
 **The resolution this needs is already built, for the sibling session kind.** `open_sk_capture`
 points an engine at `securekernel.exe` *as a file* at its preferred base
@@ -2555,8 +2565,10 @@ process down mid-run (Hyper-V event 3040, "could not initialize"), ending the gu
   live.) What is genuinely unsettled is narrow: VTL1 maps more than the Secure Kernel image, so a
   bare name or RVA is unambiguous only for the one image the profile pins, and an arm into `skci`
   or a trustlet would have to name its module.
-- **What would close it:** a live session able to turn a **name** into a VTL1 address against its
-  own profile-pinned image. **Not** by admitting `EngineOp::SkSymbol` for `SecureKernelLive` in
+- **What would close it:** first, an authoritative Secure Kernel image for a live session — where
+  it comes from, and how its identity is checked against the running build — since the profile
+  supplies only a build number and RVAs. Then a live session able to turn a **name** into a VTL1
+  address against that image. **Not** by admitting `EngineOp::SkSymbol` for `SecureKernelLive` in
   `refuse_op_on_kind`, which was this entry's first suggestion and does not work: that dispatch arm
   calls `held_capture(sk)?` unconditionally, and a live-control session initialises only its own
   live state and holds no capture, so every lookup would fail before reaching DbgEng. It needs a

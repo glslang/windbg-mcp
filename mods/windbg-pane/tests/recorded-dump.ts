@@ -34,7 +34,7 @@ export const RECORDED_DUMP: RecordedCall[] = [
      "checksum": 11584734,
      "end": "0xfffff802eae4a000",
      "image_name": "ntkrnlmp.exe",
-     "loaded_image_name": "C:\\workspace\\windbg-mcp\\target\\debug\\sym\\ntkrnlmp.exe\\00587F24124a000\\ntkrnlmp.exe",
+     "loaded_image_name": "<symbol-cache>\\ntkrnlmp.exe\\<pdb-identity>\\ntkrnlmp.exe",
      "name": "nt",
      "pdb": {
       "age": 1,
@@ -1127,7 +1127,7 @@ export const RECORDED_DUMP: RecordedCall[] = [
      "checksum": 59577,
      "end": "0xfffff802e698f000",
      "image_name": "HEVD.sys",
-     "loaded_image_name": "HEVD.sys",
+     "loaded_image_name": "<symbol-cache>\\ntkrnlmp.exe\\<pdb-identity>\\ntkrnlmp.exe",
      "name": "HEVD",
      "size": 585728,
      "start": "0xfffff802e6900000",

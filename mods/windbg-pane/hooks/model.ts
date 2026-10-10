@@ -281,8 +281,18 @@ export function finish(v: View, n: number, tool: string, args: Record<string, un
   let s: Session | null = null
   if (sid) {
     const found = sessions.find(x => x.id === sid)
-    s = found ? { ...found } : freshSession(v, sid)
-    sessions = found ? sessions.map(x => (x.id === sid ? s! : x)) : [...sessions, s]
+    // A session is invented only by a call that *succeeded*. A failure carrying an unknown,
+    // expired or mistyped `session_id` would otherwise mint one, label it open with no target, and
+    // — through `current` below — make the pane switch to it, hiding the real session at exactly
+    // the moment a stale-handle error needed reading. A failure against a session already known
+    // still updates its log, which is all a failure has to say.
+    if (found) {
+      s = { ...found }
+      sessions = sessions.map(x => (x.id === sid ? s! : x))
+    } else if (out.ok) {
+      s = freshSession(v, sid)
+      sessions = [...sessions, s]
+    }
   }
   let note = ''
   if (!out.ok) {
@@ -392,16 +402,28 @@ export function finish(v: View, n: number, tool: string, args: Record<string, un
       })
       if (tool === 'set_breakpoint') note = s.bps.length + ' breakpoint(s)'
     }
-    if (RUN.test(tool) && ('stopped_at' in d || d.target_gone === true)) {
+    // Three different shapes report a run, and reading only the synchronous one left an async run
+    // invisible: the pane kept prior registers, stack and memory marked current while the target
+    // was moving, then never picked up the stop. `go`/`step_*` answer with `stopped_at` at the top
+    // level; `continue_async` answers with `moved`/`running` and no stop at all, because the point
+    // of it is that the caller left; `wait_for_stop` nests the stop under `stop`; and
+    // `run_to_address` reports an ending through `verdict` rather than the boolean.
+    const stop = obj(d.stop) ?? d
+    const gone = stop.target_gone === true || d.verdict === 'target_gone'
+    if (RUN.test(tool) && ('stopped_at' in stop || gone || d.moved === true || d.running === true)) {
       s.movedAt = n
-      if (d.target_gone === true) {
+      if (gone) {
         s.gone = true
         s.ip = null
         note = 'target ended'
+      } else if (d.running === true && !('stopped_at' in stop)) {
+        // Deliberately no position: the target is still moving, so every earlier read is now
+        // stale and saying where it *was* would be the misreading this exists to prevent.
+        note = 'running' + (typeof d.handle === 'string' ? ', handle ' + d.handle : '')
       } else {
-        const ip = norm(d.stopped_at)
+        const ip = norm(stop.stopped_at)
         if (ip) { s.ip = ip; s.ipAt = n }
-        note = (d.interrupted === true ? 'broken in at ' : d.timed_out === true ? 'wait ran out at ' : 'stopped at ') + where(s, ip)
+        note = (stop.interrupted === true ? 'broken in at ' : stop.timed_out === true ? 'wait ran out at ' : 'stopped at ') + where(s, ip)
       }
     }
     // Last, deliberately: `crash_triage` also carries `frames`, and the bug check is the headline
