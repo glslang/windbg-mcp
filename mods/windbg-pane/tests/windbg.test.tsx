@@ -443,3 +443,200 @@ test('movement is folded from a text-only seek and from a run that timed out', (
   expect(timedOut.gone).toBe(false)
   expect(v.log[v.log.length - 1]!.note).toBe('ran on, no stop within the wait')
 })
+
+test('a result is folded into the session its call began on, not the current one', () => {
+  // Two sessions open. s2 becomes current.
+  let v = EMPTY
+  const open = (id: string, target: string) => {
+    const a = { command: target }
+    const [st, n] = begin(v, 'launch', a)
+    v = finish(st, n, 'launch', a, {
+      ok: true,
+      data: { status: 'ok', kind: 'launch', session_id: id, target },
+      error: '',
+      ms: 1,
+    })
+  }
+  open('sess-1', 'one.exe')
+  open('sess-2', 'two.exe')
+  expect(v.current).toBe('sess-2')
+
+  // An implicit call begins while s2 is current... but the pane is switched to s1 first.
+  {
+    const a = { session_id: 'sess-1' }
+    const [st, n] = begin(v, 'registers', a)
+    v = finish(st, n, 'registers', a, {
+      ok: true,
+      data: { status: 'ok', registers: [{ name: 'rax', value: '0x1' }], instruction_pointer: '0x1111' },
+      error: '',
+      ms: 1,
+    })
+  }
+  expect(v.current).toBe('sess-1')
+
+  // A slow implicit call starts here — pinned to s1, the current session at `begin`.
+  const slow = begin(v, 'backtrace', {})
+  v = slow[0]
+  // An explicit call to s2 lands first and makes s2 current.
+  {
+    const a = { session_id: 'sess-2' }
+    const [st, n] = begin(v, 'registers', a)
+    v = finish(st, n, 'registers', a, {
+      ok: true,
+      data: { status: 'ok', registers: [{ name: 'rax', value: '0x2' }], instruction_pointer: '0x2222' },
+      error: '',
+      ms: 1,
+    })
+  }
+  expect(v.current).toBe('sess-2')
+
+  // Now the slow one answers. Its frames belong to s1.
+  v = finish(v, slow[1], 'backtrace', {}, {
+    ok: true,
+    data: { status: 'ok', frames: [{ index: 0, address: '0x1111', symbol: 'one!main' }] },
+    error: '',
+    ms: 1,
+  })
+  const s1 = v.sessions.find(x => x.id === 'sess-1')!
+  const s2 = v.sessions.find(x => x.id === 'sess-2')!
+  expect(s1.frames!.map(f => f.symbol)).toEqual(['one!main'])
+  // Null rather than empty: s2 has had no stack read at all, which is what being misfiled would
+  // have changed.
+  expect(s2.frames).toBe(null)
+  // And the log entry still names the session it began on.
+  expect(v.log.find(e => e.n === slow[1])!.session).toBe('sess-1')
+})
+
+test('clearing breakpoints replaces the inventory, and an unreadable one is not a clean one', () => {
+  const sid = 'sess-bp'
+  let v = EMPTY
+  {
+    const a = { command: 'x.exe' }
+    const [st, n] = begin(v, 'launch', a)
+    v = finish(st, n, 'launch', a, {
+      ok: true,
+      data: { status: 'ok', kind: 'launch', session_id: sid, target: 'x.exe' },
+      error: '',
+      ms: 1,
+    })
+  }
+  const arm = (w: View) => {
+    const a = { session_id: sid, address: 'x!f' }
+    const [st, n] = begin(w, 'set_breakpoint', a)
+    return finish(st, n, 'set_breakpoint', a, {
+      ok: true,
+      data: {
+        status: 'ok',
+        breakpoints: [
+          { id: 0, address: '0x1000', expression: 'x!f', enabled: true },
+          { id: 1, address: '0x2000', expression: 'x!g', enabled: true },
+        ],
+      },
+      error: '',
+      ms: 1,
+    })
+  }
+  v = arm(v)
+  expect(v.sessions[0]!.bps).toHaveLength(2)
+
+  // A clear carries `remaining` and no `breakpoints`: an empty array is the success state.
+  const cleared = (() => {
+    const a = { session_id: sid }
+    const [st, n] = begin(v, 'clear_breakpoints', a)
+    return finish(st, n, 'clear_breakpoints', a, { ok: true, data: { status: 'ok', remaining: [] }, error: '', ms: 1 })
+  })()
+  expect(cleared.sessions[0]!.bps).toEqual([])
+  expect(cleared.log[cleared.log.length - 1]!.note).toBe('all breakpoints cleared')
+
+  // One of two removed: `remaining` is the authoritative post-removal inventory.
+  const one = (() => {
+    const a = { session_id: sid, id: 0 }
+    const [st, n] = begin(v, 'clear_breakpoints', a)
+    return finish(st, n, 'clear_breakpoints', a, {
+      ok: true,
+      data: { status: 'ok', remaining: [{ id: 1, address: '0x2000', expression: 'x!g', enabled: true }] },
+      error: '',
+      ms: 1,
+    })
+  })()
+  expect(one.sessions[0]!.bps!.map(b => b.expression)).toEqual(['x!g'])
+
+  // `null` means the listing could not be read — not that nothing is armed.
+  const unknown = (() => {
+    const a = { session_id: sid }
+    const [st, n] = begin(v, 'clear_breakpoints', a)
+    return finish(st, n, 'clear_breakpoints', a, {
+      ok: true,
+      data: { status: 'ok', remaining: null },
+      error: '',
+      ms: 1,
+    })
+  })()
+  expect(unknown.sessions[0]!.bps).toBe(null)
+  expect(unknown.log[unknown.log.length - 1]!.note).toBe('cleared, inventory could not be read')
+})
+
+test('a batch is folded from what the session holds afterwards', () => {
+  const sid = 'sess-batch'
+  let v = EMPTY
+  {
+    const a = { command: 'x.exe' }
+    const [st, n] = begin(v, 'launch', a)
+    v = finish(st, n, 'launch', a, {
+      ok: true,
+      data: { status: 'ok', kind: 'launch', session_id: sid, target: 'x.exe' },
+      error: '',
+      ms: 1,
+    })
+  }
+  {
+    const a = { session_id: sid }
+    const [st, n] = begin(v, 'registers', a)
+    v = finish(st, n, 'registers', a, {
+      ok: true,
+      data: { status: 'ok', registers: [{ name: 'rax', value: '0x1' }], instruction_pointer: '0x1000' },
+      error: '',
+      ms: 1,
+    })
+  }
+  const base = v
+  expect(base.sessions[0]!.regsAt).toBeGreaterThan(base.sessions[0]!.movedAt)
+
+  const batch = (after: Record<string, unknown>) => {
+    const a = { session_id: sid, steps: [] }
+    const [st, n] = begin(base, 'debug_batch', a)
+    return finish(st, n, 'debug_batch', a, {
+      ok: true,
+      data: { status: 'ok', outcome: 'committed', committed: true, rollback_complete: true, after },
+      error: '',
+      ms: 1,
+    })
+  }
+
+  // A batch that resumed and re-stopped elsewhere: movement, with the new position.
+  const moved = batch({ state: 'stopped', ip: '0x4000' }).sessions[0]!
+  expect(moved.movedAt).toBeGreaterThan(moved.regsAt)
+  expect(moved.ip).toBe('4000')
+
+  // A read-only batch reports `stopped` at the same place: not movement, or every inspection
+  // would look like execution.
+  const read = batch({ state: 'stopped', ip: '0x1000' }).sessions[0]!
+  expect(read.movedAt).toBe(base.sessions[0]!.movedAt)
+  expect(read.regsAt).toBeGreaterThan(read.movedAt)
+
+  // Running, detached, ended and uncertain all stale the earlier reads.
+  const running = batch({ state: 'running', why: 'a resume step' }).sessions[0]!
+  expect(running.movedAt).toBeGreaterThan(running.regsAt)
+
+  const detached = batch({ state: 'detached', by: 'step 3' }).sessions[0]!
+  expect(detached.state).toBe('detached')
+  expect(detached.gone).toBe(false)
+
+  const ended = batch({ state: 'ended', by: 'step 2' }).sessions[0]!
+  expect(ended.gone).toBe(true)
+  expect(ended.ip).toBe(null)
+
+  const uncertain = batch({ state: 'uncertain', why: 'the probe failed' }).sessions[0]!
+  expect(uncertain.movedAt).toBeGreaterThan(uncertain.regsAt)
+  expect(uncertain.gone).toBe(false)
+})
