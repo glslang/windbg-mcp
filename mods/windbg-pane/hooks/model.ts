@@ -272,6 +272,19 @@ function where(s: Session, ip: string | null): string {
 
 const str = (v: unknown, d = ''): string => (typeof v === 'string' ? v : typeof v === 'number' ? String(v) : d)
 
+/** The breakpoint rows of any listing that carries them — `breakpoints`, or a clear's `remaining`. */
+function readBps(rows: unknown[]): Bp[] {
+  return rows.flatMap(x => {
+    const o = obj(x)
+    return o
+      ? [{
+          id: typeof o.id === 'number' ? o.id : 0, address: str(o.address), expression: str(o.expression),
+          enabled: o.enabled !== false, oneShot: o.one_shot === true,
+        } as Bp]
+      : []
+  })
+}
+
 /** A call answered: fold its typed result into the session it was routed to. */
 export function finish(v: View, n: number, tool: string, args: Record<string, unknown>, out: Outcome): View {
   const d = out.data
@@ -289,7 +302,16 @@ export function finish(v: View, n: number, tool: string, args: Record<string, un
     failure && typeof failure.session_id === 'string' && left !== '' && left !== 'no'
       ? (failure.session_id as string)
       : null
-  const sid = opened ?? stranded ?? (typeof args.session_id === 'string' ? args.session_id : v.current)
+  // `begin` already pinned which session this call was routed to, so use that rather than asking
+  // `v.current` again: calls overlap, and recomputing here misfiles a result whenever another call
+  // changed the current session while this one was outstanding — an implicit call that started on
+  // s1 folding into s2, which then draws s1's registers, stack and memory under the wrong target.
+  // The fallback is only for a call whose log entry has aged out of the ring.
+  const pinned = v.log.find(e => e.n === n)?.session
+  const sid =
+    opened ??
+    stranded ??
+    (pinned !== undefined ? pinned : typeof args.session_id === 'string' ? args.session_id : v.current)
   let sessions = v.sessions
   let s: Session | null = null
   if (sid) {
@@ -414,14 +436,61 @@ export function finish(v: View, n: number, tool: string, args: Record<string, un
       note = d.loaded + ' loaded' + (typeof before === 'number' && before !== d.loaded ? ', refreshed from ' + before : '')
     }
     if (Array.isArray(d.breakpoints)) {
-      s.bps = (d.breakpoints as unknown[]).flatMap(x => {
-        const o = obj(x)
-        return o ? [{
-          id: typeof o.id === 'number' ? o.id : 0, address: str(o.address), expression: str(o.expression),
-          enabled: o.enabled !== false, oneShot: o.one_shot === true,
-        } as Bp] : []
-      })
+      s.bps = readBps(d.breakpoints)
       if (tool === 'set_breakpoint') note = s.bps.length + ' breakpoint(s)'
+    }
+    // A clear answers with `remaining` and carries no `breakpoints` at all, so the branch above
+    // never fired and the pane went on drawing the cleared entries as armed. `remaining` is
+    // nullable where every other listing is not, deliberately: an empty array is the success state
+    // after clearing everything, and `null` means the inventory could not be read. The pane's own
+    // `bps: Bp[] | null` says the same thing — null hides the panel rather than asserting a count —
+    // so the two meanings are kept apart instead of collapsing an unreadable session into a clean
+    // one.
+    if (tool === 'clear_breakpoints' && 'remaining' in d) {
+      const remaining = d.remaining
+      if (Array.isArray(remaining)) {
+        s.bps = readBps(remaining)
+        note = s.bps.length === 0 ? 'all breakpoints cleared' : s.bps.length + ' breakpoint(s) remaining'
+      } else {
+        s.bps = null
+        note = 'cleared, inventory could not be read'
+      }
+    }
+    // A batch can resume, step or release the target, and `after` is the only thing that says what
+    // the session holds once it is done — the step list cannot. Without reading it a batch holding
+    // a `resume` or a `run_to` left the old registers, stack, memory, position and target state on
+    // screen marked current.
+    if (tool === 'debug_batch') {
+      const after = obj(d.after)
+      const state = after ? str(after.state) : ''
+      const ip = after ? norm(after.ip) : null
+      if (state === 'stopped') {
+        // A read-only batch also reports `stopped`, so the position decides whether it moved:
+        // marking every batch as movement would make an inspection look like execution.
+        if (ip && ip !== s.ip) {
+          s.movedAt = n
+          s.ip = ip
+          s.ipAt = n
+          note = 'batch stopped at ' + where(s, ip)
+        }
+      } else if (state === 'running') {
+        s.movedAt = n
+        note = 'batch left the target running' + (after && str(after.why) ? ': ' + str(after.why) : '')
+      } else if (state === 'detached') {
+        s.movedAt = n
+        s.state = 'detached'
+        note = 'batch detached the target' + (after && str(after.by) ? ' by ' + str(after.by) : '')
+      } else if (state === 'ended') {
+        s.movedAt = n
+        s.gone = true
+        s.ip = null
+        note = 'batch ended the target' + (after && str(after.by) ? ' by ' + str(after.by) : '')
+      } else if (state === 'uncertain') {
+        // The server reports not knowing rather than guessing, so neither does the pane: what it
+        // cannot claim is that the reads taken before the batch still describe the target.
+        s.movedAt = n
+        note = 'batch left the session uncertain' + (after && str(after.why) ? ': ' + str(after.why) : '')
+      }
     }
     // Three different shapes report a run, and reading only the synchronous one left an async run
     // invisible: the pane kept prior registers, stack and memory marked current while the target

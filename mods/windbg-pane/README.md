@@ -44,14 +44,26 @@ The pane now picks a register bank per target, and **counts anything it leaves o
 target kind, add its bank — and check the count line rather than the grid.
 
 **And a fixture only covers the shapes it happens to contain**, which is the limit of the paragraph
-above. Review of this directory found six more defects in the same class, none of them reachable
-from these recordings: an asynchronous run reports `moved`/`running` with no stop, `wait_for_stop`
-nests its stop under `stop`, `run_to_address` reports an ending or a timeout through `verdict`,
-`goto_position` answers with debugger *text* and no payload at all, and an opener that fails after
-creating a target puts the only handle that reaches it in `error.session_id`. Every one of them
-left stale registers, stack and memory on screen marked current, or hid a session. So when you add
-a branch here, read the field in `src/structured.rs` rather than inferring it from a payload in
-`tests/` — the recordings are evidence of what the server *did* send, never of what it *can*.
+above. Review of this directory found **nine** more defects in the same class, not one of them
+reachable from these recordings: an asynchronous run reports `moved`/`running` with no stop and
+names its handle in `execution`; `wait_for_stop` nests its stop under `stop`; `run_to_address`
+reports an ending or a timeout through `verdict`, with `stopped_at` deliberately absent;
+`goto_position` answers with debugger *text* and no payload at all; `clear_breakpoints` answers
+with `remaining` and carries no `breakpoints`; `debug_batch` says what the session holds in
+`after`; and an opener that fails after creating a target puts the only handle that reaches it in
+`error.session_id`. Every one left stale registers, stack and memory on screen marked current, or
+hid a session, or drew cleared breakpoints as armed.
+
+Two of those are worth the extra sentence, because they are not missing fields. `remaining` is
+**nullable where every other listing is not** — an empty array is the success state after clearing
+everything, and `null` means the inventory could not be read — so collapsing them reports an
+unreadable session as a clean one. And a *read-only* batch also reports `stopped`, so marking every
+batch as movement would make an inspection look like execution; the position is what decides.
+
+So when you add a branch here, read the field in `src/structured.rs` rather than inferring it from
+a payload in `tests/` — the recordings are evidence of what the server *did* send, never of what it
+*can*. The field's doc comment usually states the distinction that matters, and in both cases above
+it did.
 
 Some fixtures are deliberately absent. `tests/recorded-sk.ts` and `tests/sk.test.tsx` hold a lab
 VM's GUID and live VTL1 addresses from a private run and are gitignored; `windbg.test.tsx` covers
