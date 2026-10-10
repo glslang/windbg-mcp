@@ -38,9 +38,14 @@ must discover CR3 and report it in its hello". Supplying a value sampled by the 
 worse than supplying none: it adds a race and promotes the result to a pin the opener accepts.
 **One live read of a VP's CR3 is not the Secure Kernel's root** — it is whatever address space was
 resident at that instant, and two independent sources agreeing on it proves only that they sampled
-together, not whose space it is. Read the root a session settled on back from a stop's
-`target.expected_cr3`. `vmwp_pid`, `dispatcher_vnd` and `partition_id` are optional assertions for
-the same reason.
+together, not whose address space it is. `vmwp_pid`, `dispatcher_vnd` and `partition_id` are
+optional assertions for the same reason.
+
+**The root in force at a stop is in the stop's own `registers.values`, not in its `target`.**
+`target.expected_cr3` is the session's provider-hello baseline and the `TargetIdentity` is cloned
+unchanged into every stop, so under `allow_transition_cr3` it holds exactly the *wrong* root for
+the case that flag exists for. Read the `cr3` entry of the register snapshot; the two differing is
+what the transition **is**, and comparing them is how a caller detects one.
 
 **A single step is validated against the root it was armed in**, so an instruction that writes CR3
 cannot be stepped: `ExpectedStop::SingleStep` carries the CR3 and `RegisterSnapshot::from_values`
