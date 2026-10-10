@@ -14,12 +14,25 @@ guest" but **does the guest's `bcdedit /dbgsettings hostip` equal this debugger 
 on the port the profile names; the host IP moves between sessions. Compare the key by *hash* rather
 than printing it.
 
-*Finding* the guest is topology-specific. On the machine that paragraph was written for, the
-debugger host is itself a Hyper-V guest — `Get-VM` does not exist and there is no local VM to start
-— so the target is a *sibling*: it appears in the neighbour table (`Get-NetNeighbor | ?
-LinkLayerAddress -like '00-15-5D*'`) and answers **TCP 5985** and nothing else, ICMP and 445 being
-closed, so a failed ping proves nothing there. With several neighbours the table will happily
-validate the wrong guest, which is what the `hostip` comparison is for.
+*Finding* the guest is topology-specific. **Where the debugger host is also the Hyper-V host for the
+target, `Get-VM` is exactly the right instrument** — it finds the guest, starts it, and reports its
+state, and nothing below replaces it.
+
+What it cannot do is answer for a guest somebody *else* hypervises: it enumerates the VMs **this
+host** hypervises, so a sibling is neither found nor ruled out. Under KDNET the target dials this
+host over the network, so who hypervises it does not enter into whether the link can work. The trap
+is therefore a **negative** read of a listing: measured 2026-10-10, a six-VM listing with no target
+in it was taken as *"there is no guest to dial in"*, and the target was a sibling the whole time.
+A listing that does not contain your target tells you nothing; one that does is authoritative.
+Reach for the neighbour table below only once `Get-VM` has come back without it.
+
+What finds it is the neighbour table (`Get-NetNeighbor -AddressFamily IPv4 | ? LinkLayerAddress
+-like '00-15-5D*'`) plus a TCP probe of **5985** on those addresses alone — the guest answers WinRM
+and nothing else, ICMP and 445 being closed, so a failed ping proves nothing. Probe the neighbours
+the table names, never the subnet: a sweep is slower and is refused on this bench as network
+scanning. A `State` of `Stale` is an entry nothing has spoken to lately, not a dead host. With
+several neighbours the table will happily validate the wrong guest, which is what the `hostip`
+comparison is for.
 
 **Serial, which is what the Parallels bench uses** — and there KDNET is not merely unconfigured but
 *impossible*: guests get a `Parallels VirtIO Ethernet Adapter` (`PCI\VEN_1AF4`), and `1AF4` is not

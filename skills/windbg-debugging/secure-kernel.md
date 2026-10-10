@@ -335,6 +335,37 @@ Every mutating stopped operation consumes one session-scoped epoch. Never reuse 
 instruction, or widen a branch beyond its decoded destinations. If teardown is unconfirmed,
 `session_status` reports `live_control_unresolved` and retains the worker plus the exact VM/`vmwp`
 reservation. Do not open a second controller; inspect or discard the disposable VM out of band.
+Note that `live_control_unresolved` also appears **transiently** on a healthy release, followed by
+`closed` and `released: true`; the end is what is authoritative, in both directions.
+
+Six things about that sequence are not visible from the tool signatures, and each one costs a run
+against somebody's VM to discover:
+
+- **These twelve tools are an `extra` group**, so a client that asks for nothing is served none of
+  them and `open_sk_live_control` is refused `-32602` naming `--tools`. The group is widened on the
+  server's command line — except on a listener, where a client may carry its own surface
+  (`WINDBG_MCP_TOOLS_<NAME>`, or a `tools` field in the credential file) that replaces the run's
+  and may be wider, so a listener started without this group can still serve it to a configured
+  client.
+- **Opening and arming need VTL1 quiescent.** The baseline and the live-memory source must agree on
+  the page-table root, so anything executing in VTL1 while the session is established makes them
+  sample different instants and the arm fails naming both roots. A *transition* stop is the goal,
+  but it is permitted at a stop and not before one.
+- **CR3 is discovered by the provider, not asserted by the caller.** `expected_cr3` is an optional
+  assertion; one live read of a VP's CR3 is whatever address space was resident at that instant,
+  and two sources agreeing on it says only that they sampled together.
+- **The root in force at a stop is in that stop's `registers.values`, not its `target`.** Read the
+  `cr3` entry of the register snapshot. `target.expected_cr3` is the provider-hello baseline, cloned
+  unchanged into every stop, so under `allow_transition_cr3` it holds the wrong root for exactly the
+  case that flag exists for — and the two differing is what the transition is.
+- **Debug registers are per virtual processor.** A session arms one VP; a workload on another fires
+  nothing, and the symptom is a wait that merely expires. Pin what you mean to catch.
+- **The whole VM is paused while breakpoint state changes**, so nothing can be arranged inside the
+  guest between the arm and the wait. Anything the stop depends on has to be in flight already, and
+  timed on a guest clock rather than a host one — the pause stops the former and not the latter.
+- **A repeated step must state the instruction at the *current* RIP**, which the stop record does
+  not give you: its `instruction` field describes what the previous step executed. Supplying it
+  again fails saying the step address does not match the stopped RIP.
 
 ### If the user wants live Secure Kernel
 
