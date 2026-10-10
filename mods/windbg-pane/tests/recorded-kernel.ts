@@ -44,7 +44,7 @@ export const RECORDED_KERNEL: RecordedCall[] = [
         {
           checksum: 16799,
           end: '0xfffff80074b07000',
-          image_name: '\\??\\C:\\Users\\Admin\\Desktop\\MessageManager.sys',
+          image_name: '\\??\\<driver-path>\\MessageManager.sys',
           name: 'MessageManager',
           size: 28672,
           symbols: 'deferred',

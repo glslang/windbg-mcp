@@ -14,14 +14,17 @@ guest" but **does the guest's `bcdedit /dbgsettings hostip` equal this debugger 
 on the port the profile names; the host IP moves between sessions. Compare the key by *hash* rather
 than printing it.
 
-*Finding* the guest is topology-specific, and **`Get-VM` is the wrong instrument either way**: it
-enumerates the VMs *this host* hypervises, so it can neither find a sibling nor rule one out. Under
-KDNET the target dials **this host** over the network, so who hypervises it does not enter into it.
-On the bench this was written for, the debugger host is itself a Hyper-V guest with no local VM to
-start — but a host that runs Hyper-V *and* has siblings reads identically, and that is the more
-convincing version of the trap, because the listing looks like an answer. Measured 2026-10-10: a
-six-VM listing with no target in it was read as *"there is no guest to dial in"*, and the target was
-a sibling the whole time. The absence of `Get-VM` was never the tell.
+*Finding* the guest is topology-specific. **Where the debugger host is also the Hyper-V host for the
+target, `Get-VM` is exactly the right instrument** — it finds the guest, starts it, and reports its
+state, and nothing below replaces it.
+
+What it cannot do is answer for a guest somebody *else* hypervises: it enumerates the VMs **this
+host** hypervises, so a sibling is neither found nor ruled out. Under KDNET the target dials this
+host over the network, so who hypervises it does not enter into whether the link can work. The trap
+is therefore a **negative** read of a listing: measured 2026-10-10, a six-VM listing with no target
+in it was taken as *"there is no guest to dial in"*, and the target was a sibling the whole time.
+A listing that does not contain your target tells you nothing; one that does is authoritative.
+Reach for the neighbour table below only once `Get-VM` has come back without it.
 
 What finds it is the neighbour table (`Get-NetNeighbor -AddressFamily IPv4 | ? LinkLayerAddress
 -like '00-15-5D*'`) plus a TCP probe of **5985** on those addresses alone — the guest answers WinRM
