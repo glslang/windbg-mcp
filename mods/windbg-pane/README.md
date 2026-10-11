@@ -44,7 +44,7 @@ The pane now picks a register bank per target, and **counts anything it leaves o
 target kind, add its bank — and check the count line rather than the grid.
 
 **And a fixture only covers the shapes it happens to contain**, which is the limit of the paragraph
-above. Review of this directory found **sixteen** more defects in the same class, not one of them
+above. Review of this directory found **eighteen** more defects in the same class, not one of them
 reachable from these recordings: an asynchronous run reports `moved`/`running` with no stop and
 names its handle in `execution`; `wait_for_stop` nests its stop under `stop`; `run_to_address`
 reports an ending or a timeout through `verdict`, with `stopped_at` deliberately absent;
@@ -57,7 +57,10 @@ whether a run is still outstanding, which is what a `continue_async` whose own c
 leaves behind; and an opener that fails after creating a target puts the only handle that reaches it
 in `error.session_id`, where `TargetCreated::Yes` means the handle is **usable** rather than
 abandoned. Every one left stale registers, stack and memory on screen marked current, or hid a
-session, or drew cleared breakpoints as armed, or sent a working session to recovery.
+session, or drew cleared breakpoints as armed, or sent a working session to recovery. And
+`sk_read_memory` is the only guest-memory read an `open_sk_capture` session has, answering with a
+type of its own rather than with the live control's — so a capture's reads were folded nowhere at
+all.
 
 Three of those are worth the extra sentence, because they are not missing fields. `remaining` is
 **nullable where every other listing is not** — an empty array is the success state after clearing
@@ -69,12 +72,42 @@ none, while on a `set_breakpoint` it is an inspection taken after the mutation a
 empty means it could not be read — and `breakpoint` beside it reports what the call actually did,
 authoritatively and always.
 
+**Five rounds in a row landed on this one seam, so the fifth was answered by enumerating instead of
+waiting for a sixth.** Every panel here is built from named fields, and every round found another
+tool or another field the list did not have — the same mistake as the register banks above, one
+layer out. A count of what was left out will not fix it this time: that worked for the banks because
+the server hands over a **closed** set to count against, and "every tool whose payload this pane
+should fold" is not one. What *is* closed is the other direction — the fields — so
+`src/structured.rs` was read for every payload carrying one the panels draw, and there are no more.
+Memory bytes at an address are `MemoryRead`, `SecureKernelRead` and `LiveMemoryRead` and nothing
+else; `stopped_at` is `StopReport` and `RunToReport`; `location_state` is `CurrentLocation` alone,
+`remaining` `BreakpointsCleared` alone; and `frames`, `registers` and `instructions` are matched by
+**shape** rather than by tool, so `exception_triage`'s stack folds without ever being named. The
+audit found one gap of its own, which is the point of running it: a short `read_memory` carries
+`stopped`, saying whether it ran out of time or somebody interrupted it, and that field's own doc
+says `read_size` cannot answer the question — the pane drew the shortfall with no reason beside it.
+**Thirty-five of the surface's seventy-eight tools are named nowhere here**, and that is correct
+rather than a to-do list: this draws five panels and a command window, not a view per tool.
+
 So when you add a branch here, read the field in `src/structured.rs` rather than inferring it from
 a payload in `tests/` — the recordings are evidence of what the server *did* send, never of what it
 *can*. The field's doc comment usually states the distinction that matters, and in all three cases
 above it did.
 
-**One of the thirteen is the host's contract rather than the server's, and it is the same mistake
+**And an absent field is not the absence of the thing it reports**, which is where a decline of mine
+was too narrow rather than wrong. Review asked earlier for a `stopped_at` of `null` to be read as a
+stop, and that was declined correctly: the field carries `skip_serializing_if`, so it is **absent**
+and never `null`. What the decline stopped short of is what *else* produces that absence. Its own
+doc says "running, gone, or has **no thread context**", and `target_gone` is a field of its own
+precisely because "a target with no thread context also produces" an absent position — so a
+module-load break answers a successful `go` with a report that has no position, no `verdict`, no
+`running` and no `moved`, and looking for the position alone read a run that happened as no movement
+at all. The tell is the report itself: `command` and `output` are the two plain strings every
+`StopReport` carries, where `ExecutionStarted` has the first without the second and `RunToReport`
+the second without the first. The pane now marks the reads stale and says the target stopped without
+saying where.
+
+**One of the eighteen is the host's contract rather than the server's, and it is the same mistake
 one layer out.** A `tool.call` hook is handed the MCP record, so an MCP server's own `isError`
 rides on `ran.result` — the very object `payloadOf` reads the payload out of — while the engine
 also sets one on the result `next` resolves to. The hook read the outer flag alone and folded error

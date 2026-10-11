@@ -983,3 +983,178 @@ test('a raw command leaves the pane unable to claim the earlier reads are curren
   expect(refused.sessions[0]!.movedAt).toBe(v.sessions[0]!.movedAt)
   expect(refused.log[refused.log.length - 1]!.note).toBe('the target is running')
 })
+
+test('a captured Secure Kernel read reaches the memory panel, where only the live one did', () => {
+  const sid = 'sess-capture'
+  let v = EMPTY
+  {
+    const a = { capture: 'vtl1.dmp' }
+    const [st, n] = begin(v, 'open_sk_capture', a)
+    v = finish(st, n, 'open_sk_capture', a, {
+      ok: true,
+      data: { status: 'ok', kind: 'sk_capture', session_id: sid, target: 'vtl1.dmp' },
+      error: '',
+      ms: 1,
+    })
+  }
+  // `sk_read_memory` is the only guest-memory read an `open_sk_capture` session has, and it answers
+  // with a different type from the live control's — the same `address`, `gpa`, `requested_size` and
+  // `data`, plus the `symbol` the capture's own PDBs resolved. Reading only the live tool's name
+  // left every capture read folded nowhere.
+  const a = { session_id: sid, address: '0xfffff80012340000', size: 8 }
+  const [st, n] = begin(v, 'sk_read_memory', a)
+  v = finish(st, n, 'sk_read_memory', a, {
+    ok: true,
+    data: {
+      status: 'ok',
+      address: '0xfffff80012340000',
+      gpa: '0x1a2b3000',
+      requested_size: 8,
+      read_size: 8,
+      data: '48895C2408574883',
+      symbol: 'securekernel!SkmmAccessFault',
+    },
+    error: '',
+    ms: 1,
+  })
+  const s = v.sessions[0]!
+  expect(s.mem?.address).toBe('0xfffff80012340000')
+  expect(s.mem?.size).toBe(8)
+  expect(s.mem?.gpa).toBe('0x1a2b3000')
+  expect(s.memAt).toBe(n)
+  const last = v.log[v.log.length - 1]!
+  expect(last.note).toBe('8 bytes at gpa 000000001a2b3000, securekernel!SkmmAccessFault')
+  // And the command window names the read rather than leaving the row as the raw tool call.
+  expect(last.command).toBe('db 0xfffff80012340000 L0n8')
+  expect(last.isWinDbg).toBe(true)
+})
+
+test('a stop that reports no position is still movement, and claims no position', () => {
+  const sid = 'sess-noctx'
+  let v = EMPTY
+  {
+    const a = { program: 'cmd.exe' }
+    const [st, n] = begin(v, 'launch', a)
+    v = finish(st, n, 'launch', a, {
+      ok: true,
+      data: { status: 'ok', kind: 'launch', session_id: sid, target: 'cmd.exe' },
+      error: '',
+      ms: 1,
+    })
+  }
+  {
+    const a = { session_id: sid }
+    const [st, n] = begin(v, 'registers', a)
+    v = finish(st, n, 'registers', a, {
+      ok: true,
+      data: { status: 'ok', registers: [{ name: 'rax', value: '0x1' }], instruction_pointer: '0x7ff600001000' },
+      error: '',
+      ms: 1,
+    })
+  }
+  expect(v.sessions[0]!.regsAt).toBeGreaterThan(v.sessions[0]!.movedAt)
+
+  // `StopReport::stopped_at` is absent "for a target that is running, gone, or has no thread
+  // context", and `target_gone` is a field of its own precisely because an absent position does not
+  // say which. A module-load break is the ordinary case: the run happened, `target_gone` is false,
+  // and there is no position, no `verdict`, no `running` and no `moved` — so every condition the
+  // pane looked for was false and it went on marking the pre-run reads current.
+  {
+    const a = { session_id: sid }
+    const [st, n] = begin(v, 'go', a)
+    v = finish(st, n, 'go', a, {
+      ok: true,
+      data: {
+        status: 'ok',
+        command: 'g',
+        interrupted: false,
+        timed_out: false,
+        target_gone: false,
+        output: 'ModLoad: 00007ffa`27180000 00007ffa`27450000   ntdll.dll',
+      },
+      error: '',
+      ms: 1,
+    })
+  }
+  const moved = v.sessions[0]!
+  expect(moved.movedAt).toBeGreaterThan(moved.regsAt)
+  expect(moved.gone).toBe(false)
+  expect(v.log[v.log.length - 1]!.note).toBe('stopped, no position reported')
+  // The position the target left is not re-asserted as where it is now.
+  expect(moved.ip).toBe('7ff600001000')
+  expect(moved.ipAt).toBeLessThan(moved.movedAt)
+
+  // The same report nested under a `wait_for_stop`, which is where the async path reads it. A fresh
+  // register read first, so there is something for the stop to stale.
+  {
+    const a = { session_id: sid }
+    const [st, n] = begin(v, 'registers', a)
+    v = finish(st, n, 'registers', a, {
+      ok: true,
+      data: { status: 'ok', registers: [{ name: 'rax', value: '0x2' }], instruction_pointer: '0x7ff600002000' },
+      error: '',
+      ms: 1,
+    })
+  }
+  expect(v.sessions[0]!.regsAt).toBeGreaterThan(v.sessions[0]!.movedAt)
+  {
+    const a = { session_id: sid, execution: 'run-1' }
+    const [st, n] = begin(v, 'wait_for_stop', a)
+    v = finish(st, n, 'wait_for_stop', a, {
+      ok: true,
+      data: {
+        status: 'ok',
+        session_id: sid,
+        execution: 'run-1',
+        running_for_ms: 12,
+        stop: {
+          command: 'g',
+          interrupted: false,
+          timed_out: false,
+          target_gone: false,
+          output: 'ModLoad: 00007ffa`27450000 00007ffa`27600000   kernel32.dll',
+        },
+      },
+      error: '',
+      ms: 1,
+    })
+  }
+  const waited = v.sessions[0]!
+  expect(waited.movedAt).toBeGreaterThan(waited.regsAt)
+  expect(v.log[v.log.length - 1]!.note).toBe('stopped, no position reported')
+  expect(waited.ip).toBe('7ff600002000')
+  expect(waited.ipAt).toBeLessThan(waited.movedAt)
+})
+
+test('a short read says why it stopped, which the byte count cannot', () => {
+  const sid = 'sess-short'
+  let v = EMPTY
+  {
+    const a = { program: 'cmd.exe' }
+    const [st, n] = begin(v, 'launch', a)
+    v = finish(st, n, 'launch', a, {
+      ok: true,
+      data: { status: 'ok', kind: 'launch', session_id: sid, target: 'cmd.exe' },
+      error: '',
+      ms: 1,
+    })
+  }
+  // `MemoryRead::stopped` exists because `read_size` cannot answer it: a read that ran out of time
+  // and one a caller interrupted both come back with fewer bytes and nothing else to tell them
+  // apart, and the next move differs. The pane reported the shortfall and not the reason.
+  const read = (stopped: string | undefined) => {
+    const a = { session_id: sid, address: '0x7ff600001000', size: 8 }
+    const [st, n] = begin(v, 'read_memory', a)
+    v = finish(st, n, 'read_memory', a, {
+      ok: true,
+      data: { status: 'ok', address: '0x7ff600001000', requested_size: 8, read_size: 4, data: '48895C24', ...(stopped ? { stopped } : {}) },
+      error: '',
+      ms: 1,
+    })
+    return v.log[v.log.length - 1]!.note
+  }
+  expect(read('deadline')).toBe('4 bytes, 8 requested, ran out of time')
+  expect(read('interrupted')).toBe('4 bytes, 8 requested, was interrupted')
+  // Absent means the whole range was read — so a short read with no reason claims none.
+  expect(read(undefined)).toBe('4 bytes, 8 requested')
+})
