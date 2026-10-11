@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
 import type { LogEntry, Session } from '../types'
-import { EMPTY, begin, finish, norm, payloadOf, regHex, shapeOf, wd, windbgTool } from './model'
+import { EMPTY, answered, begin, finish, norm, payloadOf, regHex, shapeOf, wd, windbgTool } from './model'
 
 const PANE = 'windbg'
 const TITLE = 'WinDbg'
@@ -110,8 +110,8 @@ export const register: Register = on => {
     const started = Date.now()
     const ran = await next(e)
     try {
-      const ok = ran.deny === undefined && ran.isError !== true
       const data = ran.deny === undefined ? payloadOf(ran.result, ran.text) : null
+      const ok = ran.deny === undefined && answered(ran.result, ran.isError, data)
       const error = ran.deny !== undefined ? 'denied: ' + ran.deny : typeof ran.text === 'string' ? ran.text : ''
       let first = false
       await update($, view, v => {
