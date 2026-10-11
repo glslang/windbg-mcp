@@ -95,7 +95,7 @@ line is simply open.
 - [Item 121](#121-windbg-mcp-tracing-pool-allocations-on-an-x86-kernel) — [windbg-mcp] Tracing pool allocations on an x86 kernel
 - [Item 122](#122-windbg-mcp-a-live-secure-kernel-session-has-no-image-to-resolve-names-or-instructions-against) — [windbg-mcp] A live Secure Kernel session has no image to resolve names or instructions against
 - [Item 123](#123-windbg-mcp-sk_live_step-refuses-a-cr3-changing-instruction-instead-of-stepping-over-it) — [windbg-mcp] `sk_live_step` refuses a CR3-changing instruction instead of stepping over it
-- [Item 124](#124-windbg-mcp-nothing-asserts-that-a-live-secure-kernel-read-was-of-memory-vtl0-cannot-reach) — [windbg-mcp] Nothing asserts that a live Secure Kernel read was of memory VTL0 cannot reach
+- [Item 124](#124-windbg-mcp-nothing-asserts-that-a-live-secure-kernel-read-was-of-memory-vtl0-cannot-reach) — [windbg-mcp] Nothing asserts that a live Secure Kernel read was of memory VTL0 cannot reach — **half landed**
 
 ## 2. [dbgscope] Typed write primitives
 
@@ -2719,6 +2719,47 @@ translation — but the run records only that the read succeeded.
   consuming test in `tests/mcp_smoke.rs`; the live-tier claims in
   [`docs/smoke-test.md`](./docs/smoke-test.md).
 
+**Landed, 2026-10-11: the statement, not the comparison.** The fallback this entry named is in
+place — the live tier's stopped read carries a comment saying what it establishes and what it does
+not, the test's doc comment says a pass does not show the memory read was protected, and
+`docs/smoke-test.md`'s live-tier section says the same for a reader who never opens the test. Two
+corrections to this entry's own first paragraph, made while writing them. The live tier does not
+assert the *shape* of the read's answer: it asserts that the read's `epoch` is the stop's and that
+`data` begins with the guarded instruction's bytes, and it does not read `gpa` at all — the
+`sk_read_memory` assertion in the *capture* tier is the one that checks a `gpa` is reported. And
+"nothing anywhere asserts" was true of the code and of the docs alike; the docs now say so rather
+than leaving it to be inferred from what the assertions omit.
+
+**Decided 2026-10-11: admit the VTL0 root — and hold both VTLs the way the NT kernel and the
+hypervisor are held, as two sessions on one guest rather than as a mode of one.** Where the pin
+actually is, re-derived: not in the policy file, which carries no VTL field at all. It is in the
+operator's provider command template, which the policy admits token for token with only
+`{partition_id}`, `{vp}` and `{cr3}` expanded, and in `skcontrol::TargetIdentity::validate`, which
+refuses any identity whose `vtl` is not 1 ("this protocol revision controls VTL1") —
+`TargetSelector::require` and `HeldEvent::validate` repeat the check. So widening the live
+transport itself to VTL0 is a protocol revision as well as a template, and it would hand the VTL0
+half a second copy of machinery the normal kernel already has a debugger for. The shape to build
+instead is the hypervisor pair's (`.claude/skills/live-hypervisor/SKILL.md`): VTL0 is the guest's
+ordinary NT KDNET endpoint, opened with `attach_kernel` through a profile carrying a `guest`, and
+VTL1 is the live-control session or the managed KD facade beside it, each in its own worker, joined
+by that `guest` claim — an assertion rather than a check, exactly as it is for the pair. The KD work
+is what makes the VTL1 side look like the VTL0 side: `open_sk_kd` serves a held VTL1 stop as a
+serial KD target on a named pipe, so an `attach_kernel` onto that pipe would give VTL1 the same
+`read_memory` and `execute` the NT session has, and the comparison this item wants becomes one
+address translated by two kernel sessions. **The last step is unmeasured on both sides.** This
+server has never attached to its own facade. And the third outcome — the only one that rules the
+*page* out — is an access attempted from VTL0, and what the guest does when its kernel debugger
+touches a page VTL1 protects is not known here: a refusal and the guest going down are both
+plausible, which is why that attempt is the first thing the disposable tier should take, and why
+the trustlet case stays out of reach of any page-table walk either way.
+
+- **Where it picks up now:** the `guest` and `role` claims on a profile (`src/kdconn.rs`,
+  `docs/kernel-profiles.md`); `open_sk_kd` and its connection string
+  (`docs/secure-kernel/kd-facade.md`, "Running the managed session"); the VTL1 check in
+  `skcontrol::TargetIdentity::validate`, which a facade-attached session never meets because it is
+  on the KD side of the pipe; and the three-outcome criterion above, which is what a two-session
+  comparison has to report per address.
+
 ## Where these items came from
 
 Each cluster above, and what filing it measured. Items named here as *"now in `DONE.md`"* have
@@ -2869,5 +2910,11 @@ Item 120, now in [`DONE.md`](./DONE.md), came from checking that review against 
 goal the same day: the standalone KD role and the MCP live-control session were alternative owners,
 so the server could not create, observe or release the WinDbg-facing session it presented to an
 operator.
+Items 122–124 came from the first live VTL1 stop/step runs driven through the seven live tools
+(2026-10-10), the day the `secure-kernel-live` rule was written from them: a session with no image
+to resolve names or instruction lengths against (122), a step refused at the instruction that
+changes CR3 rather than carried over it (123), and a review of what a passing run actually
+establishes, which found that every assertion is of the Secure Kernel being *readable* and none of
+the memory being *protected* (124).
 `DECISIONS.md`'s 2026-08-02 entries are the bounded-command coverage review that produced
 item 13, now in [`DONE.md`](./DONE.md).
