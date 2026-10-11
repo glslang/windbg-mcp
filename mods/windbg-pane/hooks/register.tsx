@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
 import type { LogEntry, Session } from '../types'
-import { EMPTY, EMPTY_DRAWABLE, answered, begin, drawable, finish, norm, payloadOf, regHex, shapeOf, wd, windbgTool } from './model'
+import { EMPTY, EMPTY_DRAWABLE, answered, begin, cleared, drawable, finish, norm, payloadOf, regHex, shapeOf, wd, windbgTool } from './model'
 
 const PANE = 'windbg'
 const TITLE = 'WinDbg'
@@ -78,7 +78,9 @@ export const register: Register = on => {
       return { text: 'WinDbg pane closed.' }
     }
     if (arg === 'clear') {
-      await update($, view, v => ({ ...EMPTY, autoOpened: v.autoOpened }))
+      // The command forgets the **history**, which is what it says and what it is for — see
+      // `cleared`, where the reason it is not a reset to `EMPTY` is written down.
+      await update($, view, cleared)
       return { text: 'WinDbg pane cleared.' }
     }
     if (arg === 'shape') {

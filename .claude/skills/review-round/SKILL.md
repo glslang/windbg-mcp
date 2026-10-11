@@ -370,6 +370,13 @@ paragraph stating another limitation, and say why. When a real defect's only rem
 machinery, **retract the claim instead**: a weaker claim costs a sentence and leaves nothing for the
 next round to read, while a new counter leaves surface that later rounds will land on.
 
+**A new-machinery finding that is genuinely a good idea is a feature request, so file it as one.**
+Building it into the PR under review is feature creep wearing a review finding's clothes: it arrives
+with no issue, no discussion of whether it is wanted, and a diff the next round then reads. Open an
+issue instead — the finding's own text is most of the body — say in the reply that it is filed and
+why it is not in this PR, and leave the branch alone. That keeps the idea without letting the review
+decide the roadmap, and it is the one disposal that is neither building it nor losing it.
+
 **Then stop at the first round whose findings are all new-mechanism requests and prose preference,
 and do not ask.** Report once: rounds worked, taken against declined, and anything left unworked
 with where to find it, so it can be triaged rather than taken on trust. Continuing past that point

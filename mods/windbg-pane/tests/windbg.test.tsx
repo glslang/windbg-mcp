@@ -2,7 +2,7 @@ import { expect, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import type { View } from '../types'
-import { EMPTY, answered, begin, bpsMayBeStale, finish, payloadOf, readFrame, windbgTool } from '../hooks/model'
+import { EMPTY, answered, begin, bpsMayBeStale, cleared, finish, payloadOf, readFrame, windbgTool } from '../hooks/model'
 import { RECORDED } from './recorded'
 import { RECORDED_KERNEL } from './recorded-kernel'
 import { RECORDED_DUMP } from './recorded-dump'
@@ -1547,4 +1547,104 @@ test('the instruction a live step just ran is not drawn as the stop', async ($, 
   // taken somewhere else, when it is the instruction this stop just ran.
   expect(drawn).not.toMatch(/ip is elsewhere/)
   await ui.unmount()
+})
+
+test('clearing forgets the history and keeps following the open sessions', () => {
+  let v = EMPTY
+  const a = { command: 'x.exe' }
+  const [st, n] = begin(v, 'launch', a)
+  v = finish(st, n, 'launch', a, {
+    ok: true,
+    data: { status: 'ok', kind: 'launch', session_id: 'sess-c', target: 'x.exe' },
+    error: '',
+    ms: 1,
+  })
+  expect(v.log.length).toBe(1)
+
+  v = cleared(v)
+  expect(v.log).toEqual([])
+  expect(v.lastShape).toBe('')
+  // The server's session is still open, so the pane's must be too — resetting to `EMPTY` dropped
+  // it and `current` with it, and then nothing could be folded.
+  expect(v.sessions.map(x => x.id)).toEqual(['sess-c'])
+  expect(v.current).toBe('sess-c')
+
+  // An implicit call after the clear still lands on that session.
+  {
+    const b = {}
+    const [st2, n2] = begin(v, 'registers', b)
+    v = finish(st2, n2, 'registers', b, {
+      ok: true,
+      data: { status: 'ok', registers: [{ name: 'rax', value: '0x1' }], instruction_pointer: '0x1000' },
+      error: '',
+      ms: 1,
+    })
+  }
+  expect(v.sessions[0]!.regs!.map(r => r.name)).toEqual(['rax'])
+  expect(v.log[v.log.length - 1]!.session).toBe('sess-c')
+})
+
+test('a write retires the two inventories movement does not cover', () => {
+  const setUp = () => {
+    let v = EMPTY
+    const call = (tool: string, a: Record<string, unknown>, data: Record<string, unknown> | null) => {
+      const [st, n] = begin(v, tool, a)
+      v = finish(st, n, tool, a, { ok: true, data, error: '', ms: 1 })
+    }
+    call('launch', { command: 'x.exe' }, { status: 'ok', kind: 'launch', session_id: 'sess-w2', target: 'x.exe' })
+    call('disassemble', { session_id: 'sess-w2', address: '0x1000', count: 1 }, {
+      status: 'ok', start: '0x1000',
+      instructions: [{ address: '0x1000', bytes: '90', module: 'x', rva: '0x1000', text: 'nop' }],
+    })
+    call('breakpoints', { session_id: 'sess-w2' }, {
+      status: 'ok',
+      breakpoints: [{ id: 0, address: '0x1000', expression: 'x!main', enabled: true, one_shot: false }],
+    })
+    expect(v.sessions[0]!.disasm).not.toBe(null)
+    expect(v.sessions[0]!.bps!.length).toBe(1)
+    return { v, call: (tool: string, a: Record<string, unknown>, data: Record<string, unknown> | null) => {
+      const [st, n] = begin(v, tool, a)
+      v = finish(st, n, tool, a, { ok: true, data, error: '', ms: 1 })
+      return v
+    } }
+  }
+
+  // A raw `bc *` retires every breakpoint and a raw `eb` rewrites the code. Neither is movement,
+  // so the timestamps the other panels use cannot cover them, and the pane cannot read the command
+  // text to tell which — the rules file records that as unfinishable. Both go.
+  {
+    const { call } = setUp()
+    const v = call('execute', { session_id: 'sess-w2', command: 'bc *' }, null)
+    expect(v.sessions[0]!.bps).toBe(null)
+    expect(v.sessions[0]!.disasm).toBe(null)
+  }
+
+  // And a batch that reports any change at all, without reading which kind it was: `changes` is a
+  // fixed vocabulary but `batch::mutation` calls it best-effort over a list that "cannot
+  // enumerate" every way DbgEng touches a target, so keying on `breakpoints` would treat an
+  // admittedly incomplete list as complete.
+  {
+    const { call } = setUp()
+    const v = call('debug_batch', { session_id: 'sess-w2', steps: [] }, {
+      status: 'ok', outcome: 'committed', committed: true, rollback_complete: true,
+      steps: [{ position: 1, label: 'arm', action: 'bp x!other', result: 'ok', changes: 'breakpoints', cut_short: false, target_gone: false }],
+      always: [],
+      after: { state: 'stopped', ip: '0x1000' },
+    })
+    expect(v.sessions[0]!.bps).toBe(null)
+    expect(v.sessions[0]!.disasm).toBe(null)
+  }
+
+  // A batch that reports no change leaves both alone.
+  {
+    const { call } = setUp()
+    const v = call('debug_batch', { session_id: 'sess-w2', steps: [] }, {
+      status: 'ok', outcome: 'committed', committed: true, rollback_complete: true,
+      steps: [{ position: 1, label: 'read', action: 'r', result: 'ok', cut_short: false, target_gone: false }],
+      always: [],
+      after: { state: 'stopped', ip: '0x1000' },
+    })
+    expect(v.sessions[0]!.bps!.length).toBe(1)
+    expect(v.sessions[0]!.disasm).not.toBe(null)
+  }
 })
