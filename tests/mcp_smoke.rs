@@ -19935,7 +19935,10 @@ fn a_kdnet_endpoint_another_process_holds_is_refused_rather_than_parked() {
     // Held for the whole call, which is the point: this stands in for another engine's listener.
     let held = std::net::UdpSocket::bind("0.0.0.0:0").expect("a udp port to hold");
     let port = held.local_addr().expect("a bound address").port();
-    let mut server = Server::started_with(&[("WINDBG_MCP_CALL_TIMEOUT_SECS", "1")]);
+    // This checks the engine's refusal, not its speed. A one-second caller deadline can win
+    // before AttachKernel returns, yielding unresolved ownership instead of the refusal.
+    let timeout = STEP.as_secs().to_string();
+    let mut server = Server::started_with(&[("WINDBG_MCP_CALL_TIMEOUT_SECS", &timeout)]);
     let reply = server.call_tool(
         "attach_kernel",
         json!({ "connection": format!("net:port={port},key=1.1.1.1") }),
@@ -19949,8 +19952,14 @@ fn a_kdnet_endpoint_another_process_holds_is_refused_rather_than_parked() {
     // `no` rather than `unknown`: nothing was claimed, so there is no target whose state is in
     // doubt and nothing for an operator to recover — which is exactly what separates this from
     // the parked attach the tests above are about.
-    assert_eq!(failure["target"], "no");
-    assert_eq!(failure["error"]["category"], "debugger");
+    assert_eq!(
+        failure["target"], "no",
+        "the occupied endpoint must be refused before a target is claimed: {reply}"
+    );
+    assert_eq!(
+        failure["error"]["category"], "debugger",
+        "the occupied endpoint must report the debugger's refusal: {reply}"
+    );
     assert!(
         server.tool_data("session_status", json!({}), STEP)["sessions"]
             .as_array()
