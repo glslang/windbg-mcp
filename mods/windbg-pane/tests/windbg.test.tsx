@@ -2,7 +2,7 @@ import { expect, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import type { View } from '../types'
-import { EMPTY, answered, begin, finish, payloadOf, readFrame, windbgTool } from '../hooks/model'
+import { EMPTY, answered, begin, bpsMayBeStale, finish, payloadOf, readFrame, windbgTool } from '../hooks/model'
 import { RECORDED } from './recorded'
 import { RECORDED_KERNEL } from './recorded-kernel'
 import { RECORDED_DUMP } from './recorded-dump'
@@ -363,9 +363,12 @@ test('a failed opener that left a target keeps its handle in view', () => {
   // or further work both take, so the pane must not send a usable session to recovery.
   expect(stranded!.state).toBe('held')
   expect(stranded!.target).toBe('target exists; use this handle or end the session')
-  expect(after.current).toBe('sess-stranded')
-  expect(after.current).not.toBe(live)
   expect(after.log[after.log.length - 1]!.note).toContain('target held')
+  // The pane does **not** move its current session to it. An opener that failed leaves a session
+  // `accepts_default` refuses, so the server goes on routing unaddressed calls to the live one —
+  // and switching would pin the next implicit call to a session the server is not using. The
+  // handle is in the list either way, which is what this test is named for.
+  expect(after.current).toBe(live)
 
   // `pending` says the open may still land; `no` leaves nothing behind and invents nothing.
   const mk = (target: string, id: string) => {
@@ -1246,4 +1249,163 @@ test('a teardown is unresolved only where the server says recovery is required',
     .toEqual({ state: 'closed', note: 'released, target left running' })
   expect(end({ released: true, worker_terminated: false, recovery_required: false }))
     .toEqual({ state: 'closed', note: 'released' })
+})
+
+test('the current session follows the server, not whichever session is newest', () => {
+  let v = EMPTY
+  const open = (id: string, target: string) => {
+    const a = { command: target }
+    const [st, n] = begin(v, 'launch', a)
+    v = finish(st, n, 'launch', a, {
+      ok: true,
+      data: { status: 'ok', kind: 'launch', session_id: id, target },
+      error: '',
+      ms: 1,
+    })
+  }
+  open('sess-1', 'one.exe')
+  open('sess-2', 'two.exe')
+  expect(v.current).toBe('sess-2')
+
+  // s2 turns out to be releasing a Secure Kernel KD session. `accepts_handle` admits six of the
+  // nine KD phases and `Releasing` is **not** one, so the server routes an unaddressed call to s1
+  // and says so in `SessionInfo::current`.
+  //
+  // The phase is the whole point of the construction. Any state the pane can *name* as ineligible
+  // — `failed`, `closed` — is caught by its own exclusion list, so a test using one of those would
+  // pass with this fix backed out, on the neighbouring rule. `sk kd releasing` is a display string
+  // no list can keep up with, which is why the server's own answer has to be the authority.
+  {
+    const a = { session_id: 'sess-2' }
+    const [st, n] = begin(v, 'session_status', a)
+    v = finish(st, n, 'session_status', a, {
+      ok: true,
+      data: {
+        status: 'ok',
+        asked: 'sess-2',
+        max_sessions: 4,
+        sessions: [
+          { session_id: 'sess-1', kind: 'launch', target: 'one.exe', state: { state: 'open' }, current: true },
+          { session_id: 'sess-2', kind: 'launch', target: 'two.exe', state: { state: 'secure_kernel_kd', phase: 'releasing' }, current: false },
+        ],
+      },
+      error: '',
+      ms: 1,
+    })
+  }
+  expect(v.sessions.find(x => x.id === 'sess-2')!.state).toBe('sk kd releasing')
+  expect(v.current).toBe('sess-1')
+
+  // And it stays there: a later addressed call to s2 does not take it back, and neither does
+  // anything else short of an opener or another status row.
+  {
+    const a = { session_id: 'sess-2' }
+    const [st, n] = begin(v, 'registers', a)
+    v = finish(st, n, 'registers', a, {
+      ok: true,
+      data: { status: 'ok', registers: [{ name: 'rax', value: '0x9' }], instruction_pointer: '0x9000' },
+      error: '',
+      ms: 1,
+    })
+  }
+  expect(v.current).toBe('sess-1')
+
+  // A third opener does move it, and the belief survives without another status call.
+  open('sess-3', 'three.exe')
+  expect(v.current).toBe('sess-3')
+  {
+    const a = { session_id: 'sess-1' }
+    const [st, n] = begin(v, 'backtrace', a)
+    v = finish(st, n, 'backtrace', a, { ok: true, data: { status: 'ok', frames: [] }, error: '', ms: 1 })
+  }
+  expect(v.current).toBe('sess-3')
+})
+
+test('a one-shot breakpoint is not drawn as armed after the target has run', () => {
+  let v = EMPTY
+  const call = (tool: string, a: Record<string, unknown>, data: Record<string, unknown> | null) => {
+    const [st, n] = begin(v, tool, a)
+    v = finish(st, n, tool, a, { ok: true, data, error: '', ms: 1 })
+  }
+  call('launch', { command: 'x.exe' }, { status: 'ok', kind: 'launch', session_id: 'sess-1s', target: 'x.exe' })
+
+  // Two breakpoints, one of them one-shot. DbgEng deletes a one-shot when it is hit.
+  call('breakpoints', { session_id: 'sess-1s' }, {
+    status: 'ok',
+    breakpoints: [
+      { id: 0, address: '0x1000', expression: 'x!main', enabled: true, one_shot: false },
+      { id: 1, address: '0x2000', expression: 'x!once', enabled: true, one_shot: true },
+    ],
+  })
+  const fresh = v.sessions[0]!
+  expect(bpsMayBeStale(fresh)).toBe(false)
+  expect(fresh.bpsAt).toBeGreaterThan(fresh.movedAt)
+
+  // A run. The ordinary breakpoint survives it; the one-shot may not have.
+  call('go', { session_id: 'sess-1s' }, {
+    status: 'ok', command: 'g', interrupted: false, timed_out: false, target_gone: false,
+    output: 'Breakpoint 1 hit', stopped_at: '0x2000',
+  })
+  const ran = v.sessions[0]!
+  expect(ran.movedAt).toBeGreaterThan(ran.bpsAt)
+  expect(bpsMayBeStale(ran)).toBe(true)
+
+  // Re-reading the inventory settles it, and the panel stops hedging.
+  call('breakpoints', { session_id: 'sess-1s' }, {
+    status: 'ok',
+    breakpoints: [{ id: 0, address: '0x1000', expression: 'x!main', enabled: true, one_shot: false }],
+  })
+  const after = v.sessions[0]!
+  expect(after.bps!.map(b => b.id)).toEqual([0])
+  expect(bpsMayBeStale(after)).toBe(false)
+
+  // And an inventory with no one-shot in it is never put in doubt by movement alone.
+  call('go', { session_id: 'sess-1s' }, {
+    status: 'ok', command: 'g', interrupted: false, timed_out: false, target_gone: false,
+    output: 'Breakpoint 0 hit', stopped_at: '0x1000',
+  })
+  const plain = v.sessions[0]!
+  expect(plain.movedAt).toBeGreaterThan(plain.bpsAt)
+  expect(bpsMayBeStale(plain)).toBe(false)
+})
+
+test('a batch that writes drops the disassembly rather than redrawing it', () => {
+  let v = EMPTY
+  const call = (tool: string, a: Record<string, unknown>, data: Record<string, unknown> | null) => {
+    const [st, n] = begin(v, tool, a)
+    v = finish(st, n, tool, a, { ok: true, data, error: '', ms: 1 })
+  }
+  call('launch', { command: 'x.exe' }, { status: 'ok', kind: 'launch', session_id: 'sess-w', target: 'x.exe' })
+  call('disassemble', { session_id: 'sess-w', address: '0x1000', count: 2 }, {
+    status: 'ok',
+    start: '0x1000',
+    instructions: [
+      { address: '0x1000', bytes: '90', module: 'x', rva: '0x1000', text: 'nop' },
+      { address: '0x1001', bytes: '90', module: 'x', rva: '0x1001', text: 'nop' },
+    ],
+  })
+  expect(v.sessions[0]!.disasm!.rows.length).toBe(2)
+
+  // A batch whose steps report no change leaves the listing alone — code does not change because
+  // the target moved, which is why `movedAt` is not the stamp for it.
+  call('debug_batch', { session_id: 'sess-w', steps: [] }, {
+    status: 'ok', outcome: 'committed', committed: true, rollback_complete: true,
+    steps: [{ position: 1, label: 'read', action: 'r', result: 'ok', cut_short: false, target_gone: false }],
+    always: [],
+    after: { state: 'stopped', ip: '0x1000' },
+  })
+  expect(v.sessions[0]!.disasm!.rows.length).toBe(2)
+
+  // One that patched a byte does not. `BatchStepInfo::changes` is the executor's own record of a
+  // mutation, and patching a byte is what a batch is for — so the pane no longer knows what is at
+  // those addresses and says so by dropping the panel rather than drawing stale bytes.
+  call('debug_batch', { session_id: 'sess-w', steps: [] }, {
+    status: 'ok', outcome: 'committed', committed: true, rollback_complete: true,
+    steps: [{ position: 1, label: 'patch', action: 'eb 0x1000 cc', result: 'ok', changes: '1 byte at 0x1000', cut_short: false, target_gone: false }],
+    always: [{ position: 1, label: 'restore', action: 'eb 0x1000 90', result: 'ok', changes: '1 byte at 0x1000', cut_short: false, target_gone: false }],
+    after: { state: 'stopped', ip: '0x1000' },
+  })
+  expect(v.sessions[0]!.disasm).toBe(null)
+  // Both blocks count: a rollback writes too.
+  expect(v.log[v.log.length - 1]!.note).toContain('wrote 1 byte at 0x1000, 1 byte at 0x1000')
 })

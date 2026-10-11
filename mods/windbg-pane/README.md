@@ -44,7 +44,7 @@ The pane now picks a register bank per target, and **counts anything it leaves o
 target kind, add its bank — and check the count line rather than the grid.
 
 **And a fixture only covers the shapes it happens to contain**, which is the limit of the paragraph
-above. Review of this directory found **twenty-two** more defects in the same class, not one of them
+above. Review of this directory found **twenty-five** more defects in the same class, none of them
 reachable from these recordings: an asynchronous run reports `moved`/`running` with no stop and
 names its handle in `execution`; `wait_for_stop` nests its stop under `stop`; `run_to_address`
 reports an ending or a timeout through `verdict`, with `stopped_at` deliberately absent;
@@ -111,6 +111,29 @@ open, so a worker killed holding one left the session marked unresolved for ever
 `recovery_required` is the field that means unconfirmed, and `target_left_running` is the teardown
 fact that is not recoverable afterwards.
 
+**The draw-layer audit then closed the rest of it, and the round after found what the audit had
+dismissed.** Five reads are drawn: registers, stack, memory, the position, and the breakpoint
+inventory. The first four are stamped and gated. The inventory was not, and the audit judged that
+harmless because an ordinary breakpoint survives a run — which is true and is not the whole set. A
+**one-shot** does not: DbgEng removes it when it is hit, so a `go` after the inventory was read can
+have deleted an entry the panel went on drawing as armed. `bpsAt` and `bpsMayBeStale` close it, and
+the condition is deliberately the two facts together rather than a plain stale flag, so an inventory
+with no one-shot in it is never put in doubt by movement alone. The disassembly is the other
+ungated read and `movedAt` is correctly **not** its stamp — code does not change because the target
+moved — but a patched byte does change it, and patching a byte is what `debug_batch` is for, so a
+batch reporting `BatchStepInfo::changes` now drops the listing rather than redrawing stale bytes as
+instructions.
+
+**And the server's own answer beats a rule the pane cannot finish.** `Sessions::current` routes an
+unaddressed call to the newest session whose state `accepts_default` admits — `Opening`,
+`Attaching`, `Open`, `Retired` and six of the nine Secure Kernel KD phases. The pane's `state` is a
+display string, so any list of the ineligible ones it keeps is a list it has to keep in step, and
+`sk kd releasing` is exactly the case such a list misses. So `current` is a **belief** rather than a
+value derived per call: an opener moves it, a `session_status` row carrying `current` sets it
+authoritatively, and otherwise it stays. Deriving it was the previous round's fix and was wrong for
+the reason this paragraph exists — it put the server's eligibility predicate in the pane, where it
+cannot be completed.
+
 So when you add a branch here, read the field in `src/structured.rs` rather than inferring it from
 a payload in `tests/` — the recordings are evidence of what the server *did* send, never of what it
 *can*. The field's doc comment usually states the distinction that matters, and in all three cases
@@ -129,7 +152,7 @@ at all. The tell is the report itself: `command` and `output` are the two plain 
 the second without the first. The pane now marks the reads stale and says the target stopped without
 saying where.
 
-**One of the twenty-two is the host's contract rather than the server's, and it is the same mistake
+**One of the twenty-five is the host's contract rather than the server's, and it is the same mistake
 one layer out.** A `tool.call` hook is handed the MCP record, so an MCP server's own `isError`
 rides on `ran.result` — the very object `payloadOf` reads the payload out of — while the engine
 also sets one on the result `next` resolves to. The hook read the outer flag alone and folded error

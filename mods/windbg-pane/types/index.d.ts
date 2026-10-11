@@ -70,6 +70,13 @@ export type Session = {
   } | null
   memAt: number
   bps: Bp[] | null
+  /**
+   * The call the inventory above was read on, so a one-shot breakpoint consumed by a later run is
+   * not drawn as still armed. The other four reads are stamped for staleness against `movedAt`;
+   * this one is not stale on movement in general — an ordinary breakpoint survives a `go` — only
+   * where the inventory holds a `oneShot`, which DbgEng removes when it is hit.
+   */
+  bpsAt: number
   gone: boolean
   /** Set on a target that has bug checked, from the opener's summary or from `crash_triage`. */
   bugCheck: { code: string; name: string; blamed: string } | null
