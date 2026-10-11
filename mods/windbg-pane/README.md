@@ -11,8 +11,8 @@ showing the WinDbg equivalent of each call. It watches; it never changes a call.
 /windbg-pane shape      report what the last tool result actually looked like
 ```
 
-Install it for development with `claude --plugin-dir mods/windbg-pane`, or copy the directory into
-`~/.claude/mods/`.
+Load it for one session with `claude --plugin-dir mods/windbg-pane`, or copy the directory to
+`~/.claude/skills/windbg-pane/`, where Claude Code loads it in every session.
 
 ## What it is for
 
