@@ -159,6 +159,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attempt and control both execute `!db <gpa> L10`; any bytes returned by the attempt fail the
   test and are printed. The answer parsers are pinned on the verbatim text. The tier's server
   now starts with `--tools securekernel,inspect`.
+  Configuring that half also requires `vtl0_guest`, the expected profile guest claim paired by
+  the operator with the VTL1 VM ID; the attached profile must match it before any memory reads.
+  Physical answers must name the requested GPA. The paired observations alone do not establish
+  protection: the independent audit must also exclude a reboot during the session handoff.
 
 - **`driver_hazards` takes a privileged instruction's family from the decoder**, as it already took
   whether the instruction is privileged at all. `dbgscope` now answers both (glslang/dbgscope#153):

@@ -86,7 +86,9 @@ run as a failed one.
 **What a passing run establishes, and what it does not.** A live read answers with bytes and the GPA
 its VTL1 walk resolved to, which shows the Secure Kernel *can* be read. Whether the normal kernel
 could **not** make the same read is asserted only when the tier's config names a `vtl0_profile`
-(item 124), and then as a pair of readings on a VTL0 kernel session opened *after* the VTL1
+(item 124), with `vtl0_guest` naming the expected profile guest claim for the VTL1 VM. The attached
+profile must carry that claim before any reads; the pairing is still the operator's assertion.
+Then it takes the pair of readings on a VTL0 kernel session opened *after* the VTL1
 release — a guest held in the stop cannot answer KDNET — with the server on
 `--tools securekernel,inspect`, since `execute` is in `inspect`. Three traps. The axis is
 **physical**: VTL0 and VTL1 are separate address spaces and a kernel-looking VA is valid-looking in
@@ -99,3 +101,6 @@ VTL1 read that just returned bytes from that GPA are what make the failure mean 
 page-table comparison settles nothing for a trustlet's pages, which VTL0's tables **do** map. The
 attempt and control both use `!db <gpa> L10`; a successful attempt fails the tier and prints the
 bytes VTL0 returned.
+Each answer must name the requested GPA. The tier does not bind the two sessions to a boot ID;
+its paired observations support protection only with an independent audit excluding a reboot
+between them. A reboot could make the saved GPA absent, so the tier alone makes no such claim.
