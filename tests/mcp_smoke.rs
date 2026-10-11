@@ -20760,6 +20760,38 @@ fn managed_secure_kernel_kd_script(symbol_gate: bool) -> String {
     script
 }
 
+fn managed_secure_kernel_kd_first_peer_ready(transcript: &str, symbol_gate: bool) -> bool {
+    let marker = if symbol_gate {
+        "WINDBG_MCP_KD_QUIT_PENDING"
+    } else {
+        "WINDBG_MCP_KD_SCRIPT_COMPLETE"
+    };
+    transcript.lines().any(|line| line.trim() == marker)
+}
+
+#[test]
+fn managed_secure_kernel_kd_symbol_gate_waits_until_the_quit_command_is_parsed() {
+    let script_complete = "WINDBG_MCP_KD_SCRIPT_COMPLETE\n";
+    assert!(managed_secure_kernel_kd_first_peer_ready(
+        script_complete,
+        false
+    ));
+    assert!(!managed_secure_kernel_kd_first_peer_ready(
+        script_complete,
+        true
+    ));
+    let command_echo = format!("{script_complete}0: kd> .echo WINDBG_MCP_KD_QUIT_PENDING; q\n");
+    assert!(!managed_secure_kernel_kd_first_peer_ready(
+        &command_echo,
+        true
+    ));
+    let quit_pending = format!("{command_echo}WINDBG_MCP_KD_QUIT_PENDING\n");
+    assert!(managed_secure_kernel_kd_first_peer_ready(
+        &quit_pending,
+        true
+    ));
+}
+
 #[test]
 fn managed_secure_kernel_kd_lifecycle_script_does_not_require_symbols() {
     let lifecycle = managed_secure_kernel_kd_script(false);
@@ -20942,10 +20974,7 @@ fn managed_secure_kernel_kd_gate(symbol_gate: bool) {
                 // Only the transcript proves script completion; process exit alone does not.
             }
             let transcript = std::fs::read_to_string(&log).unwrap_or_default();
-            if transcript
-                .lines()
-                .any(|line| line.trim() == "WINDBG_MCP_KD_SCRIPT_COMPLETE")
-            {
+            if managed_secure_kernel_kd_first_peer_ready(&transcript, symbol_gate) {
                 eprintln!("--- managed KD WinDbg transcript ---\n{transcript}");
                 if symbol_gate {
                     break;
