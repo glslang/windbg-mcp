@@ -233,9 +233,10 @@ Secure Kernel has no NT `KTHREAD`, and WinDbg dereferences the wait-state thread
 will issue `t`. The facade therefore reports a synthetic thread at `0xfffffffefffe0000` and serves
 zeros for the page there, for the life of the connection. It also serves zeros **once each** for the
 bookkeeping reads WinDbg makes while constructing an NT scope — two null-page probes and four
-`KUSER_SHARED_DATA` probes. **Natural stops always read real stack and code.** Redirected stops also
-have one-shot probes for 0x80 bytes at RSP, 0x2b bytes ending at RIP and 0x80 bytes after the
-instruction; the once-only window resets at each new stop or KD reset. Those bytes exist
+`KUSER_SHARED_DATA` probes. **Natural stops always read real stack and code.** Only the initial
+redirected stop has one-shot probes for 0x80 bytes at RSP, 0x2b bytes ending at RIP and 0x80 bytes
+after the instruction. A KD reset or reconnect renews the probes for the current stop; after
+execution reaches a new stop, neither can restore redirected stack/code probes. Those bytes exist
 only in the KD view. Every other read goes to guarded VTL1 memory through the live source, clamped
 to 3,944 bytes a request. Every fabricated read is logged at `info` with its shape, address, count
 and zero fill. The version and state-change records identify their fixed compatibility fields;

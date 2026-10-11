@@ -20741,6 +20741,39 @@ fn a_managed_secure_kernel_kd_session_resolves_symbols_and_unwinds_a_natural_sto
     managed_secure_kernel_kd_gate(true);
 }
 
+fn managed_secure_kernel_kd_script(symbol_gate: bool) -> String {
+    let mut script = String::from("lm m securekernel\nt\nr\n");
+    if symbol_gate {
+        script.push_str(
+            ".reload /f securekernel.exe\n\
+             x securekernel!KiTimerInterrupt\n\
+             .printf \"WINDBG_MCP_KD_SYMBOL=%p\\n\", securekernel!KiTimerInterrupt\n\
+             .echo WINDBG_MCP_KD_STACK_BEGIN\n\
+             k 4\n\
+             .echo WINDBG_MCP_KD_STACK_END\n",
+        );
+    }
+    script.push_str(".echo WINDBG_MCP_KD_SCRIPT_COMPLETE\n");
+    if symbol_gate {
+        script.push_str(".echo WINDBG_MCP_KD_QUIT_PENDING; q\n");
+    }
+    script
+}
+
+#[test]
+fn managed_secure_kernel_kd_lifecycle_script_does_not_require_symbols() {
+    let lifecycle = managed_secure_kernel_kd_script(false);
+    assert!(lifecycle.contains("lm m securekernel\nt\nr\n"));
+    assert!(lifecycle.contains("WINDBG_MCP_KD_SCRIPT_COMPLETE"));
+    for command in [".reload", "x securekernel!", "k 4", "; q"] {
+        assert!(
+            !lifecycle.contains(command),
+            "unexpected command: {command}"
+        );
+        assert!(managed_secure_kernel_kd_script(true).contains(command));
+    }
+}
+
 fn managed_secure_kernel_kd_gate(symbol_gate: bool) {
     let Some(config) = secure_kernel_kd_tier() else {
         return;
@@ -20789,22 +20822,8 @@ fn managed_secure_kernel_kd_gate(symbol_gate: bool) {
             "the stack gate requires a natural guest stop"
         );
     }
-    let mut script = String::from("lm m securekernel\nt\nr\n");
-    if symbol_path.is_some() {
-        script.push_str(
-            ".reload /f securekernel.exe\n\
-             x securekernel!KiTimerInterrupt\n\
-             .printf \"WINDBG_MCP_KD_SYMBOL=%p\\n\", securekernel!KiTimerInterrupt\n\
-             .echo WINDBG_MCP_KD_STACK_BEGIN\n\
-             k 4\n\
-             .echo WINDBG_MCP_KD_STACK_END\n",
-        );
-    }
-    script.push_str(".echo WINDBG_MCP_KD_SCRIPT_COMPLETE\n");
-    if symbol_gate {
-        script.push_str(".echo WINDBG_MCP_KD_QUIT_PENDING; q\n");
-    }
-    std::fs::write(&commands, script).expect("write the KD command file");
+    std::fs::write(&commands, managed_secure_kernel_kd_script(symbol_gate))
+        .expect("write the KD command file");
     std::fs::write(&quit_commands, b".echo WINDBG_MCP_KD_QUIT_PENDING; q\n")
         .expect("write the KD quit command file");
     let _ = std::fs::remove_file(&log);
@@ -21020,7 +21039,7 @@ fn managed_secure_kernel_kd_gate(symbol_gate: bool) {
             .unwrap_or_else(|| {
                 panic!("WinDbg did not enumerate the live securekernel.exe range:\n{transcript}")
             });
-        if symbol_path.is_some() {
+        if symbol_gate {
             let resolved = transcript
                 .lines()
                 .find_map(|line| {
