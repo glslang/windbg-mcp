@@ -2769,6 +2769,37 @@ assertion can be written is the form the fault takes — a stop the NT session r
 or a guest that is simply gone, and whether the NT session survives it — because the assertion is
 written against that form. The trustlet case reaches the same fault by the same route.
 
+**Measured 2026-10-11 on the disposable VBS guest (build 26100, two VPs), and the fault did not
+present.** The VTL1 coordinate came from a standard checkpoint decoded with `--sk-inspect`:
+`securekernel.exe` identified at `0xFFFFF807084DA000`, GPA `0x12D1000`, four KDBG hits, 373 of
+373 oracle pages agreeing. It was taken *after* the reboot that enabled KDNET on the guest, because
+the same decode on the previous boot gave GPA `0xAD1000` — which matched the host-side probe's
+reading of that boot, so the two readers agree and the GPA is per boot. The VTL0 side was an
+ordinary `attach_kernel` by profile; readings in the order taken, all through `execute`:
+
+- `!pte nt!KeBugCheckEx` and `!vtop 0 fffff80772efd130`: a 2 MB large page, physical
+  `0x1008FD130`, VTL0 root `0x7D5000`.
+- `!db 1008fd000 L10`, a VTL0 page: sixteen bytes returned.
+- `!db 1000000000 L10`, no RAM there: `Physical memory read at 1000000000 failed`, followed by the
+  debugger's caching-attribute warning.
+- `!vtop 0 fffff807084da000`, the Secure Kernel base: PML4E, PDPE and PDE present, `zero PTE`,
+  `translation fails, error 0xD0000147`; `!pte` reports `not valid` at the leaf. Outcome one.
+- `!db 12d1000 L10`, the attempt, made once: `Physical memory read at 12d1000 failed`, with the
+  same warning — the unbacked read's form, byte for byte. No exception, no bugcheck. The guest's
+  heartbeat read `LostCommunication` while it was held in the debugger, and `end_session` answered
+  `released: true`, `target_left_running: true`.
+
+So at the kernel debugger's physical-read surface the Secure Kernel's page reads exactly as a page
+with no RAM behind it, and the attempt alone cannot tell *denied* from *absent*. What tells them
+apart is the pair: the same GPA holds the Secure Kernel's PE header to the VTL1 reader — the
+capture decode found it there, and a live read reports it — and nothing to the VTL0 one, while a
+VTL0 page reads normally through the same command. The tier's assertion is therefore three
+readings on one coordinate rather than one: VTL1 reads the page; VTL0's physical read of the same
+GPA fails in the unbacked form; VTL0's physical read of a known VTL0 page succeeds. The VTL0
+virtual walk is a fourth, weaker reading — outcome one here — reported and not relied on. Nothing
+measured says *why* the read fails in that form, and this entry does not guess; the paragraph
+above expected an exception, and at this surface there was none.
+
 ## Where these items came from
 
 Each cluster above, and what filing it measured. Items named here as *"now in `DONE.md`"* have
