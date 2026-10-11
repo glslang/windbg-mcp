@@ -272,6 +272,19 @@ function bugCheckOf(d: Obj): Session['bugCheck'] {
 }
 
 /** A call arrived: log it as running. Returns the new view and the call's number. */
+/**
+ * What `/windbg-pane clear` leaves: the history forgotten, the sessions kept.
+ *
+ * Here rather than in the hook so a test can reach it, which is the whole reason the folding lives
+ * in this file. Resetting to `EMPTY` also discarded the known sessions and `current` while the
+ * *server's* sessions stayed open — and an implicit call has no session to be folded into then,
+ * `session_status` included, because a listing deliberately does not mint one. The pane quietly
+ * stopped following anything until the next opener.
+ */
+export function cleared(v: View): View {
+  return { ...v, log: [], lastShape: '' }
+}
+
 export function begin(v: View, tool: string, args: Record<string, unknown>): [View, number] {
   const n = v.n + 1
   const wdc = commandFor(tool, args)
@@ -453,6 +466,21 @@ function sessionState(st: Obj | null): string {
  * precisely the answer that says the earlier reads can no longer be trusted.
  */
 /**
+ * Forget the two reads that **movement does not stale**, because something may have written.
+ *
+ * `movedAt` covers the registers, the stack, the memory and the position. It cannot cover these
+ * two: code does not change because the target moved, and an ordinary breakpoint survives a run —
+ * so greying either on movement would be wrong, and both go stale on a *write* instead. Null is
+ * the right state rather than an old timestamp: it hides the panel instead of asserting a count or
+ * redrawing bytes as instructions, which is what "the pane does not know" has to look like.
+ */
+function forgetInventories(s: Session, n: number): void {
+  s.disasm = null
+  s.bps = null
+  s.bpsAt = n
+}
+
+/**
  * What a batch's steps say they changed, from `BatchStepInfo::changes` in both blocks.
  *
  * Read because it is the only thing that invalidates the **disassembly**, and the stale marks the
@@ -476,8 +504,16 @@ function foldBatch(s: Session, d: Obj, n: number): string {
   // what it wrote is true either way.
   const changed = batchChanges(d)
   // Dropped rather than stamped. A stamp would say the listing is old; this says the pane does not
-  // know what is at those addresses any more, which is the honest claim once a step has written.
-  if (changed.length) s.disasm = null
+  // know what is there any more, which is the honest claim once a step has written.
+  //
+  // **Both inventories, and deliberately without reading which kind of change it was.** `changes`
+  // is a fixed vocabulary — "memory", "registers", "breakpoints", "the debug target" and two more —
+  // so matching `breakpoints` in it would work and would still be wrong: `batch::mutation`'s own
+  // doc calls it "best-effort, and biased toward reporting a change", because "DbgEng has more ways
+  // to touch a target than a name list can enumerate". Keying on the token treats that list as
+  // complete. Any reported change therefore retires both, which costs a re-read and claims nothing
+  // the pane cannot support.
+  if (changed.length) forgetInventories(s, n)
   const wrote = changed.length ? '; wrote ' + changed.join(', ') : ''
   const after = obj(d.after)
   if (!after) return wrote ? wrote.slice(2) : ''
@@ -939,6 +975,13 @@ export function finish(v: View, n: number, tool: string, args: Record<string, un
   // Reading the text instead would be inventing a position out of a rendering.
   if (s && out.ok && tool === 'execute') {
     s.movedAt = n
+    // The two inventories movement does not cover go with it. `bc *` retires every breakpoint and
+    // `eb` rewrites the code, and neither is movement — so staling only the position and the three
+    // timestamped reads left breakpoints drawn as armed and a listing drawn as the instructions at
+    // those addresses. This is the same weaker claim the hatch already makes rather than a reading
+    // of the command text: recognising the forms is what `.claude/rules/execution-waits.md` records
+    // as unfinishable, so the pane retires what it can no longer vouch for and says so.
+    forgetInventories(s, n)
     if (!note) note = 'raw command, target state not reported'
   }
   // Outside that chain on purpose — see `foldBatch`. A failed batch keeps the failure in front of
@@ -947,23 +990,18 @@ export function finish(v: View, n: number, tool: string, args: Record<string, un
     const said = foldBatch(s, d, n)
     if (said) note = note ? note + '; ' + said : said
   }
-  // **An explicitly addressed call does not move the server's default, so it must not move this
-  // one.** `Sessions::current` is `self.all.iter().rev().find(|s| s.state().accepts_default())` —
-  // the newest session the caller owns that still takes an unaddressed call — and nothing a call
-  // naming a `session_id` does changes it. Assigning from any such call pointed the pane at the
-  // older of two open sessions while the server went on routing implicit calls to the newer, so
-  // `begin` pinned the next one to the wrong session and drew one target's reads under another:
-  // the misfiling an earlier round fixed, arrived at from the other end. An opener moves it
-  // (the new session *is* the newest), `session_status` overrides it with the server's own answer,
-  // and otherwise it moves only when the session it names has closed — mirroring that `rev()`.
-  // **A belief updated by the events that change it, not a value derived on every call.** That was
-  // the mistake in the previous fix: recomputing it meant encoding `accepts_default`, and the
-  // pane's states are display strings rather than that enum — so a newest session that had gone
-  // `failed` or `unresolved` was still chosen while the server had moved on to the older one, which
-  // is the same misfiling one layer down. It moves on exactly three things: an opener (the new
-  // session is the newest and accepts a default call), a `session_status` row saying `current`
-  // (the server's own answer, and the authority), and the believed session ceasing to be eligible
-  // — where the fallback is a guess that the next status call corrects.
+  // **A belief updated by the events that change it, never a value derived per call.** Two rounds
+  // landed here. First the pane followed whichever session a call *named*, which the server's
+  // default ignores — `Sessions::current` is
+  // `self.all.iter().rev().find(|s| s.state().accepts_default())` and no addressed call moves it,
+  // so an explicit call to the older of two sessions pointed the pane there while implicit calls
+  // kept going to the newer, and one target's reads were drawn under another. Deriving it per call
+  // was the fix and was wrong the same way one layer down: it put `accepts_default` inside the
+  // pane, whose `state` is a display string, so a newest session gone `failed` or into a
+  // non-routable KD phase was still chosen. So it moves on three things and nothing else: an
+  // opener (the new session is the newest and accepts a default call), a `session_status` row
+  // carrying `current` (the server's own answer, and the authority), and the believed session
+  // ceasing to be eligible — where the fallback is a guess the next status call corrects.
   const believed = v.current && sessions.some(x => x.id === v.current && !NOT_ROUTABLE.has(x.state))
   const current = opened ?? routed ?? (believed ? v.current : newestOpen(sessions) ?? v.current)
   const log = v.log.map(e =>
