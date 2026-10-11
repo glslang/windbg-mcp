@@ -86,8 +86,8 @@ else; `stopped_at` is `StopReport` and `RunToReport`; `location_state` is `Curre
 audit found one gap of its own, which is the point of running it: a short `read_memory` carries
 `stopped`, saying whether it ran out of time or somebody interrupted it, and that field's own doc
 says `read_size` cannot answer the question — the pane drew the shortfall with no reason beside it.
-**Thirty-five of the surface's seventy-eight tools are named nowhere here**, and that is correct
-rather than a to-do list: this draws five panels and a command window, not a view per tool.
+**Most of the tool surface is named nowhere here**, and that is correct rather than a to-do list:
+this draws five panels and a command window, not a view per tool.
 
 So when you add a branch here, read the field in `src/structured.rs` rather than inferring it from
 a payload in `tests/` — the recordings are evidence of what the server *did* send, never of what it
