@@ -51,6 +51,20 @@ enumerated `securekernel.exe`; the gate used an empty local symbol directory, so
 discovery independently of a symbol server. It then completed the same `t`, `r`, `q` sequence and
 post-release audit.
 
+On 2026-10-11, the item 116 symbol gate used the same kd version and a prepared local PDB cache
+against Secure Kernel 26100.9457. The worker verified the mapped PE and its version resource before
+publishing the pipe. At a natural `KiTimerInterrupt` stop, `t` executed `sub rsp,8`, `lm` enumerated
+the live image, and `x securekernel!KiTimerInterrupt` resolved inside that range. `k 4` unwound two
+symbolized frames: `KiTimerInterrupt+0x4` and `SkpReturnFromNormalModeRaxSet+0xe`, using real stack
+and code reads. A redirected stop did not establish an unwind: its borrowed stack produced a
+bogus return address. This is a bounded natural-stop result, not a claim about arbitrary stacks.
+The exact server build and release audit are recorded under item 116 in `DONE.md`.
+
+That run also corrects the earlier wording that `r` simply succeeds. It prints real registers and
+the stepped RIP, followed by `Unable to get program counter 'r'`. `t` prints a `SetContext failed`
+diagnostic when WinDbg tries to clear the controller-owned DR7 enable bit through a refused
+control-space write; the guarded step still completes. These diagnostics remain product limits.
+
 Two things that run also measured, both load-bearing for anyone running it again. WinDbg's serial
 reconnect window is a few seconds, and the arm-and-stop transition took about five, so the role
 captures its initial stop **before** it creates the pipe. And `kd -c "r;t;t;r;q"` did not execute
@@ -97,7 +111,11 @@ Call `open_sk_kd` with the exact-build dispatcher profile, the two provider comm
 GUID and selected VP. The profile carries the initial guarded instruction as a Secure Kernel RVA;
 the same required section carries the build-specific debugger-data list, block and loaded-module
 list RVAs. The worker resolves them from the provider-reported image base and validates their live
-links and identities before creating the pipe. `{partition_id}` and `{vp}` are expanded only
+links and identities before creating the pipe. It also reads the live AMD64 PE header and version
+resource at that base and requires the image's file-version build to equal the profile's build.
+Missing, unreadable or malformed version metadata refuses the open; the profile is not a fallback
+for guest evidence. The resource-directory read is bounded to 64 KiB and shares the held stop's
+service deadline. `{partition_id}` and `{vp}` are expanded only
 after the worker discovers them; `{cr3}` is expanded for the memory provider after the register
 provider reports and validates it. `vmwp_pid`, `dispatcher_vnd`, `partition_id` and `expected_cr3`
 remain optional mismatch assertions. The server resolves the current `vmwp` PID itself, generates
@@ -141,14 +159,14 @@ windbg-mcp --sk-kd-target --pipe <name> --profile <json> \
 The standalone role now resolves PID, VND and partition in its worker and accepts provider-reported
 CR3 and Secure Kernel base. The optional values above, including the paired initial address and
 bytes, are assertions for migration and diagnosis. The pipe remains operator-named in this compatibility role; the managed opener is the
-route that generates it and applies startup policy. The version build comes from the exact-build
-profile; `--build` is only an optional mismatch assertion. The arm mode defaults to natural guest
+route that generates it and applies startup policy. The version build is read from the live image
+and must match the exact-build profile; `--build` is only an optional mismatch assertion. The arm mode defaults to natural guest
 execution; select redirect explicitly when intentionally moving RIP to the guard.
 
 1. The role opens the controller session and runs the provider handshake, arms slot 0 on the initial
    instruction in the chosen mode, and waits for that stop. No pipe exists yet.
 2. It creates the pipe and prints `Secure Kernel stop held at <rip>; waiting for WinDbg on
-   \\.\pipe\<name>` to stderr. The connect wait and the KD reset wait that follows are each bounded
+   \\.\pipe\<name>; KD processor 0 of 1 maps to guest VP <vp>` to stderr. The connect wait and the KD reset wait that follows are each bounded
    by `--connect-timeout-ms` (default 30 s; 1 ms to 1 h).
 3. Start the debugger. WinDbg takes the same `-k` string as kd:
 
@@ -169,21 +187,23 @@ execution; select redirect explicitly when intentionally moving RIP to the guard
 ## Known product limits
 
 The private bench plan's limits, re-derived against `src/kdtarget.rs`, `src/kdapi.rs` and
-`src/sklive.rs` on 2026-10-07 rather than copied, plus two the code states and the plan did not —
+`src/sklive.rs` on 2026-10-07 and updated by the 2026-10-11 symbol gate, plus two the code states and the plan did not —
 which single steps are refused, and what every other request is answered with:
 
 - **Named-pipe serial KD only.** No KDNET network transport.
 - **One selected VTL1 VP, and four hardware execute breakpoints.** A `bp` arrives as
   `WriteBreakpoint` and takes a DR slot; a fifth is refused. `StateChange64` reports one processor
-  at index 0 whatever `--vp` named, so nothing on the wire says which guest VP that is (item 116).
+  at index 0. The pipe banner and every state-change audit record identify the guest VP represented
+  by that index; `SwitchProcessor` remains refused.
 - **The version record still says `NOMM`, but its module and debugger-data pointers are live.** The
   worker validates the exact-build `KdpDebuggerDataListHead`, `KdDebuggerDataBlock` and loaded-module
   list before serving them. `lm m securekernel` enumerated `securekernel.exe` with an empty local
-  symbol path. Symbol loading, stack walking and NT process, thread and memory-manager extensions
-  have not passed and remain outside the current claim.
-- **The measured command order is `lm m securekernel`, `t`, `r`, `q`.** `r` now completes after
-  `GetContextEx` because the AMD64 special-register control-space selector returns real CR3 and
-  debug-register state, with unavailable fields zero. An execution command after `r` has not been
+  symbol path. A prepared PDB cache also passed symbol resolution and a bounded two-frame natural
+  stack walk. NT process, thread and memory-manager extensions remain outside the current claim.
+- **The measured command order starts with `lm m securekernel`, `t`, `r`.** The symbol gate adds
+  `.reload`, `x` and `k 4` before `q` and MCP teardown. The AMD64 special-register control-space
+  selector returns real CR3 and debug-register state, with unavailable fields zero. The debugger
+  diagnostics described above remain. An execution command after `r` has not been
   measured, so the gate does not claim that ordering yet.
 - **`t` steps the linear successor only.** A branch, call, return, interrupt or exception is
   refused; so is a `rep`-prefixed string instruction, and anything that writes `ss` (`mov ss`,
@@ -194,7 +214,7 @@ which single steps are refused, and what every other request is answered with:
 - **The proven redirected step is one five-byte NOP.** On that bench the next instruction used the
   interrupted context's RBX, so the acceptance takes one step and quits.
 - **`SetContext` succeeds only for WinDbg's unchanged compatibility write**; a changed byte is
-  refused. No guest memory is written and no general-purpose register is: the only writes are the
+  refused, as are all control-space writes. No guest memory is written and no general-purpose register is: the only writes are the
   controller's own — debug registers for a breakpoint, TF for a step — and the baseline restores
   them at release.
 - **Break-in is not implemented as a new stop.** While stopped it is logged as unsupported and the
@@ -212,14 +232,17 @@ which single steps are refused, and what every other request is answered with:
 Secure Kernel has no NT `KTHREAD`, and WinDbg dereferences the wait-state thread field before it
 will issue `t`. The facade therefore reports a synthetic thread at `0xfffffffefffe0000` and serves
 zeros for the page there, for the life of the connection. It also serves zeros **once each** for the
-bookkeeping reads WinDbg makes while constructing an NT scope — two null-page probes, four
-`KUSER_SHARED_DATA` probes, 0x80 bytes at RSP, 0x2b bytes ending at RIP and 0x80 bytes after the
-instruction, and that once-only window resets for every reported stop. Those bytes exist
+bookkeeping reads WinDbg makes while constructing an NT scope — two null-page probes and four
+`KUSER_SHARED_DATA` probes. **Natural stops always read real stack and code.** Redirected stops also
+have one-shot probes for 0x80 bytes at RSP, 0x2b bytes ending at RIP and 0x80 bytes after the
+instruction; the once-only window resets at each new stop or KD reset. Those bytes exist
 only in the KD view. Every other read goes to guarded VTL1 memory through the live source, clamped
-to 3,944 bytes a request. The facade's stderr says which happened for every read, `served by
-compatibility memory` against `served by Secure Kernel memory`; the synthesized version and state
-change are logged too. That audit is the only place the two are told apart: item 116 is about WinDbg
-having no way to tell them apart.
+to 3,944 bytes a request. Every fabricated read is logged at `info` with its shape, address, count
+and zero fill. The version and state-change records identify their fixed compatibility fields;
+context and special-register replies identify which unavailable fields were zeroed. These tracing
+records reach both stderr and MCP `server_log`. Native KD has no per-read provenance field, so
+WinDbg still displays compatibility bytes as memory; the audit is where an operator distinguishes
+those bytes from guest reads.
 
 ## Pipe and host safety
 
@@ -242,25 +265,28 @@ having no way to tell them apart.
 
 ## What is tested
 
-The four protocol modules retain focused unit tests over inline packet vectors, including malformed
-framing, short manipulate requests, both context APIs and the AMD64 special-register record. The ignored WINDBG_MCP_SMOKE_SK_KD tier opens the managed
-session over MCP, observes its phases, and launches installed kd with a t, r, q command file. Once
-the transcript proves `q` completed, the harness closes a kd process that still retains its pipe,
-then requires the managed session to enter reconnecting before releasing it through MCP and running
-the bounded external health/register/text audit. Its private config is forbidden from carrying a boot address, VND, partition ID, CR3,
-kernel base or vmwp PID. The tier still requires the disposable bench and is not part of ordinary
-CI; docs/smoke-test.md has the runbook.
+Focused unit tests cover framing, short manipulate requests, both context APIs, the AMD64
+special-register record, malformed mapped PE/version metadata and compatibility-memory shapes.
+The ignored WINDBG_MCP_SMOKE_SK_KD gates open the managed session through MCP and launch installed
+kd with command files. The lifecycle gate checks forced disconnect and reconnect separately from
+the symbol gate, which requires a natural stop, cached symbols and an unwind beyond the current
+frame. Both release through MCP and require `quit:` plus the bounded external health/register/text
+audit. The 2026-10-11 forced-disconnect run failed: the terminated kd retained its pipe until idle
+expiry. It does not establish a reconnect result. The symbol gate exercises MCP teardown without
+forcing that disconnect. Private configs must omit boot addresses, VND, partition ID, CR3, kernel
+base and vmwp PID. These gates require the disposable bench and are outside ordinary CI;
+docs/smoke-test.md has the runbook.
 
 | WinDbg operation | Current result | Source of the answer |
 | --- | --- | --- |
 | Connect and initial stop | Live measured | Real retained VTL1 vector-1 event; synthetic KD envelope |
-| `r` | Live measured | Real stopped general, segment, flag, CR3 and debug-register values; unavailable special-register fields are zero |
+| `r` | Values live measured; display diagnostic remains | Real stopped general, segment, flag, CR3 and debug-register values; unavailable special-register fields are zero |
 | `t` over a fall-through instruction | Live measured | Real TF step and returned VTL1 vector-1 event |
 | Virtual instruction reads/disassembly | Live measured | Real VTL1 virtual memory, plus narrowly scoped compatibility addresses |
 | `bp`/`g` to one of four hardware slots | Implemented, not live measured | Guarded VTL1 DR state and retained dispatcher event |
 | Software breakpoints or memory/register writes | Refused | No safe patch owner; `SetContext` accepts only an unchanged prefix |
 | `lm m securekernel` module discovery | Live measured | Validated live debugger-data head, `KDBG` block and loaded-module list |
-| Symbol discovery and stack walking | Unavailable | No live symbol or stack gate has passed |
+| PDB symbol resolution and bounded stack walking | Live measured at a natural timer stop | Prepared PDB cache, live module range, real stack/code; two Secure Kernel frames |
 | Asynchronous break-in | Unavailable | No running-state interrupt route has passed item 117 |
 | `q` and MCP `end_session` | Live measured | Proved restore/release, followed by the external audit |
 
@@ -276,7 +302,7 @@ produced `Continue2` with the trace flag.
 
 The [item 119 capability record](../../DONE.md#119-windbg-mcp-what-a-vtl1-debugger-still-cannot-do--done-2026-10-07)
 holds the ordered ladder. The version record now names validated live debugger and module
-lists, and the control-space record is sufficient for `r`; module enumeration therefore precedes
-symbol and stack support as a measured rung. Symbol loading, a bounded stack walk, break-in,
+lists; module enumeration, PDB symbol resolution and one bounded natural stack walk have passed.
+Debugger display/write diagnostics, forced-disconnect behavior, break-in,
 stepping over anything but a fall-through, repeated run-break-run, more than one VP and writes are
 left, each behind a guard or an explicit refusal in `src/sklive.rs` and `src/kdtarget.rs`.
