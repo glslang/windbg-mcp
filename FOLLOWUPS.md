@@ -2746,12 +2746,9 @@ by that `guest` claim — an assertion rather than a check, exactly as it is for
 is what makes the VTL1 side look like the VTL0 side: `open_sk_kd` serves a held VTL1 stop as a
 serial KD target on a named pipe, so an `attach_kernel` onto that pipe would give VTL1 the same
 `read_memory` and `execute` the NT session has, and the comparison this item wants becomes one
-address translated by two kernel sessions. **The last step is unmeasured on both sides.** This
-server has never attached to its own facade. And the third outcome — the only one that rules the
-*page* out — is an access attempted from VTL0, and what the guest does when its kernel debugger
-touches a page VTL1 protects is not known here: a refusal and the guest going down are both
-plausible, which is why that attempt is the first thing the disposable tier should take, and why
-the trustlet case stays out of reach of any page-table walk either way.
+address translated by two kernel sessions. **The facade self-attach is unmeasured**: this server
+has never attached to its own facade. The third outcome — the only one that rules the *page* out —
+is an access attempted from VTL0, and what that attempt does is the paragraph after the next.
 
 - **Where it picks up now:** the `guest` and `role` claims on a profile (`src/kdconn.rs`,
   `docs/kernel-profiles.md`); `open_sk_kd` and its connection string
@@ -2759,6 +2756,18 @@ the trustlet case stays out of reach of any page-table walk either way.
   `skcontrol::TargetIdentity::validate`, which a facade-attached session never meets because it is
   on the KD side of the pipe; and the three-outcome criterion above, which is what a two-session
   comparison has to report per address.
+
+**The third outcome is a fault, and the fault is the result.** The commit that recorded the
+decision called what the guest does on that access "not known here", and that was the wrong
+frame. To VTL0 the page is not a mapped physical page at all — the denial is the hypervisor's
+second-level translation, not a permission on a mapping VTL0 holds — so an access attempted from
+VTL0 is a hardware exception and possibly a bugcheck of the guest, and that is what shows the
+protection as the guest experiences it. So the third outcome's pass is the guest faulting on the
+attempt, not a read coming back refused, and the attempt is the **last** step of a run on a
+checkpointed disposable guest rather than the first. What the tier has to record before an
+assertion can be written is the form the fault takes — a stop the NT session reports, a bugcheck,
+or a guest that is simply gone, and whether the NT session survives it — because the assertion is
+written against that form. The trustlet case reaches the same fault by the same route.
 
 ## Where these items came from
 
