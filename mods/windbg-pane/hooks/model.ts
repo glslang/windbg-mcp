@@ -434,10 +434,24 @@ export function finish(v: View, n: number, tool: string, args: Record<string, un
     if (s && sid === stranded) {
       // Not 'open': the open failed. What the pane has to carry is that a target exists and this
       // is the handle for it, which is the difference between recovering and attaching twice.
+      //
+      // The three words are the three `TargetCreated` variants, said as that enum says them.
+      // `yes` is **not** an abandoned target: its doc is "the target exists … Do not open again;
+      // use the handle, or `end_session`", and it covers both a wait that failed and an open that
+      // worked whose follow-up report failed — the second being a session that is simply usable.
+      // Only the message prose tells those apart (`server.rs`, `report_only`), and prose is not
+      // something to branch on, so the pane says what is true of both rather than calling a
+      // working session stranded.
       s.kind = str(d?.kind, tool)
-      s.state = left === 'pending' ? 'opening' : left === 'unknown' ? 'unresolved' : 'stranded'
-      s.target = left === 'pending' ? 'open may still land' : 'target left by a failed ' + tool
-      note = 'open failed, ' + (left === 'pending' ? 'may still land' : 'target left') + ' as ' + s.label + ': ' + note
+      s.state = left === 'pending' ? 'opening' : left === 'unknown' ? 'unresolved' : 'held'
+      s.target =
+        left === 'pending'
+          ? 'open may still land'
+          : left === 'unknown'
+            ? 'controller ownership unresolved'
+            : 'target exists; use this handle or end the session'
+      const what = left === 'pending' ? 'may still land' : left === 'unknown' ? 'ownership unresolved' : 'target held'
+      note = 'open failed, ' + what + ' as ' + s.label + ': ' + note
     }
   } else if (s && d) {
     if (opened) {
@@ -650,7 +664,14 @@ export function finish(v: View, n: number, tool: string, args: Record<string, un
         if (state) t.state = state
         t.kind = str(o.kind, t.kind)
         if (str(o.target)) t.target = str(o.target)
-        said.push(t.label + ' ' + t.state)
+        // `execution.stopped` is the one field here that is not about the session's lifetime: it
+        // says whether the run this session has outstanding has ended, and while it is false "the
+        // target is moving and every tool that reads it is refused". So this is also the recovery
+        // answer for a `continue_async` whose own call timed out — that failure advances nothing,
+        // and until this is read the pane goes on drawing the pre-run reads as current.
+        const moving = obj(o.execution)?.stopped === false
+        if (moving) t.movedAt = n
+        said.push(t.label + ' ' + t.state + (moving ? ', target moving' : ''))
       }
       // An `unknown_handle` is the complement in the same payload, and reading `sessions` alone
       // conflates them: the list is empty either way, so a handle the server has never heard of
@@ -673,6 +694,22 @@ export function finish(v: View, n: number, tool: string, args: Record<string, un
     // call succeeding; the new position is not, so it is marked moved and nothing is invented.
     s.movedAt = n
     note = 'moved, position not reported'
+  }
+  // The raw `execute` hatch can move the target and cannot say so: it declares no output schema,
+  // so the whole answer is debugger text and there is no field to read. What the pane must not do
+  // is go on claiming the earlier reads are current — a `g` through this hatch leaves registers,
+  // stack and memory describing a target that is somewhere else now.
+  //
+  // There is deliberately **no list of command names**, which is what review asked for.
+  // `.claude/rules/execution-waits.md` records why one cannot be finished: `bp X; g`, an alias,
+  // `.if (1) { g }` and `dx …ExecuteCommand("g")` all reach execution without saying so, and the
+  // server's own fix was to ask the engine rather than the text. The pane cannot ask the engine, so
+  // the honest reading is that a raw command *may* have moved the target — `movedAt` says only
+  // that the reads before it are no longer known to be current, which is exactly the claim left.
+  // Reading the text instead would be inventing a position out of a rendering.
+  if (s && out.ok && tool === 'execute') {
+    s.movedAt = n
+    if (!note) note = 'raw command, target state not reported'
   }
   // Outside that chain on purpose — see `foldBatch`. A failed batch keeps the failure in front of
   // what the report says the session is left holding, since both are facts the reader wants.

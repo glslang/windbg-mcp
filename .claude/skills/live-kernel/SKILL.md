@@ -15,8 +15,9 @@ on the port the profile names; the host IP moves between sessions. Compare the k
 than printing it.
 
 *Finding* the guest is topology-specific. **Where the debugger host is also the Hyper-V host for the
-target, `Get-VM` is exactly the right instrument** — it finds the guest, starts it, and reports its
-state, and nothing below replaces it.
+target, `Get-VM` is exactly the right instrument** — it finds the guest and reports its state, and
+nothing below replaces it. It does not *start* one: a guest listed `Off` needs `Start-VM` before any
+probe below means anything, which is a second step and not a flag on the listing.
 
 What it cannot do is answer for a guest somebody *else* hypervises: it enumerates the VMs **this
 host** hypervises, so a sibling is neither found nor ruled out. Under KDNET the target dials this

@@ -17,9 +17,14 @@ follows is this server's half.
 group marked that way, which means a client that asks for nothing gets every *ordinary* group and
 none of these twelve tools. The refusal is `-32602` naming `--tools`, which reads like a
 configuration mistake rather than a missing capability — and an **unset** `WINDBG_MCP_TOOLS`
-produces it just as surely as a narrowed one. It can only be widened on the **command line**: the
-unnamed `WINDBG_MCP_TOOLS` is a *credential's* surface, read on the listener and service paths
-alone, with no stdio read site, so setting it in the environment of a stdio server changes nothing.
+produces it just as surely as a narrowed one. **On stdio the command line is the only way to widen
+it**, and that is a property of where the variable is read rather than of the group: a tools spec in
+the environment is a *credential's* surface, resolved in the listener's own factory
+(`listen::gate` → `Credentials::surface_for`) and nowhere else, so setting `WINDBG_MCP_TOOLS` for a
+stdio server changes nothing. A **listener or service** client is therefore widened without touching
+the command line — `WINDBG_MCP_TOOLS_<NAME>` beside that client's token, or a `tools` field in its
+credential-file entry, naming `securekernel` like any other group — which is also how one client on
+a port gets these tools and another does not.
 
 **Establishing the session needs VTL1 quiescent; the transition is permitted at a stop.** This is
 the ordering that looks like a bug from both ends. `allow_transition_cr3` says plainly that "the

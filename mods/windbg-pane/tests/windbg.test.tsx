@@ -356,11 +356,14 @@ test('a failed opener that left a target keeps its handle in view', () => {
   })
   const stranded = after.sessions.find(x => x.id === 'sess-stranded')
   expect(stranded).toBeDefined()
-  // Not 'open' — the open failed — but visible, and not attributed to the live session.
-  expect(stranded!.state).toBe('stranded')
+  // Not 'open' — the open failed — but visible, and not attributed to the live session. And not
+  // abandoned either: `yes` means the target exists and this handle reaches it, which `end_session`
+  // or further work both take, so the pane must not send a usable session to recovery.
+  expect(stranded!.state).toBe('held')
+  expect(stranded!.target).toBe('target exists; use this handle or end the session')
   expect(after.current).toBe('sess-stranded')
   expect(after.current).not.toBe(live)
-  expect(after.log[after.log.length - 1]!.note).toContain('target left')
+  expect(after.log[after.log.length - 1]!.note).toContain('target held')
 
   // `pending` says the open may still land; `no` leaves nothing behind and invents nothing.
   const mk = (target: string, id: string) => {
@@ -871,5 +874,112 @@ test('a batch that did not settle is a failure whose report is still read', () =
     ms: 1,
   })
   expect(refused.sessions[0]!.movedAt).toBe(before.movedAt)
+  expect(refused.log[refused.log.length - 1]!.note).toBe('the target is running')
+})
+
+test('a status that reports an outstanding run stales the reads taken before it', () => {
+  const sid = 'sess-async'
+  let v = EMPTY
+  {
+    const a = { command: 'x.exe' }
+    const [st, n] = begin(v, 'launch', a)
+    v = finish(st, n, 'launch', a, { ok: true, data: { status: 'ok', kind: 'launch', session_id: sid, target: 'x.exe' }, error: '', ms: 1 })
+  }
+  {
+    const a = { session_id: sid }
+    const [st, n] = begin(v, 'registers', a)
+    v = finish(st, n, 'registers', a, {
+      ok: true,
+      data: { status: 'ok', registers: [{ name: 'rax', value: '0x1' }], instruction_pointer: '0x1000' },
+      error: '',
+      ms: 1,
+    })
+  }
+  {
+    // A `continue_async` whose own call timed out: the run was submitted and the failure advances
+    // nothing, so the pane is still drawing the registers above as current.
+    const a = { session_id: sid }
+    const [st, n] = begin(v, 'continue_async', a)
+    v = finish(st, n, 'continue_async', a, {
+      ok: false,
+      data: { status: 'error', error: { category: 'timeout', message: 'the call expired', session_id: sid } },
+      error: 'the call expired',
+      ms: 1,
+    })
+  }
+  expect(v.sessions[0]!.movedAt).toBeLessThan(v.sessions[0]!.regsAt)
+
+  const status = (execution: Record<string, unknown> | undefined) => {
+    const a = { session_id: sid }
+    const [st, n] = begin(v, 'session_status', a)
+    return finish(st, n, 'session_status', a, {
+      ok: true,
+      data: {
+        status: 'ok',
+        max_sessions: 4,
+        unknown_handle: false,
+        sessions: [{ session_id: sid, kind: 'launch', target: 'x.exe', state: { state: 'open' }, current: true, live: true, ...(execution ? { execution } : {}) }],
+      },
+      error: '',
+      ms: 1,
+    })
+  }
+
+  // `stopped: false` is the server saying the target is moving and every read of it is refused.
+  const moving = status({ execution: 'exec-1', command: 'g', running_for_ms: 4200, stopped: false, breaks_in_ms: 60000 })
+  expect(moving.sessions[0]!.movedAt).toBeGreaterThan(moving.sessions[0]!.regsAt)
+  expect(moving.log[moving.log.length - 1]!.note).toBe('s1 open, target moving')
+
+  // A run that has ended is not movement to fold: its stop is waiting to be collected, and
+  // whatever reads follow are what say where it is.
+  const settled = status({ execution: 'exec-1', command: 'g', running_for_ms: 4200, stopped: true })
+  expect(settled.sessions[0]!.movedAt).toBeLessThan(settled.sessions[0]!.regsAt)
+  expect(settled.log[settled.log.length - 1]!.note).toBe('s1 open')
+
+  // And a session with no run outstanding carries no `execution` at all.
+  expect(status(undefined).sessions[0]!.movedAt).toBeLessThan(v.sessions[0]!.regsAt)
+})
+
+test('a raw command leaves the pane unable to claim the earlier reads are current', () => {
+  const sid = 'sess-raw'
+  let v = EMPTY
+  {
+    const a = { command: 'x.exe' }
+    const [st, n] = begin(v, 'launch', a)
+    v = finish(st, n, 'launch', a, { ok: true, data: { status: 'ok', kind: 'launch', session_id: sid, target: 'x.exe' }, error: '', ms: 1 })
+  }
+  {
+    const a = { session_id: sid }
+    const [st, n] = begin(v, 'registers', a)
+    v = finish(st, n, 'registers', a, {
+      ok: true,
+      data: { status: 'ok', registers: [{ name: 'rax', value: '0x1' }], instruction_pointer: '0x1000' },
+      error: '',
+      ms: 1,
+    })
+  }
+  expect(v.sessions[0]!.movedAt).toBeLessThan(v.sessions[0]!.regsAt)
+
+  // `execute` declares no output schema: the whole answer is text, so there is no field saying
+  // whether the target moved — and no list of command names can decide it, which is why this is
+  // read as "may have moved" rather than either claim.
+  const raw = (command: string, ok = true) => {
+    const a = { session_id: sid, command }
+    const [st, n] = begin(v, 'execute', a)
+    return finish(st, n, 'execute', a, { ok, data: null, error: ok ? '' : 'the target is running', ms: 1 })
+  }
+  const went = raw('bp x!f; g')
+  expect(went.sessions[0]!.movedAt).toBeGreaterThan(went.sessions[0]!.regsAt)
+  expect(went.log[went.log.length - 1]!.note).toBe('raw command, target state not reported')
+  // The position is not touched: the pane knows the reads are stale, not where the target is.
+  expect(went.sessions[0]!.ip).toBe('1000')
+
+  // The WinDbg column still shows the command itself, which is how a reader sees what was run.
+  expect(went.log[went.log.length - 1]!.command).toBe('bp x!f; g')
+  expect(went.log[went.log.length - 1]!.isWinDbg).toBe(true)
+
+  // A call that did not answer says only what failed.
+  const refused = raw('g', false)
+  expect(refused.sessions[0]!.movedAt).toBe(v.sessions[0]!.movedAt)
   expect(refused.log[refused.log.length - 1]!.note).toBe('the target is running')
 })
