@@ -44,7 +44,7 @@ The pane now picks a register bank per target, and **counts anything it leaves o
 target kind, add its bank — and check the count line rather than the grid.
 
 **And a fixture only covers the shapes it happens to contain**, which is the limit of the paragraph
-above. Review of this directory found **twenty-five** more defects in the same class, none of them
+above. Review of this directory found **twenty-eight** more defects in the same class, none of them
 reachable from these recordings: an asynchronous run reports `moved`/`running` with no stop and
 names its handle in `execution`; `wait_for_stop` nests its stop under `stop`; `run_to_address`
 reports an ending or a timeout through `verdict`, with `stopped_at` deliberately absent;
@@ -124,6 +124,25 @@ moved — but a patched byte does change it, and patching a byte is what `debug_
 batch reporting `BatchStepInfo::changes` now drops the listing rather than redrawing stale bytes as
 instructions.
 
+**Then the round after *that* found the one-shot still marked armed in the disassembly, and three
+rounds of one defect is a design answer rather than a third patch.** Each fix had been right and
+local — the header's `ip`, then the breakpoint panel — and each time the next drawing site was
+found by the next review, because **every site computed its own view of freshness from the raw
+fields**. Being correct therefore meant remembering the rule once per panel. `drawable(session)`
+now answers all of it in one place — the position, the three stale flags, and the breakpoint
+addresses split into armed and doubtful — and the renderer reads that and holds no opinion. A new
+panel that reaches for `Session` directly is this class of bug returning; put the fact in
+`drawable` and draw it from there.
+
+Two reads came with it. A live Secure Kernel stop's `instruction` is the one it **just executed**,
+not the one at the stop — `.claude/rules/secure-kernel-live.md` says so, and `sk_live_step` refuses
+that record fed back as the next instruction — so drawing it as the current listing labelled the
+previous bytes as the stop and reported the ip as elsewhere, RIP being the instruction after it.
+And `session_status`'s `execution` block is matched by its **handle** rather than read for its flag:
+a finished run's block is kept "until another run replaces it", so presence says nothing, while a
+handle the pane has not accounted for is a run it never saw — which is what a `continue_async` whose
+own call timed out leaves behind, and `stopped: true` there still means every earlier read is stale.
+
 **And the server's own answer beats a rule the pane cannot finish.** `Sessions::current` routes an
 unaddressed call to the newest session whose state `accepts_default` admits — `Opening`,
 `Attaching`, `Open`, `Retired` and six of the nine Secure Kernel KD phases. The pane's `state` is a
@@ -152,8 +171,8 @@ at all. The tell is the report itself: `command` and `output` are the two plain 
 the second without the first. The pane now marks the reads stale and says the target stopped without
 saying where.
 
-**One of the twenty-five is the host's contract rather than the server's, and it is the same mistake
-one layer out.** A `tool.call` hook is handed the MCP record, so an MCP server's own `isError`
+**One of them is the host's contract rather than the server's, and it is the same mistake one layer
+out.** A `tool.call` hook is handed the MCP record, so an MCP server's own `isError`
 rides on `ran.result` — the very object `payloadOf` reads the payload out of — while the engine
 also sets one on the result `next` resolves to. The hook read the outer flag alone and folded error
 payloads as successes. `answered` reads both, and the server's own `status` as well: `Outcome` is

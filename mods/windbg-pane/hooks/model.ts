@@ -169,7 +169,7 @@ function freshSession(v: View, id: string): Session {
   return {
     id, label: 's' + (v.sessions.length + 1), kind: '', target: '', state: 'open',
     regs: null, prevRegs: null, regsAt: -1, ip: null, ipAt: -1, movedAt: -1,
-    disasm: null, frames: null, framesTruncated: false, framesAt: -1, mem: null, memAt: -1, bps: null, bpsAt: -1, gone: false,
+    disasm: null, frames: null, framesTruncated: false, framesAt: -1, mem: null, memAt: -1, bps: null, bpsAt: -1, gone: false, execSeen: '',
     bugCheck: null, sk: null, skPhase: '',
   }
 }
@@ -311,6 +311,63 @@ export function ipIsCurrent(s: Session): boolean {
  */
 export function bpsMayBeStale(s: Session): boolean {
   return !!s.bps && s.movedAt > s.bpsAt && s.bps.some(b => b.oneShot)
+}
+
+/** Nothing may be asserted about no session. */
+export const EMPTY_DRAWABLE: Drawable = {
+  ip: null, regsStale: false, framesStale: false, memStale: false, bpsStale: false,
+  armed: new Set(), doubtful: new Set(),
+}
+
+/** What a renderer may assert about a session, decided once. */
+export type Drawable = {
+  /** The position, or null where the target has moved since it was read. */
+  ip: string | null
+  regsStale: boolean
+  framesStale: boolean
+  memStale: boolean
+  /** Whether the inventory may have lost a one-shot since it was read. */
+  bpsStale: boolean
+  /** Addresses that can be drawn as armed. */
+  armed: Set<string>
+  /** One-shot addresses that execution may already have consumed. */
+  doubtful: Set<string>
+}
+
+/**
+ * Every freshness question about a session, answered in one place.
+ *
+ * **This exists because three consecutive review rounds were the same defect**: a staleness rule
+ * applied at one drawing site and not at another. The header asserted an `ip` the folds had
+ * deliberately not re-stamped; then the breakpoint panel hedged a consumed one-shot while the
+ * disassembly went on marking it armed. Each fix was correct and local, and the next site was
+ * found by the next round, because every site was computing its own view from the raw fields —
+ * so being right required remembering the rule four times.
+ *
+ * The renderer now asks this and has no opinion of its own. A new panel that reads `Session`
+ * directly is the bug coming back; add the fact here and draw it from here.
+ */
+export function drawable(s: Session): Drawable {
+  const bpsStale = bpsMayBeStale(s)
+  const armed = new Set<string>()
+  const doubtful = new Set<string>()
+  for (const b of s.bps ?? []) {
+    if (!b.enabled) continue
+    const a = norm(b.address)
+    if (!a) continue
+    // Only the one-shots are in doubt: an ordinary breakpoint survives a run.
+    if (bpsStale && b.oneShot) doubtful.add(a)
+    else armed.add(a)
+  }
+  return {
+    ip: ipIsCurrent(s) ? s.ip : null,
+    regsStale: s.movedAt > s.regsAt,
+    framesStale: s.movedAt > s.framesAt,
+    memStale: s.movedAt > s.memAt,
+    bpsStale,
+    armed,
+    doubtful,
+  }
 }
 
 /**
@@ -610,8 +667,15 @@ export function finish(v: View, n: number, tool: string, args: Record<string, un
     const ins = obj(d.instruction)
     if (ins && ins.address !== undefined) {
       // Live control reports the bytes it guarded and no disassembly, so the row carries no text.
+      //
+      // **And the row is the instruction just *executed*, not the one at the stop.**
+      // `.claude/rules/secure-kernel-live.md` says so in as many words — "a stop's `instruction` is
+      // the one just stepped", and feeding it back to `sk_live_step` is refused with "the step
+      // instruction address … does not match the stopped RIP". Drawn as the current-stop listing it
+      // labelled the previous bytes as the stop and, since RIP is the *next* instruction, made the
+      // panel report the ip as elsewhere. `executed` is what the renderer reads to say what it is.
       s.disasm = {
-        start: str(ins.address), bytesOnly: true,
+        start: str(ins.address), bytesOnly: true, executed: true,
         rows: [{ address: str(ins.address), bytes: insBytes(ins.bytes), module: '', rva: '', text: '' }],
       }
     }
@@ -741,6 +805,10 @@ export function finish(v: View, n: number, tool: string, args: Record<string, un
     const stopped = typeof stop.command === 'string' && typeof stop.output === 'string'
     if (RUN.test(tool) && ('stopped_at' in stop || stopped || gone || ranOn || d.moved === true)) {
       s.movedAt = n
+      // The run this call is about, so a later `session_status` can tell it from one the pane
+      // never saw. `continue_async` and `wait_for_stop` both name it; the synchronous tools do not
+      // and leave it alone.
+      if (typeof d.execution === 'string' && d.execution) s.execSeen = d.execution
       if (gone) {
         s.gone = true
         s.ip = null
@@ -795,8 +863,22 @@ export function finish(v: View, n: number, tool: string, args: Record<string, un
         // target is moving and every tool that reads it is refused". So this is also the recovery
         // answer for a `continue_async` whose own call timed out — that failure advances nothing,
         // and until this is read the pane goes on drawing the pre-run reads as current.
-        const moving = obj(o.execution)?.stopped === false
-        if (moving) t.movedAt = n
+        // **Both answers mean the target ran**, and reading only `stopped: false` caught one of
+        // them. The case this is the recovery for is a `continue_async` whose own call timed out:
+        // the pane saw a failure, so nothing recorded movement — and if the run then finished
+        // before the first poll, `stopped` is already `true` and the old condition folded nothing,
+        // leaving the pre-run registers, stack, memory and position marked current.
+        //
+        // What separates "a run the pane has accounted for" from one it has not is the **handle**,
+        // not the flag: `ExecutionInfo` keeps a finished run's stop "until another run replaces
+        // it", so the block is still there long after the target stopped, and advancing on its
+        // mere presence would re-stale reads taken *after* that stop.
+        const ex = obj(o.execution)
+        const moving = ex?.stopped === false
+        const handle = ex ? str(ex.execution) : ''
+        const unreported = !!ex && handle !== '' && handle !== t.execSeen
+        if (moving || unreported) t.movedAt = n
+        if (handle) t.execSeen = handle
         // `SessionInfo::current` — "whether a call that names no session is routed here" — is the
         // authority, and declining to read it last round was wrong. The objection was that it
         // answers about one instant and would need somewhere to live; `current` on the view is
@@ -804,7 +886,8 @@ export function finish(v: View, n: number, tool: string, args: Record<string, un
         // only way the pane learns that the server has moved off a session whose ineligible state
         // the pane cannot name — a KD phase, say.
         if (o.current === true) routed = t.id
-        said.push(t.label + ' ' + t.state + (moving ? ', target moving' : ''))
+        said.push(t.label + ' ' + t.state +
+          (moving ? ', target moving' : unreported ? ', a run this session had not reported' : ''))
       }
       // An `unknown_handle` is the complement in the same payload, and reading `sessions` alone
       // conflates them: the list is empty either way, so a handle the server has never heard of
