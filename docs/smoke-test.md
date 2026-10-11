@@ -206,9 +206,9 @@ the epoch to single-step, consumes the next epoch to restore and continue, then 
 to report both release and a running target. Run it alone through the bench's independent VM
 heartbeat/crash/unchanged-text wrapper. The repository stores none of the config or evidence.
 
-**Whether the memory it read is protected is asserted only with `vtl0_profile` configured, and
-that half has a marked gap.** Without it, the stopped read is checked for the stop's epoch, for
-bytes that begin with the guarded instruction, and for the `gpa` its VTL1 walk resolved — which
+**Whether the memory it read is protected is asserted only with `vtl0_profile` configured.**
+Without it, the stopped read is checked for the stop's epoch, for bytes that begin with the guarded
+instruction, and for the `gpa` its VTL1 walk resolved — which
 shows the Secure Kernel *can* be read while a stop is held and nothing about whether the normal
 kernel could make the same read; the run prints `NOT ASSERTED`, and a pass supports "the Secure
 Kernel was read" rather than "this memory is protected". With it, after the VTL1 session is
@@ -220,10 +220,9 @@ header, so a later failure measures the page and not the command. The attempt: t
 the GPA VTL1 just read from, which must fail — and measured 2026-10-11 it fails in exactly the
 form of a read with no RAM behind it, so the pair is the evidence and neither half is on its own.
 VTL0's virtual walk of the address is printed and not asserted, since each of its three outcomes
-is admissible. The attempt itself is a **marked gap** in `tests/mcp_smoke.rs`
-(`secure_kernel_page_read_from_vtl0`): a configured run fails there, loudly, rather than passing
-without the reading. The server for this tier starts with `--tools securekernel,inspect`, because
-`execute` is in `inspect`.
+is admissible. Both physical reads use `!db <gpa> L10`; a successful attempt fails the test and
+prints the returned bytes. The server for this tier starts with `--tools securekernel,inspect`,
+because `execute` is in `inspect`.
 
 **The managed Secure Kernel KD tier uses the same disposable-machine boundary.**
 WINDBG_MCP_SMOKE_SK_KD names a private JSON config with kd, profile, control_transport,

@@ -244,13 +244,18 @@ cargo test --test mcp_smoke -- --ignored --exact a_live_secure_kernel_session_st
 ```
 
 The JSON supplies `profile`, `control_transport`, `live_transport`, `vmwp_pid`, `dispatcher_vnd`,
-`vm_id`, `partition_id`, `expected_cr3`, `instruction_address` and `instruction_bytes`; `vp` and
-`read_size` are optional. It must contain the literal guard `"disposable": true`. Neither that file,
-the provider commands nor the resulting evidence belongs in the repository.
+`vm_id`, `partition_id`, `expected_cr3`, `instruction_address` and `instruction_bytes`; `vp`,
+`read_size` and `vtl0_profile` are optional. It must contain the literal guard `"disposable": true`.
+Neither that file, the provider commands nor the resulting evidence belongs in the repository.
 
 Run the test alone under the bench's independent heartbeat, crash-record and unchanged-text audit.
 It opens the live-control session, arms an exact DR0 stop, waits, compares the retained registers,
 reads stopped VTL1 memory, consumes the epoch to step, consumes the next epoch to restore and
 continue, and requires teardown to report both release and a running target. A green ordinary test
 run makes no live-control claim; this ignored test's `RAN:` output and the independent audit do.
+
+With `vtl0_profile` naming the same guest's NT kernel profile, the tier attaches after the VTL1
+release and requires a physical read of the GPA VTL1 just read to fail, beside a successful physical
+read of the NT image base's page (`FOLLOWUPS.md` item 124). VTL0's virtual walk is reported, not
+asserted. Without that profile the run prints `NOT ASSERTED` about protection.
 

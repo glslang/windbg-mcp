@@ -97,5 +97,5 @@ RAM behind it** — `Physical memory read at <gpa> failed` — so the attempt al
 from absent; the control beside it (the NT image base's page reads back its PE header) and the
 VTL1 read that just returned bytes from that GPA are what make the failure mean something. And a
 page-table comparison settles nothing for a trustlet's pages, which VTL0's tables **do** map. The
-attempt itself is a marked gap in the tier (`secure_kernel_page_read_from_vtl0`), and a configured
-run fails there until it is written.
+attempt and control both use `!db <gpa> L10`; a successful attempt fails the tier and prints the
+bytes VTL0 returned.
