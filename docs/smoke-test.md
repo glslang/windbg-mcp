@@ -196,7 +196,7 @@ that item.
 **The live Secure Kernel tier is a different, explicitly disposable gate.**
 `WINDBG_MCP_SMOKE_SK_LIVE` names a private JSON file containing `profile`, `control_transport`,
 `live_transport`, `dispatcher_vnd`, `vm_id`, `partition_id`, `expected_cr3`,
-`instruction_address` and `instruction_bytes`; `vp` and `read_size` are optional. The file must also
+`instruction_address` and `instruction_bytes`; `vp`, `read_size` and `vtl0_profile` are optional. The file must also
 carry `"disposable": true`. `vmwp_pid` is an optional mismatch assertion; the server resolves the
 current PID from `vm_id` before it reserves and starts the worker. Startup policy also fixes the
 absolute `max_pause_ms`; calls cannot extend or replace it. The ignored test opens a separate
@@ -206,18 +206,24 @@ the epoch to single-step, consumes the next epoch to restore and continue, then 
 to report both release and a running target. Run it alone through the bench's independent VM
 heartbeat/crash/unchanged-text wrapper. The repository stores none of the config or evidence.
 
-**What a green run of the live tier does not assert: that the memory it read is protected.** The
-stopped read is checked for the stop's epoch and for bytes that begin with the guarded instruction,
-which shows the Secure Kernel *can* be read while a stop is held. Nothing in the tier asserts that
-the normal kernel could not make the same read. The answer's `gpa` is the VTL1 page-table walk's
-translation, and no VTL0 translation or effective access is reported beside it to compare it with,
-because the live transport is pinned to VTL1 by its control protocol and by the admitted provider
-template — and the one outcome that would rule the *page* out, the same GPA mapped in both and
-denied to VTL0 by the effective VTL permission, is visible only to an access attempted from VTL0,
-which no host-side reader makes. A pass therefore supports "the Secure Kernel was read" and not
-"this memory is protected". `FOLLOWUPS.md` item 124 holds what would add the second claim and the
-shape decided for it: a VTL0 kernel session beside the VTL1 one, the way the hypervisor tier holds
-the hypervisor beside NT.
+**Whether the memory it read is protected is asserted only with `vtl0_profile` configured, and
+that half has a marked gap.** Without it, the stopped read is checked for the stop's epoch, for
+bytes that begin with the guarded instruction, and for the `gpa` its VTL1 walk resolved — which
+shows the Secure Kernel *can* be read while a stop is held and nothing about whether the normal
+kernel could make the same read; the run prints `NOT ASSERTED`, and a pass supports "the Secure
+Kernel was read" rather than "this memory is protected". With it, after the VTL1 session is
+released (a guest held in the VTL1 stop cannot answer KDNET), the tier opens the guest's ordinary
+NT kernel session through that profile — the way the hypervisor tier holds NT beside the
+hypervisor — and takes the readings `FOLLOWUPS.md` item 124 is made of, on the coordinate the
+stopped read reported. The control: a physical read of the NT image base's page must return its PE
+header, so a later failure measures the page and not the command. The attempt: the same command on
+the GPA VTL1 just read from, which must fail — and measured 2026-10-11 it fails in exactly the
+form of a read with no RAM behind it, so the pair is the evidence and neither half is on its own.
+VTL0's virtual walk of the address is printed and not asserted, since each of its three outcomes
+is admissible. The attempt itself is a **marked gap** in `tests/mcp_smoke.rs`
+(`secure_kernel_page_read_from_vtl0`): a configured run fails there, loudly, rather than passing
+without the reading. The server for this tier starts with `--tools securekernel,inspect`, because
+`execute` is in `inspect`.
 
 **The managed Secure Kernel KD tier uses the same disposable-machine boundary.**
 WINDBG_MCP_SMOKE_SK_KD names a private JSON config with kd, profile, control_transport,
