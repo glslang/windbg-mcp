@@ -218,7 +218,9 @@ released (a guest held in the VTL1 stop cannot answer KDNET), the tier opens the
 NT kernel session through that profile and requires its reported `guest` claim to equal
 `vtl0_guest` before reading memory — the operator's pairing with the VTL1 VM, not a discovered
 machine identity. It takes the readings `FOLLOWUPS.md` item 124 is made of, on the coordinate the
-stopped read reported. The control: a physical read of the NT image base's page must return its PE
+stopped read reported. The attach must also identify `kernel_target: "windows"`, derived from the
+target rather than the profile's declared role. The control: a physical read of the NT image
+base's page must return its PE
 header, so a later failure measures the page and not the command. The attempt: the same command on
 the GPA VTL1 just read from, which must fail — and measured 2026-10-11 it fails in exactly the
 form of a read with no RAM behind it, so the pair is the evidence and neither half is on its own.
