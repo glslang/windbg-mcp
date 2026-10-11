@@ -20732,6 +20732,16 @@ fn a_physical_db_answer_is_read_as_its_bytes_or_as_the_failing_line() {
 #[test]
 #[ignore = "controls one explicitly disposable VBS VM; set WINDBG_MCP_SMOKE_SK_KD and the startup policy, then run alone"]
 fn a_managed_secure_kernel_kd_session_steps_in_windbg_and_releases_through_mcp() {
+    managed_secure_kernel_kd_gate(false);
+}
+
+#[test]
+#[ignore = "controls one explicitly disposable VBS VM; needs WINDBG_MCP_SMOKE_SK_KD, cached symbols and a natural stop"]
+fn a_managed_secure_kernel_kd_session_resolves_symbols_and_unwinds_a_natural_stop() {
+    managed_secure_kernel_kd_gate(true);
+}
+
+fn managed_secure_kernel_kd_gate(symbol_gate: bool) {
     let Some(config) = secure_kernel_kd_tier() else {
         return;
     };
@@ -20765,11 +20775,36 @@ fn a_managed_secure_kernel_kd_session_steps_in_windbg_and_releases_through_mcp()
     let quit_log = marker_path("sk-kd-quit-windbg").with_extension("log");
     let symbols = marker_path("sk-kd-empty-symbols");
     std::fs::create_dir(&symbols).expect("create the empty KD symbol directory");
-    std::fs::write(
-        &commands,
-        b"lm m securekernel\nt\nr\n.echo WINDBG_MCP_KD_SCRIPT_COMPLETE\n",
-    )
-    .expect("write the KD command file");
+    let symbol_path = config
+        .get("symbol_path")
+        .map(|value| value.as_str().expect("symbol_path is a string"));
+    if symbol_gate {
+        assert!(
+            symbol_path.is_some(),
+            "the symbol gate requires symbol_path"
+        );
+        assert_eq!(
+            config.get("arm_mode").and_then(Value::as_str),
+            Some("natural"),
+            "the stack gate requires a natural guest stop"
+        );
+    }
+    let mut script = String::from("lm m securekernel\nt\nr\n");
+    if symbol_path.is_some() {
+        script.push_str(
+            ".reload /f securekernel.exe\n\
+             x securekernel!KiTimerInterrupt\n\
+             .printf \"WINDBG_MCP_KD_SYMBOL=%p\\n\", securekernel!KiTimerInterrupt\n\
+             .echo WINDBG_MCP_KD_STACK_BEGIN\n\
+             k 4\n\
+             .echo WINDBG_MCP_KD_STACK_END\n",
+        );
+    }
+    script.push_str(".echo WINDBG_MCP_KD_SCRIPT_COMPLETE\n");
+    if symbol_gate {
+        script.push_str(".echo WINDBG_MCP_KD_QUIT_PENDING; q\n");
+    }
+    std::fs::write(&commands, script).expect("write the KD command file");
     std::fs::write(&quit_commands, b".echo WINDBG_MCP_KD_QUIT_PENDING; q\n")
         .expect("write the KD quit command file");
     let _ = std::fs::remove_file(&log);
@@ -20820,6 +20855,24 @@ fn a_managed_secure_kernel_kd_session_steps_in_windbg_and_releases_through_mcp()
                 .to_string()
         }
     };
+    let profile: Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            required("profile")
+                .as_str()
+                .expect("profile is a path string"),
+        )
+        .expect("read the managed KD profile"),
+    )
+    .expect("parse the managed KD profile");
+    let rva_text = profile["secure_kernel_kd"]["initial"]["rva"]
+        .as_str()
+        .expect("the profile has a Secure Kernel initial RVA");
+    let rva = u64::from_str_radix(rva_text.trim_start_matches("0x"), 16)
+        .expect("the initial RVA is hexadecimal");
+    let instruction_len = profile["secure_kernel_kd"]["initial"]["original"]
+        .as_array()
+        .expect("the profile has initial instruction bytes")
+        .len() as u64;
     let mut kd_process: Option<Child> = None;
     let run = catch_unwind(AssertUnwindSafe(|| {
         let deadline = Instant::now() + TARGET_STEP;
@@ -20831,7 +20884,11 @@ fn a_managed_secure_kernel_kd_session_steps_in_windbg_and_releases_through_mcp()
             assert!(
                 !matches!(
                     phase.as_str(),
-                    "recovery_required" | "live_control_unresolved" | "failed" | "closed"
+                    "recovery_required"
+                        | "live_control_unresolved"
+                        | "failed"
+                        | "closed"
+                        | "released"
                 ),
                 "managed KD failed before WinDbg connected: {phase}\n--- stderr ---\n{}",
                 server.stderr()
@@ -20848,7 +20905,7 @@ fn a_managed_secure_kernel_kd_session_steps_in_windbg_and_releases_through_mcp()
             .args(["-k", &connection, "-cf"])
             .arg(&commands)
             .arg("-y")
-            .arg(&symbols)
+            .arg(symbol_path.map(std::path::Path::new).unwrap_or(&symbols))
             .arg("-logo")
             .arg(&log)
             .stdin(Stdio::null())
@@ -20863,10 +20920,17 @@ fn a_managed_secure_kernel_kd_session_steps_in_windbg_and_releases_through_mcp()
             let status = child.try_wait().expect("query kd.exe");
             if let Some(status) = status {
                 assert!(status.success(), "kd.exe exited {status}");
-                break;
+                // Only the transcript proves script completion; process exit alone does not.
             }
             let transcript = std::fs::read_to_string(&log).unwrap_or_default();
-            if transcript.contains("WINDBG_MCP_KD_SCRIPT_COMPLETE") {
+            if transcript
+                .lines()
+                .any(|line| line.trim() == "WINDBG_MCP_KD_SCRIPT_COMPLETE")
+            {
+                eprintln!("--- managed KD WinDbg transcript ---\n{transcript}");
+                if symbol_gate {
+                    break;
+                }
                 // This first peer has completed every observable debugger assertion. Close the
                 // authenticated pipe client before its launcher, then require the managed
                 // session's reconnect transition. A second peer below owns the q check; separating
@@ -20891,13 +20955,20 @@ fn a_managed_secure_kernel_kd_session_steps_in_windbg_and_releases_through_mcp()
         }
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
+            if symbol_gate {
+                break;
+            }
             let phase = state(&mut server);
             if phase == "reconnecting" {
                 break;
             }
             assert!(
-                phase != "recovery_required",
-                "KD disconnect faulted the session"
+                !matches!(
+                    phase.as_str(),
+                    "recovery_required" | "released" | "failed" | "closed"
+                ),
+                "KD disconnect lost the retained session: {phase}\n{}",
+                server.stderr()
             );
             assert!(
                 Instant::now() < deadline,
@@ -20914,24 +20985,6 @@ fn a_managed_secure_kernel_kd_session_steps_in_windbg_and_releases_through_mcp()
             "registers were not visible:\n{transcript}\n--- server stderr ---\n{}",
             server.stderr()
         );
-        let profile: Value = serde_json::from_str(
-            &std::fs::read_to_string(
-                required("profile")
-                    .as_str()
-                    .expect("profile is a path string"),
-            )
-            .expect("read the managed KD profile"),
-        )
-        .expect("parse the managed KD profile");
-        let rva_text = profile["secure_kernel_kd"]["initial"]["rva"]
-            .as_str()
-            .expect("the profile has a Secure Kernel initial RVA");
-        let rva = u64::from_str_radix(rva_text.trim_start_matches("0x"), 16)
-            .expect("the initial RVA is hexadecimal");
-        let instruction_len = profile["secure_kernel_kd"]["initial"]["original"]
-            .as_array()
-            .expect("the profile has initial instruction bytes")
-            .len() as u64;
         let base_marker = "Kernel base = 0x";
         let base_start = transcript
             .find(base_marker)
@@ -20955,10 +21008,60 @@ fn a_managed_secure_kernel_kd_session_steps_in_windbg_and_releases_through_mcp()
                 && !transcript.contains("KdDebuggerDataBlock not available"),
             "WinDbg did not accept the validated Secure Kernel debugger metadata:\n{transcript}"
         );
-        assert!(
-            transcript.to_ascii_lowercase().contains("securekernel"),
-            "WinDbg did not enumerate securekernel.exe:\n{transcript}"
-        );
+        let module = transcript
+            .lines()
+            .find_map(|line| {
+                let mut fields = line.split_whitespace();
+                let start = fields.next().and_then(hex_value)?;
+                let end = fields.next().and_then(hex_value)?;
+                (fields.next() == Some("securekernel") && start == base && end > start)
+                    .then_some(start..end)
+            })
+            .unwrap_or_else(|| {
+                panic!("WinDbg did not enumerate the live securekernel.exe range:\n{transcript}")
+            });
+        if symbol_path.is_some() {
+            let resolved = transcript
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("WINDBG_MCP_KD_SYMBOL=")
+                        .and_then(hex_value)
+                })
+                .expect("WinDbg must resolve the Secure Kernel symbol to an address");
+            assert!(
+                module.contains(&resolved),
+                "symbol did not resolve inside the live image: {resolved:#x}"
+            );
+            let stack = transcript
+                .lines()
+                .skip_while(|line| line.trim() != "WINDBG_MCP_KD_STACK_BEGIN")
+                .skip(1)
+                .take_while(|line| !line.contains("WINDBG_MCP_KD_STACK_END"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            eprintln!("--- bounded Secure Kernel stack ---\n{stack}");
+            let frames = stack
+                .lines()
+                .filter(|line| {
+                    let mut fields = line.split_whitespace();
+                    fields.next().is_some_and(|index| {
+                        index.len() == 2 && index.bytes().all(|byte| byte.is_ascii_digit())
+                    }) && fields
+                        .next()
+                        .and_then(hex_value)
+                        .is_some_and(|sp| sp >> 48 == 0xffff)
+                        && line.contains("securekernel!")
+                })
+                .count();
+            assert!(
+                frames >= 2,
+                "stack did not unwind beyond its current Secure Kernel frame: {stack}"
+            );
+        }
+
+        if symbol_gate {
+            return;
+        }
 
         // Reconnect a fresh peer for q itself. This build does not publish `quit:` or exit until
         // its target closes the pipe, so MCP teardown below supplies that half of the handshake.
@@ -20986,11 +21089,11 @@ fn a_managed_secure_kernel_kd_session_steps_in_windbg_and_releases_through_mcp()
                     "the q peer exited {status}\n--- WinDbg ---\n{}",
                     std::fs::read_to_string(&quit_log).unwrap_or_else(|error| error.to_string())
                 );
-                break;
             }
             if std::fs::read_to_string(&quit_log)
                 .unwrap_or_default()
-                .contains("WINDBG_MCP_KD_QUIT_PENDING")
+                .lines()
+                .any(|line| line.trim() == "WINDBG_MCP_KD_QUIT_PENDING")
             {
                 break;
             }
@@ -21004,18 +21107,21 @@ fn a_managed_secure_kernel_kd_session_steps_in_windbg_and_releases_through_mcp()
         }
     }));
 
+    let ended = server.call_tool("end_session", json!({ "session_id": id }), TARGET_STEP);
+    eprintln!("--- managed KD server audit ---\n{}", server.stderr());
+    // Release the controller before waiting for a failed debugger's process to finish exiting.
     if run.is_err()
         && let Some(child) = kd_process.as_mut()
         && child.try_wait().ok().flatten().is_none()
     {
         kill_process_tree(child, "the failed KD peer");
     }
-    let ended = server.call_tool("end_session", json!({ "session_id": id }), TARGET_STEP);
     if run.is_ok() {
+        let quit_log = if symbol_gate { &log } else { &quit_log };
         let child = kd_process.as_mut().expect("the q peer remains owned");
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
-            let transcript = std::fs::read_to_string(&quit_log).unwrap_or_default();
+            let transcript = std::fs::read_to_string(quit_log).unwrap_or_default();
             let quit_completed = transcript.lines().any(|line| line.trim() == "quit:");
             if quit_completed && !still_running(child) {
                 break;
@@ -21035,7 +21141,7 @@ fn a_managed_secure_kernel_kd_session_steps_in_windbg_and_releases_through_mcp()
         assert!(
             status.success(),
             "q peer exited {status} after publishing quit\n--- WinDbg ---\n{}",
-            std::fs::read_to_string(&quit_log).unwrap_or_else(|error| error.to_string())
+            std::fs::read_to_string(quit_log).unwrap_or_else(|error| error.to_string())
         );
         assert_no_error(&ended, "tools/call end_session");
         let ended = &ended["result"]["structuredContent"];
@@ -21106,6 +21212,13 @@ fn a_managed_secure_kernel_kd_session_steps_in_windbg_and_releases_through_mcp()
             "{audit}"
         );
         assert_eq!(audit["target_after"]["valid"], true, "{audit}");
+        assert_eq!(
+            audit["target_after"]["target_rva"]
+                .as_str()
+                .and_then(hex_value),
+            Some(rva),
+            "the external audit must check this session's guarded instruction: {audit}"
+        );
         let dr7 = audit["debug_registers"]["dr7"]["low"]
             .as_str()
             .and_then(|value| value.strip_prefix("0x"))
@@ -21130,7 +21243,11 @@ fn a_managed_secure_kernel_kd_session_steps_in_windbg_and_releases_through_mcp()
     if let Err(panic) = run {
         resume_unwind(panic);
     }
-    ran("MCP-managed Secure Kernel KD t/r/q and release lifecycle");
+    ran(if symbol_gate {
+        "MCP-managed Secure Kernel KD symbols, natural stack and release audit"
+    } else {
+        "MCP-managed Secure Kernel KD t/r/q and release lifecycle"
+    });
 }
 
 /// **A capture opens as a session, and answers about the guest rather than about the image.**

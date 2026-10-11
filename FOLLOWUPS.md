@@ -90,7 +90,6 @@ line is simply open.
 - [Item 112](#112-windbg-mcp-the-ioctl-fixtures-writes_flags-is-architecture-blind) — [windbg-mcp] The IOCTL fixture's `writes_flags` is architecture-blind
 - [Item 113](#113-windbg-mcp-the-device-descriptor-sweeps-own-figures-do-not-add-up) — [windbg-mcp] The `\Device` descriptor sweep's own figures do not add up
 - [Item 114](#114-dbgscope-a-big-pool-entry-in-no-region-the-walk-discovers) — [dbgscope] A big-pool entry in no region the walk discovers
-- [Item 116](#116-windbg-mcp-the-kd-facade-answers-windbg-with-fabricated-state-it-cannot-tell-apart-from-guest-state) — [windbg-mcp] The KD facade answers WinDbg with fabricated state it cannot tell apart from guest state
 - [Item 117](#117-windbg-mcp-the-kd-facade-pipe-has-only-the-default-acl-no-client-authentication-and-no-break-in) — [windbg-mcp] The KD facade pipe has only the default ACL, no client authentication and no break-in
 - [Item 121](#121-windbg-mcp-tracing-pool-allocations-on-an-x86-kernel) — [windbg-mcp] Tracing pool allocations on an x86 kernel
 - [Item 122](#122-windbg-mcp-a-live-secure-kernel-session-has-no-image-to-resolve-names-or-instructions-against) — [windbg-mcp] A live Secure Kernel session has no image to resolve names or instructions against
@@ -2339,78 +2338,6 @@ that address at all**, which is a question about discovery rather than about dec
   `src/pool/snapshot.rs`; the tier prints the addresses under `big-pool allocation(s) the walk has
   no span for`.
 
-## 116. [windbg-mcp] The KD facade answers WinDbg with fabricated state it cannot tell apart from guest state
-
-**Repo:** `windbg-mcp`. **Origin:** the 2026-10-07 review (item 115's origin), reading
-`src/kdtarget.rs` and `src/kdapi.rs` beside the 2026-10-05 live log.
-
-#463's review rounds narrowed the startup fabrication to one-shot shapes, which fixed the shadowing
-findings. What remains is that WinDbg has no way to tell an invented answer from a guest one, and
-that several fields it keys on are invented permanently:
-
-- `Version64` carries `PsLoadedModuleList = 0` and `DebuggerDataList = 0` with `NOMM|PTR64`
-  (`kdapi.rs`, `Version64::encode`), so WinDbg prints "Debugger data list address is NULL",
-  "Module List address is NULL" and "KdDebuggerDataBlock not available!" and `.reload` fails —
-  while the capture decode in `src/sk.rs` already locates the real `KdDebuggerDataBlock` at
-  `securekernel.exe+0x1335E0` on this build and the loader list it names.
-- `KernBase` is whatever `--kernel-base` said and `MinorVersion` whatever `--build` said, which
-  defaults to 26100; nothing reads the guest to check either. Enumerated once rather than found
-  one per round: those two are the only operator-supplied fields in `Version64` — the rest are
-  fixed constants (NT major 15, protocol 6, x64, the three maxima) or the two zeros above. The
-  first draft of this inventory listed one of the two (Codex, round 7).
-- The synthetic thread page at `0xfffffffefffe0000` reads as zeros for the life of the
-  connection; the null-page, `KUSER_SHARED_DATA`, stack and code probes read as zeros once each,
-  and their window resets on a KD peer reset rather than at every stop, so WinDbg's bookkeeping
-  reads reach real memory after the first stop and not before it.
-- `StateChange64` reports `NumberProcessors = 1` and `Processor = 0` whatever `--vp` was. That
-  pair is consistent rather than invented — under a count of one the only valid index is zero,
-  and the KD field is a `u16` where `--vp` is a `u32` (Codex, round 3) — so what is missing is
-  any statement, on the wire or to the operator, of which guest VP that index stands for. The
-  exception code is **not** on this list either, and the first draft of this entry had it there: a
-  debug-register execute hit raises `#DB`, vector 1, exactly as a trap-flag step does, NT
-  reports both as `STATUS_SINGLE_STEP`, and which slot fired travels in the control report's
-  DR6, which the facade sends as read. Reporting `STATUS_BREAKPOINT` instead would make WinDbg
-  apply its one-byte `int 3` RIP adjustment (`kdapi.rs`, the state-change builder's comment).
-  Codex caught that on review of this entry.
-- `ReadControlSpace` is refused, so `r` ends in "Unable to get program counter" and `k` has no
-  KPRCB to start from; the stop record already carries CR3, and the bench provider's register map
-  names the rest of `KSPECIAL_REGISTERS`.
-
-- **Why deferred:** each of these is a protocol-shape decision with a live WinDbg on the other
-  end, and the one bench that can run it is the disposable K3 VM behind the private provider.
-  Changing the fabricated answers without a run is how the `-c "r;t;t;r;q"` mistake and the
-  five-second reconnect window were found.
-- **What would close it:** point `DebuggerDataList` at `KdpDebuggerDataListHead` — the
-  `LIST_ENTRY` whose `Flink` is the block, not the block itself, which WinDbg would otherwise
-  read as a head and walk the real head as a record (Codex, round 2). On 26100.9457 it is
-  `securekernel.exe+0x1335C0`, and it needs no symbols: `SkdInitDebuggerDataBlock` links the
-  two both ways, so the block's own `List.Flink` names it
-  (`docs/samples/secure-kernel-debugger-investigation/26100.9457.txt`). Then measure that `lm`
-  and `x securekernel!*` resolve; keep processor 0 and print its mapping to `--vp` where the pipe
-  name is printed, or report the guest's VP count in `NumberProcessors` *together with* the
-  index in `Processor` and answer `SwitchProcessor` coherently — never the index alone; verify
-  both operator-supplied fields against the image at that base — `--kernel-base` by parsing the
-  PE header the way `sk::pe_identity` does for a capture, `--build` by reading the image's
-  version resource or matching its PDB identity to the on-disk `securekernel.exe`; either
-  reset the compatibility
-  window per stop or drop the stack/code shapes, since a transport-only run with control-space
-  reads refused still produced `Continue2`; and log every fabricated answer at `info` with its
-  shape, so a transcript shows what was invented.
-- **Where it picks up:** `kdtarget.rs`'s `CompatibilityMemory` and `send_stop`; `kdapi.rs`'s
-  `Version64::encode` and the `StateChange64` builder; the register bank in `skcontrol.rs`.
-
-**Implementation status, 2026-10-07:** the managed route no longer takes a caller-supplied base,
-build or initial address. The memory provider supplies the base, the exact-build profile supplies
-the build and guarded initial RVA, and optional standalone values are mismatch assertions. Before
-publishing the version record, the worker reads the live list head, debugger-data block and loader
-head; proves the list links, `KDBG` tag, plausible block size, matching kernel base and matching
-`PsLoadedModuleList`; and then reports those live addresses. WinDbg accepted the result and
-`lm m securekernel` enumerated `securekernel.exe` with an empty local symbol path. `GetContextEx`
-plus the bounded AMD64 `KSPECIAL_REGISTERS` control-space record also makes `r` succeed with real
-CR3 and debug registers; fields the provider cannot report are zero. The synthetic thread and
-one-shot compatibility reads remain explicit facade state, and symbol resolution and stack walking
-have not passed live, so this item remains open for those narrower claims.
-
 ## 117. [windbg-mcp] The KD facade pipe has only the default ACL, no client authentication and no break-in
 
 **Repo:** `windbg-mcp`. **Origin:** the 2026-10-07 review (item 115's origin).
@@ -2458,6 +2385,12 @@ only after three consecutive errors. Short manipulate packets and invalid contex
 failure replies without losing the retained stop. A stopped-state break-in is logged and refused,
 and the managed reconnect and absolute-pause windows are bounded. A real running-state break-in
 and the decoder fuzz target remain open, so this item is not closed.
+
+**Transport evidence, 2026-10-11:** item 116's forced-disconnect run did not reach reconnecting:
+the terminated kd retained its pipe until idle expiry. The controller then restored and released
+successfully. The separate passing symbol/stack gate uses MCP teardown and establishes no forced
+reconnect result. The exact builds, runs and limits are recorded in
+[item 116's close](./DONE.md#116-windbg-mcp-the-kd-facade-answers-windbg-with-fabricated-state-it-cannot-tell-apart-from-guest-state--done-2026-10-11).
 
 ## 121. [windbg-mcp] Tracing pool allocations on an x86 kernel
 
@@ -2789,7 +2722,7 @@ And item 113 from closing item 69 on
 "other 141" as a typo for 142 and reading the commit that first recorded the figures showed all
 three written that way on the day — so what the close could record was the gap, and what it could
 not do from a Mac was settle which of the three is wrong (2026-10-06).
-And items 115–119 from the 2026-10-07 review of the whole VTL1 surface — items 115 and 119 are now
+And items 115–119 from the 2026-10-07 review of the whole VTL1 surface — items 115, 116, 118 and 119 are now
 in [`DONE.md`](./DONE.md) — capture decode, live
 control, and the KD facade [#463](https://github.com/glslang/windbg-mcp/pull/463) had merged the
 day before — read against `main` with the private bench runs beside it: a facade that shipped with

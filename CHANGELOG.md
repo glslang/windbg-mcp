@@ -57,6 +57,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The Secure Kernel KD facade verifies and identifies the state it reports** (item 116).
+  Before publishing its pipe it validates the live AMD64 PE header and version-resource build
+  against the profile. Its banner maps KD processor 0 to the selected guest VP, and info-level
+  audit records name compatibility memory shapes, fixed protocol fields and unavailable register
+  fields filled with zeros. Natural stops use real stack and code reads. A separate disposable-VM
+  gate measures PDB symbol resolution and a bounded two-frame unwind; debugger diagnostics and
+  the failed forced-disconnect check remain documented in `docs/secure-kernel/kd-facade.md`.
+
 - **`driver_hazards` answers for a live driver whose import directory the loader freed**
   (`FOLLOWUPS.md` item 73, now in `DONE.md`). HEVD links its import directory into `INIT`, which is
   discarded once the driver starts, so on a live kernel the scan refused outright -- the canonical

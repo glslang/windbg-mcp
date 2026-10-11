@@ -234,11 +234,11 @@ independent audit to exclude a reboot between sessions, which would invalidate t
 
 **The managed Secure Kernel KD tier uses the same disposable-machine boundary.**
 WINDBG_MCP_SMOKE_SK_KD names a private JSON config with kd, profile, control_transport,
-live_transport, vm_id, a post_release_audit command array and optional vp/arm_mode. The exact
+live_transport, vm_id, a post_release_audit command array and optional vp/arm_mode/symbol_path. The exact
 initial instruction is a build-relative RVA and byte guard in the profile. That profile section
 also carries the exact-build debugger-data head, block and loaded-module-list RVAs; the worker
 combines all four with the base reported by the live-memory provider and validates the live links,
-so the config carries no boot address.
+plus the live PE header and version resource's build, so the config carries no boot address.
 It must carry disposable true, and it must omit vmwp_pid, dispatcher_vnd, partition_id,
 expected_cr3 and kernel_base: discovering those is part of the gate. Set the server-side
 WINDBG_MCP_SK_LIVE_POLICY as well. The ignored test opens the managed KD tool, waits for the
@@ -252,6 +252,23 @@ that untouched peer to publish its exact `quit:` record and exit successfully on
 the server side. Kernel process state supplies the exit observation because `Child::try_wait` can
 lag a Windows process exit. The harness then runs the bounded external audit and requires three
 healthy same-PID samples, no enabled debug-register breakpoint and unchanged Secure Kernel text.
+The separate ignored test
+`a_managed_secure_kernel_kd_session_resolves_symbols_and_unwinds_a_natural_stop`
+requires `symbol_path` naming a prepared local symbol cache and `arm_mode: "natural"`. It forces a
+Secure Kernel reload, resolves `securekernel!KiTimerInterrupt` inside the enumerated image range,
+and issues `k 4`. It requires at least two symbolized Secure Kernel frames, not merely a displayed
+current RIP. Use a guarded fall-through instruction for this arm: a redirected
+stop borrows a stack from different code and cannot establish an unwind. The command transcript
+and the server's provenance audit are printed under `--nocapture`. It issues `q`, releases through
+MCP, requires the exact `quit:` record and successful debugger exit, and runs the same external
+audit. It does not force the first client to disconnect: the 2026-10-11 lifecycle attempt retained
+the pipe after debugger termination until idle expiry and failed its reconnect assertion. That
+failure remains separate from the symbol/stack claim. `SetContext failed` during `t` and the
+program-counter diagnostic after `r` are recorded limits, despite the real returned RIP and unwind.
+The audit's `target_after.target_rva` must match the profile's initial guarded RVA, so an audit of
+an older fixture's instruction cannot establish this run's unchanged text.
+A controller that releases
+before publishing its pipe fails the gate immediately, including an initial wait's idle expiry.
 
 **The sample they open follows the host.** Four dumps are checked in (below), and the two crashes
 a *memory* read is asserted against are paired with the architecture the tests are running on — so

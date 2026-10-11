@@ -881,6 +881,10 @@ async fn run_async(
     refuse_managed_teardown()?;
     report_managed_phase(managed_job, crate::proto::SecureKernelKdPhase::Stopped);
     let kernel_base = provider_kernel_base;
+    let build = crate::kdimage::validate_build(kernel_base, profile.build, |address, count| {
+        let read = session.read_memory_until(address, count, stopped_deadline)?;
+        decode_hex(&read.data)
+    })?;
     let metadata = validate_debugger_metadata(
         session,
         kernel_base,
@@ -898,8 +902,8 @@ async fn run_async(
         let pipe = create_kd_pipe(&path)
             .with_context(|| format!("creating Secure Kernel KD pipe {path}"))?;
         eprintln!(
-            "Secure Kernel stop held at {:#x}; waiting for WinDbg on {path}",
-            values.rip
+            "Secure Kernel stop held at {:#x}; waiting for WinDbg on {path}; KD processor 0 of 1 maps to guest VP {}",
+            values.rip, stop.target.vp
         );
         report_managed_phase(
             managed_job,
@@ -967,6 +971,7 @@ async fn run_async(
             &mut link,
             &reported_instruction.bytes,
             &values,
+            stop.target.vp,
             stopped_since,
             service_pause,
         )
@@ -974,7 +979,7 @@ async fn run_async(
         eprintln!("initial KD state change sent");
 
         let mut breakpoints = BTreeMap::<u32, BreakpointGuard>::new();
-        let mut compatibility = CompatibilityMemory::default();
+        let mut compatibility = CompatibilityMemory::for_stop(options.arm_mode);
         loop {
             let frame_wait =
                 bounded_pause_wait(options.idle_timeout, stopped_since, service_pause)?;
@@ -1018,13 +1023,14 @@ async fn run_async(
                 continue;
             }
             if peer_reset {
-                compatibility = CompatibilityMemory::default();
+                compatibility = CompatibilityMemory::for_stop(options.arm_mode);
                 breakpoints.clear();
                 send_stop(
                     &mut writer,
                     &mut link,
                     &reported_instruction.bytes,
                     &values,
+                    stop.target.vp,
                     stopped_since,
                     service_pause,
                 )
@@ -1058,14 +1064,15 @@ async fn run_async(
             };
             let response = if request.api_number() == crate::kdapi::DBGKD_GET_VERSION_API {
                 tracing::info!(
-                    build = profile.build,
+                    build,
                     kernel_base = format_args!("{kernel_base:#x}"),
                     debugger_data_list = format_args!("{:#x}", metadata.debugger_data_list),
                     loaded_module_list = format_args!("{:#x}", metadata.loaded_module_list),
+                    compatibility_fields = "major=15,protocol=6,flags=NOMM|PTR64,machine=AMD64,max_packet=12,max_state_change=3,max_manipulate=0x36",
                     "serving synthesized Secure Kernel KD version record"
                 );
                 request.get_version_response(Version64 {
-                    build: profile.build,
+                    build,
                     kernel_base,
                     loaded_module_list: metadata.loaded_module_list,
                     debugger_data_list: metadata.debugger_data_list,
@@ -1081,11 +1088,6 @@ async fn run_async(
                     values.rip,
                     reported_instruction.bytes.len(),
                 ) {
-                    tracing::info!(
-                        address = format_args!("{:#x}", read.address),
-                        count,
-                        "serving synthesized Secure Kernel KD compatibility memory"
-                    );
                     request.read_virtual_memory_response(&bytes)?
                 } else {
                     match session.read_memory_until(read.address, count, stopped_deadline) {
@@ -1110,9 +1112,12 @@ async fn run_async(
                         &values,
                         stopped_low(&stop, RegisterName::Cr3)?,
                     );
-                    eprintln!(
-                        "KD AMD64 special-register read {:#x}+{:#x}",
-                        read.address, read.count
+                    tracing::info!(
+                        selector = format_args!("{:#x}", read.address),
+                        count = read.count,
+                        guest_fields = "cr3,dr0,dr1,dr2,dr3,dr6,dr7",
+                        zero_filled = "cr0,cr2,cr4,gdtr,idtr,tr,ldtr,mxcsr,debug_control,branch_records,cr8,msrs,xcr0",
+                        "serving synthesized AMD64 KSPECIAL_REGISTERS with unavailable fields zeroed"
                     );
                     request.read_control_space_response(&special[..read.count as usize])?
                 } else {
@@ -1129,7 +1134,7 @@ async fn run_async(
                 );
                 request.failure_response()
             } else if request.api_number() == crate::kdapi::DBGKD_GET_CONTEXT_API {
-                eprintln!("KD GetContext");
+                log_context_shape(0, crate::kdapi::AMD64_CONTEXT_BYTES as u32);
                 request.get_context_response(&context)?
             } else if let Some(range) = request.get_context_ex() {
                 eprintln!(
@@ -1137,7 +1142,10 @@ async fn run_async(
                     range.offset, range.count
                 );
                 match request.get_context_ex_response(&context) {
-                    Ok(response) => response,
+                    Ok(response) => {
+                        log_context_shape(range.offset, range.count);
+                        response
+                    }
                     Err(error) => {
                         tracing::warn!("refusing Secure Kernel KD context range: {error}");
                         request.failure_response()
@@ -1214,6 +1222,7 @@ async fn run_async(
                         &mut link,
                         &reported_instruction.bytes,
                         &values,
+                        stop.target.vp,
                         stopped_since,
                         service_pause,
                     )
@@ -1253,12 +1262,13 @@ async fn run_async(
                 (values, context) = read_context(session, &stop, stopped_deadline)?;
                 reported_instruction =
                     read_instruction_guard(session, values.rip, stopped_deadline)?;
-                compatibility = CompatibilityMemory::default();
+                compatibility = CompatibilityMemory::for_stop(options.arm_mode);
                 send_stop(
                     &mut writer,
                     &mut link,
                     &reported_instruction.bytes,
                     &values,
+                    stop.target.vp,
                     stopped_since,
                     service_pause,
                 )
@@ -1521,15 +1531,18 @@ async fn send_stop<W: AsyncWrite + Unpin>(
     link: &mut TargetLink,
     instruction: &[u8],
     values: &Amd64ContextValues,
+    guest_vp: u32,
     stopped_since: Instant,
     max_pause: Duration,
 ) -> Result<()> {
     tracing::info!(
         processor = 0u16,
         number_processors = 1u32,
+        guest_vp,
         synthetic_thread = format_args!("{:#x}", crate::kdapi::SYNTHETIC_THREAD),
+        compatibility_fields = "processor_level=15,first_chance=true,exception=STATUS_SINGLE_STEP",
         rip = format_args!("{:#x}", values.rip),
-        "serving Secure Kernel KD state change; processor 0 maps to the selected guest VP"
+        "serving synthesized Secure Kernel KD state change; processor 0 maps to guest_vp"
     );
     let state = crate::kdapi::breakpoint_state_change(values, instruction)?;
     let packet = link
@@ -1538,6 +1551,16 @@ async fn send_stop<W: AsyncWrite + Unpin>(
     write_stopped_pipe(writer, &packet, stopped_since, max_pause).await?;
     flush_stopped_pipe(writer, stopped_since, max_pause).await?;
     Ok(())
+}
+
+fn log_context_shape(offset: u32, count: u32) {
+    tracing::info!(
+        offset,
+        count,
+        context_flags = "CONTROL|INTEGER|SEGMENTS|DEBUG_REGISTERS",
+        zero_filled = "home_slots,mxcsr,floating_point,vector,branch_records",
+        "serving synthesized AMD64 CONTEXT with unavailable fields zeroed and unadvertised"
+    );
 }
 
 fn read_context(
@@ -1818,7 +1841,8 @@ fn validate_debugger_metadata(
 /// WinDbg also probes the reported RSP as an NT trap frame and disassembles backwards across bytes
 /// preceding the current instruction. Neither assumption holds for this redirected Secure Kernel
 /// stop: the selected NOP follows embedded data, and the backscan changes WinDbg's current address
-/// to a 16-bit `CS:IP`. Each stop-specific startup probe is served at most once. A later explicit
+/// to a 16-bit `CS:IP`. Natural stops always read real stack and code. Each redirected stop-specific
+/// startup probe is served at most once. A later explicit
 /// debugger read of the same real address therefore reaches guest memory instead of receiving
 /// fabricated bytes.
 struct CompatibilityMemory {
@@ -1842,6 +1866,16 @@ impl Default for CompatibilityMemory {
 }
 
 impl CompatibilityMemory {
+    fn for_stop(mode: ArmMode) -> Self {
+        let redirected = mode == ArmMode::Redirect;
+        Self {
+            stack_bookkeeping: redirected,
+            code_backscan: redirected,
+            code_lookahead: redirected,
+            ..Self::default()
+        }
+    }
+
     fn read(
         &mut self,
         address: u64,
@@ -1857,7 +1891,7 @@ impl CompatibilityMemory {
                 && u64::from(count) <= COMPATIBILITY_PAGE_BYTES
         };
         if inside(crate::kdapi::SYNTHETIC_THREAD) {
-            return Some(vec![0; count as usize]);
+            return Some(compatibility_zeros("synthetic_thread", address, count));
         }
         if let Some((index, _)) = NULL_STARTUP_PROBES
             .iter()
@@ -1867,7 +1901,7 @@ impl CompatibilityMemory {
             })
         {
             self.null_startup_probes[index] = false;
-            return Some(vec![0; count as usize]);
+            return Some(compatibility_zeros("null_startup", address, count));
         }
         if let Some((index, _)) = KUSER_STARTUP_PROBES
             .iter()
@@ -1877,7 +1911,7 @@ impl CompatibilityMemory {
             })
         {
             self.kuser_startup_probes[index] = false;
-            return Some(vec![0; count as usize]);
+            return Some(compatibility_zeros("kuser_startup", address, count));
         }
         let stack_bookkeeping = self.stack_bookkeeping
             && address == stopped_rsp
@@ -1900,8 +1934,28 @@ impl CompatibilityMemory {
         if code_lookahead {
             self.code_lookahead = false;
         }
-        (stack_bookkeeping || code_backscan || code_lookahead).then(|| vec![0; count as usize])
+        let shape = if stack_bookkeeping {
+            "stack_bookkeeping"
+        } else if code_backscan {
+            "code_backscan"
+        } else if code_lookahead {
+            "code_lookahead"
+        } else {
+            return None;
+        };
+        Some(compatibility_zeros(shape, address, count))
     }
+}
+
+fn compatibility_zeros(shape: &'static str, address: u64, count: u32) -> Vec<u8> {
+    tracing::info!(
+        shape,
+        address = format_args!("{address:#x}"),
+        count,
+        fill = 0,
+        "serving synthesized Secure Kernel KD compatibility memory"
+    );
+    vec![0; count as usize]
 }
 
 fn parse_word(name: &str, value: &str) -> Result<u64> {
@@ -2006,6 +2060,22 @@ mod tests {
         assert_eq!(memory.read(0x8010, 0x70, 0x8000, 0x9000, 5), None);
         assert_eq!(memory.read(0x1000, 1, 0x8000, 0x9000, 5), None);
         assert_eq!(memory.read(u64::MAX, 2, 0x8000, 0x9000, 5), None);
+    }
+
+    #[test]
+    fn natural_stops_never_fabricate_stack_or_code_reads() {
+        let mut memory = CompatibilityMemory::for_stop(ArmMode::Natural);
+        for (address, count) in [
+            (0x8000, 0x80),
+            (0x9000 - CODE_BACKSCAN_BYTES, 0x2b),
+            (0x9005, 0x80),
+        ] {
+            assert_eq!(memory.read(address, count, 0x8000, 0x9000, 5), None);
+        }
+        assert_eq!(
+            memory.read(crate::kdapi::SYNTHETIC_THREAD, 8, 0x8000, 0x9000, 5),
+            Some(vec![0; 8])
+        );
     }
 
     #[test]

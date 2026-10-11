@@ -36,6 +36,7 @@ mod hazards;
 mod ioctl;
 mod kdapi;
 mod kdconn;
+mod kdimage;
 mod kdprobe;
 mod kdtarget;
 mod kdwire;

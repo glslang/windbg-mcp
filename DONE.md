@@ -171,6 +171,7 @@ engine — it adds a target and leaves the current one alone. The entry records 
 - [Item 119](#119-windbg-mcp-what-a-vtl1-debugger-still-cannot-do--done-2026-10-07) — [windbg-mcp] The VTL1 capability matrix is live-derived — done (2026-10-07)
 - [Item 73](#73-windbg-mcp-a-drivers-import-directory-can-be-in-a-section-the-loader-freed--done-2026-10-09-dbgscope196) — [windbg-mcp] A driver's import directory can be in a section the loader freed — done (2026-10-09, dbgscope#196)
 - [Item 124](#124-windbg-mcp-nothing-asserts-that-a-live-secure-kernel-read-was-of-memory-vtl0-cannot-reach--done-2026-10-11) — [windbg-mcp] Nothing asserts that a live Secure Kernel read was of memory VTL0 cannot reach — done (2026-10-11)
+- [Item 116](#116-windbg-mcp-the-kd-facade-answers-windbg-with-fabricated-state-it-cannot-tell-apart-from-guest-state--done-2026-10-11) — [windbg-mcp] The KD facade answers WinDbg with fabricated state it cannot tell apart from guest state — done (2026-10-11)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -10107,3 +10108,132 @@ The Windows-target guard passed the configured K3 tier and independent audit in 
 All three health samples, unchanged text, matching CR3/base/GPA and restored-register checks
 passed again. Plain `cargo test` passed 1,385 unit tests and 145 smoke tests (20 opt-in tests
 ignored); formatting, strict Clippy and markdownlint passed too.
+
+## 116. [windbg-mcp] The KD facade answers WinDbg with fabricated state it cannot tell apart from guest state — **done** (2026-10-11)
+
+**Repo:** `windbg-mcp`. **Origin:** the 2026-10-07 review (item 115's origin), reading
+`src/kdtarget.rs` and `src/kdapi.rs` beside the 2026-10-05 live log.
+
+#463's review rounds narrowed the startup fabrication to one-shot shapes, which fixed the shadowing
+findings. What remains is that WinDbg has no way to tell an invented answer from a guest one, and
+that several fields it keys on are invented permanently:
+
+- `Version64` carries `PsLoadedModuleList = 0` and `DebuggerDataList = 0` with `NOMM|PTR64`
+  (`kdapi.rs`, `Version64::encode`), so WinDbg prints "Debugger data list address is NULL",
+  "Module List address is NULL" and "KdDebuggerDataBlock not available!" and `.reload` fails —
+  while the capture decode in `src/sk.rs` already locates the real `KdDebuggerDataBlock` at
+  `securekernel.exe+0x1335E0` on this build and the loader list it names.
+- `KernBase` is whatever `--kernel-base` said and `MinorVersion` whatever `--build` said, which
+  defaults to 26100; nothing reads the guest to check either. Enumerated once rather than found
+  one per round: those two are the only operator-supplied fields in `Version64` — the rest are
+  fixed constants (NT major 15, protocol 6, x64, the three maxima) or the two zeros above. The
+  first draft of this inventory listed one of the two (Codex, round 7).
+- The synthetic thread page at `0xfffffffefffe0000` reads as zeros for the life of the
+  connection; the null-page, `KUSER_SHARED_DATA`, stack and code probes read as zeros once each,
+  and their window resets on a KD peer reset rather than at every stop, so WinDbg's bookkeeping
+  reads reach real memory after the first stop and not before it.
+- `StateChange64` reports `NumberProcessors = 1` and `Processor = 0` whatever `--vp` was. That
+  pair is consistent rather than invented — under a count of one the only valid index is zero,
+  and the KD field is a `u16` where `--vp` is a `u32` (Codex, round 3) — so what is missing is
+  any statement, on the wire or to the operator, of which guest VP that index stands for. The
+  exception code is **not** on this list either, and the first draft of this entry had it there: a
+  debug-register execute hit raises `#DB`, vector 1, exactly as a trap-flag step does, NT
+  reports both as `STATUS_SINGLE_STEP`, and which slot fired travels in the control report's
+  DR6, which the facade sends as read. Reporting `STATUS_BREAKPOINT` instead would make WinDbg
+  apply its one-byte `int 3` RIP adjustment (`kdapi.rs`, the state-change builder's comment).
+  Codex caught that on review of this entry.
+- `ReadControlSpace` is refused, so `r` ends in "Unable to get program counter" and `k` has no
+  KPRCB to start from; the stop record already carries CR3, and the bench provider's register map
+  names the rest of `KSPECIAL_REGISTERS`.
+
+- **Why deferred:** each of these is a protocol-shape decision with a live WinDbg on the other
+  end, and the one bench that can run it is the disposable K3 VM behind the private provider.
+  Changing the fabricated answers without a run is how the `-c "r;t;t;r;q"` mistake and the
+  five-second reconnect window were found.
+- **What would close it:** point `DebuggerDataList` at `KdpDebuggerDataListHead` — the
+  `LIST_ENTRY` whose `Flink` is the block, not the block itself, which WinDbg would otherwise
+  read as a head and walk the real head as a record (Codex, round 2). On 26100.9457 it is
+  `securekernel.exe+0x1335C0`, and it needs no symbols: `SkdInitDebuggerDataBlock` links the
+  two both ways, so the block's own `List.Flink` names it
+  (`docs/samples/secure-kernel-debugger-investigation/26100.9457.txt`). Then measure that `lm`
+  and `x securekernel!*` resolve; keep processor 0 and print its mapping to `--vp` where the pipe
+  name is printed, or report the guest's VP count in `NumberProcessors` *together with* the
+  index in `Processor` and answer `SwitchProcessor` coherently — never the index alone; verify
+  both operator-supplied fields against the image at that base — `--kernel-base` by parsing the
+  PE header the way `sk::pe_identity` does for a capture, `--build` by reading the image's
+  version resource or matching its PDB identity to the on-disk `securekernel.exe`; either
+  reset the compatibility
+  window per stop or drop the stack/code shapes, since a transport-only run with control-space
+  reads refused still produced `Continue2`; and log every fabricated answer at `info` with its
+  shape, so a transcript shows what was invented.
+- **Where it picks up:** `kdtarget.rs`'s `CompatibilityMemory` and `send_stop`; `kdapi.rs`'s
+  `Version64::encode` and the `StateChange64` builder; the register bank in `skcontrol.rs`.
+
+**Implementation status, 2026-10-07:** the managed route no longer takes a caller-supplied base,
+build or initial address. The memory provider supplies the base, the exact-build profile supplies
+the build and guarded initial RVA, and optional standalone values are mismatch assertions. Before
+publishing the version record, the worker reads the live list head, debugger-data block and loader
+head; proves the list links, `KDBG` tag, plausible block size, matching kernel base and matching
+`PsLoadedModuleList`; and then reports those live addresses. WinDbg accepted the result and
+`lm m securekernel` enumerated `securekernel.exe` with an empty local symbol path. `GetContextEx`
+plus the bounded AMD64 `KSPECIAL_REGISTERS` control-space record also makes `r` succeed with real
+CR3 and debug registers; fields the provider cannot report are zero. The synthetic thread and
+one-shot compatibility reads remain explicit facade state, and symbol resolution and stack walking
+have not passed live, so this item remains open for those narrower claims.
+
+**Closed, 2026-10-11.** The earlier live-list validation remains in place: the KD version names
+`KdpDebuggerDataListHead`, not its block, and the real loaded-module list. Before publishing the
+pipe, `kdimage::validate_build` now reads the live AMD64 PE header and its bounded version resource,
+requires the image build to match the profile, and reports that validated build. A missing,
+malformed, unreadable or mismatched version resource refuses the open rather than substituting the
+profile. Reads share the retained stop's service deadline, use at most 4 KiB per exchange and cap
+the resource directory at 64 KiB.
+
+The pipe banner and each state-change audit map KD processor 0 of 1 to the actual selected guest
+VP. Every compatibility-memory reply logs its shape, address, count and zero fill at `info`;
+version/state-change records name their fixed fields, and context/control-space replies name the
+unavailable fields filled with zeros. These records reach stderr and MCP `server_log`. Native KD
+has no per-read provenance field: WinDbg still renders fabricated bytes as memory, so the audit is
+the distinction this close provides. Natural stops no longer fabricate stack or code reads.
+Redirected compatibility shapes remain once per stop, with the existing reset on a new stop or
+peer reset.
+
+**Live evidence:** private run `20261011T204649`, server
+`0.22.0+g09101311-dirty.f5d4c27f`, installed kd **10.0.26100.6584**, Secure Kernel **26100.9457**,
+a prepared matching local PDB cache and a natural stop at `KiTimerInterrupt` (RVA `0xe8f70`). The
+separate ignored symbol/stack gate passed: `lm m securekernel` enumerated the live image range,
+`x securekernel!KiTimerInterrupt` resolved inside it, `t` executed `sub rsp,8`, and `k 4` unwound
+`KiTimerInterrupt+0x4` then `SkpReturnFromNormalModeRaxSet+0xe`, both with canonical stack pointers.
+Stack and code reads came from the live source. A redirected-stop attempt produced a bogus return
+address and is not stack evidence.
+
+`q` completed after MCP `end_session` closed the pipe; the peer exited successfully. The MCP result
+confirmed restored baseline, completed event, removed handler/scratch, handled detach and
+`released: true`. The independent audit observed healthy same-PID samples immediately, at 30 s
+and at 60 s, no recent vmwp errors, DR0–DR3 zero, DR7 enables clear and TF/RF clear. It read the
+original **timer instruction** twice unchanged; the gate now requires the audit's `target_rva` to
+match the profile's initial RVA. An earlier symbol pass (`20261011T204236`,
+`0.22.0+g09101311-dirty.d030ce6c`) had audited the old NOP fixture instead; it establishes symbols
+and the unwind, not unchanged text at the timer. The disposable VM and provider services were
+returned to Off/stopped after the final audit. Private configs, addresses, provider wiring and logs
+remain under `target/private/`.
+
+**Limits retained:** `r` prints real registers and the stepped RIP, followed by `Unable to get
+program counter 'r'`. `t` prints `SetContext failed` alongside WinDbg's refused attempt to clear
+the controller-owned DR7 enable bit through a control-space write; the guarded step completes.
+No register-write support is claimed. The forced-disconnect lifecycle gate also failed in private
+run `20261011T203559` (`0.22.0+g09101311-dirty.a18172c5`): the terminated kd retained its pipe
+until idle expiry; the controller then restored and released successfully. The passing symbol
+gate uses MCP teardown without forcing that disconnect, so it establishes no reconnect result.
+That remains with item 117's transport work. Arbitrary stack walks, execution after `r`, break-in,
+non-fall-through steps, multiple VPs and writes remain outside this close.
+
+Focused unit tests cover mapped PE/version rejection and natural-stop compatibility behavior.
+Temporarily removing the build-match guard and enabling natural stack/code fabrication made their
+respective tests fail; restoring the guards passed them again. The operator record is in
+`docs/secure-kernel/kd-facade.md`, and `docs/smoke-test.md` names the separate symbol gate and its
+fixture-bound external audit.
+
+Final checks: plain `cargo test` passed **1,388 unit tests** and **145 smoke tests** (21 opt-in
+tests ignored); formatting, strict Clippy and the pinned documentation lint passed. The separate
+ignored symbol/stack gate above ran against the disposable VM and passed its external audit.
