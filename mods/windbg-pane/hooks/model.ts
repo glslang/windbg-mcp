@@ -285,6 +285,41 @@ export function begin(v: View, tool: string, args: Record<string, unknown>): [Vi
 
 export type Outcome = { ok: boolean; data: Obj | null; error: string; ms: number }
 
+/**
+ * Whether `s.ip` is where the target is **now**, rather than where it was before the last movement.
+ *
+ * Every fold that sees movement with no position deliberately keeps the old `ip` and does not stamp
+ * `ipAt` — a text-only `goto_position`, a `run_to_address` timeout, a stop with no thread context,
+ * an outstanding asynchronous run, a raw `execute`. That care was being discarded at the draw: the
+ * header printed the old address as `ip`, the disassembly marked it `▶`, and the panel note read
+ * "ip is elsewhere" about a position nothing had re-read. The register grid already asked a version
+ * of this question and the other three sites did not, which is how one rule came to be half
+ * applied. Exported so the renderer and the tests share the one predicate.
+ */
+export function ipIsCurrent(s: Session): boolean {
+  return !!s.ip && !s.gone && s.ipAt >= s.movedAt
+}
+
+/**
+ * The session an unaddressed call reaches: the **newest** one still eligible.
+ *
+ * This is `Sessions::current` — `self.all.iter().rev().find(|s| s.state().accepts_default())` —
+ * written as the same rule rather than as an approximation of its effects, so the pane's idea of
+ * where an implicit call goes cannot drift from the server's. Which states are eligible is the one
+ * part that has to be approximated, because `accepts_default` is an enum this pane does not have:
+ * its own `state` is a display string. So only the two it knows are ineligible are excluded — a
+ * session that has closed, and one the server has said it does not know. A target that has *gone*
+ * stays eligible on purpose: `session_status` reports such a session `open`, and `end_session` is
+ * what it is still there for.
+ */
+function newestOpen(sessions: Session[]): string | null {
+  for (let i = sessions.length - 1; i >= 0; i--) {
+    const st = sessions[i]!.state
+    if (st !== 'closed' && st !== 'unknown to the server') return sessions[i]!.id
+  }
+  return null
+}
+
 function where(s: Session, ip: string | null): string {
   if (!ip) return ''
   const row = s.disasm?.rows.find(x => norm(x.address) === ip)
@@ -351,13 +386,24 @@ function foldBatch(s: Session, d: Obj, n: number): string {
   const why = str(after.why) ? ': ' + str(after.why) : ''
   const by = str(after.by) ? ' by ' + str(after.by) : ''
   if (state === 'stopped') {
-    // A read-only batch also reports `stopped`, so the position decides whether it moved:
-    // marking every batch as movement would make an inspection look like execution.
-    if (!ip || ip === s.ip) return ''
+    // **The final position is not evidence that nothing ran**, and treating it as such was this
+    // branch's own bug. `SessionAfterInfo::Stopped` carries the instruction pointer and nothing
+    // else — there is no execution flag — and a step's `action` is rendered debugger *text*, which
+    // `.claude/rules/execution-waits.md` records as unfinishable to read for whether it reaches
+    // execution. A resume that loops back to the same breakpoint therefore stops exactly where it
+    // started, having changed every register and whatever the target wrote.
+    //
+    // An earlier round was right that marking every batch as movement makes an inspection look
+    // like execution, and that reading is kept — in the **note**, which is where a reading
+    // belongs. It cannot be kept in the staleness, because the two errors do not cost the same: a
+    // read drawn as current when the target has moved under it is the defect this whole pane is
+    // about, and a panel greyed after an inspection costs one re-read.
     s.movedAt = n
+    if (!ip) return 'batch stopped, position not reported'
+    const same = ip === s.ip
     s.ip = ip
     s.ipAt = n
-    return 'batch stopped at ' + where(s, ip)
+    return 'batch stopped at ' + where(s, ip) + (same ? ', position unchanged' : '')
   }
   if (state === 'running') {
     s.movedAt = n
@@ -701,6 +747,11 @@ export function finish(v: View, n: number, tool: string, args: Record<string, un
         // and until this is read the pane goes on drawing the pre-run reads as current.
         const moving = obj(o.execution)?.stopped === false
         if (moving) t.movedAt = n
+        // `SessionInfo::current` is deliberately *not* folded. It is the server's own answer to
+        // "is a call that names no session routed here", and it is better than the rule below —
+        // but it is an answer about one instant, and keeping it would mean a field on the state
+        // contract to hold it until something contradicted it. The rule below needs none and is
+        // right whenever the pane has seen every opener, which it has.
         said.push(t.label + ' ' + t.state + (moving ? ', target moving' : ''))
       }
       // An `unknown_handle` is the complement in the same payload, and reading `sessions` alone
@@ -712,9 +763,23 @@ export function finish(v: View, n: number, tool: string, args: Record<string, un
       }
       note = said.length ? said.join(', ') : (d.sessions as unknown[]).length + ' session(s)'
     }
+    // `released` says whether the **worker** let go of the target itself, not whether the session
+    // is still open: one that had to be killed holding its target answers `false` while the
+    // supervisor has closed the session anyway, and reading it as the state left such a session
+    // marked `unresolved` for ever. `recovery_required` is the field that says a teardown is
+    // unconfirmed and wants out-of-band work — "this response is not a confirmed detach" — and
+    // only the preserved live-control case sets it. So it decides the state, and the other two
+    // facts go where facts go.
     if (tool === 'end_session') {
-      s.state = d.released === false ? 'unresolved' : 'closed'
-      note = d.released === false ? 'released: false' : 'released'
+      s.state = d.recovery_required === true ? 'unresolved' : 'closed'
+      // `target_left_running` is absent for a dump or a trace, which have nothing that outlives
+      // the session. For a live kernel `false` is the one that matters: it was *not* resumed, so
+      // it is halted at a break with one processor stopped and the rest spinning.
+      const left = d.target_left_running === true
+        ? ', target left running'
+        : d.target_left_running === false ? ', target did not outlive the session' : ''
+      note = (d.released === false ? 'the worker did not release the target' : 'released') + left +
+        (d.recovery_required === true ? ', recovery required' : '')
     }
   } else if (s && RUN.test(tool)) {
     // A successful run with no typed payload still moved the target. `goto_position` seeks a TTD
@@ -747,7 +812,16 @@ export function finish(v: View, n: number, tool: string, args: Record<string, un
     const said = foldBatch(s, d, n)
     if (said) note = note ? note + '; ' + said : said
   }
-  const current = opened ?? (sid && sessions.some(x => x.id === sid) ? sid : v.current)
+  // **An explicitly addressed call does not move the server's default, so it must not move this
+  // one.** `Sessions::current` is `self.all.iter().rev().find(|s| s.state().accepts_default())` —
+  // the newest session the caller owns that still takes an unaddressed call — and nothing a call
+  // naming a `session_id` does changes it. Assigning from any such call pointed the pane at the
+  // older of two open sessions while the server went on routing implicit calls to the newer, so
+  // `begin` pinned the next one to the wrong session and drew one target's reads under another:
+  // the misfiling an earlier round fixed, arrived at from the other end. An opener moves it
+  // (the new session *is* the newest), `session_status` overrides it with the server's own answer,
+  // and otherwise it moves only when the session it names has closed — mirroring that `rev()`.
+  const current = newestOpen(sessions) ?? v.current
   const log = v.log.map(e =>
     e.n === n ? { ...e, session: sid, status: out.ok ? ('ok' as const) : ('error' as const), note, ms: out.ms } : e,
   )

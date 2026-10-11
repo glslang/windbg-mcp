@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
 import type { LogEntry, Session } from '../types'
-import { EMPTY, answered, begin, finish, norm, payloadOf, regHex, shapeOf, wd, windbgTool } from './model'
+import { EMPTY, answered, begin, finish, ipIsCurrent, norm, payloadOf, regHex, shapeOf, wd, windbgTool } from './model'
 
 const PANE = 'windbg'
 const TITLE = 'WinDbg'
@@ -194,12 +194,16 @@ export const register: Register = on => {
           ) : null}
           {skBanner(s!)}
           <Text wrap="truncate-end">
-            {s!.ip ? (
+            {ipIsCurrent(s!) ? (
               <Text>
                 <Text dimColor>ip </Text>
                 <Text bold>{wd(s!.ip)}</Text>
-                <Text dimColor>{'  ' + locate(s!, s!.ip)}</Text>
+                <Text dimColor>{'  ' + locate(s!, s!.ip!)}</Text>
               </Text>
+            ) : s!.ip && !s!.gone ? (
+              // The target moved and said nothing about where it ended up. The last known position
+              // is still worth showing — it is where this session was — but not as `ip`.
+              <Text dimColor>{'moved from ' + wd(s!.ip) + ', position not reported'}</Text>
             ) : (
               <Text dimColor>{s!.gone ? 'the target has ended' : 'no position read yet'}</Text>
             )}
@@ -211,7 +215,9 @@ export const register: Register = on => {
     const disasm = (w: number, budget: number) => {
       if (!s!.disasm) return <Box flexDirection="column">{title('Disassembly', '')}<Text dimColor>no disassembly read yet</Text></Box>
       const all = s!.disasm.rows
-      const at = s!.ip ? all.findIndex(x => norm(x.address) === s!.ip) : -1
+      // Only a position the target is still at can mark a row or claim to be elsewhere.
+      const here = ipIsCurrent(s!) ? s!.ip : null
+      const at = here ? all.findIndex(x => norm(x.address) === here) : -1
       const from = at > 2 ? Math.min(at - 2, Math.max(0, all.length - budget)) : 0
       const shown = all.slice(from, from + budget)
       const bps = new Set((s!.bps ?? []).filter(b => b.enabled).map(b => norm(b.address)))
@@ -220,18 +226,18 @@ export const register: Register = on => {
       // A listing read at an explicit address need not contain the stop — reading a driver's
       // dispatch while stopped in `nt` is the ordinary case. Say where the ip is instead of
       // flagging it, since the position is known and nothing is wrong.
-      const elsewhere = !!s!.ip && at < 0 && !s!.gone
+      const elsewhere = !!here && at < 0
       // Live Secure Kernel control answers with the bytes it guarded and no disassembly, so say so
       // rather than letting an empty mnemonic column read as a failed read.
       const note = (s!.disasm.bytesOnly ? 'bytes at the stop, no disassembly · ' : '') +
         'u ' + wd(s!.disasm.start) +
-        (elsewhere ? ' · ip is elsewhere, at ' + (locate(s!, s!.ip!) || wd(s!.ip)) : '')
+        (elsewhere ? ' · ip is elsewhere, at ' + (locate(s!, here!) || wd(here)) : '')
       return (
         <Box flexDirection="column">
           {title('Disassembly', note)}
           {shown.map(x => {
             const a = norm(x.address)
-            const cur = !s!.gone && a === s!.ip
+            const cur = a === here
             const sp = x.text.indexOf(' ')
             const mn = sp < 0 ? x.text : x.text.slice(0, sp)
             const ops = sp < 0 ? '' : x.text.slice(sp)

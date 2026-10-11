@@ -44,7 +44,7 @@ The pane now picks a register bank per target, and **counts anything it leaves o
 target kind, add its bank — and check the count line rather than the grid.
 
 **And a fixture only covers the shapes it happens to contain**, which is the limit of the paragraph
-above. Review of this directory found **eighteen** more defects in the same class, not one of them
+above. Review of this directory found **twenty-two** more defects in the same class, not one of them
 reachable from these recordings: an asynchronous run reports `moved`/`running` with no stop and
 names its handle in `execution`; `wait_for_stop` nests its stop under `stop`; `run_to_address`
 reports an ending or a timeout through `verdict`, with `stopped_at` deliberately absent;
@@ -65,8 +65,11 @@ all.
 Three of those are worth the extra sentence, because they are not missing fields. `remaining` is
 **nullable where every other listing is not** — an empty array is the success state after clearing
 everything, and `null` means the inventory could not be read — so collapsing them reports an
-unreadable session as a clean one. A *read-only* batch also reports `stopped`, so marking every
-batch as movement would make an inspection look like execution; the position is what decides. And
+unreadable session as a clean one. A *read-only* batch also reports `stopped`, so a batch's note
+distinguishes an inspection from a run — but **not** its staleness, and reading the final position
+as proof that nothing ran was wrong: `SessionAfterInfo::Stopped` carries the instruction pointer and
+no execution flag, and a resume that loops back to the same breakpoint stops where it started having
+changed every register. And
 `breakpoints` means two different things by tool: on the listing it *is* the answer, so empty means
 none, while on a `set_breakpoint` it is an inspection taken after the mutation and best-effort, so
 empty means it could not be read — and `breakpoint` beside it reports what the call actually did,
@@ -89,6 +92,25 @@ says `read_size` cannot answer the question — the pane drew the shortfall with
 **Most of the tool surface is named nowhere here**, and that is correct rather than a to-do list:
 this draws five panels and a command window, not a view per tool.
 
+**And the audit was still half a rule, because it only covered the fold.** The round after it found
+that every one of those careful model-side decisions was being undone at the **draw**: a fold that
+sees movement with no position deliberately keeps the old `ip` and does not stamp `ipAt`, and the
+renderer printed that address as `ip` anyway, marked its row `▶`, and said "ip is elsewhere" about a
+position nothing had re-read. The register grid already asked a version of the question and the
+other three sites did not — one rule, applied in one of four places, which is what makes a class fix
+look finished. `ipIsCurrent` is now the single predicate and the renderer has no opinion of its own.
+So: a reading folded carefully is not a reading drawn correctly, and the place to check a staleness
+rule is every site that paints the thing.
+
+Three more from that round, each a field read instead of inferred. `Sessions::current` routes an
+unaddressed call to the **newest** session that accepts one and no addressed call moves it, so the
+pane now applies that rule rather than following whichever session was last named — which had it
+pointing at the older of two open sessions while the server routed elsewhere.
+`SessionEnded.released` says whether the *worker* let go of the target, not whether the session is
+open, so a worker killed holding one left the session marked unresolved for ever;
+`recovery_required` is the field that means unconfirmed, and `target_left_running` is the teardown
+fact that is not recoverable afterwards.
+
 So when you add a branch here, read the field in `src/structured.rs` rather than inferring it from
 a payload in `tests/` — the recordings are evidence of what the server *did* send, never of what it
 *can*. The field's doc comment usually states the distinction that matters, and in all three cases
@@ -107,7 +129,7 @@ at all. The tell is the report itself: `command` and `output` are the two plain 
 the second without the first. The pane now marks the reads stale and says the target stopped without
 saying where.
 
-**One of the eighteen is the host's contract rather than the server's, and it is the same mistake
+**One of the twenty-two is the host's contract rather than the server's, and it is the same mistake
 one layer out.** A `tool.call` hook is handed the MCP record, so an MCP server's own `isError`
 rides on `ran.result` — the very object `payloadOf` reads the payload out of — while the engine
 also sets one on the result `next` resolves to. The hook read the outer flag alone and folded error

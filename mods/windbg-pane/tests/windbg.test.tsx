@@ -110,7 +110,9 @@ test('a live kernel attach keeps its control registers and reports the refresh',
   expect(map.get('cr3')).toBe('0x00000000007d5000')
   expect(map.get('xcr0')).toBeDefined()
   expect(v.log.find(e => e.tool === 'modules')!.note).toBe('156 loaded, refreshed from 1')
-  expect(v.log.find(e => e.tool === 'end_session')!.note).toBe('released')
+  // The recordings carry `target_left_running`, which the note now reads: a live kernel
+  // resumed and actively detached is the only teardown fact not recoverable afterwards.
+  expect(v.log.find(e => e.tool === 'end_session')!.note).toBe('released, target left running')
 })
 
 test('the kernel pane draws cr3, drops nothing silently, and says where the ip is', async ($, on) => {
@@ -464,7 +466,10 @@ test('a result is folded into the session its call began on, not the current one
   open('sess-2', 'two.exe')
   expect(v.current).toBe('sess-2')
 
-  // An implicit call begins while s2 is current... but the pane is switched to s1 first.
+  // An explicit call to s1 must **not** make s1 current. `Sessions::current` takes the newest
+  // session that accepts an unaddressed call and nothing a call naming a `session_id` changes it,
+  // so moving the pane's would pin the next implicit call to a session the server is not routing
+  // it to — one target's registers, stack and memory drawn under another.
   {
     const a = { session_id: 'sess-1' }
     const [st, n] = begin(v, 'registers', a)
@@ -475,39 +480,30 @@ test('a result is folded into the session its call began on, not the current one
       ms: 1,
     })
   }
-  expect(v.current).toBe('sess-1')
-
-  // A slow implicit call starts here — pinned to s1, the current session at `begin`.
-  const slow = begin(v, 'backtrace', {})
-  v = slow[0]
-  // An explicit call to s2 lands first and makes s2 current.
-  {
-    const a = { session_id: 'sess-2' }
-    const [st, n] = begin(v, 'registers', a)
-    v = finish(st, n, 'registers', a, {
-      ok: true,
-      data: { status: 'ok', registers: [{ name: 'rax', value: '0x2' }], instruction_pointer: '0x2222' },
-      error: '',
-      ms: 1,
-    })
-  }
   expect(v.current).toBe('sess-2')
 
-  // Now the slow one answers. Its frames belong to s1.
+  // A slow implicit call starts here — pinned to s2, the current session at `begin`.
+  const slow = begin(v, 'backtrace', {})
+  v = slow[0]
+  // Opening a third session *does* move it, legitimately: the new session is the newest.
+  open('sess-3', 'three.exe')
+  expect(v.current).toBe('sess-3')
+
+  // Now the slow one answers. Its frames belong to s2, where it began — not to s3.
   v = finish(v, slow[1], 'backtrace', {}, {
     ok: true,
-    data: { status: 'ok', frames: [{ index: 0, address: '0x1111', symbol: 'one!main' }] },
+    data: { status: 'ok', frames: [{ index: 0, address: '0x2222', symbol: 'two!main' }] },
     error: '',
     ms: 1,
   })
-  const s1 = v.sessions.find(x => x.id === 'sess-1')!
   const s2 = v.sessions.find(x => x.id === 'sess-2')!
-  expect(s1.frames!.map(f => f.symbol)).toEqual(['one!main'])
-  // Null rather than empty: s2 has had no stack read at all, which is what being misfiled would
+  const s3 = v.sessions.find(x => x.id === 'sess-3')!
+  expect(s2.frames!.map(f => f.symbol)).toEqual(['two!main'])
+  // Null rather than empty: s3 has had no stack read at all, which is what being misfiled would
   // have changed.
-  expect(s2.frames).toBe(null)
+  expect(s3.frames).toBe(null)
   // And the log entry still names the session it began on.
-  expect(v.log.find(e => e.n === slow[1])!.session).toBe('sess-1')
+  expect(v.log.find(e => e.n === slow[1])!.session).toBe('sess-2')
 })
 
 test('clearing breakpoints replaces the inventory, and an unreadable one is not a clean one', () => {
@@ -621,11 +617,15 @@ test('a batch is folded from what the session holds afterwards', () => {
   expect(moved.movedAt).toBeGreaterThan(moved.regsAt)
   expect(moved.ip).toBe('4000')
 
-  // A read-only batch reports `stopped` at the same place: not movement, or every inspection
-  // would look like execution.
-  const read = batch({ state: 'stopped', ip: '0x1000' }).sessions[0]!
-  expect(read.movedAt).toBe(base.sessions[0]!.movedAt)
-  expect(read.regsAt).toBeGreaterThan(read.movedAt)
+  // A batch that stops where it started is **not** evidence that nothing ran: `after` carries the
+  // position and no execution flag, and a resume that loops back to the same breakpoint lands here
+  // having changed every register. So the reads are stale, and the note is where the distinction
+  // an inspection deserves is kept.
+  const sameSpot = batch({ state: 'stopped', ip: '0x1000' })
+  const read = sameSpot.sessions[0]!
+  expect(read.movedAt).toBeGreaterThan(read.regsAt)
+  expect(read.ip).toBe('1000')
+  expect(sameSpot.log[sameSpot.log.length - 1]!.note).toBe('batch stopped at 00000000`00001000, position unchanged')
 
   // Running, detached, ended and uncertain all stale the earlier reads.
   const running = batch({ state: 'running', why: 'a resume step' }).sessions[0]!
@@ -1157,4 +1157,93 @@ test('a short read says why it stopped, which the byte count cannot', () => {
   expect(read('interrupted')).toBe('4 bytes, 8 requested, was interrupted')
   // Absent means the whole range was read — so a short read with no reason claims none.
   expect(read(undefined)).toBe('4 bytes, 8 requested')
+})
+
+test('a position the target has moved away from is never drawn as the ip', async ($, on) => {
+  // The pane folds a stop, then a run that reports no position. The model deliberately keeps the
+  // old `ip` and does not stamp `ipAt`; the renderer has to honour that or the care is undone at
+  // the draw — the header printed the old address as `ip`, the disassembly marked it `▶`, and the
+  // panel note said "ip is elsewhere" about a position nothing had re-read.
+  const answers: unknown[] = [
+    { status: 'ok', kind: 'launch', session_id: 'sess-stale', target: 'x.exe' },
+    { status: 'ok', start: '0x1000', instructions: [
+      { address: '0x1000', bytes: '90', module: 'x', rva: '0x1000', text: 'nop' },
+      { address: '0x1001', bytes: '90', module: 'x', rva: '0x1001', text: 'nop' },
+    ] },
+    { status: 'ok', command: 'g', interrupted: false, timed_out: false, target_gone: false, output: 'Breakpoint 0 hit', stopped_at: '0x1000' },
+  ]
+  let i = 0
+  on('tool.call', async () => {
+    const data = answers[i++]!
+    const text = JSON.stringify(data)
+    return { result: { content: [{ type: 'text', text }], isError: false, structuredContent: data }, text }
+  })
+  await $.tool.call({ tool: 'mcp__windbg__launch', command: 'x.exe' })
+  await $.tool.call({ tool: 'mcp__windbg__disassemble', address: '0x1000', count: 2 })
+  await $.tool.call({ tool: 'mcp__windbg__go' })
+
+  const mount = () => $.ui.mount({
+    plugin: 'windbg-pane',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'windbg',
+    props: { title: 'WinDbg', isFocused: false, bodyColumns: 140, placement: 'dock', scroll: { offset: 0, bodyRows: 48 }, view: {} },
+    viewport: { columns: 220, rows: 50, isFullscreen: true },
+  })
+  const text = async (ui: Awaited<ReturnType<typeof mount>>) =>
+    (await ui.findAll({ type: 'Text' })).map(x => x.text).join('\n')
+
+  // Stopped at a known position: it is the ip, and its row is marked.
+  const first = await mount()
+  const atStop = await text(first)
+  expect(atStop).toMatch(/ip 00000000`00001000/)
+  expect(atStop).toMatch(/▶/)
+  await first.unmount()
+
+  // A positionless stop — a module-load break, where the engine answers no thread context.
+  answers.push({ status: 'ok', command: 'g', interrupted: false, timed_out: false, target_gone: false, output: 'ModLoad: ntdll.dll' })
+  await $.tool.call({ tool: 'mcp__windbg__go' })
+  const second = await mount()
+  const after = await text(second)
+  expect(after).toMatch(/moved from 00000000`00001000, position not reported/)
+  // Not as the ip, not marked in the listing, and not called "elsewhere".
+  expect(after).not.toMatch(/ip 00000000`00001000/)
+  expect(after).not.toMatch(/▶/)
+  expect(after).not.toMatch(/ip is elsewhere/)
+  await second.unmount()
+})
+
+test('a teardown is unresolved only where the server says recovery is required', () => {
+  const end = (payload: Record<string, unknown>) => {
+    let v = EMPTY
+    const a = { command: 'x.exe' }
+    const [o, m] = begin(v, 'launch', a)
+    v = finish(o, m, 'launch', a, {
+      ok: true,
+      data: { status: 'ok', kind: 'launch', session_id: 'sess-end', target: 'x.exe' },
+      error: '',
+      ms: 1,
+    })
+    const b = { session_id: 'sess-end' }
+    const [st, n] = begin(v, 'end_session', b)
+    v = finish(st, n, 'end_session', b, { ok: true, data: { status: 'ok', session_id: 'sess-end', ...payload }, error: '', ms: 1 })
+    return { state: v.sessions[0]!.state, note: v.log[v.log.length - 1]!.note }
+  }
+
+  // `released` says whether the *worker* let go of the target, not whether the session is still
+  // open: one killed holding its target answers `false` while the supervisor has closed the
+  // session anyway. Reading it as the state left such a session marked `unresolved` for ever.
+  expect(end({ released: false, worker_terminated: true, recovery_required: false, target_left_running: false }))
+    .toEqual({ state: 'closed', note: 'the worker did not release the target, target did not outlive the session' })
+
+  // `recovery_required` is the field that says a teardown is unconfirmed — "this response is not a
+  // confirmed detach" — and only the preserved live-control case sets it.
+  expect(end({ released: false, worker_terminated: true, recovery_required: true }))
+    .toEqual({ state: 'unresolved', note: 'the worker did not release the target, recovery required' })
+
+  // An attached process detached and left running; and a dump, which has nothing that outlives it.
+  expect(end({ released: true, worker_terminated: false, recovery_required: false, target_left_running: true }))
+    .toEqual({ state: 'closed', note: 'released, target left running' })
+  expect(end({ released: true, worker_terminated: false, recovery_required: false }))
+    .toEqual({ state: 'closed', note: 'released' })
 })
