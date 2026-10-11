@@ -146,6 +146,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The live Secure Kernel tier says what a pass does not assert** (`FOLLOWUPS.md` item 124, half
+  landed). Its stopped read is checked for the stop's epoch and for bytes beginning with the
+  guarded instruction, which shows the Secure Kernel can be read at a held stop; nothing compares
+  the answer's `gpa` with VTL0's translation or effective access to the same address, because the
+  live transport is pinned to VTL1 by its control protocol and the admitted provider template.
+  `docs/smoke-test.md` and the test now say so, so a green run is not read as showing the memory
+  is protected. The comparison is decided for and not built: the item carries the shape, a VTL0
+  kernel session held beside the VTL1 one as the hypervisor tier holds NT beside the hypervisor.
+
 - **`driver_hazards` takes a privileged instruction's family from the decoder**, as it already took
   whether the instruction is privileged at all. `dbgscope` now answers both (glslang/dbgscope#153):
   on x86 from iced's CPUID features, implicit registers and flags, and on ARM64 from the

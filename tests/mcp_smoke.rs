@@ -20164,6 +20164,10 @@ fn secure_kernel_kd_tier() -> Option<Value> {
 /// VM identity, current partition/CR3, `vmwp` PID and dispatcher pointer, provider commands,
 /// exact-build profile, and guarded instruction. The opener repeats those coordinates to each
 /// provider and the adapter revalidates the VM-to-`vmwp` binding before mutation.
+///
+/// A pass shows the Secure Kernel can be read, stepped and released at a held stop. It does not
+/// show that the memory read was protected from VTL0; the note at the stopped read says why
+/// (`FOLLOWUPS.md` item 124).
 #[test]
 #[ignore = "controls one explicitly disposable VBS VM; set WINDBG_MCP_SMOKE_SK_LIVE and run alone"]
 fn a_live_secure_kernel_session_stops_steps_inspects_resumes_and_closes() {
@@ -20269,6 +20273,15 @@ fn a_live_secure_kernel_session_stops_steps_inspects_resumes_and_closes() {
                 .starts_with(&expected_prefix),
             "the stopped read does not begin with the guarded instruction: {read}"
         );
+        // What that read establishes, and what it does not (`FOLLOWUPS.md` item 124). It is of the
+        // stop's own epoch and begins with the guarded instruction's bytes, so the Secure Kernel
+        // *can* be read while a stop is held. Nothing here asserts that VTL0 could not make the
+        // same read: the answer's `gpa` is the VTL1 walk's translation and is not read by this
+        // test, and no VTL0 translation or effective access is reported beside it to compare —
+        // the live transport is pinned to VTL1 by its control protocol and the admitted provider
+        // template, and the one negative that would rule the *page* out (the same GPA, denied to
+        // VTL0 by the effective VTL permission) is visible only to an access attempted from VTL0.
+        // A green run is not evidence that the memory read is protected.
 
         let configured_steps = config.get("steps").and_then(Value::as_array);
         let perform_step = config

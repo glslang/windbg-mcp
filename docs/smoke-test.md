@@ -206,6 +206,19 @@ the epoch to single-step, consumes the next epoch to restore and continue, then 
 to report both release and a running target. Run it alone through the bench's independent VM
 heartbeat/crash/unchanged-text wrapper. The repository stores none of the config or evidence.
 
+**What a green run of the live tier does not assert: that the memory it read is protected.** The
+stopped read is checked for the stop's epoch and for bytes that begin with the guarded instruction,
+which shows the Secure Kernel *can* be read while a stop is held. Nothing in the tier asserts that
+the normal kernel could not make the same read. The answer's `gpa` is the VTL1 page-table walk's
+translation, and no VTL0 translation or effective access is reported beside it to compare it with,
+because the live transport is pinned to VTL1 by its control protocol and by the admitted provider
+template — and the one outcome that would rule the *page* out, the same GPA mapped in both and
+denied to VTL0 by the effective VTL permission, is visible only to an access attempted from VTL0,
+which no host-side reader makes. A pass therefore supports "the Secure Kernel was read" and not
+"this memory is protected". `FOLLOWUPS.md` item 124 holds what would add the second claim and the
+shape decided for it: a VTL0 kernel session beside the VTL1 one, the way the hypervisor tier holds
+the hypervisor beside NT.
+
 **The managed Secure Kernel KD tier uses the same disposable-machine boundary.**
 WINDBG_MCP_SMOKE_SK_KD names a private JSON config with kd, profile, control_transport,
 live_transport, vm_id, a post_release_audit command array and optional vp/arm_mode. The exact
