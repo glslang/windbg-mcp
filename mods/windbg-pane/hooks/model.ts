@@ -169,7 +169,7 @@ function freshSession(v: View, id: string): Session {
   return {
     id, label: 's' + (v.sessions.length + 1), kind: '', target: '', state: 'open',
     regs: null, prevRegs: null, regsAt: -1, ip: null, ipAt: -1, movedAt: -1,
-    disasm: null, frames: null, framesTruncated: false, framesAt: -1, mem: null, memAt: -1, bps: null, gone: false,
+    disasm: null, frames: null, framesTruncated: false, framesAt: -1, mem: null, memAt: -1, bps: null, bpsAt: -1, gone: false,
     bugCheck: null, sk: null, skPhase: '',
   }
 }
@@ -301,21 +301,38 @@ export function ipIsCurrent(s: Session): boolean {
 }
 
 /**
- * The session an unaddressed call reaches: the **newest** one still eligible.
+ * Whether the breakpoint inventory may have been consumed since it was read.
  *
- * This is `Sessions::current` — `self.all.iter().rev().find(|s| s.state().accepts_default())` —
- * written as the same rule rather than as an approximation of its effects, so the pane's idea of
- * where an implicit call goes cannot drift from the server's. Which states are eligible is the one
- * part that has to be approximated, because `accepts_default` is an enum this pane does not have:
- * its own `state` is a display string. So only the two it knows are ineligible are excluded — a
- * session that has closed, and one the server has said it does not know. A target that has *gone*
- * stays eligible on purpose: `session_status` reports such a session `open`, and `end_session` is
- * what it is still there for.
+ * The other four reads go stale on any movement; this one does not — an ordinary breakpoint
+ * survives a `go`, and greying the panel on every step would be wrong. A **one-shot** does not:
+ * DbgEng removes it when it is hit, so a run after the inventory was read can have deleted an
+ * entry the pane would otherwise go on drawing as armed. So the condition is the two facts
+ * together, which is why this is a predicate and not a `stale` flag like the others.
+ */
+export function bpsMayBeStale(s: Session): boolean {
+  return !!s.bps && s.movedAt > s.bpsAt && s.bps.some(b => b.oneShot)
+}
+
+/**
+ * The states `SessionState::accepts_default` refuses that this pane can actually name.
+ *
+ * `accepts_default` is `accepts_handle() || Retired`, and `accepts_handle` admits `Opening`,
+ * `Attaching`, `Open` and six of the Secure Kernel KD phases — so `Failed`, `KernelUnresolved`,
+ * `LiveControlUnresolved`, `Closed` and the remaining KD phases are all refused. The pane sees
+ * display strings rather than that enum, so this names the four it can recognise and **cannot** be
+ * complete: the KD phases in particular are a list it would have to keep in step. That is why the
+ * server's own answer wins wherever it has been read — see `routed` below.
+ */
+const NOT_ROUTABLE = new Set(['closed', 'failed', 'unresolved', 'unknown to the server'])
+
+/**
+ * The newest session that could take an unaddressed call: `Sessions::current`'s `rev().find(…)`,
+ * as far as the pane can tell. Used only as the fallback when the believed session has stopped
+ * being eligible and no status call has said which one took over.
  */
 function newestOpen(sessions: Session[]): string | null {
   for (let i = sessions.length - 1; i >= 0; i--) {
-    const st = sessions[i]!.state
-    if (st !== 'closed' && st !== 'unknown to the server') return sessions[i]!.id
+    if (!NOT_ROUTABLE.has(sessions[i]!.state)) return sessions[i]!.id
   }
   return null
 }
@@ -378,9 +395,35 @@ function sessionState(st: Obj | null): string {
  * about what the session holds. That is the case the pane least wants to skip — `uncertain` is
  * precisely the answer that says the earlier reads can no longer be trusted.
  */
+/**
+ * What a batch's steps say they changed, from `BatchStepInfo::changes` in both blocks.
+ *
+ * Read because it is the only thing that invalidates the **disassembly**, and the stale marks the
+ * other panels carry cannot stand in for it: `movedAt` is movement, and movement does not change
+ * code — a listing greyed on every step would be wrong. A *patched byte* does change it, and
+ * patching a byte is what `debug_batch` is for. The field is the executor's own record, "recorded
+ * whether or not the step then succeeded", since a command that errors may already have written;
+ * the `always` block counts too, because a rollback writes.
+ */
+function batchChanges(d: Obj): string[] {
+  const blocks = [d.steps, d.always].flatMap(b => (Array.isArray(b) ? (b as unknown[]) : []))
+  return blocks.flatMap(x => {
+    const o = obj(x)
+    const c = o ? str(o.changes) : ''
+    return c ? [c] : []
+  })
+}
+
 function foldBatch(s: Session, d: Obj, n: number): string {
+  // Before the `after` guard: a batch can report what it wrote and fail to probe the session, and
+  // what it wrote is true either way.
+  const changed = batchChanges(d)
+  // Dropped rather than stamped. A stamp would say the listing is old; this says the pane does not
+  // know what is at those addresses any more, which is the honest claim once a step has written.
+  if (changed.length) s.disasm = null
+  const wrote = changed.length ? '; wrote ' + changed.join(', ') : ''
   const after = obj(d.after)
-  if (!after) return ''
+  if (!after) return wrote ? wrote.slice(2) : ''
   const state = str(after.state)
   const ip = norm(after.ip)
   const why = str(after.why) ? ': ' + str(after.why) : ''
@@ -399,32 +442,32 @@ function foldBatch(s: Session, d: Obj, n: number): string {
     // read drawn as current when the target has moved under it is the defect this whole pane is
     // about, and a panel greyed after an inspection costs one re-read.
     s.movedAt = n
-    if (!ip) return 'batch stopped, position not reported'
+    if (!ip) return 'batch stopped, position not reported' + wrote
     const same = ip === s.ip
     s.ip = ip
     s.ipAt = n
-    return 'batch stopped at ' + where(s, ip) + (same ? ', position unchanged' : '')
+    return 'batch stopped at ' + where(s, ip) + (same ? ', position unchanged' : '') + wrote
   }
   if (state === 'running') {
     s.movedAt = n
-    return 'batch left the target running' + why
+    return 'batch left the target running' + why + wrote
   }
   if (state === 'detached') {
     s.movedAt = n
     s.state = 'detached'
-    return 'batch detached the target' + by
+    return 'batch detached the target' + by + wrote
   }
   if (state === 'ended') {
     s.movedAt = n
     s.gone = true
     s.ip = null
-    return 'batch ended the target' + by
+    return 'batch ended the target' + by + wrote
   }
   if (state === 'uncertain') {
     // The server reports not knowing rather than guessing, so neither does the pane: what it
     // cannot claim is that the reads taken before the batch still describe the target.
     s.movedAt = n
-    return 'batch left the session uncertain' + why
+    return 'batch left the session uncertain' + why + wrote
   }
   return ''
 }
@@ -457,6 +500,9 @@ export function finish(v: View, n: number, tool: string, args: Record<string, un
     stranded ??
     (pinned !== undefined ? pinned : typeof args.session_id === 'string' ? args.session_id : v.current)
   let sessions = v.sessions
+  // Set only from `SessionInfo::current`, which is the server's own answer to which session an
+  // unaddressed call reaches. See the `current` computation at the end of this function.
+  let routed: string | null = null
   let s: Session | null = null
   if (sid) {
     const found = sessions.find(x => x.id === sid)
@@ -637,6 +683,7 @@ export function finish(v: View, n: number, tool: string, args: Record<string, un
     // an unreadable session as a clean one.
     if (Array.isArray(d.breakpoints) && (tool !== 'set_breakpoint' || d.breakpoints.length > 0)) {
       s.bps = readBps(d.breakpoints)
+      s.bpsAt = n
       if (tool === 'set_breakpoint') note = s.bps.length + ' breakpoint(s)'
     } else if (tool === 'set_breakpoint') {
       const set = readBps([d.breakpoint])
@@ -645,6 +692,7 @@ export function finish(v: View, n: number, tool: string, args: Record<string, un
       const replaced = Array.isArray(d.replaced) ? d.replaced : []
       const kept = (s.bps ?? []).filter(b => !replaced.includes(b.id) && !set.some(x => x.id === b.id))
       s.bps = [...kept, ...set]
+      s.bpsAt = n
       note = (set.length ? 'breakpoint ' + set[0]!.id + ' set' : 'set') + ', inventory could not be read'
     }
     // A clear answers with `remaining` and carries no `breakpoints` at all, so the branch above
@@ -658,9 +706,11 @@ export function finish(v: View, n: number, tool: string, args: Record<string, un
       const remaining = d.remaining
       if (Array.isArray(remaining)) {
         s.bps = readBps(remaining)
+        s.bpsAt = n
         note = s.bps.length === 0 ? 'all breakpoints cleared' : s.bps.length + ' breakpoint(s) remaining'
       } else {
         s.bps = null
+        s.bpsAt = n
         note = 'cleared, inventory could not be read'
       }
     }
@@ -747,11 +797,13 @@ export function finish(v: View, n: number, tool: string, args: Record<string, un
         // and until this is read the pane goes on drawing the pre-run reads as current.
         const moving = obj(o.execution)?.stopped === false
         if (moving) t.movedAt = n
-        // `SessionInfo::current` is deliberately *not* folded. It is the server's own answer to
-        // "is a call that names no session routed here", and it is better than the rule below —
-        // but it is an answer about one instant, and keeping it would mean a field on the state
-        // contract to hold it until something contradicted it. The rule below needs none and is
-        // right whenever the pane has seen every opener, which it has.
+        // `SessionInfo::current` — "whether a call that names no session is routed here" — is the
+        // authority, and declining to read it last round was wrong. The objection was that it
+        // answers about one instant and would need somewhere to live; `current` on the view is
+        // that somewhere, now that it is a belief rather than a per-call derivation. It is the
+        // only way the pane learns that the server has moved off a session whose ineligible state
+        // the pane cannot name — a KD phase, say.
+        if (o.current === true) routed = t.id
         said.push(t.label + ' ' + t.state + (moving ? ', target moving' : ''))
       }
       // An `unknown_handle` is the complement in the same payload, and reading `sessions` alone
@@ -821,7 +873,16 @@ export function finish(v: View, n: number, tool: string, args: Record<string, un
   // the misfiling an earlier round fixed, arrived at from the other end. An opener moves it
   // (the new session *is* the newest), `session_status` overrides it with the server's own answer,
   // and otherwise it moves only when the session it names has closed — mirroring that `rev()`.
-  const current = newestOpen(sessions) ?? v.current
+  // **A belief updated by the events that change it, not a value derived on every call.** That was
+  // the mistake in the previous fix: recomputing it meant encoding `accepts_default`, and the
+  // pane's states are display strings rather than that enum — so a newest session that had gone
+  // `failed` or `unresolved` was still chosen while the server had moved on to the older one, which
+  // is the same misfiling one layer down. It moves on exactly three things: an opener (the new
+  // session is the newest and accepts a default call), a `session_status` row saying `current`
+  // (the server's own answer, and the authority), and the believed session ceasing to be eligible
+  // — where the fallback is a guess that the next status call corrects.
+  const believed = v.current && sessions.some(x => x.id === v.current && !NOT_ROUTABLE.has(x.state))
+  const current = opened ?? routed ?? (believed ? v.current : newestOpen(sessions) ?? v.current)
   const log = v.log.map(e =>
     e.n === n ? { ...e, session: sid, status: out.ok ? ('ok' as const) : ('error' as const), note, ms: out.ms } : e,
   )

@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
 import type { LogEntry, Session } from '../types'
-import { EMPTY, answered, begin, finish, ipIsCurrent, norm, payloadOf, regHex, shapeOf, wd, windbgTool } from './model'
+import { EMPTY, answered, begin, bpsMayBeStale, finish, ipIsCurrent, norm, payloadOf, regHex, shapeOf, wd, windbgTool } from './model'
 
 const PANE = 'windbg'
 const TITLE = 'WinDbg'
@@ -408,12 +408,15 @@ export const register: Register = on => {
 
     const breakpoints = (budget: number) => {
       if (!s!.bps) return null
+      // A one-shot the target may have hit since this was read is no longer known to be armed, and
+      // only the one-shots are in doubt — an ordinary breakpoint survives a run.
+      const used = bpsMayBeStale(s!)
       return (
         <Box flexDirection="column">
-          {title('Breakpoints', s!.bps.length + ' set')}
+          {title('Breakpoints', used ? 'a one-shot may have been hit since this was read' : s!.bps.length + ' set', used)}
           {s!.bps.slice(0, budget).map(b => (
-            <Text wrap="truncate-end" dimColor={!b.enabled}>
-              <Text color={BAD}>{'● '}</Text>
+            <Text wrap="truncate-end" dimColor={!b.enabled || (used && b.oneShot)}>
+              <Text color={used && b.oneShot ? WARN : BAD}>{'● '}</Text>
               {String(b.id).padEnd(3) + (b.enabled ? 'e ' : 'd ') + (b.address ? wd(b.address) : 'deferred') + '  ' + b.expression + (b.oneShot ? '  /1' : '')}
             </Text>
           ))}
