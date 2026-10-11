@@ -20194,8 +20194,12 @@ fn a_live_secure_kernel_session_stops_steps_inspects_resumes_and_closes() {
         "expected_cr3": required("expected_cr3")
     });
 
-    let mut server = Server::started_with_args(&[], &["--tools", "securekernel"]);
+    // `inspect` as well, because the VTL0 half below runs `execute`, which lives there.
+    let mut server = Server::started_with_args(&[], &["--tools", "securekernel,inspect"]);
     let mut session: Option<String> = None;
+    // The coordinate the stopped read reported — its VTL1 address and the GPA the walk resolved —
+    // carried out of the closure for the VTL0 half, which runs after this session is released.
+    let mut vtl1_read: Option<(u64, u64)> = None;
     let run = catch_unwind(AssertUnwindSafe(|| {
         let opened = server.tool_data("open_sk_live_control", open, TARGET_STEP);
         session = Some(
@@ -20273,15 +20277,17 @@ fn a_live_secure_kernel_session_stops_steps_inspects_resumes_and_closes() {
                 .starts_with(&expected_prefix),
             "the stopped read does not begin with the guarded instruction: {read}"
         );
-        // What that read establishes, and what it does not (`FOLLOWUPS.md` item 124). It is of the
-        // stop's own epoch and begins with the guarded instruction's bytes, so the Secure Kernel
-        // *can* be read while a stop is held. Nothing here asserts that VTL0 could not make the
-        // same read: the answer's `gpa` is the VTL1 walk's translation and is not read by this
-        // test, and no VTL0 translation or effective access is reported beside it to compare —
-        // the live transport is pinned to VTL1 by its control protocol and the admitted provider
-        // template, and the one negative that would rule the *page* out (the same GPA, denied to
-        // VTL0 by the effective VTL permission) is visible only to an access attempted from VTL0.
-        // A green run is not evidence that the memory read is protected.
+        // What that read establishes on its own (`FOLLOWUPS.md` item 124): it is of the stop's own
+        // epoch and begins with the guarded instruction's bytes, so the Secure Kernel *can* be read
+        // while a stop is held. Whether VTL0 could make the same read is the VTL0 half, taken after
+        // this session is released and only when `vtl0_profile` is configured; without it a green
+        // run is not evidence that the memory read is protected.
+        let read_address = hex_value(read["address"].as_str().unwrap_or_default())
+            .unwrap_or_else(|| panic!("a stopped read reports the address it was of: {read}"));
+        let read_gpa = hex_value(read["gpa"].as_str().unwrap_or_default()).unwrap_or_else(|| {
+            panic!("a stopped read reports the GPA its VTL1 walk resolved: {read}")
+        });
+        vtl1_read = Some((read_address, read_gpa));
 
         let configured_steps = config.get("steps").and_then(Value::as_array);
         let perform_step = config
@@ -20350,7 +20356,236 @@ fn a_live_secure_kernel_session_stops_steps_inspects_resumes_and_closes() {
     if let Err(panic) = run {
         resume_unwind(panic);
     }
-    ran("live Secure Kernel MCP stop/step/resume lifecycle");
+    match config.get("vtl0_profile").and_then(Value::as_str) {
+        Some(profile) => {
+            let (address, gpa) = vtl1_read.expect("the VTL1 half ran through its stopped read");
+            vtl0_readings_beside_the_vtl1_read(&mut server, profile, address, gpa);
+            ran(
+                "live Secure Kernel MCP stop/step/resume lifecycle, with the VTL0 readings beside it",
+            );
+        }
+        None => {
+            eprintln!(
+                "NOT ASSERTED: `vtl0_profile` is not configured, so nothing here says VTL0 could \
+                 not make the same read"
+            );
+            ran("live Secure Kernel MCP stop/step/resume lifecycle");
+        }
+    }
+}
+
+/// The VTL0 half of the live tier (`FOLLOWUPS.md` item 124), after the VTL1 session is released —
+/// a guest held in the VTL1 stop cannot answer KDNET. It opens the guest's ordinary NT kernel
+/// session by `profile` and takes the readings the entry's assertion is made of, on the coordinate
+/// the stopped VTL1 read reported: `address` is the VTL1 virtual address and `gpa` the GPA its
+/// walk resolved.
+///
+/// Three readings make the assertion and a fourth is reported. The **control** is a physical read
+/// of the NT image base's page, which must return its PE header: that proves the command and the
+/// path before anything is concluded from a failure. The **attempt** is the same command on `gpa`.
+/// The two are read together because, measured 2026-10-11, the attempt answers in exactly the form
+/// of a read with no RAM behind it, so on its own it cannot tell *denied* from *absent*; what tells
+/// them apart is that the VTL1 read just returned bytes from that GPA. The fourth, VTL0's virtual
+/// walk of `address`, is printed and not asserted: each of its three outcomes is admissible, and
+/// only the attempt is evidence about the page.
+fn vtl0_readings_beside_the_vtl1_read(server: &mut Server, profile: &str, address: u64, gpa: u64) {
+    with_live_kernel_selector(
+        server,
+        json!({ "profile": profile }),
+        |server, session, attached| {
+            let kernel_base = attached["summary"]["primary_module"]["start"]
+                .as_str()
+                .and_then(hex_value)
+                .unwrap_or_else(|| panic!("the attach reports the kernel's base: {attached}"));
+            let vtop = |server: &mut Server, va: u64| {
+                translated_physical(&server.tool_text(
+                    "execute",
+                    json!({ "command": format!("!vtop 0 {va:x}"), "session_id": session }),
+                    TARGET_STEP,
+                ))
+            };
+            let control = match vtop(server, kernel_base) {
+                Translation::Physical(physical) => physical & !0xfff,
+                Translation::Fails(line) => {
+                    panic!("VTL0 does not translate its own kernel base {kernel_base:#x}: {line}")
+                }
+            };
+            let control_read = physical_read(&server.tool_text(
+                "execute",
+                json!({ "command": format!("!db {control:x} L10"), "session_id": session }),
+                TARGET_STEP,
+            ));
+            match &control_read {
+                PhysicalRead::Bytes(bytes) => assert!(
+                    bytes.starts_with(b"MZ"),
+                    "a physical read of the kernel image base's page is its PE header: {bytes:02x?}"
+                ),
+                PhysicalRead::Failed(line) => panic!(
+                    "the control failed, so a failing attempt would measure the command and not \
+                     the page: {line}"
+                ),
+            }
+            let outcome = match vtop(server, address) {
+                Translation::Fails(line) => format!("no translation ({line})"),
+                Translation::Physical(physical) if physical & !0xfff == gpa & !0xfff => {
+                    format!("the same page, {physical:#x}")
+                }
+                Translation::Physical(physical) => format!("a different page, {physical:#x}"),
+            };
+            eprintln!(
+                "VTL0's walk of {address:#x} reaches {outcome}; VTL1's reached {gpa:#x}. Reported, \
+                 not asserted: only the attempt is evidence about the page."
+            );
+            match secure_kernel_page_read_from_vtl0(server, session, gpa) {
+                PhysicalRead::Failed(line) => {
+                    eprintln!("VTL0's physical read of the Secure Kernel page: {line}");
+                }
+                PhysicalRead::Bytes(bytes) => panic!(
+                    "VTL0 read {} byte(s) of the Secure Kernel page at {gpa:#x} that VTL1 had just \
+                     read: {bytes:02x?}",
+                    bytes.len()
+                ),
+            }
+        },
+    );
+}
+
+/// **GAP** (`FOLLOWUPS.md` item 124): the one `execute` of the Secure Kernel page's GPA on the
+/// VTL0 session, its text handed to [`physical_read`]. It is not written here, so a run with
+/// `vtl0_profile` configured fails at this point rather than passing without the reading.
+fn secure_kernel_page_read_from_vtl0(
+    _server: &mut Server,
+    _session: &str,
+    gpa: u64,
+) -> PhysicalRead {
+    unimplemented!(
+        "the VTL0 reading of the Secure Kernel page at {gpa:#x} is not written (FOLLOWUPS.md \
+         item 124)"
+    )
+}
+
+/// A hexadecimal value as this server and the debugger print one: with or without `0x`, with or
+/// without the debugger's backtick in the middle.
+fn hex_value(text: &str) -> Option<u64> {
+    let text = text.trim().trim_start_matches("0x").replace('`', "");
+    u64::from_str_radix(&text, 16).ok()
+}
+
+/// What `!vtop 0 <va>` answered.
+#[derive(Debug, PartialEq, Eq)]
+enum Translation {
+    /// The last line named a physical address.
+    Physical(u64),
+    /// The line that said the translation fails, verbatim.
+    Fails(String),
+}
+
+/// Reads a `!vtop` answer. The address is on a line of the form
+/// `Virtual address <va> translates to physical address <pa>.`; a walk that stopped says
+/// `translation fails` on its line, with the error code the extension gives.
+fn translated_physical(text: &str) -> Translation {
+    for line in text.lines().map(str::trim) {
+        if let Some(rest) = line.split("translates to physical address ").nth(1)
+            && let Some(physical) = hex_value(rest.trim_end_matches('.'))
+        {
+            return Translation::Physical(physical);
+        }
+        if line.contains("translation fails") {
+            return Translation::Fails(line.to_string());
+        }
+    }
+    panic!("`!vtop` answered neither a physical address nor a failure:\n{text}")
+}
+
+/// What a `!db <physical> L10` answered.
+#[derive(Debug, PartialEq, Eq)]
+enum PhysicalRead {
+    /// The bytes of the one dump line.
+    Bytes(Vec<u8>),
+    /// The `Physical memory read at <address> failed` line, verbatim.
+    Failed(String),
+}
+
+/// Reads a physical `!db` answer. A dump line is `#<address>` followed by sixteen byte columns,
+/// the eighth and ninth joined by `-`, then the ASCII column — which is why the bytes are counted
+/// rather than parsed to the end of the line: an ASCII column can spell a hex pair. A failure is
+/// one line, followed by the extension's caching-attribute warning, which is not read.
+fn physical_read(text: &str) -> PhysicalRead {
+    for line in text.lines().map(str::trim) {
+        if line.starts_with("Physical memory read at ") && line.ends_with(" failed") {
+            return PhysicalRead::Failed(line.to_string());
+        }
+        if let Some(rest) = line.strip_prefix('#') {
+            let bytes: Vec<u8> = rest
+                .split_whitespace()
+                .skip(1)
+                .flat_map(|column| column.split('-'))
+                .take(16)
+                .map_while(|pair| u8::from_str_radix(pair, 16).ok())
+                .collect();
+            if bytes.len() == 16 {
+                return PhysicalRead::Bytes(bytes);
+            }
+        }
+    }
+    panic!("`!db` answered neither a dump line nor a failure:\n{text}")
+}
+
+/// The fixtures are the verbatim answers of the VTL0 kernel session on the disposable VBS guest,
+/// 2026-10-11 (`FOLLOWUPS.md` item 124), which is why the addresses are what they are.
+#[test]
+fn a_vtop_answer_is_read_as_a_physical_address_or_as_the_failing_line() {
+    let translated = "!vtop 0 fffff80772efd130\n\
+                      Amd64VtoP: Virt fffff80772efd130, pagedir 00000000007d5000\n\
+                      Amd64VtoP: PML4E 00000000007d5f80\n\
+                      Amd64VtoP: PDPE 00000000007f70e8\n\
+                      Amd64VtoP: PDE 0000000000821cb8\n\
+                      Amd64VtoP: Large page mapped phys 00000001008fd130\n\
+                      Virtual address fffff80772efd130 translates to physical address 1008fd130.\n";
+    assert_eq!(
+        translated_physical(translated),
+        Translation::Physical(0x1008fd130)
+    );
+    let fails = "!vtop 0 fffff807084da000\n\
+                 Amd64VtoP: Virt fffff807084da000, pagedir 00000000007d5000\n\
+                 Amd64VtoP: PML4E 00000000007d5f80\n\
+                 Amd64VtoP: PDPE 00000000007f70e0\n\
+                 Amd64VtoP: PDE 00000000007f6210\n\
+                 Amd64VtoP: PTE 00000000008966d0\n\
+                 Amd64VtoP: zero PTE\n\
+                 Virtual address fffff807084da000 translation fails, error 0xD0000147.\n";
+    assert_eq!(
+        translated_physical(fails),
+        Translation::Fails(
+            "Virtual address fffff807084da000 translation fails, error 0xD0000147.".to_string()
+        )
+    );
+}
+
+/// Same provenance as the `!vtop` fixtures above.
+#[test]
+fn a_physical_db_answer_is_read_as_its_bytes_or_as_the_failing_line() {
+    let bytes = "!db 1008fd000 L10\n\
+                 #1008fd000 cb 08 48 3b e8 73 7a 41-8b 45 04 a8 20 74 3f 33 ..H;.szA.E.. t?3\n";
+    assert_eq!(
+        physical_read(bytes),
+        PhysicalRead::Bytes(vec![
+            0xcb, 0x08, 0x48, 0x3b, 0xe8, 0x73, 0x7a, 0x41, 0x8b, 0x45, 0x04, 0xa8, 0x20, 0x74,
+            0x3f, 0x33
+        ])
+    );
+    let failed = "!db 1000000000 L10\n\
+                  Physical memory read at 1000000000 failed\n\
+                  If you know the caching attributes used for the memory,\n\
+                  try specifying [c], [uc] or [wc], as in !dd [c] <params>.\n\
+                  WARNING: Incorrect use of these flags will cause unpredictable\n\
+                  processor corruption.  This may immediately (or at any time in\n\
+                  the future until reboot) result in a system hang, incorrect data\n\
+                  being displayed or other strange crashes and corruption.\n";
+    assert_eq!(
+        physical_read(failed),
+        PhysicalRead::Failed("Physical memory read at 1000000000 failed".to_string())
+    );
 }
 
 /// The server-managed facade gate: MCP owns lifecycle and recovery while WinDbg owns the execution

@@ -84,11 +84,18 @@ must treat the end as authoritative in both directions; a sticky "bad" mark rend
 run as a failed one.
 
 **What a passing run establishes, and what it does not.** A live read answers with bytes and the GPA
-its VTL1 walk resolved to, which shows the Secure Kernel *can* be read. Nothing asserts that the
-normal kernel could **not** make the same read, and that is the claim the feature exists to
-demonstrate (item 124). Two traps when reasoning about it. The axis is **physical**: VTL0 and VTL1
-are separate address spaces and a kernel-looking VA is valid-looking in both, so a VTL0 read of a
-Secure Kernel address does not fail — it answers about a different page. And a page-table
-comparison settles it only for the Secure Kernel's *own* addresses: a trustlet's pages **are**
-mapped by VTL0's tables, and the denial is the hypervisor's second-level translation, which no walk
-can see. Only attempting the access from VTL0 shows that.
+its VTL1 walk resolved to, which shows the Secure Kernel *can* be read. Whether the normal kernel
+could **not** make the same read is asserted only when the tier's config names a `vtl0_profile`
+(item 124), and then as a pair of readings on a VTL0 kernel session opened *after* the VTL1
+release — a guest held in the stop cannot answer KDNET — with the server on
+`--tools securekernel,inspect`, since `execute` is in `inspect`. Three traps. The axis is
+**physical**: VTL0 and VTL1 are separate address spaces and a kernel-looking VA is valid-looking in
+both, so a VTL0 read of a Secure Kernel address does not fail — it answers about a different page,
+and VTL0's walk of the address is reported, never relied on. The attempt is a physical read of the
+GPA VTL1 just read from, and measured 2026-10-11 it fails in **exactly the form of a read with no
+RAM behind it** — `Physical memory read at <gpa> failed` — so the attempt alone cannot tell denied
+from absent; the control beside it (the NT image base's page reads back its PE header) and the
+VTL1 read that just returned bytes from that GPA are what make the failure mean something. And a
+page-table comparison settles nothing for a trustlet's pages, which VTL0's tables **do** map. The
+attempt itself is a marked gap in the tier (`secure_kernel_page_read_from_vtl0`), and a configured
+run fails there until it is written.

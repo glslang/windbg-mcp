@@ -2800,6 +2800,17 @@ virtual walk is a fourth, weaker reading — outcome one here — reported and n
 measured says *why* the read fails in that form, and this entry does not guess; the paragraph
 above expected an exception, and at this surface there was none.
 
+**Built around a marked gap, 2026-10-11.** The tier takes the VTL0 half when its config names a
+`vtl0_profile`: after the VTL1 session's release it opens that NT kernel session through
+`with_live_kernel_selector`, reads the kernel base from the attach's typed summary, and takes the
+control (the base page's physical read must return `MZ`), the reported VTL0 walk of the address,
+and the attempt — whose one `execute` is `secure_kernel_page_read_from_vtl0`, left
+`unimplemented!` so a configured run fails there rather than passing without the reading. The
+parsers for the two answer shapes, `translated_physical` and `physical_read`, are pinned by unit
+tests on the verbatim text above. The tier's server moved to `--tools securekernel,inspect`,
+`execute` being in `inspect`. Unrun on the bench as a whole; the parsers ran under `cargo test`.
+What closes the item is the gap filled and one configured run green.
+
 ## Where these items came from
 
 Each cluster above, and what filing it measured. Items named here as *"now in `DONE.md`"* have
