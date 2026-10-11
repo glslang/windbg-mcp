@@ -10092,3 +10092,18 @@ failure reported above. The independent audit passed all three health samples, u
 and restored-register checks; the before/after VTL1 CR3, image base and guarded GPA also matched.
 Those are the recorded observations, not a new boot-ID proof. Plain `cargo test` (including the
 new guest checks), formatting, strict Clippy, the citation test and markdownlint passed.
+
+The next review found that the same guest claim can name its hypervisor endpoint too. The VTL0
+half now requires the attach summary's discovered `kernel_target` to be `windows` before any
+reads. The worker derives that value from kernel mode and an `nt` primary module; a profile's
+declared role cannot substitute for it. The attach-boundary audit is thus: the session comes from
+`attach_kernel`, its guest claim matches the explicit pairing, its discovered target is Windows,
+and its parsed kernel base supplies the physical `MZ` control. Boot continuity remains unbound,
+as stated above. This round adds one guard and its mutation-verified test, not another identity
+mechanism; the measured physical-read answer has not changed.
+
+The Windows-target guard passed the configured K3 tier and independent audit in private run
+`20261011T115805` (`0.22.0+g09a18318-dirty.1b96ef84`, with the exact test source hash recorded).
+All three health samples, unchanged text, matching CR3/base/GPA and restored-register checks
+passed again. Plain `cargo test` passed 1,385 unit tests and 145 smoke tests (20 opt-in tests
+ignored); formatting, strict Clippy and markdownlint passed too.

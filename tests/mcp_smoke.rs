@@ -20396,6 +20396,12 @@ fn vtl0_kernel_base(attached: &Value, guest: &str) -> u64 {
         Some(guest),
         "the VTL0 profile must claim the configured VTL1 guest before reading its memory: {attached}"
     );
+    // The worker derives this from kernel mode and an `nt` primary module, not the profile's role.
+    assert_eq!(
+        attached["summary"]["kernel_target"].as_str(),
+        Some("windows"),
+        "the VTL0 attach must identify the Windows kernel before reading its memory: {attached}"
+    );
     attached["summary"]["primary_module"]["start"]
         .as_str()
         .and_then(hex_value)
@@ -20516,7 +20522,10 @@ fn vtl0_selector_requires_a_profile_and_its_expected_guest_together() {
 fn vtl0_kernel_base_requires_the_expected_guest_claim() {
     let mut attached = json!({
         "profile": { "name": "test-nt", "guest": "test-vm" },
-        "summary": { "primary_module": { "start": "0xfffff80000000000" } }
+        "summary": {
+            "kernel_target": "windows",
+            "primary_module": { "start": "0xfffff80000000000" }
+        }
     });
     assert_eq!(vtl0_kernel_base(&attached, "test-vm"), 0xfffff80000000000);
     for guest in [json!("other-vm"), json!(""), Value::Null] {
@@ -20527,6 +20536,30 @@ fn vtl0_kernel_base_requires_the_expected_guest_claim() {
         );
     }
     attached.as_object_mut().unwrap().remove("profile");
+    assert!(catch_unwind(|| vtl0_kernel_base(&attached, "test-vm")).is_err());
+}
+
+#[test]
+fn vtl0_kernel_base_requires_the_discovered_windows_kernel() {
+    let mut attached = json!({
+        "profile": { "name": "test-nt", "guest": "test-vm", "role": "windows" },
+        "summary": {
+            "kernel_target": "windows",
+            "primary_module": { "start": "0xfffff80000000000" }
+        }
+    });
+    assert_eq!(vtl0_kernel_base(&attached, "test-vm"), 0xfffff80000000000);
+    for target in [json!("hypervisor"), json!("unknown"), Value::Null] {
+        attached["summary"]["kernel_target"] = target;
+        assert!(
+            catch_unwind(|| vtl0_kernel_base(&attached, "test-vm")).is_err(),
+            "a matching guest claim and declared Windows role cannot override the discovered target"
+        );
+    }
+    attached["summary"]
+        .as_object_mut()
+        .unwrap()
+        .remove("kernel_target");
     assert!(catch_unwind(|| vtl0_kernel_base(&attached, "test-vm")).is_err());
 }
 
