@@ -147,7 +147,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **The live Secure Kernel tier says what a pass asserts about protection, and takes the VTL0 half
-  when configured** (`FOLLOWUPS.md` item 124, half landed). Its stopped read is checked for the
+  when configured** (`FOLLOWUPS.md` item 124). Its stopped read is checked for the
   stop's epoch, for bytes beginning with the guarded instruction and for the `gpa` its VTL1 walk
   resolved, which shows the Secure Kernel can be read at a held stop; without a `vtl0_profile` in
   the tier's config nothing says VTL0 could not make the same read, and the run and
@@ -156,9 +156,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   readings the item measured on 2026-10-11: a physical read of the NT image base's page returns
   its PE header, and the same read of the GPA VTL1 just read from fails, in exactly the form of a
   read with no RAM behind it, which is why the pair is the evidence and neither half alone. The
-  attempt's one `execute` is a marked gap (`secure_kernel_page_read_from_vtl0`) a configured run
-  fails at rather than passing without the reading; the answer parsers are pinned on the verbatim
-  text. The tier's server now starts with `--tools securekernel,inspect`.
+  attempt and control both execute `!db <gpa> L10`; any bytes returned by the attempt fail the
+  test and are printed. The answer parsers are pinned on the verbatim text. The tier's server
+  now starts with `--tools securekernel,inspect`.
 
 - **`driver_hazards` takes a privileged instruction's family from the decoder**, as it already took
   whether the instruction is privileged at all. `dbgscope` now answers both (glslang/dbgscope#153):

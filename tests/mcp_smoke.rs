@@ -20165,9 +20165,9 @@ fn secure_kernel_kd_tier() -> Option<Value> {
 /// exact-build profile, and guarded instruction. The opener repeats those coordinates to each
 /// provider and the adapter revalidates the VM-to-`vmwp` binding before mutation.
 ///
-/// A pass shows the Secure Kernel can be read, stepped and released at a held stop. It does not
-/// show that the memory read was protected from VTL0; the note at the stopped read says why
-/// (`FOLLOWUPS.md` item 124).
+/// A pass shows the Secure Kernel can be read, stepped and released at a held stop. With
+/// `vtl0_profile`, it also requires a VTL0 physical read of the same GPA to fail beside a
+/// successful VTL0 control read (`FOLLOWUPS.md` item 124).
 #[test]
 #[ignore = "controls one explicitly disposable VBS VM; set WINDBG_MCP_SMOKE_SK_LIVE and run alone"]
 fn a_live_secure_kernel_session_stops_steps_inspects_resumes_and_closes() {
@@ -20450,18 +20450,13 @@ fn vtl0_readings_beside_the_vtl1_read(server: &mut Server, profile: &str, addres
     );
 }
 
-/// **GAP** (`FOLLOWUPS.md` item 124): the one `execute` of the Secure Kernel page's GPA on the
-/// VTL0 session, its text handed to [`physical_read`]. It is not written here, so a run with
-/// `vtl0_profile` configured fails at this point rather than passing without the reading.
-fn secure_kernel_page_read_from_vtl0(
-    _server: &mut Server,
-    _session: &str,
-    gpa: u64,
-) -> PhysicalRead {
-    unimplemented!(
-        "the VTL0 reading of the Secure Kernel page at {gpa:#x} is not written (FOLLOWUPS.md \
-         item 124)"
-    )
+/// Attempt the same physical read as the VTL0 control on the GPA the stopped VTL1 read reported.
+fn secure_kernel_page_read_from_vtl0(server: &mut Server, session: &str, gpa: u64) -> PhysicalRead {
+    physical_read(&server.tool_text(
+        "execute",
+        json!({ "command": format!("!db {gpa:x} L10"), "session_id": session }),
+        TARGET_STEP,
+    ))
 }
 
 /// A hexadecimal value as this server and the debugger print one: with or without `0x`, with or

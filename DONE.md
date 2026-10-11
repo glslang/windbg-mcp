@@ -170,6 +170,7 @@ engine — it adds a target and leaves the current one alone. The entry records 
 - [Item 118](#118-windbg-mcp-live-control-is-on-by-default-runs-client-supplied-programs-and-has-no-bound-on-a-paused-guest--done-2026-10-09) — [windbg-mcp] Live control is on by default, runs client-supplied programs, and has no bound on a paused guest — done (2026-10-09)
 - [Item 119](#119-windbg-mcp-what-a-vtl1-debugger-still-cannot-do--done-2026-10-07) — [windbg-mcp] The VTL1 capability matrix is live-derived — done (2026-10-07)
 - [Item 73](#73-windbg-mcp-a-drivers-import-directory-can-be-in-a-section-the-loader-freed--done-2026-10-09-dbgscope196) — [windbg-mcp] A driver's import directory can be in a section the loader freed — done (2026-10-09, dbgscope#196)
+- [Item 124](#124-windbg-mcp-nothing-asserts-that-a-live-secure-kernel-read-was-of-memory-vtl0-cannot-reach--done-2026-10-11) — [windbg-mcp] Nothing asserts that a live Secure Kernel read was of memory VTL0 cannot reach — done (2026-10-11)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -9884,3 +9885,189 @@ dispatch path (`0x222FFF`, which no handler accepts), one page was resident and 
 **And the image-file half the entry described as working was not**: `driver_hazards` refused HEVD
 opened as an image target too, because dbgscope's name reader asked for 512 bytes inside a page and
 an image file's section ends at its raw size mid-page. dbgscope#194 fixed that independently.
+
+## 124. [windbg-mcp] Nothing asserts that a live Secure Kernel read was of memory VTL0 cannot reach — **done (2026-10-11)**
+
+**Repo:** `windbg-mcp`. **Origin:** reviewing what a passing live VTL1 run actually establishes,
+2026-10-10.
+
+`sk_live_read_memory` returns the bytes and the GPA its VTL1 page-table walk resolved to, and the
+live tier asserts the *shape* of that answer. Nothing anywhere asserts the half that makes it
+interesting: that the normal kernel could not have made the same read. Every green run therefore
+supports "the Secure Kernel can be read" and none of it supports "this memory is protected", which
+is the claim the feature exists to demonstrate and the one a reader will take from it.
+
+**The right axis is physical, not virtual**, which is what makes this cheap. VTL0 and VTL1 are
+separate address spaces, so the same virtual address resolves through different roots — and a
+kernel-looking VA is *valid-looking in both*, so a VTL0 read of it does not fail, it silently
+answers about a different page. What distinguishes them is the **GPA**: VTL1's translation of a
+Secure Kernel address must reach a page that VTL0's translation of the same address does not. The
+read already reports its own half of that comparison; only the VTL0 root is missing.
+
+The same applies to a trustlet's memory, where the protection is the point rather than an
+implementation detail: a stop at the Secure Kernel's syscall entry holds the caller's stack pointer,
+and a read there is of VTL1 user memory that VTL0 is denied by the hypervisor's second-level
+translation — but the run records only that the read succeeded.
+
+- **Why deferred:** it needs a VTL0 root, and the policy's live transport is pinned `--vtl 1` by
+  design, so a session cannot currently obtain one. Letting a live session read VTL0 widens what it
+  can touch, which is a policy decision rather than a test change — and the walk itself lives in
+  `MemorySource`, so the comparison would either be a second bound root or a one-off translation
+  that deliberately does not rebind. There is also a presentation question: a negative result is
+  only meaningful if its three shapes are distinguished — not mapped, mapped elsewhere, and mapped
+  to the same page but denied by the effective VTL permissions — since all three are passes for
+  different reasons and only the third is visible to nothing but an attempted access.
+- **What would close it:** a live read able to report, beside its own GPA, VTL0's **effective
+  access** to the same virtual address. Three outcomes count as passes and the criterion must
+  admit all three, because GPA protections are **per VTL** — the TLFS gives a higher VTL
+  `HvCallModifyVtlProtectionMask` over a lower one's access, so the same GPA can be mapped in both
+  with different effective permissions. So: VTL0 has no translation; or it translates to a
+  different page; **or it translates to the same page and is denied by the effective VTL
+  permissions**. A criterion written as "different page or none" would call that third case a
+  failure to prove protection when it is the protection working.
+
+  Or, failing all of it, an explicit statement in the tier and in `docs/smoke-test.md` that
+  protection is **not** asserted, so a green run is not read as proving it. A bench-side
+  demonstration also exists and is weaker in one specific way worth recording:
+  `target/private/probe_vtl_split.py` (private) walks both roots
+  through hvlib and compares GPAs, which shows the split but from the **host**, where everything is
+  visible by construction; only a VTL0-side reader shows the denial as the guest experiences it.
+
+  **And only the third outcome is evidence about the *page*, which this entry had wrong.** A GPA
+  can be mapped at more than one virtual address, so "no translation" and "translates elsewhere"
+  establish that *this* virtual address does not reach the GPA and nothing more: VTL0 may reach the
+  same page through another mapping, and a walk of one address cannot see that. What rules the page
+  out is the effective VTL permission on the GPA itself — the third outcome. So the first two are
+  evidence about the address the Secure Kernel or a trustlet actually uses, which is worth
+  reporting and is the weaker claim, and the criterion above admits all three as passes without
+  any of them being proof on its own. Wording that counted the first two as proof that VTL0 cannot
+  reach the memory was a review finding on this item, and it was right.
+- **Where it picks up:** `MemorySource::bind_root`/`walk_space` in `src/skdispatch.rs`;
+  `SkLiveReadArgs` and the read handler in `src/server.rs`; `secure_kernel_live_tier` and its
+  consuming test in `tests/mcp_smoke.rs`; the live-tier claims in
+  [`docs/smoke-test.md`](./docs/smoke-test.md).
+
+**Landed, 2026-10-11: the statement, not the comparison.** The fallback this entry named is in
+place — the live tier's stopped read carries a comment saying what it establishes and what it does
+not, the test's doc comment says a pass does not show the memory read was protected, and
+`docs/smoke-test.md`'s live-tier section says the same for a reader who never opens the test. Two
+corrections to this entry's own first paragraph, made while writing them. The live tier does not
+assert the *shape* of the read's answer: it asserts that the read's `epoch` is the stop's and that
+`data` begins with the guarded instruction's bytes, and it does not read `gpa` at all — the
+`sk_read_memory` assertion in the *capture* tier is the one that checks a `gpa` is reported. And
+"nothing anywhere asserts" was true of the code and of the docs alike; the docs now say so rather
+than leaving it to be inferred from what the assertions omit.
+
+**Decided 2026-10-11: admit the VTL0 root — and hold both VTLs the way the NT kernel and the
+hypervisor are held, as two sessions on one guest rather than as a mode of one.** Where the pin
+actually is, re-derived: not in the policy file, which carries no VTL field at all. It is in the
+operator's provider command template, which the policy admits token for token with only
+`{partition_id}`, `{vp}` and `{cr3}` expanded, and in `skcontrol::TargetIdentity::validate`, which
+refuses any identity whose `vtl` is not 1 ("this protocol revision controls VTL1") —
+`TargetSelector::require` and `HeldEvent::validate` repeat the check. So widening the live
+transport itself to VTL0 is a protocol revision as well as a template, and it would hand the VTL0
+half a second copy of machinery the normal kernel already has a debugger for. The shape to build
+instead is the hypervisor pair's (`.claude/skills/live-hypervisor/SKILL.md`): VTL0 is the guest's
+ordinary NT KDNET endpoint, opened with `attach_kernel` through a profile carrying a `guest`, and
+VTL1 is the live-control session or the managed KD facade beside it, each in its own worker, joined
+by that `guest` claim — an assertion rather than a check, exactly as it is for the pair. The KD work
+is what makes the VTL1 side look like the VTL0 side: `open_sk_kd` serves a held VTL1 stop as a
+serial KD target on a named pipe, so an `attach_kernel` onto that pipe would give VTL1 the same
+`read_memory` and `execute` the NT session has, and the comparison this item wants becomes one
+address translated by two kernel sessions. **The facade self-attach is unmeasured**: this server
+has never attached to its own facade. The third outcome — the only one that rules the *page* out —
+is an access attempted from VTL0, and what that attempt does is the paragraph after the next.
+
+- **Where it picks up now:** the `guest` and `role` claims on a profile (`src/kdconn.rs`,
+  `docs/kernel-profiles.md`); `open_sk_kd` and its connection string
+  (`docs/secure-kernel/kd-facade.md`, "Running the managed session"); the VTL1 check in
+  `skcontrol::TargetIdentity::validate`, which a facade-attached session never meets because it is
+  on the KD side of the pipe; and the three-outcome criterion above, which is what a two-session
+  comparison has to report per address.
+
+**The third outcome is a fault, and the fault is the result.** The commit that recorded the
+decision called what the guest does on that access "not known here", and that was the wrong
+frame. To VTL0 the page is not a mapped physical page at all — the denial is the hypervisor's
+second-level translation, not a permission on a mapping VTL0 holds — so an access attempted from
+VTL0 is a hardware exception and possibly a bugcheck of the guest, and that is what shows the
+protection as the guest experiences it. So the third outcome's pass is the guest faulting on the
+attempt, not a read coming back refused, and the attempt is the **last** step of a run on a
+checkpointed disposable guest rather than the first. What the tier has to record before an
+assertion can be written is the form the fault takes — a stop the NT session reports, a bugcheck,
+or a guest that is simply gone, and whether the NT session survives it — because the assertion is
+written against that form. The trustlet case reaches the same fault by the same route.
+
+**Measured 2026-10-11 on the disposable VBS guest (build 26100, two VPs), and the fault did not
+present.** The VTL1 coordinate came from a standard checkpoint decoded with `--sk-inspect`:
+`securekernel.exe` identified at `0xFFFFF807084DA000`, GPA `0x12D1000`, four KDBG hits, 373 of
+373 oracle pages agreeing. It was taken *after* the reboot that enabled KDNET on the guest, because
+the same decode on the previous boot gave GPA `0xAD1000` — which matched the host-side probe's
+reading of that boot, so the two readers agree and the GPA is per boot. The VTL0 side was an
+ordinary `attach_kernel` by profile; readings in the order taken, all through `execute`:
+
+- `!pte nt!KeBugCheckEx` and `!vtop 0 fffff80772efd130`: a 2 MB large page, physical
+  `0x1008FD130`, VTL0 root `0x7D5000`.
+- `!db 1008fd000 L10`, a VTL0 page: sixteen bytes returned.
+- `!db 1000000000 L10`, no RAM there: `Physical memory read at 1000000000 failed`, followed by the
+  debugger's caching-attribute warning.
+- `!vtop 0 fffff807084da000`, the Secure Kernel base: PML4E, PDPE and PDE present, `zero PTE`,
+  `translation fails, error 0xD0000147`; `!pte` reports `not valid` at the leaf. Outcome one.
+- `!db 12d1000 L10`, the attempt, made once: `Physical memory read at 12d1000 failed`, with the
+  same warning — the unbacked read's form, byte for byte. No exception, no bugcheck. The guest's
+  heartbeat read `LostCommunication` while it was held in the debugger, and `end_session` answered
+  `released: true`, `target_left_running: true`.
+
+So at the kernel debugger's physical-read surface the Secure Kernel's page reads exactly as a page
+with no RAM behind it, and the attempt alone cannot tell *denied* from *absent*. What tells them
+apart is the pair: the same GPA holds the Secure Kernel's PE header to the VTL1 reader — the
+capture decode found it there, and a live read reports it — and nothing to the VTL0 one, while a
+VTL0 page reads normally through the same command. The tier's assertion is therefore three
+readings on one coordinate rather than one: VTL1 reads the page; VTL0's physical read of the same
+GPA fails in the unbacked form; VTL0's physical read of a known VTL0 page succeeds. The VTL0
+virtual walk is a fourth, weaker reading — outcome one here — reported and not relied on. Nothing
+measured says *why* the read fails in that form, and this entry does not guess; the paragraph
+above expected an exception, and at this surface there was none.
+
+**Built around a marked gap, 2026-10-11 (commit `daa56bf`).** The tier takes the VTL0 half when
+its config names a `vtl0_profile`: after the VTL1 session's release it opens that NT kernel session through
+`with_live_kernel_selector`, reads the kernel base from the attach's typed summary, and takes the
+control (the base page's physical read must return `MZ`), the reported VTL0 walk of the address,
+and the attempt — whose one `execute` is `secure_kernel_page_read_from_vtl0`, left
+`unimplemented!` so a configured run fails there rather than passing without the reading. The
+parsers for the two answer shapes, `translated_physical` and `physical_read`, are pinned by unit
+tests on the verbatim text above. The tier's server moved to `--tools securekernel,inspect`,
+`execute` being in `inspect`. Unrun on the bench as a whole; the parsers ran under `cargo test`.
+What closes the item is the gap filled and one configured run green.
+
+At that handoff the stopped read's `gpa` was parsed and carried out of the VTL1 closure; without
+`vtl0_profile` the run printed `NOT ASSERTED`. The caller already required the attempt's failure
+form and panicked with any bytes returned. Formatting, strict Clippy, both parser tests, the
+citation test and markdownlint on the two linted files had passed; the handoff reported CRLF
+preserved. The tier as a whole was still unrun.
+
+### What closed it (2026-10-11)
+
+`secure_kernel_page_read_from_vtl0` now makes the missing `server.tool_text("execute", …)` call
+with `!db <gpa> L10` on the VTL0 session and passes its text to `physical_read`, exactly as the
+control does. A successful read still fails the assertion with the returned bytes; an unexpected
+answer still fails in the parser. No live-control policy or provider protocol was widened.
+
+**The configured live tier ran, with `vtl0_profile: "k3-nt"`, on the disposable VBS guest.** The
+server transcript identifies the build as `0.22.0+gdaa56bfe-dirty.0caa59ef`; the private run
+`20261011T113031` also records the test source's SHA-256, since the gap is in the test harness.
+One hardware stop, retained-register inspection, the stopped read, one single step, continue and
+both sessions' release passed. The three readings, in that run:
+
+- VTL1 read sixteen bytes at `0xfffff807085c2f70` (`KiTimerInterrupt`), beginning
+  `4883EC0855564881EC5001000033F648`, and reported GPA `0x13b9f70`.
+- VTL0 translated the attach summary's NT base `0xfffff80772a00000` to `0x100400000`;
+  `!db 100400000 L10` returned sixteen bytes beginning `4d 5a` (`MZ`).
+- `!db 13b9f70 L10` answered `Physical memory read at 13b9f70 failed`. VTL0's virtual walk of
+  the VTL1 address also reported a zero PTE and error `0xD0000147`; it was printed, not asserted.
+
+The tier printed `RAN: live Secure Kernel MCP stop/step/resume lifecycle, with the VTL0 readings
+beside it` and passed. Its independent audit passed too: heartbeat `OK` immediately and at 30 and
+60 seconds, unchanged `vmwp` PID, no matching `vmwp` crash records, the same SHA-256 for the
+entire guarded 4 KiB Secure Kernel text page before and after, no enabled VTL1 debug breakpoints,
+and no TF/RF left set. Config, transcript and audit evidence remain private under
+`target/private/`. Plain `cargo test`, formatting and strict Clippy passed as well.
