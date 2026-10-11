@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
 import type { LogEntry, Session } from '../types'
-import { EMPTY, answered, begin, bpsMayBeStale, finish, ipIsCurrent, norm, payloadOf, regHex, shapeOf, wd, windbgTool } from './model'
+import { EMPTY, EMPTY_DRAWABLE, answered, begin, drawable, finish, norm, payloadOf, regHex, shapeOf, wd, windbgTool } from './model'
 
 const PANE = 'windbg'
 const TITLE = 'WinDbg'
@@ -132,6 +132,9 @@ export const register: Register = on => {
     const width = Math.max(32, e.props.bodyColumns)
     const rows = Math.max(12, e.props.scroll.bodyRows)
     const s = v.sessions.find(x => x.id === v.current) ?? null
+    // Every freshness question answered once, so no panel below can form its own view of it.
+    // Three rounds of findings were one site disagreeing with another; see `drawable`.
+    const d = s ? drawable(s) : EMPTY_DRAWABLE
 
     const title = (name: string, note: string, stale = false) => (
       <Text wrap="truncate-end">
@@ -194,11 +197,11 @@ export const register: Register = on => {
           ) : null}
           {skBanner(s!)}
           <Text wrap="truncate-end">
-            {ipIsCurrent(s!) ? (
+            {d.ip ? (
               <Text>
                 <Text dimColor>ip </Text>
-                <Text bold>{wd(s!.ip)}</Text>
-                <Text dimColor>{'  ' + locate(s!, s!.ip!)}</Text>
+                <Text bold>{wd(d.ip)}</Text>
+                <Text dimColor>{'  ' + locate(s!, d.ip)}</Text>
               </Text>
             ) : s!.ip && !s!.gone ? (
               // The target moved and said nothing about where it ended up. The last known position
@@ -215,12 +218,13 @@ export const register: Register = on => {
     const disasm = (w: number, budget: number) => {
       if (!s!.disasm) return <Box flexDirection="column">{title('Disassembly', '')}<Text dimColor>no disassembly read yet</Text></Box>
       const all = s!.disasm.rows
-      // Only a position the target is still at can mark a row or claim to be elsewhere.
-      const here = ipIsCurrent(s!) ? s!.ip : null
+      // Only a position the target is still at can mark a row or claim to be elsewhere, and a row
+      // that is the instruction just *executed* is not a listing the ip should be found in.
+      const history = s!.disasm.executed === true
+      const here = history ? null : d.ip
       const at = here ? all.findIndex(x => norm(x.address) === here) : -1
       const from = at > 2 ? Math.min(at - 2, Math.max(0, all.length - budget)) : 0
       const shown = all.slice(from, from + budget)
-      const bps = new Set((s!.bps ?? []).filter(b => b.enabled).map(b => norm(b.address)))
       const wideLoc = w >= 76
       const wideBytes = w >= 60
       // A listing read at an explicit address need not contain the stop — reading a driver's
@@ -229,7 +233,9 @@ export const register: Register = on => {
       const elsewhere = !!here && at < 0
       // Live Secure Kernel control answers with the bytes it guarded and no disassembly, so say so
       // rather than letting an empty mnemonic column read as a failed read.
-      const note = (s!.disasm.bytesOnly ? 'bytes at the stop, no disassembly · ' : '') +
+      const note = (history
+        ? 'the instruction just executed, no disassembly · '
+        : s!.disasm.bytesOnly ? 'bytes at the stop, no disassembly · ' : '') +
         'u ' + wd(s!.disasm.start) +
         (elsewhere ? ' · ip is elsewhere, at ' + (locate(s!, here!) || wd(here)) : '')
       return (
@@ -243,7 +249,7 @@ export const register: Register = on => {
             const ops = sp < 0 ? '' : x.text.slice(sp)
             return (
               <Text wrap="truncate-end">
-                <Text color={BAD}>{bps.has(a) ? '●' : ' '}</Text>
+                <Text color={d.doubtful.has(a) ? WARN : BAD}>{d.armed.has(a) ? '●' : d.doubtful.has(a) ? '◌' : ' '}</Text>
                 <Text color={ACCENT} bold>{cur ? '▶ ' : '  '}</Text>
                 <Text dimColor={!cur}>{wd(x.address) + ' '}</Text>
                 {wideLoc ? <Text dimColor>{(x.module ? x.module + '+' + x.rva : '').padEnd(20) + ' '}</Text> : null}
@@ -259,7 +265,7 @@ export const register: Register = on => {
 
     const registers = (w: number) => {
       if (!s!.regs) return <Box flexDirection="column">{title('Registers', '')}<Text dimColor>no registers read yet</Text></Box>
-      const stale = s!.movedAt > s!.regsAt
+      const stale = d.regsStale
       const map = new Map(s!.regs.map(r => [r.name, r.value]))
       const prev = new Map((s!.prevRegs ?? []).map(r => [r.name, r.value]))
       const bank = bankFor(map)
@@ -286,8 +292,8 @@ export const register: Register = on => {
           {lines.map(line => (
             <Text wrap="truncate-end">
               {line.map(name => {
-                const live = name === bank.ip && !!s!.ip && s!.ipAt > s!.regsAt
-                const value = live ? s!.ip! : map.get(name) ?? ''
+                const live = name === bank.ip && !!d.ip && s!.ipAt > s!.regsAt
+                const value = live ? d.ip! : map.get(name) ?? ''
                 const before = prev.get(name)
                 const changed = !live && before !== undefined && norm(before) !== norm(value)
                 const reg = s!.regs!.find(r => r.name === name)
@@ -326,7 +332,7 @@ export const register: Register = on => {
 
     const stack = (w: number, budget: number) => {
       if (!s!.frames) return <Box flexDirection="column">{title('Stack', '')}<Text dimColor>no stack read yet</Text></Box>
-      const stale = s!.movedAt > s!.framesAt
+      const stale = d.framesStale
       const more = s!.frames.length > budget || s!.framesTruncated
       return (
         <Box flexDirection="column">
@@ -348,7 +354,7 @@ export const register: Register = on => {
 
     const memory = (w: number, budget: number) => {
       if (!s!.mem) return <Box flexDirection="column">{title('Memory', '')}<Text dimColor>no memory read yet</Text></Box>
-      const stale = s!.movedAt > s!.memAt
+      const stale = d.memStale
       const per = w >= 84 ? 16 : 8
       const hex = s!.mem.hex
       const base = BigInt('0x' + (norm(s!.mem.address) ?? '0'))
@@ -410,7 +416,7 @@ export const register: Register = on => {
       if (!s!.bps) return null
       // A one-shot the target may have hit since this was read is no longer known to be armed, and
       // only the one-shots are in doubt — an ordinary breakpoint survives a run.
-      const used = bpsMayBeStale(s!)
+      const used = d.bpsStale
       return (
         <Box flexDirection="column">
           {title('Breakpoints', used ? 'a one-shot may have been hit since this was read' : s!.bps.length + ' set', used)}

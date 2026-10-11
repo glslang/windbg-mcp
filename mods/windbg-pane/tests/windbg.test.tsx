@@ -933,8 +933,40 @@ test('a status that reports an outstanding run stales the reads taken before it'
   expect(moving.sessions[0]!.movedAt).toBeGreaterThan(moving.sessions[0]!.regsAt)
   expect(moving.log[moving.log.length - 1]!.note).toBe('s1 open, target moving')
 
-  // A run that has ended is not movement to fold: its stop is waiting to be collected, and
-  // whatever reads follow are what say where it is.
+  // **A run that has ended is movement unless the pane already accounted for it**, and the handle
+  // is what tells those apart — `ExecutionInfo` keeps a finished run's block "until another run
+  // replaces it", so its mere presence says nothing about whether the pane saw the run.
+  //
+  // `exec-9` is a run this session never reported: the case is a `continue_async` whose own call
+  // timed out, where the pane saw a failure and folded nothing, and the run then finished before
+  // the first recovery poll. `stopped: true` and the reads are still untrustworthy.
+  const unseen = status({ execution: 'exec-9', command: 'g', running_for_ms: 4200, stopped: true })
+  expect(unseen.sessions[0]!.movedAt).toBeGreaterThan(unseen.sessions[0]!.regsAt)
+  expect(unseen.log[unseen.log.length - 1]!.note).toBe('s1 open, a run this session had not reported')
+
+  // Whereas a run the pane folded itself does not re-stale reads taken after its stop. Drive the
+  // `continue_async` so the handle is known, then read the registers again.
+  {
+    const a = { session_id: sid }
+    const [st, n] = begin(v, 'continue_async', a)
+    v = finish(st, n, 'continue_async', a, {
+      ok: true,
+      data: { status: 'ok', session_id: sid, execution: 'exec-1', command: 'g', running: true, moved: true },
+      error: '',
+      ms: 1,
+    })
+  }
+  expect(v.sessions[0]!.execSeen).toBe('exec-1')
+  {
+    const a = { session_id: sid }
+    const [st, n] = begin(v, 'registers', a)
+    v = finish(st, n, 'registers', a, {
+      ok: true,
+      data: { status: 'ok', registers: [{ name: 'rax', value: '0x7' }], instruction_pointer: '0x7000' },
+      error: '',
+      ms: 1,
+    })
+  }
   const settled = status({ execution: 'exec-1', command: 'g', running_for_ms: 4200, stopped: true })
   expect(settled.sessions[0]!.movedAt).toBeLessThan(settled.sessions[0]!.regsAt)
   expect(settled.log[settled.log.length - 1]!.note).toBe('s1 open')
@@ -1408,4 +1440,111 @@ test('a batch that writes drops the disassembly rather than redrawing it', () =>
   expect(v.sessions[0]!.disasm).toBe(null)
   // Both blocks count: a rollback writes too.
   expect(v.log[v.log.length - 1]!.note).toContain('wrote 1 byte at 0x1000, 1 byte at 0x1000')
+})
+
+test('every panel asks one place whether a one-shot is still armed', async ($, on) => {
+  // The breakpoint panel hedged a consumed one-shot and the disassembly went on drawing its red
+  // marker, because each site computed its own view of freshness from the raw fields. `drawable`
+  // answers once and both read it — this asserts the two agree, which is the property that kept
+  // being broken one site at a time.
+  const answers: Record<string, unknown>[] = [
+    { status: 'ok', kind: 'launch', session_id: 'sess-marks', target: 'x.exe' },
+    { status: 'ok', start: '0x1000', instructions: [
+      { address: '0x1000', bytes: '90', module: 'x', rva: '0x1000', text: 'nop' },
+      { address: '0x2000', bytes: '90', module: 'x', rva: '0x2000', text: 'nop' },
+    ] },
+    { status: 'ok', breakpoints: [
+      { id: 0, address: '0x1000', expression: 'x!main', enabled: true, one_shot: false },
+      { id: 1, address: '0x2000', expression: 'x!once', enabled: true, one_shot: true },
+    ] },
+  ]
+  let i = 0
+  on('tool.call', async () => {
+    const data = answers[i++]!
+    const text = JSON.stringify(data)
+    return { result: { content: [{ type: 'text', text }], isError: false, structuredContent: data }, text }
+  })
+  await $.tool.call({ tool: 'mcp__windbg__launch', command: 'x.exe' })
+  await $.tool.call({ tool: 'mcp__windbg__disassemble', address: '0x1000', count: 2 })
+  await $.tool.call({ tool: 'mcp__windbg__breakpoints' })
+
+  const draw = async () => {
+    const ui = await $.ui.mount({
+      plugin: 'windbg-pane',
+      surface: 'terminal',
+      component: 'Pane',
+      requestId: 'windbg',
+      props: { title: 'WinDbg', isFocused: false, bodyColumns: 140, placement: 'dock', scroll: { offset: 0, bodyRows: 48 }, view: {} },
+      viewport: { columns: 220, rows: 50, isFullscreen: true },
+    })
+    const text = (await ui.findAll({ type: 'Text' })).map(x => x.text).join('\n')
+    await ui.unmount()
+    return text
+  }
+
+  // Freshly read: both marked armed, and the panel claims the count.
+  const fresh = await draw()
+  expect(fresh).toMatch(/2 set/)
+  expect(fresh).toMatch(/●/)
+  expect(fresh).not.toMatch(/◌/)
+
+  // A run that may have consumed the one-shot. The panel hedges *and* the listing stops drawing
+  // that one as armed — while the ordinary breakpoint keeps its marker.
+  answers.push({
+    status: 'ok', command: 'g', interrupted: false, timed_out: false, target_gone: false,
+    output: 'Breakpoint 1 hit', stopped_at: '0x2000',
+  })
+  await $.tool.call({ tool: 'mcp__windbg__go' })
+  const after = await draw()
+  expect(after).toMatch(/a one-shot may have been hit since this was read/)
+  expect(after).not.toMatch(/2 set/)
+  // Both markers are present: the ordinary one armed, the one-shot in doubt.
+  expect(after).toMatch(/●/)
+  expect(after).toMatch(/◌/)
+})
+
+test('the instruction a live step just ran is not drawn as the stop', async ($, on) => {
+  // A live Secure Kernel stop reports the instruction it *stepped*, so RIP is the one after it —
+  // `.claude/rules/secure-kernel-live.md` says so, and `sk_live_step` refuses that record fed back
+  // as the next instruction. Synthetic here so a clone covers the path; the recorded SK fixtures
+  // hold a lab VM's addresses and are not in the repository.
+  const answers: Record<string, unknown>[] = [
+    { status: 'ok', kind: 'sk_live_control', session_id: 'sess-sk', target: 'vtl1' },
+    {
+      status: 'ok',
+      vtl: 1,
+      cpl: 0,
+      reason: 'single_step',
+      slot: null,
+      registers: { values: [
+        { name: 'rip', low: '0x1008', high: '0x0', status: '0x0' },
+        { name: 'cr3', low: '0x1ab000', high: '0x0', status: '0x0' },
+      ] },
+      instruction: { address: '0x1000', bytes: [72, 139, 5, 1, 0, 0, 0, 144] },
+    },
+  ]
+  let i = 0
+  on('tool.call', async () => {
+    const data = answers[i++]!
+    const text = JSON.stringify(data)
+    return { result: { content: [{ type: 'text', text }], isError: false, structuredContent: data }, text }
+  })
+  await $.tool.call({ tool: 'mcp__windbg__open_sk_live_control', vp: 0 })
+  await $.tool.call({ tool: 'mcp__windbg__sk_live_registers' })
+
+  const ui = await $.ui.mount({
+    plugin: 'windbg-pane',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'windbg',
+    props: { title: 'WinDbg', isFocused: false, bodyColumns: 140, placement: 'dock', scroll: { offset: 0, bodyRows: 48 }, view: {} },
+    viewport: { columns: 220, rows: 50, isFullscreen: true },
+  })
+  const drawn = (await ui.findAll({ type: 'Text' })).map(x => x.text).join('\n')
+  expect(drawn).toMatch(/the instruction just executed, no disassembly/)
+  expect(drawn).not.toMatch(/bytes at the stop/)
+  // RIP is 0x1008 and the row is 0x1000. Saying the ip is "elsewhere" would read as a listing
+  // taken somewhere else, when it is the instruction this stop just ran.
+  expect(drawn).not.toMatch(/ip is elsewhere/)
+  await ui.unmount()
 })

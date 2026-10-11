@@ -51,8 +51,15 @@ export type Session = {
   ip: string | null
   ipAt: number
   movedAt: number
-  /** `bytesOnly` where the source reported instruction bytes and no disassembly, as SK live does. */
-  disasm: { start: string; rows: Ins[]; bytesOnly?: boolean } | null
+  /**
+   * `bytesOnly` where the source reported instruction bytes and no disassembly, as SK live does.
+   *
+   * `executed` where the row is the instruction the target **just ran** rather than a listing at
+   * the current position — a live Secure Kernel stop reports the instruction it stepped, so RIP is
+   * the one after it. Without the distinction the panel named the previous bytes as the stop and
+   * reported the ip as elsewhere.
+   */
+  disasm: { start: string; rows: Ins[]; bytesOnly?: boolean; executed?: boolean } | null
   frames: Frame[] | null
   framesTruncated: boolean
   framesAt: number
@@ -77,6 +84,15 @@ export type Session = {
    * where the inventory holds a `oneShot`, which DbgEng removes when it is hit.
    */
   bpsAt: number
+  /**
+   * The `continue_async` handle of the last run the pane has accounted for, or `''`.
+   *
+   * The identity of a run rather than a flag about one, because `session_status` keeps a finished
+   * run's block until another replaces it — so "is there an execution block" cannot distinguish a
+   * run the pane folded from one it never saw, which is what a `continue_async` whose own call
+   * timed out leaves behind.
+   */
+  execSeen: string
   gone: boolean
   /** Set on a target that has bug checked, from the opener's summary or from `crash_triage`. */
   bugCheck: { code: string; name: string; blamed: string } | null
