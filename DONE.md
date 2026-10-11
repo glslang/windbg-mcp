@@ -10071,3 +10071,24 @@ beside it` and passed. Its independent audit passed too: heartbeat `OK` immediat
 entire guarded 4 KiB Secure Kernel text page before and after, no enabled VTL1 debug breakpoints,
 and no TF/RF left set. Config, transcript and audit evidence remain private under
 `target/private/`. Plain `cargo test`, formatting and strict Clippy passed as well.
+
+### Review correction (2026-10-11, PR #477)
+
+The configured VTL0 half now also requires `vtl0_guest`, the expected profile guest claim paired
+by the operator with the VTL1 VM ID. It checks the attach's claim before any memory reads, so a
+different or unclaimed guest cannot supply a passing NT control. Both physical answer forms must
+name the requested GPA; a failure at another address is not the attempt's failure. Focused tests
+cover both guards, and removing each guard made its regression assertion fail.
+
+The tier asserts the paired readings, not boot continuity. A guest reboot during the handoff can
+invalidate the saved GPA; interpreting the observations as protection requires an independent
+audit excluding that reboot. The output and runbook now say so rather than claiming the tier
+alone establishes protection. No boot-identity mechanism was added to the server or harness.
+
+The corrected tier ran again on K3 with `vtl0_profile: "k3-nt"` and `vtl0_guest: "k3"`:
+private run `20261011T114925`, server `0.22.0+g5c87297e-dirty.63a82879`, with the test source's
+SHA-256 recorded beside it. It passed with the same VTL1 GPA, successful `MZ` control and exact-GPA
+failure reported above. The independent audit passed all three health samples, unchanged text
+and restored-register checks; the before/after VTL1 CR3, image base and guarded GPA also matched.
+Those are the recorded observations, not a new boot-ID proof. Plain `cargo test` (including the
+new guest checks), formatting, strict Clippy, the citation test and markdownlint passed.

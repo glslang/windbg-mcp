@@ -254,8 +254,13 @@ reads stopped VTL1 memory, consumes the epoch to step, consumes the next epoch t
 continue, and requires teardown to report both release and a running target. A green ordinary test
 run makes no live-control claim; this ignored test's `RAN:` output and the independent audit do.
 
-With `vtl0_profile` naming the same guest's NT kernel profile, the tier attaches after the VTL1
+With `vtl0_profile` naming the same guest's NT kernel profile, `vtl0_guest` must give that guest's
+expected profile claim, explicitly paired by the operator with the VTL1 VM ID. The tier requires
+the attached profile to carry that claim before reading memory. It attaches after the VTL1
 release and requires a physical read of the GPA VTL1 just read to fail, beside a successful physical
 read of the NT image base's page (`FOLLOWUPS.md` item 124). VTL0's virtual walk is reported, not
 asserted. Without that profile the run prints `NOT ASSERTED` about protection.
+Each physical answer must name the requested GPA. The tier checks the paired observations, not
+boot continuity; protection also requires the independent audit to exclude a guest reboot during
+the handoff, since that could invalidate the saved GPA.
 

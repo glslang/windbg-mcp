@@ -20174,6 +20174,7 @@ fn a_live_secure_kernel_session_stops_steps_inspects_resumes_and_closes() {
     let Some(config) = secure_kernel_live_tier() else {
         return;
     };
+    let vtl0 = vtl0_selector(&config);
     let required = |name: &str| {
         config
             .get(name)
@@ -20356,10 +20357,10 @@ fn a_live_secure_kernel_session_stops_steps_inspects_resumes_and_closes() {
     if let Err(panic) = run {
         resume_unwind(panic);
     }
-    match config.get("vtl0_profile").and_then(Value::as_str) {
-        Some(profile) => {
+    match vtl0 {
+        Some((profile, guest)) => {
             let (address, gpa) = vtl1_read.expect("the VTL1 half ran through its stopped read");
-            vtl0_readings_beside_the_vtl1_read(&mut server, profile, address, gpa);
+            vtl0_readings_beside_the_vtl1_read(&mut server, profile, guest, address, gpa);
             ran(
                 "live Secure Kernel MCP stop/step/resume lifecycle, with the VTL0 readings beside it",
             );
@@ -20372,6 +20373,33 @@ fn a_live_secure_kernel_session_stops_steps_inspects_resumes_and_closes() {
             ran("live Secure Kernel MCP stop/step/resume lifecycle");
         }
     }
+}
+
+/// The expected guest is the operator's pairing of the VTL1 VM ID with a profile's guest claim.
+fn vtl0_selector(config: &Value) -> Option<(&str, &str)> {
+    let profile = config.get("vtl0_profile")?;
+    let profile = profile
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .expect("`vtl0_profile` must be a nonempty profile name");
+    let guest = config["vtl0_guest"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .expect("`vtl0_profile` requires `vtl0_guest`, the expected guest claim for the VTL1 VM");
+    Some((profile, guest))
+}
+
+/// A failing read only means anything beside VTL1 if the NT profile claims the expected guest.
+fn vtl0_kernel_base(attached: &Value, guest: &str) -> u64 {
+    assert_eq!(
+        attached["profile"]["guest"].as_str(),
+        Some(guest),
+        "the VTL0 profile must claim the configured VTL1 guest before reading its memory: {attached}"
+    );
+    attached["summary"]["primary_module"]["start"]
+        .as_str()
+        .and_then(hex_value)
+        .unwrap_or_else(|| panic!("the attach reports the kernel's base: {attached}"))
 }
 
 /// The VTL0 half of the live tier (`FOLLOWUPS.md` item 124), after the VTL1 session is released —
@@ -20387,16 +20415,20 @@ fn a_live_secure_kernel_session_stops_steps_inspects_resumes_and_closes() {
 /// of a read with no RAM behind it, so on its own it cannot tell *denied* from *absent*; what tells
 /// them apart is that the VTL1 read just returned bytes from that GPA. The fourth, VTL0's virtual
 /// walk of `address`, is printed and not asserted: each of its three outcomes is admissible, and
-/// only the attempt is evidence about the page.
-fn vtl0_readings_beside_the_vtl1_read(server: &mut Server, profile: &str, address: u64, gpa: u64) {
+/// only the attempt is evidence about the page. These are paired observations, not a boot-ID
+/// check: protection also requires the independent audit to exclude a reboot during the handoff.
+fn vtl0_readings_beside_the_vtl1_read(
+    server: &mut Server,
+    profile: &str,
+    guest: &str,
+    address: u64,
+    gpa: u64,
+) {
     with_live_kernel_selector(
         server,
         json!({ "profile": profile }),
         |server, session, attached| {
-            let kernel_base = attached["summary"]["primary_module"]["start"]
-                .as_str()
-                .and_then(hex_value)
-                .unwrap_or_else(|| panic!("the attach reports the kernel's base: {attached}"));
+            let kernel_base = vtl0_kernel_base(attached, guest);
             let vtop = |server: &mut Server, va: u64| {
                 translated_physical(&server.tool_text(
                     "execute",
@@ -20410,11 +20442,14 @@ fn vtl0_readings_beside_the_vtl1_read(server: &mut Server, profile: &str, addres
                     panic!("VTL0 does not translate its own kernel base {kernel_base:#x}: {line}")
                 }
             };
-            let control_read = physical_read(&server.tool_text(
-                "execute",
-                json!({ "command": format!("!db {control:x} L10"), "session_id": session }),
-                TARGET_STEP,
-            ));
+            let control_read = physical_read(
+                &server.tool_text(
+                    "execute",
+                    json!({ "command": format!("!db {control:x} L10"), "session_id": session }),
+                    TARGET_STEP,
+                ),
+                control,
+            );
             match &control_read {
                 PhysicalRead::Bytes(bytes) => assert!(
                     bytes.starts_with(b"MZ"),
@@ -20438,7 +20473,11 @@ fn vtl0_readings_beside_the_vtl1_read(server: &mut Server, profile: &str, addres
             );
             match secure_kernel_page_read_from_vtl0(server, session, gpa) {
                 PhysicalRead::Failed(line) => {
-                    eprintln!("VTL0's physical read of the Secure Kernel page: {line}");
+                    eprintln!("VTL0's physical read at the GPA reported by VTL1: {line}");
+                    eprintln!(
+                        "Protection is not established by this tier alone: the independent audit \
+                         must exclude a guest reboot between the VTL1 and VTL0 readings."
+                    );
                 }
                 PhysicalRead::Bytes(bytes) => panic!(
                     "VTL0 read {} byte(s) of the Secure Kernel page at {gpa:#x} that VTL1 had just \
@@ -20450,13 +20489,57 @@ fn vtl0_readings_beside_the_vtl1_read(server: &mut Server, profile: &str, addres
     );
 }
 
+#[test]
+fn vtl0_selector_requires_a_profile_and_its_expected_guest_together() {
+    assert_eq!(vtl0_selector(&json!({})), None);
+    assert_eq!(
+        vtl0_selector(&json!({ "vtl0_profile": "test-nt", "vtl0_guest": "test-vm" })),
+        Some(("test-nt", "test-vm"))
+    );
+    for config in [
+        json!({ "vtl0_profile": "test-nt" }),
+        json!({ "vtl0_profile": "test-nt", "vtl0_guest": "" }),
+        json!({ "vtl0_profile": "test-nt", "vtl0_guest": " " }),
+        json!({ "vtl0_profile": "test-nt", "vtl0_guest": null }),
+        json!({ "vtl0_profile": "test-nt", "vtl0_guest": 1 }),
+        json!({ "vtl0_profile": "", "vtl0_guest": "test-vm" }),
+        json!({ "vtl0_profile": null, "vtl0_guest": "test-vm" }),
+    ] {
+        assert!(
+            catch_unwind(|| vtl0_selector(&config)).is_err(),
+            "invalid VTL0 configuration must fail before opening a live session: {config}"
+        );
+    }
+}
+
+#[test]
+fn vtl0_kernel_base_requires_the_expected_guest_claim() {
+    let mut attached = json!({
+        "profile": { "name": "test-nt", "guest": "test-vm" },
+        "summary": { "primary_module": { "start": "0xfffff80000000000" } }
+    });
+    assert_eq!(vtl0_kernel_base(&attached, "test-vm"), 0xfffff80000000000);
+    for guest in [json!("other-vm"), json!(""), Value::Null] {
+        attached["profile"]["guest"] = guest;
+        assert!(
+            catch_unwind(|| vtl0_kernel_base(&attached, "test-vm")).is_err(),
+            "a readable kernel from the wrong or unclaimed guest must not supply the control"
+        );
+    }
+    attached.as_object_mut().unwrap().remove("profile");
+    assert!(catch_unwind(|| vtl0_kernel_base(&attached, "test-vm")).is_err());
+}
+
 /// Attempt the same physical read as the VTL0 control on the GPA the stopped VTL1 read reported.
 fn secure_kernel_page_read_from_vtl0(server: &mut Server, session: &str, gpa: u64) -> PhysicalRead {
-    physical_read(&server.tool_text(
-        "execute",
-        json!({ "command": format!("!db {gpa:x} L10"), "session_id": session }),
-        TARGET_STEP,
-    ))
+    physical_read(
+        &server.tool_text(
+            "execute",
+            json!({ "command": format!("!db {gpa:x} L10"), "session_id": session }),
+            TARGET_STEP,
+        ),
+        gpa,
+    )
 }
 
 /// A hexadecimal value as this server and the debugger print one: with or without `0x`, with or
@@ -20505,9 +20588,18 @@ enum PhysicalRead {
 /// the eighth and ninth joined by `-`, then the ASCII column — which is why the bytes are counted
 /// rather than parsed to the end of the line: an ASCII column can spell a hex pair. A failure is
 /// one line, followed by the extension's caching-attribute warning, which is not read.
-fn physical_read(text: &str) -> PhysicalRead {
+/// Both forms must name the requested physical address.
+fn physical_read(text: &str, expected: u64) -> PhysicalRead {
     for line in text.lines().map(str::trim) {
-        if line.starts_with("Physical memory read at ") && line.ends_with(" failed") {
+        if let Some(address) = line
+            .strip_prefix("Physical memory read at ")
+            .and_then(|rest| rest.strip_suffix(" failed"))
+        {
+            assert_eq!(
+                hex_value(address),
+                Some(expected),
+                "the failed physical read must name the requested GPA {expected:#x}: {line}"
+            );
             return PhysicalRead::Failed(line.to_string());
         }
         if let Some(rest) = line.strip_prefix('#') {
@@ -20519,6 +20611,11 @@ fn physical_read(text: &str) -> PhysicalRead {
                 .map_while(|pair| u8::from_str_radix(pair, 16).ok())
                 .collect();
             if bytes.len() == 16 {
+                assert_eq!(
+                    rest.split_whitespace().next().and_then(hex_value),
+                    Some(expected),
+                    "the physical dump line must start at the requested GPA {expected:#x}: {line}"
+                );
                 return PhysicalRead::Bytes(bytes);
             }
         }
@@ -20563,7 +20660,7 @@ fn a_physical_db_answer_is_read_as_its_bytes_or_as_the_failing_line() {
     let bytes = "!db 1008fd000 L10\n\
                  #1008fd000 cb 08 48 3b e8 73 7a 41-8b 45 04 a8 20 74 3f 33 ..H;.szA.E.. t?3\n";
     assert_eq!(
-        physical_read(bytes),
+        physical_read(bytes, 0x1008fd000),
         PhysicalRead::Bytes(vec![
             0xcb, 0x08, 0x48, 0x3b, 0xe8, 0x73, 0x7a, 0x41, 0x8b, 0x45, 0x04, 0xa8, 0x20, 0x74,
             0x3f, 0x33
@@ -20578,8 +20675,13 @@ fn a_physical_db_answer_is_read_as_its_bytes_or_as_the_failing_line() {
                   the future until reboot) result in a system hang, incorrect data\n\
                   being displayed or other strange crashes and corruption.\n";
     assert_eq!(
-        physical_read(failed),
+        physical_read(failed, 0x1000000000),
         PhysicalRead::Failed("Physical memory read at 1000000000 failed".to_string())
+    );
+    assert!(catch_unwind(|| physical_read(bytes, 0x1008fd001)).is_err());
+    assert!(catch_unwind(|| physical_read(failed, 0x1000000001)).is_err());
+    assert!(
+        catch_unwind(|| physical_read("Physical memory read at not-an-address failed", 0)).is_err()
     );
 }
 

@@ -196,7 +196,9 @@ that item.
 **The live Secure Kernel tier is a different, explicitly disposable gate.**
 `WINDBG_MCP_SMOKE_SK_LIVE` names a private JSON file containing `profile`, `control_transport`,
 `live_transport`, `dispatcher_vnd`, `vm_id`, `partition_id`, `expected_cr3`,
-`instruction_address` and `instruction_bytes`; `vp`, `read_size` and `vtl0_profile` are optional. The file must also
+`instruction_address` and `instruction_bytes`; `vp`, `read_size` and `vtl0_profile` are optional.
+When `vtl0_profile` is supplied, `vtl0_guest` must name the expected profile `guest` claim for the
+VTL1 VM. The file must also
 carry `"disposable": true`. `vmwp_pid` is an optional mismatch assertion; the server resolves the
 current PID from `vm_id` before it reserves and starts the worker. Startup policy also fixes the
 absolute `max_pause_ms`; calls cannot extend or replace it. The ignored test opens a separate
@@ -213,8 +215,9 @@ shows the Secure Kernel *can* be read while a stop is held and nothing about whe
 kernel could make the same read; the run prints `NOT ASSERTED`, and a pass supports "the Secure
 Kernel was read" rather than "this memory is protected". With it, after the VTL1 session is
 released (a guest held in the VTL1 stop cannot answer KDNET), the tier opens the guest's ordinary
-NT kernel session through that profile — the way the hypervisor tier holds NT beside the
-hypervisor — and takes the readings `FOLLOWUPS.md` item 124 is made of, on the coordinate the
+NT kernel session through that profile and requires its reported `guest` claim to equal
+`vtl0_guest` before reading memory — the operator's pairing with the VTL1 VM, not a discovered
+machine identity. It takes the readings `FOLLOWUPS.md` item 124 is made of, on the coordinate the
 stopped read reported. The control: a physical read of the NT image base's page must return its PE
 header, so a later failure measures the page and not the command. The attempt: the same command on
 the GPA VTL1 just read from, which must fail — and measured 2026-10-11 it fails in exactly the
@@ -223,6 +226,9 @@ VTL0's virtual walk of the address is printed and not asserted, since each of it
 is admissible. Both physical reads use `!db <gpa> L10`; a successful attempt fails the test and
 prints the returned bytes. The server for this tier starts with `--tools securekernel,inspect`,
 because `execute` is in `inspect`.
+The parser requires each answer to name the requested physical address. The tier asserts these
+paired observations, not boot continuity: interpreting them as protection also requires the
+independent audit to exclude a reboot between sessions, which would invalidate the saved GPA.
 
 **The managed Secure Kernel KD tier uses the same disposable-machine boundary.**
 WINDBG_MCP_SMOKE_SK_KD names a private JSON config with kd, profile, control_transport,
