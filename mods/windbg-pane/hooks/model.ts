@@ -65,7 +65,9 @@ export function commandFor(tool: string, args: Record<string, unknown>): string 
     case 'threads': return '~'
     case 'breakpoints': return 'bl'
     case 'disassemble': return 'u' + (s('address') ? ' ' + s('address') : '') + (n('count') ? ' L0n' + n('count') : '')
-    case 'read_memory': return s('address') && n('size') ? 'db ' + s('address') + ' L0n' + n('size') : null
+    case 'read_memory':
+    // The captured VTL1 read has no WinDbg spelling of its own; `db` is what it does.
+    case 'sk_read_memory': return s('address') && n('size') ? 'db ' + s('address') + ' L0n' + n('size') : null
     case 'set_breakpoint':
       if (args.watch || !s('expression')) return null
       return 'bp' + (args.one_shot ? ' /1' : '') + ' ' + s('expression')
@@ -546,18 +548,31 @@ export function finish(v: View, n: number, tool: string, args: Record<string, un
       s.framesAt = n
       note = s.frames.length + ' frames'
     }
-    if (/^(read_memory|sk_live_read_memory)$/.test(tool) && typeof d.data === 'string' && d.address !== undefined) {
+    // Three tools answer with bytes, and `sk_read_memory` was missing from the list — the one that
+    // matters most for the session it belongs to, because it is the *only* guest-memory read an
+    // `open_sk_capture` session has. Every capture read was therefore folded nowhere, leaving the
+    // Memory panel empty or still showing an older read with nothing saying so. Its
+    // `SecureKernelRead` carries the same `address`, `gpa`, `requested_size` and `data` as the live
+    // control's `LiveMemoryRead`, and a `symbol` beside them where the capture's own PDBs named the
+    // address.
+    if (/^(read_memory|sk_read_memory|sk_live_read_memory)$/.test(tool) && typeof d.data === 'string' && d.address !== undefined) {
       const hex = d.data.replace(/[^0-9a-fA-F]/g, '')
       s.mem = { address: str(d.address), hex: hex.slice(0, MEM_KEEP * 2), size: hex.length / 2 }
-      // A live VTL1 read resolves through the guest's own page tables, so it can say which physical
-      // page answered — and a read shorter than the request is a fact the size alone would hide.
+      // A Secure Kernel read resolves through the guest's own page tables, so it can say which
+      // physical page answered — and a read shorter than the request is a fact the size would hide.
       if (d.gpa !== undefined) s.mem.gpa = str(d.gpa)
       const frame = readFrame(s.mem.hex)
       if (frame) s.mem.frame = frame
       s.memAt = n
       note = hex.length / 2 + ' bytes' + (d.gpa !== undefined ? ' at gpa ' + regHex(d.gpa) : '')
+      if (typeof d.symbol === 'string' && d.symbol) note += ', ' + d.symbol
       if (typeof d.requested_size === 'number' && d.requested_size !== hex.length / 2) {
-        note += ', ' + d.requested_size + ' requested'
+        // `read_size` cannot say *why* a read came up short — that is what `stopped` is for, and
+        // the two answers have different remedies: a deadline sends the caller back for the rest,
+        // an interrupt was their own doing. `WalkHalt::phrase` writes both in one place precisely
+        // so a wording invented per site cannot differ at one of them, so these are its words.
+        const halt = d.stopped === 'deadline' ? ', ran out of time' : d.stopped === 'interrupted' ? ', was interrupted' : ''
+        note += ', ' + d.requested_size + ' requested' + halt
       }
     }
     if (Array.isArray(d.modules) && typeof d.loaded === 'number') {
@@ -616,7 +631,19 @@ export function finish(v: View, n: number, tool: string, args: Record<string, un
     // whole wait, so this is movement with no position — the one combination that reads as "no
     // movement" if only the position is looked for.
     const ranOn = d.verdict === 'timeout' || (d.running === true && !('stopped_at' in stop))
-    if (RUN.test(tool) && ('stopped_at' in stop || gone || ranOn || d.moved === true)) {
+    // **A stop that cannot say where is still a stop**, and looking for the position alone read it
+    // as no movement at all. `StopReport::stopped_at` is absent "for a target that is running,
+    // gone, or has **no thread context**" — a module-load break, a bare `goto_position` to the
+    // start of a trace — and `target_gone`'s own doc says it is a separate field precisely because
+    // "a target with no thread context also produces" an absent position. So a successful `go`,
+    // step, reverse or nested `wait_for_stop` can carry none of the four conditions above while
+    // having moved the target, and the pane went on marking the pre-run registers, stack and memory
+    // current. The tell is the report itself: `command` and `output` are plain `String`s that every
+    // `StopReport` carries, where `ExecutionStarted` has the first and not the second and
+    // `RunToReport` the second and not the first — so this recognises a stop without claiming one
+    // from either of those.
+    const stopped = typeof stop.command === 'string' && typeof stop.output === 'string'
+    if (RUN.test(tool) && ('stopped_at' in stop || stopped || gone || ranOn || d.moved === true)) {
       s.movedAt = n
       if (gone) {
         s.gone = true
@@ -632,7 +659,10 @@ export function finish(v: View, n: number, tool: string, args: Record<string, un
       } else {
         const ip = norm(stop.stopped_at)
         if (ip) { s.ip = ip; s.ipAt = n }
-        note = (stop.interrupted === true ? 'broken in at ' : stop.timed_out === true ? 'wait ran out at ' : 'stopped at ') + where(s, ip)
+        const how = stop.interrupted === true ? 'broken in' : stop.timed_out === true ? 'wait ran out' : 'stopped'
+        // No position is not no movement, and `where` answers the empty string for one — so the
+        // note said "stopped at " and the panels would have kept the position the target left.
+        note = ip ? how + ' at ' + where(s, ip) : how + ', no position reported'
       }
     }
     // Last, deliberately: `crash_triage` also carries `frames`, and the bug check is the headline
