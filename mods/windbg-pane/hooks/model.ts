@@ -135,6 +135,25 @@ export function payloadOf(result: unknown, text: unknown): Obj | null {
   return typeof text === 'string' ? parseObj(text) : null
 }
 
+/**
+ * Whether a call answered, from all three places a failure can arrive in.
+ *
+ * The host sets `isError` on the result `next` resolves to when a tool "answered an error", and an
+ * MCP server's own `isError` rides on the nested record beside the payload — the same record
+ * `payloadOf` reads — so which of the two carries it depends on how the host passed the call
+ * through. Reading only the outer one treated every error as a success: an error payload folded
+ * into the session's registers, stack and position, and an opener's failure could still mint a
+ * session. And the server says so itself without either: `Outcome` is tagged on `status`
+ * (`src/structured.rs`), so `status: "error"` is the one statement that is there whichever way the
+ * host conveyed it, and it is the authority the other two are reporting.
+ */
+export function answered(result: unknown, isError: unknown, data: Obj | null): boolean {
+  if (isError === true) return false
+  const r = obj(result)
+  if (r && r.isError === true) return false
+  return !(data && data.status === 'error')
+}
+
 /** A one-line description of a result's shape, for checking what the host hands the hook. */
 export function shapeOf(result: unknown, text: unknown): string {
   const r = obj(result)
@@ -285,6 +304,83 @@ function readBps(rows: unknown[]): Bp[] {
   })
 }
 
+/**
+ * A `session_status` row's state, which is tagged on `state` and carries its own reason.
+ *
+ * `attaching` also says whether it has been waiting longer than a healthy open ever takes, which
+ * is the fact that separates a KD link coming up from a guest that was never booted in debug mode
+ * — the state alone cannot. Both unresolved variants read as `unresolved`, which is what the pane
+ * already calls them: the pane says what is refused, and the reason is in the log line.
+ */
+function sessionState(st: Obj | null): string {
+  const tag = st ? str(st.state) : ''
+  switch (tag) {
+    case 'attaching':
+      return st?.overdue === true ? 'attaching, overdue' : 'attaching'
+    case 'kernel_unresolved':
+    case 'live_control_unresolved':
+      return 'unresolved'
+    case 'secure_kernel_kd':
+      return ('sk kd ' + str(st?.phase)).trim()
+    default:
+      return tag
+  }
+}
+
+/**
+ * What a `debug_batch` left the session holding, from its `after` report.
+ *
+ * A batch can resume, step or release the target, and `after` is the only thing that says where
+ * that left the session — the step list cannot. Without reading it a batch holding a `resume` or a
+ * `run_to` left the old registers, stack, memory, position and target state on screen marked
+ * current.
+ *
+ * It is folded off the success branch because **a batch that failed still carries this report**: a
+ * batch that did not commit, or whose rollback did not finish, is answered as an MCP error wrapped
+ * around an `Outcome::Ok` report (`server::batch_settled`), and `after` is then the only statement
+ * about what the session holds. That is the case the pane least wants to skip — `uncertain` is
+ * precisely the answer that says the earlier reads can no longer be trusted.
+ */
+function foldBatch(s: Session, d: Obj, n: number): string {
+  const after = obj(d.after)
+  if (!after) return ''
+  const state = str(after.state)
+  const ip = norm(after.ip)
+  const why = str(after.why) ? ': ' + str(after.why) : ''
+  const by = str(after.by) ? ' by ' + str(after.by) : ''
+  if (state === 'stopped') {
+    // A read-only batch also reports `stopped`, so the position decides whether it moved:
+    // marking every batch as movement would make an inspection look like execution.
+    if (!ip || ip === s.ip) return ''
+    s.movedAt = n
+    s.ip = ip
+    s.ipAt = n
+    return 'batch stopped at ' + where(s, ip)
+  }
+  if (state === 'running') {
+    s.movedAt = n
+    return 'batch left the target running' + why
+  }
+  if (state === 'detached') {
+    s.movedAt = n
+    s.state = 'detached'
+    return 'batch detached the target' + by
+  }
+  if (state === 'ended') {
+    s.movedAt = n
+    s.gone = true
+    s.ip = null
+    return 'batch ended the target' + by
+  }
+  if (state === 'uncertain') {
+    // The server reports not knowing rather than guessing, so neither does the pane: what it
+    // cannot claim is that the reads taken before the batch still describe the target.
+    s.movedAt = n
+    return 'batch left the session uncertain' + why
+  }
+  return ''
+}
+
 /** A call answered: fold its typed result into the session it was routed to. */
 export function finish(v: View, n: number, tool: string, args: Record<string, unknown>, out: Outcome): View {
   const d = out.data
@@ -331,7 +427,10 @@ export function finish(v: View, n: number, tool: string, args: Record<string, un
   }
   let note = ''
   if (!out.ok) {
-    note = out.error.split(/\r?\n/).find(l => l.trim()) ?? 'failed'
+    // The host's text is the ordinary source. A failure the *payload* alone reported — `status`
+    // with no `isError` beside it, which `answered` now catches — arrives with nothing in `text`,
+    // and its message is in the structured error.
+    note = out.error.split(/\r?\n/).find(l => l.trim()) ?? (failure ? str(failure.message, 'failed') : 'failed')
     if (s && sid === stranded) {
       // Not 'open': the open failed. What the pane has to carry is that a target exists and this
       // is the handle for it, which is the difference between recovering and attaching twice.
@@ -359,6 +458,24 @@ export function finish(v: View, n: number, tool: string, args: Record<string, un
       const ip = norm(d.instruction_pointer)
       if (ip) { s.ip = ip; s.ipAt = n }
       note = ip ? 'rip=' + regHex(ip) : ''
+    }
+    // `current_location` is the authoritative answer to "where is it now", and after a text-only
+    // seek it is the *only* one: `goto_position` reports no position at all, so a caller asking
+    // here is the pane's one way to learn it. Nothing but the register and run folds set the
+    // position, so a location query that succeeded left the previous instruction drawn and marked
+    // current. `location_state` is what says whether there is an address to read — a
+    // `context_unavailable` position has none, and carrying the state is better than reporting a
+    // query that answered as one that did nothing.
+    if (tool === 'current_location') {
+      const ip = norm(d.address)
+      if (ip) {
+        s.ip = ip
+        s.ipAt = n
+        const co = obj(d.coordinate)
+        note = 'at ' + (co && str(co.module) ? str(co.module) + '+' + str(co.rva) : where(s, ip))
+      } else {
+        note = 'no position: ' + str(d.location_state, 'unknown')
+      }
     }
     // A live Secure Kernel stop, answered by `sk_live_wait` and by `sk_live_registers` alike. None
     // of the branches around this one see it: the registers are `registers.values[]` rather than an
@@ -435,9 +552,25 @@ export function finish(v: View, n: number, tool: string, args: Record<string, un
       const before = obj(d.refresh)?.before
       note = d.loaded + ' loaded' + (typeof before === 'number' && before !== d.loaded ? ', refreshed from ' + before : '')
     }
-    if (Array.isArray(d.breakpoints)) {
+    // `breakpoints` means two different things by tool, and the difference is in the field's own
+    // doc comment. On the `breakpoints` listing it *is* the answer, so empty means the session
+    // holds none. On a `set_breakpoint` it is an inspection taken after a mutation that has
+    // already happened, and best-effort: empty means it could not be read, and says nothing about
+    // the breakpoint this call made — that one is reported separately and authoritatively in
+    // `breakpoint`, which "there is no case in which it is unavailable". Replacing the inventory
+    // with the empty list hid both the breakpoint just armed and everything already known, drawing
+    // an unreadable session as a clean one.
+    if (Array.isArray(d.breakpoints) && (tool !== 'set_breakpoint' || d.breakpoints.length > 0)) {
       s.bps = readBps(d.breakpoints)
       if (tool === 'set_breakpoint') note = s.bps.length + ' breakpoint(s)'
+    } else if (tool === 'set_breakpoint') {
+      const set = readBps([d.breakpoint])
+      // `replaced` names the breakpoints the engine removed to make room at the same resolved
+      // address, so they go rather than staying on screen beside their replacement.
+      const replaced = Array.isArray(d.replaced) ? d.replaced : []
+      const kept = (s.bps ?? []).filter(b => !replaced.includes(b.id) && !set.some(x => x.id === b.id))
+      s.bps = [...kept, ...set]
+      note = (set.length ? 'breakpoint ' + set[0]!.id + ' set' : 'set') + ', inventory could not be read'
     }
     // A clear answers with `remaining` and carries no `breakpoints` at all, so the branch above
     // never fired and the pane went on drawing the cleared entries as armed. `remaining` is
@@ -454,42 +587,6 @@ export function finish(v: View, n: number, tool: string, args: Record<string, un
       } else {
         s.bps = null
         note = 'cleared, inventory could not be read'
-      }
-    }
-    // A batch can resume, step or release the target, and `after` is the only thing that says what
-    // the session holds once it is done — the step list cannot. Without reading it a batch holding
-    // a `resume` or a `run_to` left the old registers, stack, memory, position and target state on
-    // screen marked current.
-    if (tool === 'debug_batch') {
-      const after = obj(d.after)
-      const state = after ? str(after.state) : ''
-      const ip = after ? norm(after.ip) : null
-      if (state === 'stopped') {
-        // A read-only batch also reports `stopped`, so the position decides whether it moved:
-        // marking every batch as movement would make an inspection look like execution.
-        if (ip && ip !== s.ip) {
-          s.movedAt = n
-          s.ip = ip
-          s.ipAt = n
-          note = 'batch stopped at ' + where(s, ip)
-        }
-      } else if (state === 'running') {
-        s.movedAt = n
-        note = 'batch left the target running' + (after && str(after.why) ? ': ' + str(after.why) : '')
-      } else if (state === 'detached') {
-        s.movedAt = n
-        s.state = 'detached'
-        note = 'batch detached the target' + (after && str(after.by) ? ' by ' + str(after.by) : '')
-      } else if (state === 'ended') {
-        s.movedAt = n
-        s.gone = true
-        s.ip = null
-        note = 'batch ended the target' + (after && str(after.by) ? ' by ' + str(after.by) : '')
-      } else if (state === 'uncertain') {
-        // The server reports not knowing rather than guessing, so neither does the pane: what it
-        // cannot claim is that the reads taken before the batch still describe the target.
-        s.movedAt = n
-        note = 'batch left the session uncertain' + (after && str(after.why) ? ': ' + str(after.why) : '')
       }
     }
     // Three different shapes report a run, and reading only the synchronous one left an async run
@@ -533,6 +630,37 @@ export function finish(v: View, n: number, tool: string, args: Record<string, un
         note = bc.code + ' ' + bc.name + (bc.blamed ? ', blaming ' + bc.blamed : '')
       }
     }
+    // `session_status` is the only tool that reports what the *server* holds, and it is the answer
+    // to a session a failed open left `opening`, `stranded` or `unresolved`: the comment at the
+    // top of this function sends a caller here, and the pane read nothing back — so a provisional
+    // state stayed on screen after the worker had resolved it one way or the other, which is the
+    // recovery flow those sessions are kept for. Rows fold into the sessions the pane already
+    // knows; a listing does not mint one, because the pane follows calls and a session it has seen
+    // no call for has no reads to draw under it.
+    if (tool === 'session_status' && Array.isArray(d.sessions)) {
+      const said: string[] = []
+      for (const row of d.sessions as unknown[]) {
+        const o = obj(row)
+        const id = o ? str(o.session_id) : ''
+        const known = id ? sessions.find(x => x.id === id) : undefined
+        if (!o || !known) continue
+        const t = known === s ? s : { ...known }
+        if (t !== known) sessions = sessions.map(x => (x === known ? t : x))
+        const state = sessionState(obj(o.state))
+        if (state) t.state = state
+        t.kind = str(o.kind, t.kind)
+        if (str(o.target)) t.target = str(o.target)
+        said.push(t.label + ' ' + t.state)
+      }
+      // An `unknown_handle` is the complement in the same payload, and reading `sessions` alone
+      // conflates them: the list is empty either way, so a handle the server has never heard of
+      // would read exactly like one that closed. Only the session actually asked about is touched.
+      if (d.unknown_handle === true && s && str(d.asked) === s.id) {
+        s.state = 'unknown to the server'
+        said.push(s.label + ' unknown')
+      }
+      note = said.length ? said.join(', ') : (d.sessions as unknown[]).length + ' session(s)'
+    }
     if (tool === 'end_session') {
       s.state = d.released === false ? 'unresolved' : 'closed'
       note = d.released === false ? 'released: false' : 'released'
@@ -545,6 +673,12 @@ export function finish(v: View, n: number, tool: string, args: Record<string, un
     // call succeeding; the new position is not, so it is marked moved and nothing is invented.
     s.movedAt = n
     note = 'moved, position not reported'
+  }
+  // Outside that chain on purpose — see `foldBatch`. A failed batch keeps the failure in front of
+  // what the report says the session is left holding, since both are facts the reader wants.
+  if (s && d && tool === 'debug_batch') {
+    const said = foldBatch(s, d, n)
+    if (said) note = note ? note + '; ' + said : said
   }
   const current = opened ?? (sid && sessions.some(x => x.id === sid) ? sid : v.current)
   const log = v.log.map(e =>

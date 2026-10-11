@@ -2,7 +2,7 @@ import { expect, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import type { View } from '../types'
-import { EMPTY, begin, finish, payloadOf, readFrame, windbgTool } from '../hooks/model'
+import { EMPTY, answered, begin, finish, payloadOf, readFrame, windbgTool } from '../hooks/model'
 import { RECORDED } from './recorded'
 import { RECORDED_KERNEL } from './recorded-kernel'
 import { RECORDED_DUMP } from './recorded-dump'
@@ -639,4 +639,237 @@ test('a batch is folded from what the session holds afterwards', () => {
   const uncertain = batch({ state: 'uncertain', why: 'the probe failed' }).sessions[0]!
   expect(uncertain.movedAt).toBeGreaterThan(uncertain.regsAt)
   expect(uncertain.gone).toBe(false)
+})
+
+test('a failure is read from the nested result and from the payload, not the outer flag alone', () => {
+  const payload = { status: 'error', target: 'no', error: { category: 'stale_session', message: 'no such session' } }
+  // The host's own flag, which is all the hook used to read.
+  expect(answered({ content: [], isError: false }, true, payload)).toBe(false)
+  // The MCP record's flag, beside the payload `payloadOf` reads out of that same record.
+  expect(answered({ content: [], isError: true, structuredContent: payload }, undefined, payload)).toBe(false)
+  // And the record's flag with no payload at all to corroborate it, which is not a contrivance:
+  // `server::tool_error` answers a refusal with text and no structured content, so this is the
+  // only thing that says the call failed. Without it this assertion passes on the payload below.
+  expect(answered({ content: [{ type: 'text', text: 'session is not open' }], isError: true }, undefined, null)).toBe(false)
+  // And the server's own statement, which is there whichever way the host passed the call through.
+  expect(answered({ content: [], isError: false, structuredContent: payload }, undefined, payload)).toBe(false)
+  // A success is still a success in every shape, including one with no typed half at all.
+  const ok = { status: 'ok', stopped_at: '0x10' }
+  expect(answered({ content: [], isError: false, structuredContent: ok }, undefined, ok)).toBe(true)
+  expect(answered({ content: [{ type: 'text', text: 'Breakpoint 0 set' }], isError: false }, undefined, null)).toBe(true)
+
+  // End to end: the record a host hands the hook for a windbg-mcp error, through both functions.
+  const record = { content: [{ type: 'text', text: JSON.stringify(payload) }], isError: true }
+  const data = payloadOf(record, undefined)
+  expect(answered(record, undefined, data)).toBe(false)
+  // So the opener's failure cannot mint a session, and its message is the log line even where the
+  // host passed no text beside it.
+  const args = { profile: 'p' }
+  const [st, n] = begin(EMPTY, 'attach_kernel', args)
+  const v = finish(st, n, 'attach_kernel', args, { ok: false, data, error: '', ms: 1 })
+  expect(v.sessions).toEqual([])
+  expect(v.log[0]!.status).toBe('error')
+  expect(v.log[0]!.note).toBe('no such session')
+})
+
+test('a breakpoint set with an unreadable inventory keeps the one it armed', () => {
+  const sid = 'sess-arm'
+  let v = EMPTY
+  {
+    const a = { command: 'x.exe' }
+    const [st, n] = begin(v, 'launch', a)
+    v = finish(st, n, 'launch', a, { ok: true, data: { status: 'ok', kind: 'launch', session_id: sid, target: 'x.exe' }, error: '', ms: 1 })
+  }
+  const arm = (w: View, data: Record<string, unknown>) => {
+    const a = { session_id: sid, address: 'x!f' }
+    const [st, n] = begin(w, 'set_breakpoint', a)
+    return finish(st, n, 'set_breakpoint', a, { ok: true, data: { status: 'ok', ...data }, error: '', ms: 1 })
+  }
+  const first = { id: 0, address: '0x1000', expression: 'x!f', enabled: true }
+  const second = { id: 1, address: '0x2000', expression: 'x!g', enabled: true }
+
+  // The inspection read: it is the inventory, this call's breakpoint included.
+  v = arm(v, { breakpoint: first, breakpoints: [first] })
+  expect(v.sessions[0]!.bps!.map(b => b.id)).toEqual([0])
+
+  // It could not be read: `breakpoints` is empty and says nothing, while `breakpoint` is the
+  // engine's own report of what this call made. Neither it nor the inventory may vanish.
+  const blind = arm(v, { breakpoint: second, breakpoints: [] })
+  expect(blind.sessions[0]!.bps!.map(b => b.id)).toEqual([0, 1])
+  expect(blind.log[blind.log.length - 1]!.note).toBe('breakpoint 1 set, inventory could not be read')
+
+  // A breakpoint the engine replaced to make room is not left armed beside its replacement.
+  const replaced = arm(blind, { breakpoint: { ...second, address: '0x3000', expression: 'x!h' }, breakpoints: [], replaced: [0] })
+  expect(replaced.sessions[0]!.bps!.map(b => b.expression)).toEqual(['x!h'])
+
+  // And the `breakpoints` listing is unaffected: there an empty list *is* the answer.
+  const listed = (() => {
+    const a = { session_id: sid }
+    const [st, n] = begin(blind, 'breakpoints', a)
+    return finish(st, n, 'breakpoints', a, { ok: true, data: { status: 'ok', breakpoints: [] }, error: '', ms: 1 })
+  })()
+  expect(listed.sessions[0]!.bps).toEqual([])
+})
+
+test('a provisional session is resolved by the status the recovery flow asks for', () => {
+  // An opener that dialled the link and failed, leaving the handle in its error.
+  const args = { profile: 'p' }
+  const [st, n] = begin(EMPTY, 'attach_kernel', args)
+  const v = finish(st, n, 'attach_kernel', args, {
+    ok: false,
+    data: { status: 'error', target: 'pending', error: { category: 'timeout', message: 'timed out', session_id: 'sess-p' } },
+    error: 'timed out',
+    ms: 1,
+  })
+  expect(v.sessions[0]!.state).toBe('opening')
+
+  const status = (w: View, data: Record<string, unknown>, a: Record<string, unknown> = {}) => {
+    const [s2, m] = begin(w, 'session_status', a)
+    return finish(s2, m, 'session_status', a, {
+      ok: true,
+      data: { status: 'ok', max_sessions: 4, unknown_handle: false, ...data },
+      error: '',
+      ms: 1,
+    })
+  }
+
+  // The worker dialled in after all: the provisional state is replaced by what the server holds.
+  const open = status(v, {
+    sessions: [{ session_id: 'sess-p', kind: 'kernel', target: 'profile "p" (net:port=50000,key=<redacted>)', state: { state: 'open' }, current: true, live: true }],
+  })
+  expect(open.sessions[0]!.state).toBe('open')
+  expect(open.sessions[0]!.kind).toBe('kernel')
+  expect(open.sessions[0]!.target).toContain('key=<redacted>')
+  expect(open.log[open.log.length - 1]!.note).toBe('s1 open')
+
+  // The attach is still parked, and `overdue` is the half that says which kind of parked.
+  const parked = status(v, {
+    sessions: [{ session_id: 'sess-p', kind: 'kernel', target: 't', state: { state: 'attaching', waits_indefinitely: true, overdue: true }, current: true, live: true }],
+  })
+  expect(parked.sessions[0]!.state).toBe('attaching, overdue')
+
+  // It failed with the controller retained: refused, and not a clean session.
+  const unresolved = status(v, {
+    sessions: [{ session_id: 'sess-p', kind: 'kernel', target: 't', state: { state: 'kernel_unresolved', why: 'release unconfirmed' }, current: true, live: true }],
+  })
+  expect(unresolved.sessions[0]!.state).toBe('unresolved')
+
+  // A listing mints nothing: a session the pane has seen no call for has no reads to draw under it.
+  const other = status(v, {
+    sessions: [{ session_id: 'sess-other', kind: 'dump', target: 'x.dmp', state: { state: 'open' }, current: false, live: true }],
+  })
+  expect(other.sessions.map(x => x.id)).toEqual(['sess-p'])
+  expect(other.sessions[0]!.state).toBe('opening')
+  expect(other.log[other.log.length - 1]!.note).toBe('1 session(s)')
+
+  // An empty list and an unknown handle are the same list; only the second says it is gone.
+  const gone = status(v, { sessions: [], unknown_handle: true, asked: 'sess-p' }, { session_id: 'sess-p' })
+  expect(gone.sessions[0]!.state).toBe('unknown to the server')
+  const quiet = status(v, { sessions: [], asked: 'sess-p' }, { session_id: 'sess-p' })
+  expect(quiet.sessions[0]!.state).toBe('opening')
+})
+
+test('a location query moves the displayed position after a seek that reported none', () => {
+  const sid = 'sess-loc'
+  let v = EMPTY
+  {
+    const a = { trace: 't.run' }
+    const [st, n] = begin(v, 'open_trace', a)
+    v = finish(st, n, 'open_trace', a, { ok: true, data: { status: 'ok', kind: 'trace', session_id: sid, target: 't.run' }, error: '', ms: 1 })
+  }
+  {
+    const a = { session_id: sid }
+    const [st, n] = begin(v, 'registers', a)
+    v = finish(st, n, 'registers', a, {
+      ok: true,
+      data: { status: 'ok', registers: [{ name: 'rax', value: '0x1' }], instruction_pointer: '0x1000' },
+      error: '',
+      ms: 1,
+    })
+  }
+  {
+    // `goto_position` runs `!tt` and answers with debugger text: moved, position unreported.
+    const a = { session_id: sid, position: '12:0' }
+    const [st, n] = begin(v, 'goto_position', a)
+    v = finish(st, n, 'goto_position', a, { ok: true, data: null, error: '', ms: 1 })
+  }
+  expect(v.sessions[0]!.ip).toBe('1000')
+
+  const locate = (data: Record<string, unknown>) => {
+    const a = { session_id: sid }
+    const [st, n] = begin(v, 'current_location', a)
+    return finish(st, n, 'current_location', a, { ok: true, data: { status: 'ok', ...data }, error: '', ms: 1 })
+  }
+  const found = locate({
+    location_state: 'mapped',
+    address: '0x7ffed9627800',
+    thread: 1,
+    coordinate: { module: 'KERNELBASE', image_name: 'KernelBase.dll', rva: '0x27800' },
+  })
+  expect(found.sessions[0]!.ip).toBe('7ffed9627800')
+  expect(found.sessions[0]!.ipAt).toBe(found.n)
+  expect(found.log[found.log.length - 1]!.note).toBe('at KERNELBASE+0x27800')
+
+  // No thread context carries no address, and inventing one is the misreading this prevents.
+  const none = locate({ location_state: 'context_unavailable' })
+  expect(none.sessions[0]!.ip).toBe('1000')
+  expect(none.sessions[0]!.ipAt).toBe(v.sessions[0]!.ipAt)
+  expect(none.log[none.log.length - 1]!.note).toBe('no position: context_unavailable')
+})
+
+test('a batch that did not settle is a failure whose report is still read', () => {
+  const sid = 'sess-unsettled'
+  let v = EMPTY
+  {
+    const a = { command: 'x.exe' }
+    const [st, n] = begin(v, 'launch', a)
+    v = finish(st, n, 'launch', a, { ok: true, data: { status: 'ok', kind: 'launch', session_id: sid, target: 'x.exe' }, error: '', ms: 1 })
+  }
+  {
+    const a = { session_id: sid }
+    const [st, n] = begin(v, 'registers', a)
+    v = finish(st, n, 'registers', a, {
+      ok: true,
+      data: { status: 'ok', registers: [{ name: 'rax', value: '0x1' }], instruction_pointer: '0x1000' },
+      error: '',
+      ms: 1,
+    })
+  }
+  const before = v.sessions[0]!
+
+  // `server::batch_settled` answers an uncommitted batch, or one whose rollback did not finish,
+  // as an MCP error wrapped around an `Outcome::Ok` report — so `status` is `ok`, the call is a
+  // failure, and `after` is the only thing that says what the session holds. The pane must not
+  // skip it: `uncertain` is the statement that the reads above can no longer be trusted.
+  const a = { session_id: sid, steps: [{ op: 'command', command: 'eb 1000 90' }] }
+  const [st, n] = begin(v, 'debug_batch', a)
+  const unsettled = finish(st, n, 'debug_batch', a, {
+    ok: false,
+    data: {
+      status: 'ok',
+      committed: false,
+      rollback_complete: false,
+      after: { state: 'uncertain', why: 'the probe after the rollback failed' },
+    },
+    error: 'the batch did not settle',
+    ms: 1,
+  })
+  const s = unsettled.sessions[0]!
+  expect(s.movedAt).toBeGreaterThan(s.regsAt)
+  // Both facts, in the order a reader wants them: what went wrong, then where it left the session.
+  expect(unsettled.log[unsettled.log.length - 1]!.status).toBe('error')
+  expect(unsettled.log[unsettled.log.length - 1]!.note).toBe(
+    'the batch did not settle; batch left the session uncertain: the probe after the rollback failed',
+  )
+
+  // A failure that carries no report at all — refused before it started — folds nothing.
+  const [st2, n2] = begin(v, 'debug_batch', a)
+  const refused = finish(st2, n2, 'debug_batch', a, {
+    ok: false,
+    data: { status: 'error', error: { category: 'target_running', message: 'the target is running' } },
+    error: 'the target is running',
+    ms: 1,
+  })
+  expect(refused.sessions[0]!.movedAt).toBe(before.movedAt)
+  expect(refused.log[refused.log.length - 1]!.note).toBe('the target is running')
 })
