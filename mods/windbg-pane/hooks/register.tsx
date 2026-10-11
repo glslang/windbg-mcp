@@ -153,10 +153,19 @@ export const register: Register = on => {
           <Text dimColor>{'  vp ' + k.vp + '  vector ' + k.vector + '  '}</Text>
           <Text bold>{k.reason + (k.slot !== null ? ' slot ' + k.slot : '')}</Text>
           {x.skPhase === 'running' ? <Text color={WARN}>{'  VP running'}</Text> : null}
+          {/*
+            The two roots, named by where each was read rather than by whose address space it is.
+            `cr3` is the root in force at this stop and `expectedCr3` is the session's
+            provider-hello baseline, and `.claude/rules/secure-kernel-live.md` is explicit that one
+            live sample of a VP's CR3 does not establish whose space it is — "CR3 is discovered,
+            never asserted". Labelling them trustlet and sk, as this did, presents an identity the
+            reading cannot support and may have backwards. What the pane can say is that they
+            differ, which is what `allow_transition_cr3` admits.
+          */}
           {moved ? (
             <Text>
-              <Text color={WARN}>{'  trustlet cr3 ' + regHex(k.cr3)}</Text>
-              <Text dimColor>{'  sk ' + regHex(k.expectedCr3)}</Text>
+              <Text color={WARN}>{'  cr3 at stop ' + regHex(k.cr3)}</Text>
+              <Text dimColor>{'  baseline ' + regHex(k.expectedCr3)}</Text>
             </Text>
           ) : null}
         </Text>

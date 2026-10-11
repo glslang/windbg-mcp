@@ -9,9 +9,10 @@ export type Reg = { name: string; value: string; high?: string; failed?: boolean
 export type Ins = { address: string; bytes: string; module: string; rva: string; text: string }
 
 /**
- * A live Secure Kernel VTL1 stop. `cr3` differing from `expectedCr3` is the transition case: the
- * trustlet's address space is still loaded at the Secure Kernel entry, which is what
- * `allow_transition_cr3` admits.
+ * A live Secure Kernel VTL1 stop. `cr3` is the page-table root in force at the stop and
+ * `expectedCr3` the session's provider-hello baseline; the two differing is the transition case
+ * `allow_transition_cr3` admits. Which address space either root *is* does not follow from the
+ * reading — one live sample of a VP's CR3 establishes no owner — so neither is labelled with one.
  */
 export type SkStop = {
   vtl: number

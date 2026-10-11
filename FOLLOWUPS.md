@@ -2532,15 +2532,19 @@ function wants. It is unreachable from a live session for one reason: `engine::r
 sorts ops into `capture_op`, `live_op` and `kd_op`, and `EngineOp::SkSymbol` is a `capture_op`. The
 allow-list is right to exist — it is what stops a tool answering about `vmwp` as though it were the
 guest — but the effect here is that the caller does out of band what the server already does, from
-the same profile-pinned bytes.
+the same bytes. **From the *caller's* image, though, not the profile's**: `open_sk_capture` is given
+`securekernel.exe` as a required argument, so what makes the sibling path work is an image somebody
+supplied, which is exactly what a live session has no way to obtain (above).
 
 `sk_live_step` has the same shape one layer in. A *repeated* step must state `address` and the exact
 instruction `bytes`, and a stop record cannot supply them: its `instruction` field is the
 instruction that was just *stepped*, so feeding it back fails with "the step instruction address ...
 does not match the stopped RIP". The byte guard should stay — it is the interlock against stepping
-blind — but a guard the **server** derives from the pinned image is stronger than one the caller
-asserts, because a caller can assert bytes that are merely self-consistent. As it stands a caller
-stepping a sequence opens a *second* session on the same image to disassemble it, which is how the
+blind — but a guard the **server** derives from an image of its own is stronger than one the caller
+asserts, because a caller can assert bytes that are merely self-consistent. That is a statement
+about the step's design and not about today: deriving it needs the image this item's first step is
+about, so it is conditional on that step rather than available now. As it stands a caller stepping a
+sequence opens a *second* session on an image it supplies itself to disassemble it, which is how the
 2026-10-10 run finally worked.
 
 The hazard is what resolving it costs the caller. The base is randomised per guest boot, so it is
@@ -2553,18 +2557,20 @@ worker is about to compute anyway. Measured on 2026-10-10, that step took the VM
 process down mid-run (Hyper-V event 3040, "could not initialize"), ending the guest.
 
 - **Why deferred:** orchestration, not capability — and it is worth saying plainly, because the
-  first draft of this entry inflated it into a structural question it is not. Every piece is
-  already here. `vmwp` is an ordinary user-mode process on the host and the live worker's engine is
-  **already attached to it**, so nothing about the engine's target forbids resolving symbols
-  alongside it. The pinned image answers a name without reading the guest at all, since that is a
-  PDB and export-table lookup. The instruction bytes for a repeated step do not need a static
-  substitute either: `sk_live_read_memory` already reads live VTL1 memory while the stop is held,
-  which is how the 2026-10-10 run confirmed the live prologue matched the pinned image
-  byte-for-byte — so the server can read what it is about to step and check it against the image it
-  pinned. (A purely static route is a different tool's job; the point of this one is that it is
-  live.) What is genuinely unsettled is narrow: VTL1 maps more than the Secure Kernel image, so a
-  bare name or RVA is unambiguous only for the one image the profile pins, and an arm into `skci`
-  or a trustlet would have to name its module.
+  first draft of this entry inflated it into a structural question it is not. Every *mechanism* is
+  already here, and each of them is conditional on the image above. `vmwp` is an ordinary user-mode
+  process on the host and the live worker's engine is **already attached to it**, so nothing about
+  the engine's target forbids resolving symbols alongside it — once there is an image to resolve
+  them in, a name is answered without reading the guest at all, since that is a PDB and
+  export-table lookup. The *live* half needs nothing new: `sk_live_read_memory` already reads VTL1
+  memory while the stop is held, which is how the 2026-10-10 run confirmed the live prologue
+  matched the image byte-for-byte — against a file the operator supplied by hand, which is the
+  whole of what is missing. So the server could read what it is about to step and check it, and
+  cannot yet, because nothing gives it the thing to check against. (A purely static route is a
+  different tool's job; the point of this one is that it is live.) What is unsettled beyond the
+  image itself is narrow: VTL1 maps more than the Secure Kernel image, so a bare name or RVA is
+  unambiguous only for the one image a session is given, and an arm into `skci` or a trustlet would
+  have to name its module.
 - **What would close it:** first, an authoritative Secure Kernel image for a live session — where
   it comes from, and how its identity is checked against the running build — since the profile
   supplies only a build number and RVAs. Then a live session able to turn a **name** into a VTL1
@@ -2609,8 +2615,21 @@ instruction starts.** The step request carries the exact instruction `bytes`, an
 already defaults to address-plus-length from them. So instead of refusing, the step can be
 performed as a *step over* — arm a bounded execution breakpoint at `address + len(bytes)` and
 continue — and the resulting **hardware** stop is explicitly allowed to arrive in a different root,
-where `bind_stop_cr3` → `MemorySource::bind_root` re-walks the space and the session carries on
-correctly on the far side.
+where `bind_stop_cr3` → `MemorySource::bind_root` re-walks the space.
+
+**Which is not yet the whole of carrying on correctly, and the ordering is the part to settle
+first.** Every guarded instruction is read *inside the wait*: `VmwpDispatcher::wait_for_stop` calls
+`memory.read_guard_until` for each one (`src/skdispatch.rs`) before anything has bound the stop's
+own root, so those reads go through the root bound **previously**, and `validate_observation` then
+rejects a mismatch as *"a guarded instruction changed before the stop was accepted"*
+(`src/sklive.rs`). For a step-over whose destination is only mapped in the new root that is either
+a read that fails or a byte comparison against a different address space, reported as a guard that
+changed when nothing changed — and the re-verification that would catch it runs *after*
+`bind_stop_cr3`, and only when `allow_transition_cr3` is set. So the destination guard has to be
+read after the root is bound, or be kept out of the pre-bind set, and that is a change to the wait
+rather than to the step. An earlier draft of this entry said the session "carries on correctly on
+the far side" with no mention of the pre-bind read; review was right that nothing had established
+it.
 
 The concrete case this was found on is `KiSystemCall64Shadow`, whose fourth instruction is
 `mov cr3,rsp`. A caller wanting to walk a trustlet's entry into the Secure Kernel has to stop three
@@ -2631,7 +2650,9 @@ server's own `sk_live_arm` and `sk_live_continue` being used to work around `sk_
   step-over happened and names the new root; the borrowed slot released whether the step-over
   arrives or the bound expires; and the step's existing guarantee kept intact, so the instruction
   bytes are still verified through the *old* root before the step and the new root is bound only
-  once the stop is accepted.
+  once the stop is accepted. And — the ordering above — the *destination* guard read out of
+  `wait_for_stop`'s pre-bind set, or taken after `bind_stop_cr3`, so a destination mapped only in
+  the new root is not read through the old one and reported as an instruction that changed.
 - **Where it picks up:** the `ExpectedStop::SingleStep` arm of the stop validation and the step
   path in `src/sklive.rs`; `bind_stop_cr3`/`bind_stop_cr3_until` and `MemorySource::bind_root` in
   `src/skdispatch.rs`; `SkLiveStepArgs` in `src/server.rs`; and the slot accounting shared with
@@ -2669,18 +2690,30 @@ translation — but the run records only that the read succeeded.
   to the same page but denied by the effective VTL permissions — since all three are passes for
   different reasons and only the third is visible to nothing but an attempted access.
 - **What would close it:** a live read able to report, beside its own GPA, VTL0's **effective
-  access** to the same virtual address. Three outcomes all count as evidence that VTL0 cannot reach
-  it and the criterion must admit all three, because GPA protections are **per VTL** — the TLFS
-  gives a higher VTL `HvCallModifyVtlProtectionMask` over a lower one's access, so the same GPA can
-  be mapped in both with different effective permissions. So: VTL0 has no translation; or it
-  translates to a different page; **or it translates to the same page and is denied by the effective
-  VTL permissions**. A criterion written as "different page or none" would call that third case a
-  failure to prove protection when it is the protection working. Or, failing all of it, an
-  explicit statement in the tier and in `docs/smoke-test.md` that protection is **not** asserted,
-  so a green run is not read as proving it. A bench-side demonstration also exists and is weaker in
-  one specific way worth recording: `target/private/probe_vtl_split.py` (private) walks both roots
+  access** to the same virtual address. Three outcomes count as passes and the criterion must
+  admit all three, because GPA protections are **per VTL** — the TLFS gives a higher VTL
+  `HvCallModifyVtlProtectionMask` over a lower one's access, so the same GPA can be mapped in both
+  with different effective permissions. So: VTL0 has no translation; or it translates to a
+  different page; **or it translates to the same page and is denied by the effective VTL
+  permissions**. A criterion written as "different page or none" would call that third case a
+  failure to prove protection when it is the protection working.
+
+  Or, failing all of it, an explicit statement in the tier and in `docs/smoke-test.md` that
+  protection is **not** asserted, so a green run is not read as proving it. A bench-side
+  demonstration also exists and is weaker in one specific way worth recording:
+  `target/private/probe_vtl_split.py` (private) walks both roots
   through hvlib and compares GPAs, which shows the split but from the **host**, where everything is
   visible by construction; only a VTL0-side reader shows the denial as the guest experiences it.
+
+  **And only the third outcome is evidence about the *page*, which this entry had wrong.** A GPA
+  can be mapped at more than one virtual address, so "no translation" and "translates elsewhere"
+  establish that *this* virtual address does not reach the GPA and nothing more: VTL0 may reach the
+  same page through another mapping, and a walk of one address cannot see that. What rules the page
+  out is the effective VTL permission on the GPA itself — the third outcome. So the first two are
+  evidence about the address the Secure Kernel or a trustlet actually uses, which is worth
+  reporting and is the weaker claim, and the criterion above admits all three as passes without
+  any of them being proof on its own. Wording that counted the first two as proof that VTL0 cannot
+  reach the memory was a review finding on this item, and it was right.
 - **Where it picks up:** `MemorySource::bind_root`/`walk_space` in `src/skdispatch.rs`;
   `SkLiveReadArgs` and the read handler in `src/server.rs`; `secure_kernel_live_tier` and its
   consuming test in `tests/mcp_smoke.rs`; the live-tier claims in
