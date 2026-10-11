@@ -896,6 +896,7 @@ async fn run_async(
 
     let path = format!(r"\\.\pipe\{}", options.pipe);
     let mut reconnecting = false;
+    let mut compatibility = CompatibilityMemory::for_stop(options.arm_mode);
     'connections: loop {
         let connect_wait =
             bounded_pause_wait(options.connect_timeout, stopped_since, service_pause)?;
@@ -966,6 +967,7 @@ async fn run_async(
             }
             return Err(error);
         }
+        compatibility.reset_peer_probes();
         send_stop(
             &mut writer,
             &mut link,
@@ -979,7 +981,6 @@ async fn run_async(
         eprintln!("initial KD state change sent");
 
         let mut breakpoints = BTreeMap::<u32, BreakpointGuard>::new();
-        let mut compatibility = CompatibilityMemory::for_stop(options.arm_mode);
         loop {
             let frame_wait =
                 bounded_pause_wait(options.idle_timeout, stopped_since, service_pause)?;
@@ -1023,7 +1024,7 @@ async fn run_async(
                 continue;
             }
             if peer_reset {
-                compatibility = CompatibilityMemory::for_stop(options.arm_mode);
+                compatibility.reset_peer_probes();
                 breakpoints.clear();
                 send_stop(
                     &mut writer,
@@ -1262,7 +1263,7 @@ async fn run_async(
                 (values, context) = read_context(session, &stop, stopped_deadline)?;
                 reported_instruction =
                     read_instruction_guard(session, values.rip, stopped_deadline)?;
-                compatibility = CompatibilityMemory::for_stop(options.arm_mode);
+                compatibility.on_execution_stop();
                 send_stop(
                     &mut writer,
                     &mut link,
@@ -1841,11 +1842,11 @@ fn validate_debugger_metadata(
 /// WinDbg also probes the reported RSP as an NT trap frame and disassembles backwards across bytes
 /// preceding the current instruction. Neither assumption holds for this redirected Secure Kernel
 /// stop: the selected NOP follows embedded data, and the backscan changes WinDbg's current address
-/// to a 16-bit `CS:IP`. Natural stops always read real stack and code. Each redirected stop-specific
-/// startup probe is served at most once. A later explicit
-/// debugger read of the same real address therefore reaches guest memory instead of receiving
-/// fabricated bytes.
+/// to a 16-bit `CS:IP`. Only the initial redirected stop permits these stack/code probes. Subsequent
+/// execution stops always read real stack and code, including after a peer reset or reconnect.
+/// Each startup probe is served at most once until the peer resets or reconnects.
 struct CompatibilityMemory {
+    mode: ArmMode,
     stack_bookkeeping: bool,
     code_backscan: bool,
     code_lookahead: bool,
@@ -1855,13 +1856,7 @@ struct CompatibilityMemory {
 
 impl Default for CompatibilityMemory {
     fn default() -> Self {
-        Self {
-            stack_bookkeeping: true,
-            code_backscan: true,
-            code_lookahead: true,
-            null_startup_probes: [true; NULL_STARTUP_PROBES.len()],
-            kuser_startup_probes: [true; KUSER_STARTUP_PROBES.len()],
-        }
+        Self::for_stop(ArmMode::Redirect)
     }
 }
 
@@ -1869,11 +1864,21 @@ impl CompatibilityMemory {
     fn for_stop(mode: ArmMode) -> Self {
         let redirected = mode == ArmMode::Redirect;
         Self {
+            mode,
             stack_bookkeeping: redirected,
             code_backscan: redirected,
             code_lookahead: redirected,
-            ..Self::default()
+            null_startup_probes: [true; NULL_STARTUP_PROBES.len()],
+            kuser_startup_probes: [true; KUSER_STARTUP_PROBES.len()],
         }
+    }
+
+    fn reset_peer_probes(&mut self) {
+        *self = Self::for_stop(self.mode);
+    }
+
+    fn on_execution_stop(&mut self) {
+        *self = Self::for_stop(ArmMode::Natural);
     }
 
     fn read(
@@ -2076,6 +2081,39 @@ mod tests {
             memory.read(crate::kdapi::SYNTHETIC_THREAD, 8, 0x8000, 0x9000, 5),
             Some(vec![0; 8])
         );
+    }
+
+    #[test]
+    fn execution_stops_disable_redirected_probes_across_peer_resets_and_reconnects() {
+        let probes = [
+            (0x8000, STACK_BOOKKEEPING_BYTES as u32),
+            (0x9000 - CODE_BACKSCAN_BYTES, CODE_BACKSCAN_BYTES as u32),
+            (0x9005, CODE_LOOKAHEAD_BYTES as u32),
+        ];
+        let mut memory = CompatibilityMemory::for_stop(ArmMode::Redirect);
+        for _ in 0..2 {
+            for (address, count) in probes {
+                assert_eq!(
+                    memory.read(address, count, 0x8000, 0x9000, 5),
+                    Some(vec![0; count as usize]),
+                    "an initial redirected stop still needs its startup probes"
+                );
+            }
+            memory.reset_peer_probes();
+        }
+        memory.on_execution_stop();
+        for _ in 0..3 {
+            for (address, count) in probes {
+                assert_eq!(
+                    memory.read(address, count, 0x8000, 0x9000, 5),
+                    None,
+                    "execution and peer resets must never restore redirected probes"
+                );
+            }
+            let (address, count) = NULL_STARTUP_PROBES[0];
+            assert!(memory.read(address, count, 0x8000, 0x9000, 5).is_some());
+            memory.reset_peer_probes();
+        }
     }
 
     #[test]
