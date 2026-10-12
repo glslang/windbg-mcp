@@ -11,18 +11,23 @@ license = "MIT"
 
 [dependencies]
 dbgscope = { git = "https://github.com/glslang/dbgscope", rev = "f5d697b82d0bea2f822e5f1679a81071553dfdae" }
-# 3.5.1 is a floor, not a preference, and by now for three unrelated reasons. Every 3.x before 3.1.1
+# 3.5.1 is a floor, not a preference, and by now for four unrelated reasons. Every 3.x before 3.1.1
 # generates a `tools/list` that omits SEP-2549's required `ttlMs`/`cacheScope`, which a spec-strict
 # `2026-07-28` client rejects outright — the server connects and appears to expose no tools at all
 # (upstream issue #1114). Every 3.x before 3.2.0 echoes `2026-07-28` straight back out of
 # `initialize`; 3.2.0 settles that handshake on a revision which still *has* a handshake (upstream
-# #1228, `is_legacy_version`). And every 3.x before 3.5.1 sends a handler's `-32602` on the stateless
+# #1228, `is_legacy_version`). Every 3.x before 3.5.1 sends a handler's `-32602` on the stateless
 # route as an HTTP 400 — this server's surface refusal included — which a `2026-07-28` client reads
 # as a server that predates the revision and falls back to `initialize` on; 3.5.1 answers a handler's
 # `-32602` in band and leaves the transport's own refusals where they were — a `_meta` short a key,
 # a header missing or mismatched, an unsupported revision are 400, an unknown method 404 (upstream
-# #1322). The smoke tier asserts the last two, so a build that resolved an older release would fail
-# it rather than merely serve the older shape — which is what makes this a floor.
+# #1322). And every 3.x before 3.5.1 lets the first request on a stdio connection decide its
+# lifecycle for good, so a client that probes with `server/discover` and then falls back to
+# `initialize` on the same connection — Claude Code, three seconds without an answer later — gets a
+# handshake that succeeds and every request after it refused for the `_meta` the handshake era
+# never carries; 3.5.1 answers the probe without committing (upstream #1248). The smoke tier asserts
+# all four, so a build that resolved an older release would fail it rather than merely serve the
+# older shape — which is what makes this a floor.
 rmcp = { version = "3.5.1", features = [
     "server",
     "transport-io",

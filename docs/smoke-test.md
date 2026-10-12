@@ -328,7 +328,12 @@ key it on an *offered* revision and it inverts into a check that the fields are 
 broken SDK also passes. An unknown revision negotiates down to `2025-11-25`. `server/discover` opens a
 session with no handshake at all, and — the rule that is easy to get wrong — in that stateless mode
 **every** request must carry the `_meta` protocol keys, not just the opener; a request without them
-is refused with `-32602`.
+is refused with `-32602`. A discover answered and then an `initialize` on the **same** connection
+opens the handshake era instead, and its bare requests are served: that is the sequence Claude Code
+falls back to when its probe goes three seconds unanswered (measured 2026-10-12), and every `rmcp`
+before 3.5.1 let the probe commit the connection for good and refused everything after the
+handshake (upstream #1248) — the fourth reason the floor sits there, and it fails against 3.5.0,
+checked by pinning it.
 
 **Capability honesty.** `tools` is advertised and asserted to be the **whole** key set of
 `capabilities` on the wire, rather than a list of the keys that must be absent — because a list can
@@ -1077,8 +1082,9 @@ everything](#two-clients-two-of-everything) below are what closed it:
   listener refusing `debug_batch` on `2026-07-28` answers `200` with the `-32602` in the body, and
   the same call one `_meta` key short answers `400` naming the key. The split is `rmcp` 3.5.1's
   (upstream #1322; every 3.x before it sent a handler's `-32602` as `400`, which a client on that
-  route reads as a server that predates the revision), so this is the assertion that makes `3.5.1`
-  a floor: it fails against 3.5.0, checked by pinning it.
+  route reads as a server that predates the revision), so this is one of the two assertions that
+  make `3.5.1` a floor, the other being the stdio probe-then-handshake under *Protocol revisions*
+  above: it fails against 3.5.0, checked by pinning it.
 
 Three more need no debugger either, and none of them is about the lease:
 
