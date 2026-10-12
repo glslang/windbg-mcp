@@ -1173,6 +1173,11 @@ pub struct SkLiveOpenArgs {
     /// Virtual processor to control. Defaults to VP 0. The native event must report this VP.
     #[serde(default)]
     pub vp: Option<u32>,
+    /// Additional virtual processors to arm with the same guarded breakpoint set. Values must be
+    /// distinct from `vp`; the worker starts one independently validated provider per VP and caps
+    /// the whole selected set at 16 VPs.
+    #[serde(default)]
+    pub additional_vps: Vec<u32>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -4276,6 +4281,23 @@ impl WindbgServer {
                 TargetCreated::No,
             );
         }
+        if args.additional_vps.len() + 1 > crate::sklive::MAX_LIVE_CONTROL_VPS
+            || args
+                .additional_vps
+                .iter()
+                .enumerate()
+                .any(|(index, vp)| *vp == target.vp || args.additional_vps[..index].contains(vp))
+        {
+            return open_failure(
+                ErrorCategory::InvalidArgument,
+                format!(
+                    "live control accepts at most {} distinct VP selections",
+                    crate::sklive::MAX_LIVE_CONTROL_VPS
+                ),
+                None,
+                TargetCreated::No,
+            );
+        }
         if dispatcher_vnd == Some(0)
             || args.profile.trim().is_empty()
             || args.control_transport.trim().is_empty()
@@ -4316,6 +4338,19 @@ impl WindbgServer {
             }
         };
         let what = format!("VM {} VTL1 VP {}", target.vm_id, target.vp);
+        let additional_vps = args
+            .additional_vps
+            .into_iter()
+            .map(|vp| crate::skdispatch::AdditionalVp {
+                control_transport: authorized.control_transport.clone(),
+                target: crate::skdispatch::TargetRequest {
+                    vm_id: target.vm_id.clone(),
+                    partition_id: target.partition_id,
+                    vp,
+                    expected_cr3: target.expected_cr3,
+                },
+            })
+            .collect();
         self.opened(
             SessionKind::SecureKernelLive,
             what,
@@ -4328,7 +4363,7 @@ impl WindbgServer {
                 target,
                 max_pause_ms: authorized.max_pause_ms,
                 allow_transition_cr3: args.allow_transition_cr3,
-                additional_vps: Vec::new(),
+                additional_vps,
             })),
         )
         .await

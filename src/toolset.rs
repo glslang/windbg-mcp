@@ -1,7 +1,7 @@
 //! Which of this server's seventy-eight tools a run advertises.
 //!
 //! The tool surface is paid **once per conversation, before anything is debugged**, and it is
-//! 122,592 bytes — roughly 30k tokens (measured 2026-10-09; every figure here moves with any edit
+//! 122,929 bytes — roughly 30k tokens (measured 2026-10-12; every figure here moves with any edit
 //! to a description, so re-derive rather than cite). Seven tenths of that is prose, and the prose is what tells
 //! a model how to drive the tools, so there is no strip here the way there was in
 //! [`crate::schema`]: `FOLLOWUPS.md` item 24 measured it and the only honest lever left is the one
@@ -32,11 +32,11 @@
 //!   ioctl           11   16,088  driver objects, IRP stacks, reachability, hazards, IOCTL maps,
 //!                                  references to an address, device security and the
 //!                                  whole-driver survey
-//!   securekernel    12   19,013  captured and live VTL1 inspection and execution control
+//!   securekernel    12   19,350  captured and live VTL1 inspection and execution control
 //! ```
 //!
-//! Those bytes are a measurement of **2026-10-09** and move with any edit to a description — the
-//! whole surface they are shares of is 78 tools and 122,592 B, which is what the rows above sum to.
+//! Those bytes are a measurement of **2026-10-12** and move with any edit to a description — the
+//! whole surface they are shares of is 78 tools and 122,929 B, which is what the rows above sum to.
 //! Re-derive rather than quoting them.
 //!
 //! **Those are shares of the whole surface, and they do not sum to a narrowed one.** `crash` reads
@@ -50,7 +50,7 @@
 //! Not a convenience: every other tool here routes by a `session_id`, and this server is the only
 //! thing that can issue one. A surface with `registers` and no opener cannot be used at all, so a
 //! spec that leaves one out is asking for something that does not exist. On its own it is 14,208
-//! bytes (2026-10-09), and that is the floor of any usable surface — `--tools crash` is thirteen tools, not three,
+//! bytes (2026-10-12), and that is the floor of any usable surface — `--tools crash` is thirteen tools, not three,
 //! and the startup line says so rather than leaving the addition to be discovered.
 //!
 //! # Who a surface belongs to

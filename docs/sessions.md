@@ -13,7 +13,7 @@ beside it has open for symbols. It counts against the same limit, ends the same 
 `session_status` as `secure_kernel`. See [Secure Kernel captures](#secure-kernel-captures) below.
 
 `open_sk_live_control` is the eighth. Its worker binds operator-supplied providers and an
-exact-build `vmwp` debugger adapter to one selected VP in an explicitly disposable VBS VM. Opening
+exact-build `vmwp` debugger adapter to a selected VP set in an explicitly disposable VBS VM. Opening
 validates the request, profile and register-provider handshake but does not pause, attach to or
 inspect the VM. The first arm validates the live target under pause before it mutates state.
 See [Live Secure Kernel control](#live-secure-kernel-control) below.
@@ -120,20 +120,24 @@ limits are recorded there rather than here.
 
 ## Live Secure Kernel control
 
-`open_sk_live_control` opens a dedicated control session for one selected VTL1 VP in a running,
-disposable VBS VM. The caller supplies the exact VM GUID, partition ID, VP, VTL1 CR3, `vmwp` PID,
-dispatcher address, an exact-build adapter profile, a register-control provider command and a live
-memory transport command. The repository supplies neither privileged provider. The worker validates
-the request, profile and register provider's declared identity and capabilities before it accepts
-the session; opening itself does not change guest execution. The first `sk_live_arm` pauses the VM,
+`open_sk_live_control` opens a dedicated control session for selected VTL1 VPs in a running,
+disposable VBS VM. The caller supplies a primary `vp` and may add distinct `additional_vps`; every
+provider shares the exact VM GUID, discovered partition ID and VTL1 CR3. The caller also supplies
+the `vmwp` PID, dispatcher address, an exact-build adapter profile, a register-control provider
+command and a live memory transport command. The repository supplies neither privileged provider.
+The worker validates the request, profile and register provider's declared identity and
+capabilities before it accepts the session; opening itself does not change guest execution. The
+first `sk_live_arm` pauses the VM,
 validates the VM-to-`vmwp` binding, live-memory CR3, guarded instructions and local `vmwp.exe`
 build, and proceeds to register or breakpoint mutation only after those checks pass.
 
 Six tools drive that session after the open:
 
-- `sk_live_arm` saves the selected VP's baseline and installs one to four guarded execution
-  breakpoints. Each address carries the exact live instruction bytes expected there.
-- `sk_live_wait` moves the VM and returns only after `vmwp` holds the exact owned vector-1 event. Its
+- `sk_live_arm` saves every selected VP's baseline and installs one to four guarded execution
+  breakpoints on each. Each address carries the exact live instruction bytes expected there.
+- `sk_live_wait` moves the VM and returns only after `vmwp` holds the exact owned vector-1 event. For
+  several providers, it completes the winner's event and proves a VM-wide pause before restoring a
+  loser; the returned stop remains pause-backed for the winning VP. Its
   stop record carries the target and event identity, two-read register evidence, guarded instruction,
   accepted next addresses, arm mode and a new opaque epoch.
 - `sk_live_registers` returns that retained stop record without changing it, and
@@ -148,7 +152,7 @@ Ordinary debugger tools are refused on this session because its DbgEng target is
 `vmwp`, not the guest Secure Kernel. Public epochs are scoped to one controller and every mutating
 stopped operation rejects a stale epoch. Reads and register writes are refused while running.
 
-Teardown is fail-closed. A confirmed `end_session` restores the selected VP, completes any owned
+Teardown is fail-closed. A confirmed `end_session` restores every selected VP, completes any owned
 event through the native dispatcher, removes the temporary handler, detaches from `vmwp` and leaves
 the VM running. If any of that is unconfirmed, `session_status` reports
 `live_control_unresolved`; the worker, exact VM/`vmwp` reservation and session slot survive idle and

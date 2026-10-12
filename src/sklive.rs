@@ -245,6 +245,27 @@ pub(crate) trait EventDispatcher {
     ) -> Result<()> {
         self.release_event(event, mode)
     }
+    /// Complete the winning native event, then prove a VM-wide pause before any provider without
+    /// that event may be accessed.
+    fn release_event_and_pause(
+        &mut self,
+        event: &HeldEvent,
+        targets: &[TargetIdentity],
+    ) -> Result<()>;
+    fn release_event_and_pause_until(
+        &mut self,
+        event: &HeldEvent,
+        targets: &[TargetIdentity],
+        _deadline: Instant,
+    ) -> Result<()> {
+        self.release_event_and_pause(event, targets)
+    }
+    /// Release a stopped controller whose quiescence is owned by a proved VM pause rather than a
+    /// retained native event.
+    fn release_paused(&mut self) -> Result<()>;
+    fn release_paused_until(&mut self, _deadline: Instant) -> Result<()> {
+        self.release_paused()
+    }
     fn recover(&mut self, safe_to_resume: bool, event: Option<&HeldEvent>) -> Result<()>;
     fn recover_until(
         &mut self,
@@ -1011,6 +1032,7 @@ impl<P: ControlProvider> LiveControl<P> {
         Self::open_with_transition(provider, false)
     }
 
+    #[cfg(test)]
     pub(crate) fn open_with_transition(provider: P, allow_transition_cr3: bool) -> Result<Self> {
         Self::open_many_with_transition(vec![provider], allow_transition_cr3)
     }
@@ -1020,7 +1042,7 @@ impl<P: ControlProvider> LiveControl<P> {
         Self::open_many_with_transition(providers, false)
     }
 
-    fn open_many_with_transition(
+    pub(crate) fn open_many_with_transition(
         mut providers: Vec<P>,
         allow_transition_cr3: bool,
     ) -> Result<Self> {
@@ -1387,7 +1409,6 @@ impl<P: ControlProvider> LiveControl<P> {
             if echoed != observed.event {
                 bail!("provider changed the dispatcher event after publication");
             }
-            self.restore_inactive_providers(active)?;
             let first =
                 if matches!(expected_stop, ExpectedStop::Hardware) && self.allow_transition_cr3 {
                     self.read_transition_snapshot(active)?
@@ -1422,7 +1443,7 @@ impl<P: ControlProvider> LiveControl<P> {
                 self.validate_stop_registers(&observed.event, &first, &expected_stop)?;
             let mut event = observed.event.clone();
             event.reason = reason;
-            Ok(StopRecord {
+            let stop = StopRecord {
                 epoch: next_epoch.1.clone(),
                 target: self.providers[active].target.clone(),
                 event,
@@ -1430,14 +1451,43 @@ impl<P: ControlProvider> LiveControl<P> {
                 instruction,
                 expected_rips,
                 arm_mode: self.arm_mode.context("the armed session has no arm mode")?,
-            })
+            };
+            let multi_provider_stop = self
+                .providers
+                .iter()
+                .filter(|provider| provider.baseline.is_some())
+                .count()
+                > 1;
+            if multi_provider_stop {
+                // The retained event is a barrier for the winner only. Return that provider to
+                // running before native completion, complete the callback, and prove a VM-wide
+                // pause before beginning any transition on a losing provider.
+                self.providers[active].provider.release()?;
+                self.providers[active].provider_phase = ProviderPhase::Running;
+                let targets = self.targets();
+                match pause_deadline {
+                    Some(deadline) => dispatcher.release_event_and_pause_until(
+                        &observed.event,
+                        &targets,
+                        deadline,
+                    )?,
+                    None => dispatcher.release_event_and_pause(&observed.event, &targets)?,
+                }
+                if !dispatcher.provider_writes_quiesced() {
+                    bail!("the dispatcher did not prove a post-event VM pause");
+                }
+                self.providers[active].provider.begin_arm()?;
+                self.providers[active].provider_phase = ProviderPhase::Arming;
+                self.restore_inactive_providers(active)?;
+            }
+            Ok((stop, multi_provider_stop))
         })();
         for provider in &mut self.providers {
             provider.provider.set_outer_deadline(None);
         }
         match result {
-            Ok(stop) => {
-                self.dispatcher_event = Some(observed.event);
+            Ok((stop, pause_backed)) => {
+                self.dispatcher_event = (!pause_backed).then_some(observed.event);
                 self.expected_stop = None;
                 self.commit_epoch(next_epoch);
                 self.state = State::Stopped(stop.clone());
@@ -1493,10 +1543,7 @@ impl<P: ControlProvider> LiveControl<P> {
             None => dispatcher.verify_instruction(&instruction)?,
         }
         let next_epoch = self.next_epoch("running")?;
-        let dispatcher_event = self
-            .dispatcher_event
-            .clone()
-            .context("the stopped session has no dispatcher event")?;
+        let dispatcher_event = self.dispatcher_event.clone();
         let active = self
             .active_provider
             .context("the stopped session has no active VP provider")?;
@@ -1531,15 +1578,18 @@ impl<P: ControlProvider> LiveControl<P> {
             }
             self.write_one(active, RegisterName::Dr6, dr6, dr6 & !DR6_CAUSE_MASK)?;
             self.write_one(active, RegisterName::Rflags, rflags, (rflags | TF) & !RF)?;
-            self.providers[active].provider.release()?;
+            match self.providers[active].provider_phase {
+                ProviderPhase::Stopped => self.providers[active].provider.release()?,
+                ProviderPhase::Arming => self.providers[active].provider.finish_arm()?,
+                ProviderPhase::Running => bail!("the active provider is already running"),
+            }
             self.providers[active].provider_phase = ProviderPhase::Running;
-            match deadline {
-                Some(deadline) => dispatcher.release_event_until(
-                    &dispatcher_event,
-                    ReleaseMode::ArmNextStop,
-                    deadline,
-                )?,
-                None => dispatcher.release_event(&dispatcher_event, ReleaseMode::ArmNextStop)?,
+            match (&dispatcher_event, deadline) {
+                (Some(event), Some(deadline)) => {
+                    dispatcher.release_event_until(event, ReleaseMode::ArmNextStop, deadline)?
+                }
+                (Some(event), None) => dispatcher.release_event(event, ReleaseMode::ArmNextStop)?,
+                (None, _) => dispatcher.finish_arm()?,
             }
             Ok(())
         })();
@@ -1548,7 +1598,7 @@ impl<P: ControlProvider> LiveControl<P> {
             return Err(self.enter_fault_inner(
                 dispatcher,
                 error,
-                Some(dispatcher_event),
+                dispatcher_event,
                 recovery_deadline,
             ));
         }
@@ -1594,10 +1644,7 @@ impl<P: ControlProvider> LiveControl<P> {
     ) -> Result<StopEpoch> {
         self.require_stop_epoch(epoch)?;
         let next_epoch = self.next_epoch("running")?;
-        let dispatcher_event = self
-            .dispatcher_event
-            .clone()
-            .context("the stopped session has no dispatcher event")?;
+        let dispatcher_event = self.dispatcher_event.clone();
         let active = self
             .active_provider
             .context("the stopped session has no active VP provider")?;
@@ -1606,25 +1653,25 @@ impl<P: ControlProvider> LiveControl<P> {
         self.state = State::Releasing;
         let result = (|| {
             self.restore_owned_state(active)?;
-            self.providers[active].provider.release()?;
+            match self.providers[active].provider_phase {
+                ProviderPhase::Stopped => self.providers[active].provider.release()?,
+                ProviderPhase::Arming => self.providers[active].provider.finish_arm()?,
+                ProviderPhase::Running => bail!("the active provider is already running"),
+            }
             self.providers[active].provider_phase = ProviderPhase::Running;
-            match deadline {
-                Some(deadline) => dispatcher.release_event_until(
-                    &dispatcher_event,
-                    ReleaseMode::Resume,
-                    deadline,
-                )?,
-                None => dispatcher.release_event(&dispatcher_event, ReleaseMode::Resume)?,
+            match (&dispatcher_event, deadline) {
+                (Some(event), Some(deadline)) => {
+                    dispatcher.release_event_until(event, ReleaseMode::Resume, deadline)?
+                }
+                (Some(event), None) => dispatcher.release_event(event, ReleaseMode::Resume)?,
+                (None, Some(deadline)) => dispatcher.release_paused_until(deadline)?,
+                (None, None) => dispatcher.release_paused()?,
             }
             Ok(())
         })();
         if let Err(error) = result {
-            let error = self.enter_fault_inner(
-                dispatcher,
-                error,
-                Some(dispatcher_event),
-                recovery_deadline,
-            );
+            let error =
+                self.enter_fault_inner(dispatcher, error, dispatcher_event, recovery_deadline);
             self.providers[active].provider.set_outer_deadline(None);
             return Err(error);
         }
@@ -1693,10 +1740,7 @@ impl<P: ControlProvider> LiveControl<P> {
             }
         }
         let next_epoch = self.next_epoch("running")?;
-        let dispatcher_event = self
-            .dispatcher_event
-            .clone()
-            .context("the stopped session has no dispatcher event")?;
+        let dispatcher_event = self.dispatcher_event.clone();
         let active = self
             .active_provider
             .context("the stopped session has no active VP provider")?;
@@ -1741,15 +1785,18 @@ impl<P: ControlProvider> LiveControl<P> {
                 original_dr7,
                 (original_dr7 & !(DR7_ENABLE_MASK | owned_kind_mask)) | owned_enable_mask,
             )?;
-            self.providers[active].provider.release()?;
+            match self.providers[active].provider_phase {
+                ProviderPhase::Stopped => self.providers[active].provider.release()?,
+                ProviderPhase::Arming => self.providers[active].provider.finish_arm()?,
+                ProviderPhase::Running => bail!("the active provider is already running"),
+            }
             self.providers[active].provider_phase = ProviderPhase::Running;
-            match deadline {
-                Some(deadline) => dispatcher.release_event_until(
-                    &dispatcher_event,
-                    ReleaseMode::ArmNextStop,
-                    deadline,
-                )?,
-                None => dispatcher.release_event(&dispatcher_event, ReleaseMode::ArmNextStop)?,
+            match (&dispatcher_event, deadline) {
+                (Some(event), Some(deadline)) => {
+                    dispatcher.release_event_until(event, ReleaseMode::ArmNextStop, deadline)?
+                }
+                (Some(event), None) => dispatcher.release_event(event, ReleaseMode::ArmNextStop)?,
+                (None, _) => dispatcher.finish_arm()?,
             }
             Ok(())
         })();
@@ -1758,7 +1805,7 @@ impl<P: ControlProvider> LiveControl<P> {
             return Err(self.enter_fault_inner(
                 dispatcher,
                 error,
-                Some(dispatcher_event),
+                dispatcher_event,
                 recovery_deadline,
             ));
         }
@@ -2248,8 +2295,11 @@ impl<P: ControlProvider> LiveControl<P> {
         let active = self
             .active_provider
             .context("the stopped session has no active VP provider")?;
-        if self.providers[active].provider_phase != ProviderPhase::Stopped {
-            bail!("the active provider is not stopped");
+        if !matches!(
+            self.providers[active].provider_phase,
+            ProviderPhase::Stopped | ProviderPhase::Arming
+        ) {
+            bail!("the active provider is not quiesced");
         }
         Ok(stop)
     }
@@ -2726,6 +2776,8 @@ mod tests {
         Wait,
         EstablishRecoveryPause,
         Release(ReleaseMode),
+        ReleaseAndPause,
+        ReleasePaused,
         Recover { safe: bool, owned_event: bool },
         Teardown,
     }
@@ -2862,7 +2914,7 @@ mod tests {
                 self.provider_writes_quiesced = self.fail_wait_quiesced;
                 bail!("{reason}");
             }
-            self.provider_writes_quiesced = true;
+            self.provider_writes_quiesced = targets.len() == 1;
             self.stops.pop_front().context("no scripted stop")
         }
 
@@ -2899,6 +2951,41 @@ mod tests {
                 self.provider_writes_quiesced = false;
             }
             Ok(())
+        }
+
+        fn release_event_and_pause(
+            &mut self,
+            _event: &HeldEvent,
+            _targets: &[TargetIdentity],
+        ) -> Result<()> {
+            self.actions.push(Action::ReleaseAndPause);
+            self.provider_writes_quiesced = false;
+            if self.fail_release {
+                bail!("scripted native completion failure");
+            }
+            self.provider_writes_quiesced = true;
+            Ok(())
+        }
+
+        fn release_event_and_pause_until(
+            &mut self,
+            event: &HeldEvent,
+            targets: &[TargetIdentity],
+            deadline: Instant,
+        ) -> Result<()> {
+            self.release_deadlines.push(Some(deadline));
+            self.release_event_and_pause(event, targets)
+        }
+
+        fn release_paused(&mut self) -> Result<()> {
+            self.actions.push(Action::ReleasePaused);
+            self.provider_writes_quiesced = false;
+            Ok(())
+        }
+
+        fn release_paused_until(&mut self, deadline: Instant) -> Result<()> {
+            self.release_deadlines.push(Some(deadline));
+            self.release_paused()
         }
 
         fn recover(&mut self, safe_to_resume: bool, event: Option<&HeldEvent>) -> Result<()> {
@@ -3461,6 +3548,8 @@ mod tests {
 
         assert_eq!(stopped.target.vp, 1);
         assert_eq!(control.active_provider, Some(1));
+        assert_eq!(dispatcher.actions.last(), Some(&Action::ReleaseAndPause));
+        assert_eq!(control.providers[1].provider.phase, FakePhase::Arming);
         assert!(control.providers[0].baseline.is_none());
         assert_eq!(
             control.providers[0].provider.registers,
@@ -3660,6 +3749,46 @@ mod tests {
                 safe: false,
                 owned_event: false,
             })
+        );
+    }
+
+    #[test]
+    fn post_event_pause_failure_never_touches_the_losing_provider() {
+        let baseline = register_values(BASE_RIP, 0xffff_0ff0, 0x400, 0x46);
+        let mut dispatcher =
+            FakeDispatcher::new([observed(StopReason::HardwareBreakpoint { slot: 0 })]);
+        dispatcher.fail_release = true;
+        dispatcher.fail_recovery_pause = Some("post-event Suspend-VM did not complete");
+        let mut control =
+            LiveControl::open_many(vec![FakeProvider::new(), FakeProvider::new().with_vp(1)])
+                .unwrap();
+
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Natural)
+            .unwrap();
+        let losing_armed = control.providers[1].provider.registers.clone();
+        assert_ne!(losing_armed, baseline);
+
+        let error = control.wait_for_stop(&mut dispatcher).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("scripted native completion failure"),
+            "{error:#}"
+        );
+        assert!(control.fault().unwrap().target_left_paused);
+        assert_eq!(
+            control.providers[1].provider.registers, losing_armed,
+            "the losing provider must remain untouched until the VM-wide pause is proved"
+        );
+        assert_eq!(control.providers[1].provider.phase, FakePhase::Running);
+        assert!(
+            dispatcher
+                .actions
+                .windows(2)
+                .any(|actions| actions
+                    == [Action::ReleaseAndPause, Action::EstablishRecoveryPause])
         );
     }
 
