@@ -67,12 +67,22 @@ handshake, moving what it settled into per-request `_meta`. So the revision is s
 by a client on `2026-07-28`, and by `initialize` for the legacy era; and an `initialize` that names
 `2026-07-28` anyway is answered with `2025-11-25`, because a handshake cannot negotiate its way to a
 revision that has none. That is `rmcp` 3.2.0's rule rather than this server's (upstream #1228), and
-it is why the dependency carries a `3.2.0` floor — earlier 3.x echoed the offer back, so the same
+it is one reason the dependency carries a floor — earlier 3.x echoed the offer back, so the same
 client saw a different answer depending on which patch release was resolved.
+
+The floor sits at `3.5.1` for a third rule, on the listener. A JSON-RPC error a *handler* returns
+on `2026-07-28` — this server refusing a tool that is off the caller's surface, the SDK's own `tool
+not found`, an argument that does not parse — is answered `200` with the error in the body, and only
+a request missing a `_meta` key the revision requires is an HTTP `400` (upstream #1322). Every 3.x
+before it sent each of those as `400`, which on this route is the signal the revision's
+backward-compatibility rule gives a client for a server that predates it, to be answered by falling
+back to `initialize` — so a narrowed listener refusing one call could demote a sessionless client to
+the handshake era mid-conversation. The session-bearing route and stdio always carried errors in
+band, so neither changed.
 
 `2026-07-28` also makes SEP-2549's cache fields mandatory on a paginated result, so `tools/list`
 answers a client **on** that revision with `ttlMs: 0` and `cacheScope: public`, and omits both for
 the older revisions, which never defined them. Since the fields follow the revision actually in
 force, they appear on the stateless path and not after a handshake that negotiated down. This is the
-other half of why `rmcp` has a floor at all: every 3.x before `3.1.1` omitted the fields on every
-revision, and a client that validates against the spec schema then rejects the whole tool list.
+oldest of the three reasons `rmcp` has a floor at all: every 3.x before `3.1.1` omitted the fields on
+every revision, and a client that validates against the spec schema then rejects the whole tool list.

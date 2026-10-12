@@ -1024,10 +1024,10 @@ reach is the wiring, which is what these assert against a real listener on a loo
 hand-written HTTP client (a library that normalised a `409` into an exception, or hid the session
 header, would be asserting on this server's behalf).
 
-**Ten of them need no debugger**, because none of them needs a session to be open: the six below,
-the three after them, and *Two clients are served two surfaces* from the section after that — whose
-third test, the token file, is already one of the three. Counting them by grepping for
-`Listener::start` gives nine and is wrong: *It will not start without a token* spawns the exe
+**Eleven of them need no debugger**, because none of them needs a session to be open: the seven
+below, the three after them, and *Two clients are served two surfaces* from the section after that —
+whose third test, the token file, is already one of the three. Counting them by grepping for
+`Listener::start` gives ten and is wrong: *It will not start without a token* spawns the exe
 itself, because a listener that will not start cannot be started by the helper.
 
 Six are the lease's own, and not one of them presents a **second credential** — so what they prove,
@@ -1073,6 +1073,12 @@ everything](#two-clients-two-of-everything) below are what closed it:
 - *An under-specified stateless request is told which part it is missing*, rather than merely
   refused. Both shapes the probe sent are pinned here, so the same `400` cannot be read as a broken
   listener a second time.
+- *A refusal on the stateless route is in band, and a malformed request is not.* A `--tools crash`
+  listener refusing `debug_batch` on `2026-07-28` answers `200` with the `-32602` in the body, and
+  the same call one `_meta` key short answers `400` naming the key. The split is `rmcp` 3.5.1's
+  (upstream #1322; every 3.x before it sent a handler's `-32602` as `400`, which a client on that
+  route reads as a server that predates the revision), so this is the assertion that makes `3.5.1`
+  a floor: it fails against 3.5.0, checked by pinning it.
 
 Three more need no debugger either, and none of them is about the lease:
 

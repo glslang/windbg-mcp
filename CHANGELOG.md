@@ -154,6 +154,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The `rmcp` floor moves to `3.5.1`, and a refusal over `--listen` on `2026-07-28` is answered in
+  band.** Before it, a JSON-RPC error a handler returned on the stateless route — this server
+  refusing a tool off the caller's surface, the SDK's own `tool not found`, an argument that did
+  not parse — went out as an HTTP `400`, which on that route is the signal the revision's
+  backward-compatibility rule gives a client for a server that predates it, to be answered by
+  falling back to `initialize`; a `--tools crash` listener refusing `debug_batch` could demote a
+  sessionless client to the handshake era mid-conversation. `rmcp` 3.5.1
+  ([upstream #1322](https://github.com/modelcontextprotocol/rust-sdk/pull/1322)) sends it as `200`
+  with the error in the body and keeps `400` for a request missing a `_meta` key the revision
+  requires. The smoke tier pins both arms against a real listener, which is what makes this a floor
+  rather than a lockfile entry: the test fails against 3.5.0, checked by pinning it. The
+  session-bearing route and stdio always carried errors in band and are unchanged, and nothing else
+  here depends on the release — its other change, a stdio `serve` that keeps waiting after a
+  malformed opener instead of exiting ([upstream
+  #1248](https://github.com/modelcontextprotocol/rust-sdk/pull/1248)), needs no code on this side.
+
 - **The live Secure Kernel tier says what a pass asserts about protection, and takes the VTL0 half
   when configured** (`FOLLOWUPS.md` item 124). Its stopped read is checked for the
   stop's epoch, for bytes beginning with the guarded instruction and for the `gpa` its VTL1 walk
