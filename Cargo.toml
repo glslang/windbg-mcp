@@ -11,14 +11,18 @@ license = "MIT"
 
 [dependencies]
 dbgscope = { git = "https://github.com/glslang/dbgscope", rev = "f5d697b82d0bea2f822e5f1679a81071553dfdae" }
-# 3.2.0 is a floor, not a preference, and by now for two unrelated reasons. Every 3.x before 3.1.1
+# 3.5.1 is a floor, not a preference, and by now for three unrelated reasons. Every 3.x before 3.1.1
 # generates a `tools/list` that omits SEP-2549's required `ttlMs`/`cacheScope`, which a spec-strict
 # `2026-07-28` client rejects outright — the server connects and appears to expose no tools at all
-# (upstream issue #1114). And every 3.x before 3.2.0 echoes `2026-07-28` straight back out of
+# (upstream issue #1114). Every 3.x before 3.2.0 echoes `2026-07-28` straight back out of
 # `initialize`; 3.2.0 settles that handshake on a revision which still *has* a handshake (upstream
-# #1228, `is_legacy_version`). The smoke tier asserts the second behaviour, so a build that resolved
-# 3.1.x would fail it rather than merely serve the older shape — which is what makes this a floor.
-rmcp = { version = "3.2.0", features = [
+# #1228, `is_legacy_version`). And every 3.x before 3.5.1 sends a handler's `-32602` on the stateless
+# route as an HTTP 400 — this server's surface refusal included — which a `2026-07-28` client reads
+# as a server that predates the revision and falls back to `initialize` on; 3.5.1 keeps the 400 for
+# a request missing a `_meta` key and answers the rest in band (upstream #1322). The smoke tier
+# asserts the last two, so a build that resolved an older release would fail it rather than merely
+# serve the older shape — which is what makes this a floor.
+rmcp = { version = "3.5.1", features = [
     "server",
     "transport-io",
     "macros",

@@ -5925,6 +5925,92 @@ fn an_under_specified_stateless_request_is_told_which_part_it_is_missing() {
     );
 }
 
+/// A handler's refusal on `2026-07-28` is answered in band, and only a request short a `_meta`
+/// key is an HTTP `400`.
+///
+/// The surface refusal is this server's own `-32602` — a tool this build has that the caller's
+/// surface does not — and on the stateless route rmcp maps a JSON-RPC error's code to an HTTP
+/// status before deciding whether to open a stream. Every 3.x before 3.5.1 mapped `-32602` to
+/// `400` unconditionally (upstream #1322 split the two), and `400` on this route is the signal
+/// the revision's backward-compatibility rule gives a client for a server that predates it, to be
+/// answered by falling back to `initialize` — so a `--tools crash` listener refusing `debug_batch`
+/// told a spec-compliant client, mid-conversation, that it had never heard of `2026-07-28`. The
+/// same mapper covers rmcp's own `tool not found` and an argument that does not parse. 3.5.1
+/// answers `200` with the refusal where the client reads it, and keeps `400` for a request
+/// missing a key the revision requires, which is the case the status was for. Both arms are
+/// asserted because the property is the split rather than one code: a mapper answering `200` to
+/// everything passes the first and fails the second. Checked against 3.5.0 by pinning it, where
+/// the first arm came back `400`; this is the third reason `Cargo.toml` carries a floor, and the
+/// one that puts it at `3.5.1`.
+///
+/// Protocol tier: the refusal is answered before anything is routed, so no target is needed.
+#[test]
+fn a_refusal_on_the_stateless_route_is_in_band_and_a_malformed_request_is_not() {
+    let mut server = Listener::start_with_args(&[], &["--tools", "crash"]);
+
+    let refused = server.stateless(
+        "tools/call",
+        json!({ "name": "debug_batch", "arguments": {} }),
+    );
+    assert_eq!(
+        refused.status,
+        200,
+        "a handler's -32602 on {STATELESS_REVISION} must be in band, not a {} a client reads as a \
+         server that predates the revision: {}\n--- stderr ---\n{}",
+        refused.status,
+        refused.body,
+        server.stderr()
+    );
+    let payload = refused
+        .payload
+        .clone()
+        .unwrap_or_else(|| panic!("the refusal carried no JSON-RPC payload: {}", refused.body));
+    assert_eq!(
+        payload["error"]["code"], -32602,
+        "the refusal is invalid params, in the body: {}",
+        refused.body
+    );
+    let message = payload["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("`debug_batch` is a tool this server has") && message.contains("--tools"),
+        "the body has to carry the surface refusal rather than the router's `tool not found`: {}",
+        refused.body
+    );
+
+    // The control, one key short rather than the whole `_meta` missing — the test above pins that
+    // shape. The request never reaches a handler, so the status is the only place the answer can
+    // say so, and it is the one `400` the revision defines.
+    let (mut body, name) = Listener::stateless_body(
+        server.next_id,
+        "tools/call",
+        json!({ "name": "debug_batch", "arguments": {} }),
+    );
+    server.next_id += 1;
+    body["params"]["_meta"] = json!({
+        "io.modelcontextprotocol/protocolVersion": STATELESS_REVISION,
+    });
+    let token = server.token.clone();
+    let malformed = server.send_with(
+        "POST",
+        Some(&token),
+        None,
+        Some(&body),
+        &Listener::stateless_headers("tools/call", name.as_deref()),
+    );
+    assert_eq!(
+        malformed.status, 400,
+        "a request short a `_meta` key is still a malformed request: {}",
+        malformed.body
+    );
+    assert!(
+        malformed
+            .body
+            .contains("io.modelcontextprotocol/clientCapabilities"),
+        "the refusal has to name the key it wanted: {}",
+        malformed.body
+    );
+}
+
 /// Going quiet is not leaving; saying goodbye is.
 ///
 /// The distinction is the whole reason a lease exists. Every request here is its own connection —
