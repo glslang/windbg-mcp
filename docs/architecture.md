@@ -80,11 +80,25 @@ sessionless client to the handshake era mid-conversation. What moved is the hand
 nothing else: a request the transport itself refuses before any handler runs keeps its status — a
 `_meta` short a required key, a header missing or mismatched, an unsupported revision are `400`, and
 an unknown method is `404`. The session-bearing route and stdio always carried errors in band, so
-neither changed.
+neither changed for it.
+
+And a fourth, on stdio, from the same release. A client on `2026-07-28` opens with
+`server/discover`, and a client that *may* be on it probes with one: Claude Code sends
+`server/discover` first, carrying full `_meta`, and after three seconds without an answer sends
+`initialize` naming `2025-11-25` on the same connection (measured 2026-10-12, version 2.1.296).
+Every 3.x before 3.5.1 let the first request decide a stdio connection's lifecycle for good — a
+discover with full `_meta` committed it to the sessionless model, the `initialize` that followed was
+still answered, and every request after it was refused with `-32602` for the `_meta` the handshake
+era never carries: a server that connected and then failed every call. 3.5.1 answers a discover
+without committing, so the next request still chooses (upstream #1248). This server answers a warm
+discover in 60 ms, so the fallback needs a start slower than the probe's three seconds — a cold
+exe, a scan of a fresh build — and the sessionless path is what that client ordinarily gets; the
+sequence is pinned regardless, by `a_discover_probe_leaves_the_connection_free_to_initialize`,
+which fails against 3.5.0.
 
 `2026-07-28` also makes SEP-2549's cache fields mandatory on a paginated result, so `tools/list`
 answers a client **on** that revision with `ttlMs: 0` and `cacheScope: public`, and omits both for
 the older revisions, which never defined them. Since the fields follow the revision actually in
 force, they appear on the stateless path and not after a handshake that negotiated down. This is the
-oldest of the three reasons `rmcp` has a floor at all: every 3.x before `3.1.1` omitted the fields on
+oldest of the four reasons `rmcp` has a floor at all: every 3.x before `3.1.1` omitted the fields on
 every revision, and a client that validates against the spec schema then rejects the whole tool list.

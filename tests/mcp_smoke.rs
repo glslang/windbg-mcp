@@ -1320,6 +1320,67 @@ fn discover_opens_a_session_without_initialize() {
     );
 }
 
+/// A `server/discover` answered on stdio leaves the connection free to open with `initialize`
+/// after all.
+///
+/// That is the opener Claude Code sends, measured against a recorder on 2026-10-12 (2.1.296):
+/// `server/discover` first, carrying full `_meta`, and — three seconds without an answer later —
+/// `initialize` naming `2025-11-25` on the **same** connection, after which, on the handshake era's
+/// rules, its requests carry no `_meta`. Every `rmcp` before 3.5.1 let the first request decide
+/// the connection's lifecycle for good: a discover with full `_meta` committed it to the
+/// sessionless model, the `initialize` that followed was still *answered*, and every request after
+/// it was refused with `-32602` for the `_meta` it did not carry — a server that connected and then
+/// failed every call. 3.5.1 answers a discover without committing (upstream #1248), so the next
+/// request still chooses. Measured both ways by driving this sequence at two builds by hand: the
+/// release on 3.4.1 refused the `tools/list`, the build on 3.5.1 served it; and this test fails
+/// against 3.5.0, checked by pinning it. It is the fourth reason the floor sits at 3.5.1 and the
+/// one that reaches the client this server is registered with.
+///
+/// What it does not stage is the delay. A warm discover is answered in 60 ms here, well inside the
+/// probe's three seconds, so the sessionless path is what that client normally gets; the fallback
+/// is a start slower than that — a cold exe, a scan of a fresh build — which no test can arrange,
+/// so the sequence is sent as it would arrive rather than the wait that produces it.
+///
+/// Not at odds with the refusal that closes [`discover_opens_a_session_without_initialize`]: there
+/// the request after the discover is a stateless one, and that is what commits the connection;
+/// here it is the handshake, which does not.
+#[test]
+fn a_discover_probe_leaves_the_connection_free_to_initialize() {
+    let mut server = Server::spawn();
+    let probe = server.stateless_request("server/discover", json!({}), STEP);
+    assert_no_error(&probe, "server/discover probe");
+
+    // The handshake the client falls back to. Answered on every release, so this is not the
+    // assertion: an older release took it for an ordinary request on a connection it had already
+    // committed, and answered it just the same.
+    let opened = server.initialize(FALLBACK_REVISION);
+    assert_eq!(
+        opened["protocolVersion"], FALLBACK_REVISION,
+        "the handshake after a probe should settle on the revision it offered: {opened}"
+    );
+
+    // The request that tells the releases apart: no `_meta`, as a handshake-era client sends it.
+    // Before 3.5.1 this was `-32602 request _meta is missing or has malformed required fields`.
+    let tools = server.request("tools/list", json!({}), STEP);
+    assert_no_error(
+        &tools,
+        "tools/list on the handshake a discover probe gave way to",
+    );
+    assert!(
+        tools["result"]["tools"]
+            .as_array()
+            .is_some_and(|t| !t.is_empty()),
+        "the fallback has to reach a usable tool list: {tools}"
+    );
+    // And it is the handshake era's lifecycle in force, not a sessionless one tolerating a bare
+    // request: the cache fields follow the revision negotiated, and that one never defined them.
+    assert_cache_fields_match_revision(
+        &tools["result"],
+        FALLBACK_REVISION,
+        "tools/list after the fallback",
+    );
+}
+
 /// What this server may advertise, as a whole key set rather than a list of keys that must be
 /// absent.
 ///

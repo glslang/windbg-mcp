@@ -166,10 +166,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   header missing or mismatched, an unsupported revision — keeps its `400`, and an unknown method its
   `404`. The smoke tier pins both arms against a real listener, which is what makes this a floor
   rather than a lockfile entry: the test fails against 3.5.0, checked by pinning it. The
-  session-bearing route and stdio always carried errors in band and are unchanged, and nothing else
-  here depends on the release — its other change, a stdio `serve` that keeps waiting after a
-  malformed opener instead of exiting ([upstream
-  #1248](https://github.com/modelcontextprotocol/rust-sdk/pull/1248)), needs no code on this side.
+  session-bearing route and stdio always carried errors in band, so neither changed for that. The
+  same release also stops a `server/discover` on stdio from committing the connection to the
+  sessionless lifecycle ([upstream
+  #1248](https://github.com/modelcontextprotocol/rust-sdk/pull/1248)), which is the floor's fourth
+  reason and the one that reaches the client this server is registered with: Claude Code probes a
+  stdio server with `server/discover` and, three seconds without an answer later, sends
+  `initialize` on the same connection (measured 2026-10-12, version 2.1.296). On every 3.x before
+  3.5.1 that handshake was answered and every request after it refused with `-32602` for the
+  `_meta` the handshake era never carries — a server that connected and then failed every call. A
+  warm discover is answered here in 60 ms, so the fallback needs a start slower than the probe
+  allows; the sequence is pinned on stdio regardless, and that test fails against 3.5.0 too,
+  checked the same way. The release's remaining changes are default cache hints for `2026-07-28`
+  peers (#1308), which the `tool_handler` macro already sets on `tools/list` — the one list this
+  server advertises — as `ttlMs: 0` and `cacheScope: public`; the `object!` macro exported without
+  the `macros` feature (#1318), which this crate turns on; and a client-side credential-store
+  notification (#1285), where this crate has no `rmcp` client.
 
 - **The live Secure Kernel tier says what a pass asserts about protection, and takes the VTL0 half
   when configured** (`FOLLOWUPS.md` item 124). Its stopped read is checked for the
