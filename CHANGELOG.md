@@ -162,8 +162,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   falling back to `initialize`; a `--tools crash` listener refusing `debug_batch` could demote a
   sessionless client to the handshake era mid-conversation. `rmcp` 3.5.1
   ([upstream #1322](https://github.com/modelcontextprotocol/rust-sdk/pull/1322)) sends it as `200`
-  with the error in the body and keeps `400` for a request missing a `_meta` key the revision
-  requires. The smoke tier pins both arms against a real listener, which is what makes this a floor
+  with the error in the body; a request the transport itself refuses — a `_meta` short a key, a
+  header missing or mismatched, an unsupported revision — keeps its `400`, and an unknown method its
+  `404`. The smoke tier pins both arms against a real listener, which is what makes this a floor
   rather than a lockfile entry: the test fails against 3.5.0, checked by pinning it. The
   session-bearing route and stdio always carried errors in band and are unchanged, and nothing else
   here depends on the release — its other change, a stdio `serve` that keeps waiting after a
