@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Live Secure Kernel control can arm several selected VPs.** `open_sk_live_control` accepts
+  distinct `additional_vps` and starts one independently validated register provider per VP. When
+  one wins, the worker restores and completes that event, settles and detaches from `vmwp`, proves
+  a VM-wide pause, and only then restores providers that did not own the event. A two-provider,
+  four-slot live gate completed 16 guarded steps and restored both baselines; debugger-loss and
+  hard-reset identity injections also passed fail-closed containment (`DONE.md` item 110).
+
 - **`pool_trace` and `pool_trace_read`: one driver's pool allocations, recorded as a live kernel
   runs.** Arming puts a breakpoint on each of the driver's calls to a pool allocator — the call
   sites `driver_hazards` finds, through the import address table where the loader freed the import

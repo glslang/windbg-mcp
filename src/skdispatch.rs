@@ -183,18 +183,37 @@ struct PendingControl {
     live_transport: String,
     target: TargetRequest,
     allow_transition_cr3: bool,
+    additional_vps: Vec<AdditionalVp>,
 }
 
 impl Session {
     pub(crate) fn open(request: &OpenRequest) -> Result<(Self, Vec<String>)> {
-        if !request.additional_vps.is_empty() {
+        request.target.validate()?;
+        if request.additional_vps.len() + 1 > crate::sklive::MAX_LIVE_CONTROL_VPS {
             bail!(
-                "the build-guarded live adapter currently accepts exactly one selected VP; the \
-                 native vmwp dispatcher serializes held callbacks, so multi-provider control \
-                 requires a separate release-and-quiesce protocol"
+                "live control accepts at most {} VP providers",
+                crate::sklive::MAX_LIVE_CONTROL_VPS
             );
         }
-        request.target.validate()?;
+        for (index, additional) in request.additional_vps.iter().enumerate() {
+            additional.target.validate()?;
+            if !additional
+                .target
+                .vm_id
+                .eq_ignore_ascii_case(&request.target.vm_id)
+                || additional.target.partition_id != request.target.partition_id
+                || additional.target.expected_cr3 != request.target.expected_cr3
+            {
+                bail!("all live-control VP requests must name one VM, partition and CR3");
+            }
+            if additional.target.vp == request.target.vp
+                || request.additional_vps[..index]
+                    .iter()
+                    .any(|earlier| earlier.target.vp == additional.target.vp)
+            {
+                bail!("live-control VP requests must be distinct");
+            }
+        }
         let reservation = VmReservation::acquire(&request.target.vm_id)?;
         let profile = DispatcherProfile::load(&request.profile)?;
         let dispatcher = VmwpDispatcherState::new(
@@ -212,6 +231,7 @@ impl Session {
                     live_transport: request.live_transport.clone(),
                     target: request.target.clone(),
                     allow_transition_cr3: request.allow_transition_cr3,
+                    additional_vps: request.additional_vps.clone(),
                 }),
                 preparation_failed: None,
                 max_pause_ms: request.max_pause_ms,
@@ -282,9 +302,10 @@ impl Session {
             let mut dispatcher = self.dispatcher.bind(engine);
             dispatcher.prepare_identity(pending.target.partition_id.map(|value| value.0))?
         };
+        let partition_id = found.partition_id;
         let partial = TargetIdentity {
             vm_id: pending.target.vm_id.clone(),
-            partition_id: HexU64(found.partition_id),
+            partition_id: HexU64(partition_id),
             vp: pending.target.vp,
             vtl: 1,
             expected_cr3: pending.target.expected_cr3.unwrap_or(HexU64(0x1000)),
@@ -298,7 +319,7 @@ impl Session {
             &control_transport,
             crate::skcontrol::TargetSelector {
                 vm_id: pending.target.vm_id.clone(),
-                partition_id: HexU64(found.partition_id),
+                partition_id: HexU64(partition_id),
                 vp: pending.target.vp,
                 expected_cr3: pending.target.expected_cr3,
             },
@@ -307,12 +328,45 @@ impl Session {
         let live_transport = expand_target_command(&pending.live_transport, &target, true)?;
         self.dispatcher
             .bind_identity(found, live_transport, &target)?;
-        let control = LiveControl::open_with_transition(provider, pending.allow_transition_cr3)?;
-        self.control = Some(control);
-        Ok(skipped
+        let mut providers = vec![provider];
+        let mut skipped = skipped
             .into_iter()
             .map(|line| format!("VP {}: {line}", target.vp))
-            .collect())
+            .collect::<Vec<_>>();
+        for additional in pending.additional_vps {
+            let partial = TargetIdentity {
+                vm_id: additional.target.vm_id.clone(),
+                partition_id: HexU64(partition_id),
+                vp: additional.target.vp,
+                vtl: 1,
+                expected_cr3: additional.target.expected_cr3.unwrap_or(HexU64(0x1000)),
+            };
+            let command = expand_target_command(
+                &additional.control_transport,
+                &partial,
+                additional.target.expected_cr3.is_some(),
+            )?;
+            let (provider, provider_skipped) = crate::skcontrol::ControlProcess::spawn_selected(
+                &command,
+                crate::skcontrol::TargetSelector {
+                    vm_id: additional.target.vm_id,
+                    partition_id: HexU64(partition_id),
+                    vp: additional.target.vp,
+                    expected_cr3: additional.target.expected_cr3,
+                },
+            )?;
+            let vp = provider.target().vp;
+            skipped.extend(
+                provider_skipped
+                    .into_iter()
+                    .map(|line| format!("VP {vp}: {line}")),
+            );
+            providers.push(provider);
+        }
+        let control =
+            LiveControl::open_many_with_transition(providers, pending.allow_transition_cr3)?;
+        self.control = Some(control);
+        Ok(skipped)
     }
 
     fn ensure_preparation_succeeded(&self) -> Result<()> {
@@ -693,7 +747,7 @@ impl TargetRequest {
 #[serde(deny_unknown_fields)]
 pub(crate) struct AdditionalVp {
     pub(crate) control_transport: String,
-    pub(crate) target: TargetIdentity,
+    pub(crate) target: TargetRequest,
 }
 
 impl fmt::Debug for OpenRequest {
@@ -1213,18 +1267,19 @@ impl VmwpDispatcherState {
     }
 
     fn confirm_retained_provider_stop(&mut self, targets: &[TargetIdentity]) -> Result<()> {
-        let target = targets
-            .first()
-            .filter(|_| targets.len() == 1)
-            .context("provider quiescence requires exactly one selected VP")?;
         let retained = self
             .retained_event
             .as_ref()
             .context("the selected provider has no retained dispatcher event")?;
-        if retained.event.vp != target.vp || retained.event.vtl != target.vtl {
+        if !targets
+            .iter()
+            .any(|target| retained.event.vp == target.vp && retained.event.vtl == target.vtl)
+        {
             bail!("the retained dispatcher event does not name the selected provider");
         }
-        self.provider_writes_quiesced = true;
+        // A native event holds only its own VP. It is a complete provider-write barrier only for a
+        // one-provider controller; fan-out must complete it and prove a VM-wide pause first.
+        self.provider_writes_quiesced = targets.len() == 1;
         Ok(())
     }
 
@@ -2324,6 +2379,31 @@ impl EventDispatcher for VmwpDispatcher<'_> {
         self.complete_event(mode, Some(deadline))
     }
 
+    fn release_event_and_pause(
+        &mut self,
+        event: &HeldEvent,
+        targets: &[TargetIdentity],
+    ) -> Result<()> {
+        self.release_event_and_pause_inner(event, targets, None)
+    }
+
+    fn release_event_and_pause_until(
+        &mut self,
+        event: &HeldEvent,
+        targets: &[TargetIdentity],
+        deadline: Instant,
+    ) -> Result<()> {
+        self.release_event_and_pause_inner(event, targets, Some(deadline))
+    }
+
+    fn release_paused(&mut self) -> Result<()> {
+        self.release_paused_inner(None)
+    }
+
+    fn release_paused_until(&mut self, deadline: Instant) -> Result<()> {
+        self.release_paused_inner(Some(deadline))
+    }
+
     fn recover(&mut self, safe_to_resume: bool, event: Option<&HeldEvent>) -> Result<()> {
         self.recover_inner(safe_to_resume, event, None)
     }
@@ -2347,6 +2427,54 @@ impl EventDispatcher for VmwpDispatcher<'_> {
 }
 
 impl VmwpDispatcher<'_> {
+    fn release_event_and_pause_inner(
+        &mut self,
+        event: &HeldEvent,
+        targets: &[TargetIdentity],
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        let retained = self
+            .state
+            .retained_event
+            .as_ref()
+            .map(|retained| &retained.event)
+            .context("the dispatcher owns no event to release before the VM pause")?;
+        if retained != event {
+            bail!("post-event pause does not name the event held by the dispatcher");
+        }
+        self.complete_retained_event(event, deadline)?;
+        self.pause_armed_without_event_inner(targets, deadline)?;
+        self.state.recovery_deadline = None;
+        Ok(())
+    }
+
+    fn release_paused_inner(&mut self, deadline: Option<Instant>) -> Result<()> {
+        if self.state.retained_event.is_some()
+            || !self.state.vm_paused
+            || !self.state.provider_writes_quiesced
+            || !matches!(self.state.phase, DispatcherPhase::ReadyForStop)
+        {
+            bail!("release_paused requires a proved post-event VM pause");
+        }
+        require_completion_deadline(deadline)?;
+        if self.state.breakpoint.is_some() {
+            self.remove_owned_breakpoint()?;
+        }
+        if self.state.threads_frozen {
+            self.thaw_threads()?;
+        }
+        if self.state.attached {
+            self.detach_handled()?;
+        }
+        self.state.finish_completion_kick_until(deadline)?;
+        self.state.begin_vm_resume();
+        run_vm_action_until(self.bound_vm_id()?, VmAction::Resume, deadline)?;
+        self.state.vm_paused = false;
+        self.state.phase = DispatcherPhase::Detached;
+        self.state.recovery_deadline = None;
+        Ok(())
+    }
+
     fn claim_attach(&mut self) {
         self.state.attached = true;
         tracing::info!(
@@ -2452,7 +2580,10 @@ impl VmwpDispatcher<'_> {
         // event, join that helper before a fresh Suspend-VM proves recovery quiescence. An incomplete
         // callback whose exact thread was not retained remains fail-closed.
         let transition_error = self.state.finish_completion_kick_until(deadline).err();
-        let pause = if matches!(self.state.phase, DispatcherPhase::ReadyForStopInterrupted) {
+        let pause = if matches!(
+            self.state.phase,
+            DispatcherPhase::ReadyForStopInterrupted | DispatcherPhase::NativeReturn(_)
+        ) {
             self.pause_armed_without_event_inner(targets, deadline)
         } else if matches!(
             self.state.phase,
@@ -2700,19 +2831,25 @@ impl VmwpDispatcher<'_> {
         let target = targets
             .first()
             .context("no-event disarm requires at least one selected VP")?;
+        let armed = matches!(
+            self.state.phase,
+            DispatcherPhase::ReadyForStop | DispatcherPhase::ReadyForStopInterrupted
+        ) && self.state.breakpoint.is_some();
+        let completed_event = matches!(self.state.phase, DispatcherPhase::NativeReturn(_))
+            && self.state.breakpoint.is_none();
         if self.state.targets != targets
-            || !matches!(
-                self.state.phase,
-                DispatcherPhase::ReadyForStop | DispatcherPhase::ReadyForStopInterrupted
-            )
+            || !(armed || completed_event)
             || self.state.retained_event.is_some()
             || !self.state.attached
-            || self.state.breakpoint.is_none()
         {
             bail!("no-event disarm requires the debugger-stopped armed target set");
         }
 
-        self.remove_owned_breakpoint()?;
+        if completed_event {
+            self.settle_native_completion(deadline)?;
+        } else {
+            self.remove_owned_breakpoint()?;
+        }
         self.detach_handled()?;
         self.state.finish_completion_kick_until(deadline)?;
         self.state.claim_vm_pause(targets)?;
@@ -3277,6 +3414,7 @@ impl VmwpDispatcher<'_> {
     }
 
     fn complete_event(&mut self, mode: ReleaseMode, deadline: Option<Instant>) -> Result<()> {
+        inject_live_debugger_loss_after_restore()?;
         require_completion_deadline(deadline)?;
         let event = self
             .state
@@ -4100,6 +4238,16 @@ impl VmwpDispatcher<'_> {
     }
 }
 
+fn inject_live_debugger_loss_after_restore() -> Result<()> {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("WINDBG_MCP_SK_LIVE_FAULT").as_deref()
+        == Some(std::ffi::OsStr::new("debugger_loss_after_restore"))
+    {
+        bail!("injected debugger loss after provider baseline restoration");
+    }
+    Ok(())
+}
+
 fn debugger(error: impl std::fmt::Display) -> anyhow::Error {
     anyhow!("DbgEng: {error}")
 }
@@ -4874,8 +5022,8 @@ mod tests {
     }
 
     #[test]
-    fn concrete_live_adapter_refuses_fan_out_before_loading_a_profile() {
-        let mut additional = target();
+    fn concrete_live_adapter_loads_the_profile_before_preparing_fan_out() {
+        let mut additional = target_request();
         additional.vp = 1;
         let request = OpenRequest {
             profile: r"Z:\definitely-missing\profile.json".into(),
@@ -4893,11 +5041,11 @@ mod tests {
         };
 
         let error = match Session::open(&request) {
-            Ok(_) => panic!("multi-provider concrete session unexpectedly opened"),
+            Ok(_) => panic!("missing profile unexpectedly opened"),
             Err(error) => error,
         };
 
-        assert!(error.to_string().contains("exactly one selected VP"));
+        assert!(error.to_string().contains("profile"), "{error:#}");
     }
 
     #[test]

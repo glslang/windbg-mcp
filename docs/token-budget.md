@@ -341,14 +341,14 @@ None of these is a bug. They are recorded because they were invisible, and
    and, since item 41, for the sentences the tools it keeps used to spend on pointing at them.
    Where the bytes sit, and what each profile costs:
 
-   Both tables are measurements of **2026-10-09** and move with any edit to a description. The
+   Both tables are measurements of **2026-10-12** and move with any edit to a description. The
    `securekernel` row is an extra group: the absent spec omits it, while `all` includes it.
 
    | group | tools | bytes | share |
    |---|---:|---:|---:|
-   | `allocator` | 12 | 19,840 | 16.2% |
+   | `allocator` | 12 | 19,840 | 16.1% |
    | `ioctl` | 11 | 16,088 | 13.1% |
-   | `securekernel` | 12 | 19,013 | 15.5% |
+   | `securekernel` | 12 | 19,350 | 15.7% |
    | `exec` | 10 | 15,087 | 12.3% |
    | `session` | 10 | 14,208 | 11.6% |
    | `inspect` | 10 | 13,485 | 11.0% |
@@ -359,7 +359,7 @@ None of these is a bug. They are recorded because they were invisible, and
    | `--tools` | tools | model |
    |---|---:|---:|
    | *(absent)* | 66 | 103,579 |
-   | `all` | 78 | 122,592 |
+   | `all` | 78 | 122,929 |
    | `session,inspect,exec,crash` | 33 | 49,332 |
    | `session,inspect,crash` | 23 | 34,092 |
    | `crash` | 13 | 20,515 |

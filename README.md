@@ -11,7 +11,7 @@ An [MCP](https://modelcontextprotocol.io) server that exposes **WinDbg/DbgEng** 
 serves the same tools to clients that are not on the machine DbgEng runs on. It drives a live
 debugger engine for **user-mode**, **kernel-mode**, **crash-dump**, and
 **Time Travel Debugging (TTD)** workflows — and reads a VBS guest's **Secure Kernel (VTL1)** out
-of a Hyper-V checkpoint or controls one selected VP in an exact disposable VBS VM through
+of a Hyper-V checkpoint or controls selected VPs in an exact disposable VBS VM through
 operator-supplied providers.
 
 The low-level engine bindings live in [`dbgscope`](https://github.com/glslang/dbgscope)
@@ -134,7 +134,7 @@ Seventy-six tools in nine `--tools` groups; the rows below split some of those g
 | User Segment Heap | `allocator` | `heap_list`, `heap_allocations`, `heap_chunk`, `heap_census`, `heap_diagnostics` |
 | Structure walk | `allocator` | `walk_memory` |
 | Raw     | `inspect` | `execute` — run any debugger command, returns full text output |
-| Secure Kernel (extra) | `securekernel` | Capture: `open_sk_capture`, `sk_modules`, `sk_read_memory`, `sk_symbol`. Live selected-VP control: `open_sk_live_control`, `sk_live_arm`, `sk_live_wait`, `sk_live_registers`, `sk_live_read_memory`, `sk_live_step`, `sk_live_continue`, plus the managed `open_sk_kd` facade. This extra group is omitted by default; name it or use `--tools all`. Capture needs an admitted Windows SDK saved-state provider root; live control needs startup policy, an operator-supplied privileged provider and an exact-build `vmwp` profile. |
+| Secure Kernel (extra) | `securekernel` | Capture: `open_sk_capture`, `sk_modules`, `sk_read_memory`, `sk_symbol`. Live selected-VP control: `open_sk_live_control`, `sk_live_arm`, `sk_live_wait`, `sk_live_registers`, `sk_live_read_memory`, `sk_live_step`, `sk_live_continue`, plus the managed `open_sk_kd` facade. A live session may arm additional selected VPs through independently validated providers. This extra group is omitted by default; name it or use `--tools all`. Capture needs an admitted Windows SDK saved-state provider root; live control needs startup policy, an operator-supplied privileged provider and an exact-build `vmwp` profile. |
 
 The ordinary eight groups are served by default; the `securekernel` extra is opt-in. Explicit
 `--tools all` serves all seventy-eight. `--tools session,inspect,crash` cuts the surface to twenty-three

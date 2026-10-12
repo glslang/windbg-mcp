@@ -45,7 +45,7 @@ clock says *some* tier had work to do; which one is a `RAN:`/`SKIPPED` line, not
 | **Bounded command** | `--ignored` | `dbgeng.dll`, the sample dump, ~1 minute | the watchdog wiring, which now spans two processes |
 | **Live kernel** | `--ignored` + `WINDBG_MCP_SMOKE_KERNEL` | a live kernel target you can freeze — KDNET, or serial | that a kernel attach *lands*, coexists, and is let go — by `end_session` and by a disconnect; and that a `debug_batch` which patches a byte of the running kernel puts it back |
 | **Live hypervisor** | `--ignored` + `WINDBG_MCP_SMOKE_HYPERVISOR_PROFILE`; two more variables below | a disposable Microsoft hypervisor target, reached by its own configured profile | separate detach-only tests for default and experimental announcement attach; broader identity, inspection, step, and breakpoint-management test; [runbook, independent health checks, and limits](hypervisor-debugging.md#validation) |
-| **Live Secure Kernel** | `--ignored` + `WINDBG_MCP_SMOKE_SK_LIVE` | one exact disposable VBS VM, private provider commands and an exact-build `vmwp` profile | the typed MCP bind/arm/wait/inspect/step/continue/close lifecycle and its worker isolation |
+| **Live Secure Kernel** | `--ignored` + `WINDBG_MCP_SMOKE_SK_LIVE` | one exact disposable VBS VM, private provider commands and an exact-build `vmwp` profile | the typed MCP bind/arm/wait/inspect/step/continue/close lifecycle, optional multi-provider selection and worker isolation |
 | **MessageManager CTF** | `--ignored` + live-kernel gate + `WINDBG_MCP_SMOKE_CTF=1` | the challenge VM, WinRM, full `nt` symbols | the real driver and retained `Tgsm` pool objects through the shipped MCP transport |
 | **TTD** | `WINDBG_MCP_SMOKE_TTD=1` | `TTD.exe`, **elevation**, and a WinDbg engine payload beside the binary to replay what it records — both benches' came from `setup.md`'s unpacked `.msixbundle` rather than from an installed package, the ARM64 one as of 2026-08-29 | that `record_trace` records the program it was given and reports a finished recording as one, and that a TTD query returns records rather than bare indices |
 | **32-bit managed target** | a 32-bit `dbgeng.dll` in an `x86` directory beside the binary under test | that engine, `x86\windbg-mcp.exe` beside it, and the `csc.exe` every stock Windows ships — it compiles and dumps its own fixture | that a 32-bit dump **and** a 32-bit live process are each opened by a worker of *their* architecture, so 32-bit SOS loads — which this server's own engine cannot do at all |
@@ -196,7 +196,8 @@ that item.
 **The live Secure Kernel tier is a different, explicitly disposable gate.**
 `WINDBG_MCP_SMOKE_SK_LIVE` names a private JSON file containing `profile`, `control_transport`,
 `live_transport`, `dispatcher_vnd`, `vm_id`, `partition_id`, `expected_cr3`,
-`instruction_address` and `instruction_bytes`; `vp`, `read_size` and `vtl0_profile` are optional.
+`instruction_address` and `instruction_bytes`; `vp`, `additional_vps`, `read_size` and
+`vtl0_profile` are optional.
 When `vtl0_profile` is supplied, `vtl0_guest` must name the expected profile `guest` claim for the
 VTL1 VM. The file must also
 carry `"disposable": true`. `vmwp_pid` is an optional mismatch assertion; the server resolves the

@@ -142,8 +142,10 @@ The state machine implements both the narrow redirected gate and natural control
    requires the baseline CR3. With transition-CR3 control enabled, a natural hardware stop may
    establish a different nonzero, page-aligned root. The worker binds memory translation to that
    root and re-reads every guarded instruction through it before exposing the stop. Every
-   single-step must retain the same root. The build-guarded live adapter accepts one selected VP,
-   whose native intercept is the provider-write barrier for the stop;
+   single-step must retain the same root. One selected VP may use its retained native intercept as
+   the provider-write barrier. With several selected VPs, the worker restores the winner and
+   completes its event, gives native completion one watchdog-bounded run slice, detaches, and
+   proves a VM-wide pause before it reads or restores a provider that did not own that event;
 6. consume each stop epoch once to arm TF. The first step may reuse the hardware-stop instruction;
    every later step must re-prove the exact current instruction bytes. A step accepts one default
    fall-through address or at most four explicit destinations for a branch;
@@ -174,25 +176,30 @@ provider transport tests also pin bounded silence and reader death.
 
 ## MCP live-control session
 
-The `securekernel` tool group exposes one selected VP through a worker-owned live session. The
-adapter uses an initial VM pause and the held native event to keep provider state stable while it
-changes that VP:
+The `securekernel` tool group exposes a selected VP set through a worker-owned live session. The
+adapter uses an initial VM pause, the winning native event and, for a multi-provider stop, a second
+proved VM pause to keep provider state stable:
 
-1. `open_sk_live_control` applies the startup policy, records the VM, selected VP, profile and exact
+1. `open_sk_live_control` applies the startup policy, records the VM, primary `vp`, optional
+   `additional_vps`, profile and exact
    provider command templates, resolves the current `vmwp` PID, loads the profile, and reserves the
-   VM. PID, dispatcher VND, partition id and CR3 are optional mismatch assertions. Its MCP schema
-   exposes one VP; multi-provider coordination remains a separate gate. Opening does not pause,
+   VM. PID, dispatcher VND, partition id and CR3 are optional mismatch assertions. Every VP must be
+   distinct, the selected set is bounded at 16, and every selected VP receives the same set of at
+   most four hardware breakpoint slots. Opening does not pause,
    attach to or inspect the VM, and starts no provider. `allow_transition_cr3` defaults to false and
    is accepted only with natural arming.
 2. The first `sk_live_arm` pauses the VM, verifies its `vmwp` binding and exact build, discovers the
    dispatcher VND and VID partition id on the worker engine thread, then starts the register
    provider and validates its reported CR3. It opens live memory against that identity, validates
    the provider-reported Secure Kernel base and guarded instructions, and checks every profiled
-   dispatcher site. Only then does it save the selected VP's writable baseline and install one to
-   four explicitly slotted execution breakpoints. Redirect mode requires one VP and one breakpoint.
-   Natural mode arms the full VP and breakpoint set.
-3. `sk_live_wait` pumps `vmwp` until the selected VP reaches any armed address. It retains that exact
-   callback thread. In transition mode it validates two identical register snapshots, binds the
+   dispatcher site. Only then does it save every selected VP's writable baseline and install one to
+   four explicitly slotted execution breakpoints on each. Redirect mode requires one VP and one
+   breakpoint. Natural mode arms the full VP and breakpoint set.
+3. `sk_live_wait` pumps `vmwp` until a selected VP reaches any armed address. It retains that exact
+   callback thread. For a multi-provider hardware stop, it restores and releases the winner,
+   completes the native event, settles and detaches from `vmwp`, proves a VM-wide pause, and restores
+   every losing provider before returning the stop. In transition mode it validates two identical
+   register snapshots, binds the
    observed CR3, and rechecks the guarded instruction bytes through that root before returning the
    winning DR slot with complete stop evidence and a fresh controller epoch.
 4. `sk_live_registers` and `sk_live_read_memory` inspect only that stopped epoch. The memory path
@@ -250,12 +257,14 @@ scoped crash record. A preceding natural-flow VP1 attempt timed out because that
 scheduled there; bounded recovery restored the baseline and resumed the VM before faulting the
 session.
 
-The generic controller also has an offline-tested fan-out model, but the concrete adapter now
-refuses it before provider startup. The live two-provider attempt showed why: `Suspend-VM` remained
-blocked while a VID event was outstanding, including after a handled debugger detach, and parking
-the first callback prevented a second selected VP from reaching the serialized native dispatcher
-path. Multi-provider live control therefore needs a release-and-quiesce protocol in separate
-chunks; the bench-proven path selects one VP at a time.
+The first live two-provider attempt established the constraint the implemented protocol observes:
+`Suspend-VM` remained blocked while a VID event was outstanding, including after a handled debugger
+detach, and parking the first callback prevented a second selected VP from reaching the serialized
+native dispatcher path. The adapter therefore completes the winning event before requesting the
+pause and does not touch a losing provider until that pause is proved. On 2026-10-12 the resulting
+two-provider gate selected VP0 at slot 3, restored VP1 under that pause, completed 16 guarded steps
+on the winner, restored both debug-register baselines and TF/RF state, preserved Secure Kernel text,
+and left the disposable VM Off after its independent audit.
 
 On 2026-10-04 a fresh one-provider run selected the exact profile from a two-entry catalog that also
 contained a wrong-build profile, armed DR0 through DR3 at four guarded
@@ -277,6 +286,17 @@ Because the dead provider could no longer restore that state, the dedicated fail
 discarded after evidence capture; ending the unresolved debugger replaced `vmwp`, as expected for
 an unhandled DbgEng detach, before the replacement boot was stopped. This proves containment, not
 recovery or continued guest health after provider loss.
+
+The two remaining live fault gates passed on 2026-10-12. A startup-fixed debug injection failed
+DbgEng completion only after the provider baseline had been restored. The fault reported
+`target_left_paused=true`, recovery named the debugger failure, `end_session` reported unresolved
+ownership and retained the worker, and independent VTL1 reads found the saved debug registers and
+guarded text unchanged. Disposing that worker left the guest running with an OK heartbeat. The
+identity gate issued termination to the exact allowlisted VM's `vmwp` while its stop was held; the
+provider then refused the changed identity before any register write, and teardown retained the
+worker. After that worker was disposed, VMMS completed the hard reset and the same VM returned with
+a different guest boot identity. The independent distinction matters: containment covered the old
+identity; the later boot was audited as a replacement identity.
 
 ## Build-guarded dispatcher adapter
 
