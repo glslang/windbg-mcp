@@ -8122,74 +8122,101 @@ mod tests {
         );
     }
 
-    /// A `2026-07-28` client may skip the handshake entirely and open the connection with
-    /// `server/discover`. Nothing in this crate implements that path — it falls out of the
-    /// SDK's defaults — which is exactly why it is worth pinning: an SDK bump could take it
-    /// away silently, and the failure mode is a whole class of client that cannot connect at
-    /// all rather than a tool that misbehaves.
+    /// A `2026-07-28` client may skip the handshake entirely: it opens the connection with
+    /// `server/discover` and then simply sends its requests, each carrying its own `_meta`.
+    /// Nothing in this crate implements that path — it falls out of the SDK's defaults — which
+    /// is exactly why it is worth pinning: an SDK bump could take it away silently, and the
+    /// failure mode is a whole class of client that cannot connect at all rather than a tool
+    /// that misbehaves.
     ///
     /// Driven over a real duplex with hand-written JSON-RPC, because the claim is about the
     /// bytes on the wire: calling `discover()` directly would prove only that the default
     /// method exists, not that `serve` accepts it as the *opening* message.
+    ///
+    /// **`serve` runs on a task of its own, and nothing here says which message it resolves
+    /// on.** rmcp 3.5.1 (upstream #1248) made a discover a bootstrap probe: `serve` answers it
+    /// before any lifecycle exists and resolves only on the first ordinary metadata-bearing
+    /// request, where 3.5.0 resolved on the discover itself. The first version of this test
+    /// awaited `serve` before reading the discover answer, so that bump failed it after thirty
+    /// seconds with nothing wrong on the wire — it had pinned the SDK's choice rather than the
+    /// client's need. What the client needs is that both of its messages are answered and that
+    /// it ends up served, so that is what is asserted, and the join on `serve` comes last.
     #[tokio::test]
     async fn discover_opens_a_session_without_initialize() {
         use std::time::Duration;
 
         use rmcp::ServiceExt;
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt};
 
         // Generous enough that a loaded CI runner never trips it, bounded so a regression
         // fails this test instead of hanging the suite.
         const STEP: Duration = Duration::from_secs(30);
 
-        let (mut client_io, server_io) = tokio::io::duplex(64 * 1024);
+        /// The next line the server wrote, which has to answer request `id` and not be a
+        /// JSON-RPC error. Returned with the raw line, for the assertion messages.
+        async fn answer<R: AsyncBufRead + Unpin>(
+            rx: &mut R,
+            what: &str,
+            id: u64,
+        ) -> (String, serde_json::Value) {
+            let mut line = String::new();
+            tokio::time::timeout(STEP, rx.read_line(&mut line))
+                .await
+                .unwrap_or_else(|_| panic!("the {what} response should arrive"))
+                .unwrap_or_else(|e| panic!("read the {what} response: {e}"));
+            // A `tools/list` answer is hundreds of kilobytes, so a mismatch shows its head.
+            let head: String = line.chars().take(300).collect();
+            let response: serde_json::Value = serde_json::from_str(&line)
+                .unwrap_or_else(|e| panic!("malformed {what} response {head:?}: {e}"));
+            assert_eq!(
+                response["id"], id,
+                "the line read must be the answer to {what}: {head}"
+            );
+            assert_eq!(
+                response["error"],
+                serde_json::Value::Null,
+                "{what} must not be answered with a JSON-RPC error: {line}"
+            );
+            (line, response)
+        }
 
-        // Per-request metadata is what replaces the handshake, so a discover opener has to
-        // carry the two keys 2026-07-28 makes mandatory; without them the SDK is entitled to
-        // reject the request and demand `initialize`. Buffered before the server starts, so
-        // the opening message is already waiting when `serve` reads.
-        let discover = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "server/discover",
-            "params": {
-                "_meta": {
-                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                    "io.modelcontextprotocol/clientCapabilities": {},
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        // One buffered reader for the whole exchange and a writer beside it: a `BufReader`
+        // over the unsplit stream would have to be dropped before the second request could be
+        // written, taking whatever it had read ahead with it.
+        let (client_rx, mut client_tx) = tokio::io::split(client_io);
+        let mut client_rx = tokio::io::BufReader::new(client_rx);
+
+        // Per-request metadata is what replaces the handshake, so every request of this
+        // client's has to carry the two keys 2026-07-28 makes mandatory; without them the SDK
+        // is entitled to reject the request and demand `initialize`.
+        let request = |id: u64, method: &str| {
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": {
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    }
                 }
-            }
-        });
-        client_io
+            })
+        };
+
+        // Buffered before the server starts, so the opening message is already waiting when
+        // `serve` reads.
+        let discover = request(1, "server/discover");
+        client_tx
             .write_all(format!("{discover}\n").as_bytes())
             .await
             .expect("write the discover request");
 
         // No session is ever opened, so no engine worker is spawned — discover is answered
         // from `get_info` alone, which is what lets this run on a machine with no debugger.
-        let service = tokio::time::timeout(
-            STEP,
-            WindbgServer::new(Sessions::new(STEP)).serve(server_io),
-        )
-        .await
-        .expect("serve must not block waiting for an `initialize` that never comes")
-        .expect("`server/discover` must open a session on its own");
+        let serving = tokio::spawn(WindbgServer::new(Sessions::new(STEP)).serve(server_io));
 
-        let mut line = String::new();
-        tokio::time::timeout(
-            STEP,
-            tokio::io::BufReader::new(&mut client_io).read_line(&mut line),
-        )
-        .await
-        .expect("the discover response should arrive")
-        .expect("read the discover response");
-
-        let response: serde_json::Value = serde_json::from_str(&line)
-            .unwrap_or_else(|e| panic!("malformed response {line:?}: {e}"));
-        assert_eq!(
-            response["error"],
-            serde_json::Value::Null,
-            "discover must not be answered with a JSON-RPC error: {line}"
-        );
+        let (line, response) = answer(&mut client_rx, "discover", 1).await;
         let result = &response["result"];
 
         // SEP-2322: 2026-07-28 requires the discriminator, and a client that parses results
@@ -8245,6 +8272,36 @@ mod tests {
             "the reported version must be the one this build stamped: {line}"
         );
 
+        // Then the request that makes this a session rather than a probe. A discover-first
+        // client has no `initialize` to send, so its first ordinary request arrives with the
+        // same `_meta` and nothing else, and has to be served rather than refused for want of
+        // a handshake — the tools are what it came for, and discover only *advertised* them.
+        let list = request(2, "tools/list");
+        client_tx
+            .write_all(format!("{list}\n").as_bytes())
+            .await
+            .expect("write the tools/list request");
+        let (line, response) = answer(&mut client_rx, "tools/list", 2).await;
+        let head: String = line.chars().take(300).collect();
+        let tools = response["result"]["tools"]
+            .as_array()
+            .unwrap_or_else(|| panic!("tools/list must carry a tools array: {head}"));
+        // `session_status` is in every surface this server serves, so it is the one name that
+        // says these are this server's tools and not an SDK placeholder.
+        assert!(
+            tools.iter().any(|t| t["name"] == "session_status"),
+            "a discover-first client must be served this server's tools, got {} of them: {head}",
+            tools.len()
+        );
+
+        // And by now `serve` has resolved: the client is a session, whichever of its two
+        // messages the SDK opened it on. Joined last and bounded, so a `serve` that waits for
+        // an `initialize` this client will never send fails here rather than hanging the suite.
+        let service = tokio::time::timeout(STEP, serving)
+            .await
+            .expect("serve must not block waiting for an `initialize` that never comes")
+            .expect("the serve task must not panic")
+            .expect("`server/discover` and a request must open a session on their own");
         service.cancel().await.expect("shut the service down");
     }
 
