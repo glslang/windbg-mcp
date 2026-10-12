@@ -5925,8 +5925,8 @@ fn an_under_specified_stateless_request_is_told_which_part_it_is_missing() {
     );
 }
 
-/// A handler's refusal on `2026-07-28` is answered in band, and only a request short a `_meta`
-/// key is an HTTP `400`.
+/// A handler's refusal on `2026-07-28` is answered in band, and a request the transport refuses
+/// keeps its HTTP `400`.
 ///
 /// The surface refusal is this server's own `-32602` — a tool this build has that the caller's
 /// surface does not — and on the stateless route rmcp maps a JSON-RPC error's code to an HTTP
@@ -5936,8 +5936,9 @@ fn an_under_specified_stateless_request_is_told_which_part_it_is_missing() {
 /// answered by falling back to `initialize` — so a `--tools crash` listener refusing `debug_batch`
 /// told a spec-compliant client, mid-conversation, that it had never heard of `2026-07-28`. The
 /// same mapper covers rmcp's own `tool not found` and an argument that does not parse. 3.5.1
-/// answers `200` with the refusal where the client reads it, and keeps `400` for a request
-/// missing a key the revision requires, which is the case the status was for. Both arms are
+/// answers `200` with the refusal where the client reads it, and leaves a request the transport
+/// itself refuses — a `_meta` short a key, a header missing or mismatched, an unsupported revision
+/// — on the `400` the status was for (an unknown method stays `404`). Both arms are
 /// asserted because the property is the split rather than one code: a mapper answering `200` to
 /// everything passes the first and fails the second. Checked against 3.5.0 by pinning it, where
 /// the first arm came back `400`; this is the third reason `Cargo.toml` carries a floor, and the
@@ -5978,8 +5979,9 @@ fn a_refusal_on_the_stateless_route_is_in_band_and_a_malformed_request_is_not() 
     );
 
     // The control, one key short rather than the whole `_meta` missing — the test above pins that
-    // shape. The request never reaches a handler, so the status is the only place the answer can
-    // say so, and it is the one `400` the revision defines.
+    // shape, and the missing `Mcp-Method` header beside it. The request never reaches a handler,
+    // so the status is the only place the answer can say so; this is one of the `400`s the
+    // transport keeps, not the only one.
     let (mut body, name) = Listener::stateless_body(
         server.next_id,
         "tools/call",

@@ -72,13 +72,15 @@ client saw a different answer depending on which patch release was resolved.
 
 The floor sits at `3.5.1` for a third rule, on the listener. A JSON-RPC error a *handler* returns
 on `2026-07-28` — this server refusing a tool that is off the caller's surface, the SDK's own `tool
-not found`, an argument that does not parse — is answered `200` with the error in the body, and only
-a request missing a `_meta` key the revision requires is an HTTP `400` (upstream #1322). Every 3.x
-before it sent each of those as `400`, which on this route is the signal the revision's
-backward-compatibility rule gives a client for a server that predates it, to be answered by falling
-back to `initialize` — so a narrowed listener refusing one call could demote a sessionless client to
-the handshake era mid-conversation. The session-bearing route and stdio always carried errors in
-band, so neither changed.
+not found`, an argument that does not parse — is answered `200` with the error in the body
+(upstream #1322). Every 3.x before it sent each of those as `400`, which on this route is the signal
+the revision's backward-compatibility rule gives a client for a server that predates it, to be
+answered by falling back to `initialize` — so a narrowed listener refusing one call could demote a
+sessionless client to the handshake era mid-conversation. What moved is the handler's error and
+nothing else: a request the transport itself refuses before any handler runs keeps its status — a
+`_meta` short a required key, a header missing or mismatched, an unsupported revision are `400`, and
+an unknown method is `404`. The session-bearing route and stdio always carried errors in band, so
+neither changed.
 
 `2026-07-28` also makes SEP-2549's cache fields mandatory on a paginated result, so `tools/list`
 answers a client **on** that revision with `ttlMs: 0` and `cacheScope: public`, and omits both for

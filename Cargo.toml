@@ -18,10 +18,11 @@ dbgscope = { git = "https://github.com/glslang/dbgscope", rev = "f5d697b82d0bea2
 # `initialize`; 3.2.0 settles that handshake on a revision which still *has* a handshake (upstream
 # #1228, `is_legacy_version`). And every 3.x before 3.5.1 sends a handler's `-32602` on the stateless
 # route as an HTTP 400 — this server's surface refusal included — which a `2026-07-28` client reads
-# as a server that predates the revision and falls back to `initialize` on; 3.5.1 keeps the 400 for
-# a request missing a `_meta` key and answers the rest in band (upstream #1322). The smoke tier
-# asserts the last two, so a build that resolved an older release would fail it rather than merely
-# serve the older shape — which is what makes this a floor.
+# as a server that predates the revision and falls back to `initialize` on; 3.5.1 answers a handler's
+# `-32602` in band and leaves the transport's own refusals where they were — a `_meta` short a key,
+# a header missing or mismatched, an unsupported revision are 400, an unknown method 404 (upstream
+# #1322). The smoke tier asserts the last two, so a build that resolved an older release would fail
+# it rather than merely serve the older shape — which is what makes this a floor.
 rmcp = { version = "3.5.1", features = [
     "server",
     "transport-io",
