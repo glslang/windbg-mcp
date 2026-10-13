@@ -91,8 +91,8 @@ on #159 and #170, *"what is covered, what is not"* on #155.
   filed with**. Closing an item is therefore a *move*: out of `FOLLOWUPS.md`, out of its cluster
   list, and into `DONE.md` **with an index line**, which is the only list of what has closed. An
   item that is **half** landed or **declined** stays put — the first because the entry
-  narrows to what is left, the second because nothing was built and the reopening condition is the
-  content.
+  narrows to what is left, the second because what it proposed did not land and the reopening
+  condition is the content.
 
   **A citation is not retargeted, and that is a decision rather than an oversight.** Some twenty
   files say "`FOLLOWUPS.md` item N" — doc comments in eleven modules and in `tests/`,
