@@ -207,10 +207,12 @@ which single steps are refused, and what every other request is answered with:
   measured, so the gate does not claim that ordering yet.
 - **`t` steps the linear successor only.** A branch, call, return, interrupt or exception is
   refused; so is a `rep`-prefixed string instruction, and anything that writes `ss` (`mov ss`,
-  `pop ss`, `lss`), because the trap can land somewhere other than the successor. `g` needs at least
-  one hardware breakpoint installed and is refused otherwise. A refusal resends the held stop, so
-  the session survives it. The facade reads one bit of `Continue2`, the trace flag; whatever WinDbg
-  sends for `p` is handled by those same two arms.
+  `pop ss`, `lss`), because the trap can land somewhere other than the successor. A decoded
+  `mov cr3,r64` is carried to that successor with a temporary hardware breakpoint rather than TF;
+  the controller binds the resulting root and removes the slot before reporting the stop. `g`
+  needs at least one hardware breakpoint installed and is refused otherwise. A refusal resends the
+  held stop, so the session survives it. The facade reads one bit of `Continue2`, the trace flag;
+  whatever WinDbg sends for `p` is handled by those same two arms.
 - **The proven redirected step is one five-byte NOP.** On that bench the next instruction used the
   interrupted context's RBX, so the acceptance takes one step and quits.
 - **`SetContext` succeeds only for WinDbg's unchanged compatibility write**; a changed byte is

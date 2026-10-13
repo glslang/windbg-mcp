@@ -710,22 +710,34 @@ impl BreakpointGuard {
     }
 
     fn register(&self) -> RegisterName {
-        match self.slot {
-            0 => RegisterName::Dr0,
-            1 => RegisterName::Dr1,
-            2 => RegisterName::Dr2,
-            3 => RegisterName::Dr3,
-            _ => unreachable!("validated breakpoint slot"),
-        }
+        breakpoint_register(self.slot)
     }
 
     fn enable_mask(&self) -> u64 {
-        1 << (u32::from(self.slot) * 2)
+        breakpoint_enable_mask(self.slot)
     }
 
     fn kind_mask(&self) -> u64 {
-        0xf << (16 + u32::from(self.slot) * 4)
+        breakpoint_kind_mask(self.slot)
     }
+}
+
+fn breakpoint_register(slot: u8) -> RegisterName {
+    match slot {
+        0 => RegisterName::Dr0,
+        1 => RegisterName::Dr1,
+        2 => RegisterName::Dr2,
+        3 => RegisterName::Dr3,
+        _ => unreachable!("validated breakpoint slot"),
+    }
+}
+
+fn breakpoint_enable_mask(slot: u8) -> u64 {
+    1 << (u32::from(slot) * 2)
+}
+
+fn breakpoint_kind_mask(slot: u8) -> u64 {
+    0xf << (16 + u32::from(slot) * 4)
 }
 
 pub(crate) fn validate_breakpoints(breakpoints: &[BreakpointGuard], mode: ArmMode) -> Result<()> {
@@ -780,7 +792,7 @@ impl InstructionGuard {
     }
 }
 
-/// Exact current instruction and the bounded RIP set accepted after one trap-flag step.
+/// Exact current instruction and the bounded RIP set accepted after one architectural step.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StepGuard {
@@ -836,20 +848,11 @@ impl StepGuard {
     }
 }
 
-/// Refuses x64 instructions for which TF does not guarantee a trap at the next architectural
-/// instruction. The MCP and KD front ends share this gate so choosing the other protocol cannot
-/// bypass the retained-stop invariant.
+/// Refuses x64 instructions for which neither TF nor the dedicated CR3 step-over can guarantee a
+/// stop at the next architectural instruction. The MCP and KD front ends share this gate so
+/// choosing the other protocol cannot bypass the retained-stop invariant.
 pub(crate) fn validate_step_instruction_class(instruction: &InstructionGuard) -> Result<()> {
-    let mut decoder = Decoder::with_ip(
-        64,
-        &instruction.bytes,
-        instruction.address.0,
-        DecoderOptions::NONE,
-    );
-    let decoded = decoder.decode();
-    if decoded.is_invalid() || decoded.len() != instruction.bytes.len() {
-        bail!("the guarded VTL1 bytes do not decode as exactly one AMD64 instruction");
-    }
+    let decoded = decode_instruction(instruction)?;
     let writes_ss = decoded.op0_kind() == OpKind::Register
         && decoded.op0_register() == Register::SS
         && matches!(decoded.mnemonic(), Mnemonic::Mov | Mnemonic::Pop);
@@ -872,6 +875,27 @@ pub(crate) fn validate_step_instruction_class(instruction: &InstructionGuard) ->
         );
     }
     Ok(())
+}
+
+fn decode_instruction(instruction: &InstructionGuard) -> Result<iced_x86::Instruction> {
+    let mut decoder = Decoder::with_ip(
+        64,
+        &instruction.bytes,
+        instruction.address.0,
+        DecoderOptions::NONE,
+    );
+    let decoded = decoder.decode();
+    if decoded.is_invalid() || decoded.len() != instruction.bytes.len() {
+        bail!("the guarded VTL1 bytes do not decode as exactly one AMD64 instruction");
+    }
+    Ok(decoded)
+}
+
+fn writes_cr3(instruction: &InstructionGuard) -> Result<bool> {
+    let decoded = decode_instruction(instruction)?;
+    Ok(decoded.mnemonic() == Mnemonic::Mov
+        && decoded.op0_kind() == OpKind::Register
+        && decoded.op0_register() == Register::CR3)
 }
 
 /// Complete register evidence retained for one stop. Status and high halves remain visible instead
@@ -947,8 +971,8 @@ pub(crate) struct StopRecord {
     pub(crate) event: HeldEvent,
     pub(crate) registers: RegisterSnapshot,
     pub(crate) instruction: InstructionGuard,
-    /// RIP values accepted for this stop. Hardware stops name the breakpoint address; single-step
-    /// stops retain the caller's bounded destination set.
+    /// RIP values accepted for this stop. Hardware stops name the breakpoint address; trap-flag
+    /// steps retain the caller's bounded destination set; CR3 step-overs name the successor.
     pub(crate) expected_rips: Vec<HexU64>,
     pub(crate) arm_mode: ArmMode,
 }
@@ -985,6 +1009,11 @@ enum ExpectedStop {
         instruction: InstructionGuard,
         expected_rips: Vec<HexU64>,
         cr3: HexU64,
+    },
+    StepOver {
+        instruction: InstructionGuard,
+        destination: HexU64,
+        slot: u8,
     },
 }
 
@@ -1360,14 +1389,18 @@ impl<P: ControlProvider> LiveControl<P> {
                 .map(|breakpoint| breakpoint.instruction.clone())
                 .collect::<Vec<_>>(),
             ExpectedStop::SingleStep { instruction, .. } => vec![instruction.clone()],
+            // The successor belongs to the address space established by the CR3 write. Reading
+            // it here would use the old root; the stop is instead proved by DR6, RIP and the
+            // temporary debug register after the new root has been accepted.
+            ExpectedStop::StepOver { .. } => Vec::new(),
         };
         let targets = match &expected_stop {
             ExpectedStop::Hardware => self.targets(),
-            ExpectedStop::SingleStep { .. } => {
+            ExpectedStop::SingleStep { .. } | ExpectedStop::StepOver { .. } => {
                 let Some(active) = self.active_provider else {
                     return Err(self.enter_fault(
                         dispatcher,
-                        anyhow!("a single-step wait has no active VP provider"),
+                        anyhow!("a step wait has no active VP provider"),
                         None,
                     ));
                 };
@@ -1409,16 +1442,18 @@ impl<P: ControlProvider> LiveControl<P> {
             if echoed != observed.event {
                 bail!("provider changed the dispatcher event after publication");
             }
-            let first =
-                if matches!(expected_stop, ExpectedStop::Hardware) && self.allow_transition_cr3 {
+            let first = match &expected_stop {
+                ExpectedStop::Hardware if self.allow_transition_cr3 => {
                     self.read_transition_snapshot(active)?
-                } else {
-                    let required = match &expected_stop {
-                        ExpectedStop::Hardware => self.providers[active].target.expected_cr3.0,
-                        ExpectedStop::SingleStep { cr3, .. } => cr3.0,
-                    };
-                    self.read_snapshot(active, required)?
-                };
+                }
+                ExpectedStop::Hardware => {
+                    self.read_snapshot(active, self.providers[active].target.expected_cr3.0)?
+                }
+                ExpectedStop::SingleStep { cr3, .. } => self.read_snapshot(active, cr3.0)?,
+                // A CR3 write supplies its own reason to accept a new root. This is narrower than
+                // allowing an arbitrary natural hardware stop to arrive in another address space.
+                ExpectedStop::StepOver { .. } => self.read_allowed_transition_snapshot(active)?,
+            };
             let stop_cr3 = first.low(RegisterName::Cr3)?;
             self.providers[active].observed_cr3 = Some(stop_cr3);
             let second = self.read_snapshot(active, stop_cr3)?;
@@ -1441,6 +1476,9 @@ impl<P: ControlProvider> LiveControl<P> {
             }
             let (reason, instruction, expected_rips) =
                 self.validate_stop_registers(&observed.event, &first, &expected_stop)?;
+            if let ExpectedStop::StepOver { slot, .. } = expected_stop {
+                self.release_step_over_slot(active, &first, slot)?;
+            }
             let mut event = observed.event.clone();
             event.reason = reason;
             let stop = StopRecord {
@@ -1504,9 +1542,10 @@ impl<P: ControlProvider> LiveControl<P> {
         }
     }
 
-    /// Consume an owned stop and arm one architectural trap-flag step. The first step can reuse
-    /// the hardware-breakpoint guard. Every later step must name and prove the instruction at the
-    /// current RIP. A caller may admit a bounded destination set for a branch.
+    /// Consume an owned stop and arm one architectural step. Ordinary instructions use TF. A CR3
+    /// write borrows an owned debug-register slot for its linear successor so the following stop
+    /// can establish the new address-space root. Every later step must name and prove the exact
+    /// current instruction. A caller may admit a bounded destination set for a branch.
     #[cfg(test)]
     pub(crate) fn step(
         &mut self,
@@ -1536,8 +1575,33 @@ impl<P: ControlProvider> LiveControl<P> {
     ) -> Result<StopEpoch> {
         let stop = self.require_stop_epoch(epoch)?.clone();
         let (instruction, expected_rips) = guard.resolve(&stop)?;
+        let step_over_slot = if writes_cr3(&instruction)? {
+            if self.arm_mode != Some(ArmMode::Natural) {
+                bail!("stepping over a CR3 write requires natural arm mode");
+            }
+            let successor = HexU64(instruction.successor());
+            if expected_rips != [successor] {
+                bail!("a CR3-writing step accepts only its linear successor");
+            }
+            Some(match stop.event.reason {
+                StopReason::HardwareBreakpoint { slot } | StopReason::StepOver { slot, .. } => slot,
+                StopReason::SingleStep => {
+                    self.breakpoints
+                        .first()
+                        .context("the stepping session has no hardware-breakpoint slot to borrow")?
+                        .slot
+                }
+                StopReason::DebugException => {
+                    bail!("the stopped event has no validated reason")
+                }
+            })
+        } else {
+            None
+        };
         // This read has no target-side effect. A bad caller guard leaves the current stop and
-        // epoch intact so it can be corrected or continued safely.
+        // epoch intact so it can be corrected or continued safely. For a CR3 write this is the
+        // source guard through the old root; no destination read is attempted until the new root
+        // has been accepted.
         match deadline {
             Some(deadline) => dispatcher.verify_instruction_until(&instruction, deadline)?,
             None => dispatcher.verify_instruction(&instruction)?,
@@ -1548,7 +1612,22 @@ impl<P: ControlProvider> LiveControl<P> {
             .active_provider
             .context("the stopped session has no active VP provider")?;
         let recovery_deadline = dispatcher.retained_recovery_deadline().or(deadline);
+        let next_expected_stop = match step_over_slot {
+            Some(slot) => ExpectedStop::StepOver {
+                destination: expected_rips[0],
+                instruction: instruction.clone(),
+                slot,
+            },
+            None => ExpectedStop::SingleStep {
+                instruction: instruction.clone(),
+                expected_rips: expected_rips.clone(),
+                cr3: HexU64(stop.registers.low(RegisterName::Cr3)?),
+            },
+        };
         self.providers[active].provider.set_outer_deadline(deadline);
+        // Recovery must know that the released instruction may establish a new root even if
+        // native completion fails after the provider has already returned to running.
+        self.expected_stop = Some(next_expected_stop);
         self.state = State::Releasing;
         let result = (|| {
             let baseline = self.providers[active]
@@ -1557,11 +1636,20 @@ impl<P: ControlProvider> LiveControl<P> {
                 .context("the stopped session has no baseline")?;
             let dr6 = stop.registers.low(RegisterName::Dr6)?;
             let rflags = stop.registers.low(RegisterName::Rflags)?;
+            let released_step_over_slot = match stop.event.reason {
+                StopReason::StepOver { slot, .. } => Some(slot),
+                _ => None,
+            };
+            let baseline_dr7 = baseline.low(RegisterName::Dr7)?;
             self.write_one(
                 active,
                 RegisterName::Dr7,
-                stop.registers.low(RegisterName::Dr7)?,
-                baseline.low(RegisterName::Dr7)? & !DR7_ENABLE_MASK,
+                if released_step_over_slot.is_some() {
+                    baseline_dr7
+                } else {
+                    stop.registers.low(RegisterName::Dr7)?
+                },
+                baseline_dr7 & !DR7_ENABLE_MASK,
             )?;
             for register in [
                 RegisterName::Dr0,
@@ -1572,12 +1660,45 @@ impl<P: ControlProvider> LiveControl<P> {
                 self.write_one(
                     active,
                     register,
-                    stop.registers.low(register)?,
+                    if released_step_over_slot
+                        .is_some_and(|slot| breakpoint_register(slot) == register)
+                    {
+                        baseline.low(register)?
+                    } else {
+                        stop.registers.low(register)?
+                    },
                     baseline.low(register)?,
                 )?;
             }
+            if let Some(slot) = step_over_slot {
+                let register = breakpoint_register(slot);
+                self.write_one(
+                    active,
+                    register,
+                    baseline.low(register)?,
+                    instruction.successor(),
+                )?;
+            }
             self.write_one(active, RegisterName::Dr6, dr6, dr6 & !DR6_CAUSE_MASK)?;
-            self.write_one(active, RegisterName::Rflags, rflags, (rflags | TF) & !RF)?;
+            self.write_one(
+                active,
+                RegisterName::Rflags,
+                rflags,
+                if step_over_slot.is_some() {
+                    rflags & !(TF | RF)
+                } else {
+                    (rflags | TF) & !RF
+                },
+            )?;
+            if let Some(slot) = step_over_slot {
+                self.write_one(
+                    active,
+                    RegisterName::Dr7,
+                    baseline_dr7 & !DR7_ENABLE_MASK,
+                    (baseline_dr7 & !(DR7_ENABLE_MASK | breakpoint_kind_mask(slot)))
+                        | breakpoint_enable_mask(slot),
+                )?;
+            }
             match self.providers[active].provider_phase {
                 ProviderPhase::Stopped => self.providers[active].provider.release()?,
                 ProviderPhase::Arming => self.providers[active].provider.finish_arm()?,
@@ -1603,18 +1724,23 @@ impl<P: ControlProvider> LiveControl<P> {
             ));
         }
         self.dispatcher_event = None;
-        self.expected_stop = Some(ExpectedStop::SingleStep {
-            instruction,
-            expected_rips,
-            cr3: HexU64(stop.registers.low(RegisterName::Cr3)?),
-        });
         self.state = State::Running;
-        tracing::info!(
-            target: "windbg_mcp::secure_kernel_mutation",
-            vm_id = %self.providers[active].target.vm_id,
-            vp = self.providers[active].target.vp,
-            "live Secure Kernel control armed trap-flag single-step"
-        );
+        if let Some(slot) = step_over_slot {
+            tracing::info!(
+                target: "windbg_mcp::secure_kernel_mutation",
+                vm_id = %self.providers[active].target.vm_id,
+                vp = self.providers[active].target.vp,
+                slot,
+                "live Secure Kernel control armed CR3 step-over breakpoint"
+            );
+        } else {
+            tracing::info!(
+                target: "windbg_mcp::secure_kernel_mutation",
+                vm_id = %self.providers[active].target.vm_id,
+                vp = self.providers[active].target.vp,
+                "live Secure Kernel control armed trap-flag single-step"
+            );
+        }
         Ok(self.commit_epoch(next_epoch))
     }
 
@@ -1893,6 +2019,13 @@ impl<P: ControlProvider> LiveControl<P> {
                         }
                         self.providers[index].provider.begin_arm()?;
                         self.providers[index].provider_phase = ProviderPhase::Arming;
+                        if matches!(
+                            self.expected_stop.as_ref(),
+                            Some(ExpectedStop::StepOver { .. })
+                        ) && self.active_provider == Some(index)
+                        {
+                            self.refresh_step_over_cr3(index)?;
+                        }
                         self.restore_owned_state(index)?;
                         self.providers[index].provider.finish_arm()?;
                         self.providers[index].provider_phase = ProviderPhase::Running;
@@ -1960,6 +2093,7 @@ impl<P: ControlProvider> LiveControl<P> {
                 .map(|breakpoint| breakpoint.instruction.clone())
                 .collect::<Vec<_>>(),
             ExpectedStop::SingleStep { instruction, .. } => vec![instruction.clone()],
+            ExpectedStop::StepOver { .. } => Vec::new(),
         };
         if observed.instructions != expected_instructions {
             bail!("a guarded instruction changed before the stop was accepted");
@@ -2029,6 +2163,33 @@ impl<P: ControlProvider> LiveControl<P> {
                     expected_rips.clone(),
                 ))
             }
+            ExpectedStop::StepOver {
+                instruction,
+                destination,
+                slot,
+            } => {
+                let register = breakpoint_register(*slot);
+                let enable_mask = breakpoint_enable_mask(*slot);
+                let causes = registers.low(RegisterName::Dr6)? & 0xf;
+                if causes != 1_u64 << u32::from(*slot)
+                    || registers.low(RegisterName::Rip)? != destination.0
+                    || registers.low(register)? != destination.0
+                    || registers.low(RegisterName::Dr7)? & enable_mask == 0
+                    || registers.low(RegisterName::Rflags)? & (TF | RF) != 0
+                {
+                    bail!(
+                        "step-over register evidence does not carry the destination breakpoint, clear TF and clear RF"
+                    );
+                }
+                Ok((
+                    StopReason::StepOver {
+                        slot: *slot,
+                        new_cr3: HexU64(registers.low(RegisterName::Cr3)?),
+                    },
+                    instruction.clone(),
+                    vec![*destination],
+                ))
+            }
         }
     }
 
@@ -2057,6 +2218,48 @@ impl<P: ControlProvider> LiveControl<P> {
             None,
             self.allow_transition_cr3,
         )
+    }
+
+    fn read_allowed_transition_snapshot(&mut self, provider: usize) -> Result<RegisterSnapshot> {
+        RegisterSnapshot::from_values(
+            self.providers[provider]
+                .provider
+                .read_registers(SNAPSHOT_REGISTERS.to_vec())?,
+            None,
+            true,
+        )
+    }
+
+    fn refresh_step_over_cr3(&mut self, provider: usize) -> Result<()> {
+        let snapshot = self.read_allowed_transition_snapshot(provider)?;
+        self.providers[provider].observed_cr3 = Some(snapshot.low(RegisterName::Cr3)?);
+        Ok(())
+    }
+
+    fn release_step_over_slot(
+        &mut self,
+        provider: usize,
+        registers: &RegisterSnapshot,
+        slot: u8,
+    ) -> Result<()> {
+        let baseline = self.providers[provider]
+            .baseline
+            .clone()
+            .context("the step-over stop has no saved baseline")?;
+        self.write_one(
+            provider,
+            RegisterName::Dr7,
+            registers.low(RegisterName::Dr7)?,
+            baseline.low(RegisterName::Dr7)?,
+        )?;
+        let register = breakpoint_register(slot);
+        self.write_one(
+            provider,
+            register,
+            registers.low(register)?,
+            baseline.low(register)?,
+        )?;
+        Ok(())
     }
 
     fn provider_cr3(&self, provider: usize) -> u64 {
@@ -2329,6 +2532,12 @@ impl<P: ControlProvider> LiveControl<P> {
             .providers
             .iter()
             .any(|provider| provider.baseline.is_some());
+        let step_over_provider = matches!(
+            self.expected_stop.as_ref(),
+            Some(ExpectedStop::StepOver { .. })
+        )
+        .then_some(self.active_provider)
+        .flatten();
         let mut safe_to_resume = !owns_provider_state || dispatcher.provider_writes_quiesced();
         if owns_provider_state && !safe_to_resume {
             let recovery_targets = self
@@ -2381,6 +2590,22 @@ impl<P: ControlProvider> LiveControl<P> {
                 if !entered_arm {
                     safe_to_resume = false;
                     continue;
+                }
+                // The wait may expire after the CR3 write executed but before its successor event
+                // was accepted. Learn that root while the recovery pause is proved so restoring
+                // the temporary breakpoint is not rejected against the pre-step address space.
+                if step_over_provider == Some(provider) {
+                    match self.refresh_step_over_cr3(provider) {
+                        Ok(()) => {}
+                        Err(error) => {
+                            safe_to_resume = false;
+                            recovery_errors.push(format!(
+                                "read VP {} transition state for step-over recovery: {error:#}",
+                                self.providers[provider].target.vp
+                            ));
+                            continue;
+                        }
+                    }
                 }
                 if let Err(error) = self.restore_owned_state(provider) {
                     safe_to_resume = false;
@@ -2512,6 +2737,7 @@ mod tests {
         hardware_rip: u64,
         hardware_slot: Option<u8>,
         single_step_rips: VecDeque<u64>,
+        stopped_cr3s: VecDeque<u64>,
         unstable_once: bool,
         fail_reads_while_stopped: Option<&'static str>,
         wrong_cr3_while_stopped: bool,
@@ -2535,6 +2761,7 @@ mod tests {
                 hardware_rip: TARGET_RIP,
                 hardware_slot: None,
                 single_step_rips: VecDeque::new(),
+                stopped_cr3s: VecDeque::new(),
                 unstable_once: false,
                 fail_reads_while_stopped: None,
                 wrong_cr3_while_stopped: false,
@@ -2563,6 +2790,11 @@ mod tests {
 
         fn with_single_step_rips(mut self, rips: impl IntoIterator<Item = u64>) -> Self {
             self.single_step_rips = rips.into_iter().collect();
+            self
+        }
+
+        fn with_stopped_cr3s(mut self, cr3s: impl IntoIterator<Item = u64>) -> Self {
+            self.stopped_cr3s = cr3s.into_iter().collect();
             self
         }
 
@@ -2647,7 +2879,9 @@ mod tests {
             };
             set_low(&mut self.registers, RegisterName::Rip, rip);
             set_low(&mut self.registers, RegisterName::Dr6, dr6);
-            if self.wrong_cr3_while_stopped {
+            if let Some(cr3) = self.stopped_cr3s.pop_front() {
+                set_low(&mut self.registers, RegisterName::Cr3, cr3);
+            } else if self.wrong_cr3_while_stopped {
                 set_low(&mut self.registers, RegisterName::Cr3, 0xdead_0000);
             }
         }
@@ -2786,6 +3020,7 @@ mod tests {
         stops: VecDeque<ObservedStop>,
         actions: Vec<Action>,
         wait_targets: Vec<Vec<u32>>,
+        wait_instructions: Vec<Vec<InstructionGuard>>,
         bound_cr3s: Vec<u64>,
         verification_roots: Vec<Option<u64>>,
         current_root: Option<u64>,
@@ -2811,6 +3046,7 @@ mod tests {
                 stops: stops.into_iter().collect(),
                 actions: Vec::new(),
                 wait_targets: Vec::new(),
+                wait_instructions: Vec::new(),
                 bound_cr3s: Vec::new(),
                 verification_roots: Vec::new(),
                 current_root: None,
@@ -2905,11 +3141,12 @@ mod tests {
         fn wait_for_stop(
             &mut self,
             targets: &[TargetIdentity],
-            _instructions: &[InstructionGuard],
+            instructions: &[InstructionGuard],
         ) -> Result<ObservedStop> {
             self.actions.push(Action::Wait);
             self.wait_targets
                 .push(targets.iter().map(|target| target.vp).collect());
+            self.wait_instructions.push(instructions.to_vec());
             if let Some(reason) = self.fail_wait {
                 self.provider_writes_quiesced = self.fail_wait_quiesced;
                 bail!("{reason}");
@@ -4390,6 +4627,176 @@ mod tests {
     }
 
     #[test]
+    fn cr3_write_steps_over_to_a_new_root_and_releases_its_borrowed_slot() {
+        let instruction = cr3_step_instruction();
+        let successor = HexU64(instruction.successor());
+        let armed_instructions = vec![
+            InstructionGuard {
+                address: HexU64(TARGET_RIP - 0x20),
+                bytes: vec![0x90],
+            },
+            InstructionGuard {
+                address: HexU64(TARGET_RIP - 0x10),
+                bytes: vec![0x90],
+            },
+            instruction.clone(),
+            InstructionGuard {
+                address: HexU64(TARGET_RIP + 0x10),
+                bytes: vec![0x90],
+            },
+        ];
+        let initial_cr3 = target().expected_cr3.0;
+        let new_cr3 = 0xdead_0000;
+        let mut dispatcher = FakeDispatcher::new([
+            ObservedStop {
+                event: event(StopReason::DebugException),
+                instructions: armed_instructions.clone(),
+            },
+            ObservedStop {
+                event: event(StopReason::DebugException),
+                instructions: Vec::new(),
+            },
+        ]);
+        let provider = FakeProvider::new()
+            .with_hardware_slot(2)
+            .with_stopped_cr3s([initial_cr3, new_cr3]);
+        let mut control = LiveControl::open(provider).unwrap();
+
+        control
+            .arm(
+                &mut dispatcher,
+                armed_instructions
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, instruction)| BreakpointGuard {
+                        slot: slot as u8,
+                        instruction: instruction.clone(),
+                    })
+                    .collect(),
+                ArmMode::Natural,
+            )
+            .unwrap();
+        let hardware = control.wait_for_stop(&mut dispatcher).unwrap();
+        control
+            .step(&mut dispatcher, &hardware.epoch, straight_step())
+            .unwrap();
+
+        assert_eq!(
+            control
+                .test_provider()
+                .registers
+                .iter()
+                .find(|register| register.name == RegisterName::Dr2)
+                .unwrap()
+                .low,
+            successor
+        );
+        let stepped = control.wait_for_stop(&mut dispatcher).unwrap();
+
+        assert_eq!(
+            stepped.event.reason,
+            StopReason::StepOver {
+                slot: 2,
+                new_cr3: HexU64(new_cr3),
+            }
+        );
+        let reason = serde_json::to_value(&stepped.event.reason).unwrap();
+        assert_eq!(reason["reason"], "step_over");
+        assert_eq!(reason["slot"], 2);
+        assert_eq!(reason["new_cr3"], format!("0x{new_cr3:016x}"));
+        assert_eq!(stepped.instruction, instruction.clone());
+        assert_eq!(stepped.expected_rips, [successor]);
+        assert_eq!(dispatcher.wait_instructions, [armed_instructions, vec![]]);
+        assert_eq!(dispatcher.bound_cr3s, [initial_cr3, new_cr3]);
+        assert_eq!(dispatcher.verification_roots, [Some(initial_cr3)]);
+        assert_eq!(
+            control
+                .test_provider()
+                .registers
+                .iter()
+                .find(|register| register.name == RegisterName::Dr2)
+                .unwrap()
+                .low,
+            HexU64(0),
+            "the temporary successor breakpoint is removed before the stop is exposed"
+        );
+        assert_eq!(
+            control
+                .test_provider()
+                .registers
+                .iter()
+                .find(|register| register.name == RegisterName::Dr7)
+                .unwrap()
+                .low,
+            HexU64(0x400)
+        );
+
+        control
+            .continue_from(&mut dispatcher, &stepped.epoch)
+            .unwrap();
+        assert_eq!(control.phase(), LivePhase::Running);
+    }
+
+    #[test]
+    fn cr3_step_over_timeout_restores_the_borrowed_slot_through_the_observed_root() {
+        let instruction = cr3_step_instruction();
+        let new_cr3 = 0xdead_0000;
+        let mut dispatcher = FakeDispatcher::new([ObservedStop {
+            event: event(StopReason::DebugException),
+            instructions: vec![instruction.clone()],
+        }]);
+        let mut control = LiveControl::open(FakeProvider::new()).unwrap();
+
+        control
+            .arm(
+                &mut dispatcher,
+                vec![BreakpointGuard {
+                    slot: 3,
+                    instruction,
+                }],
+                ArmMode::Natural,
+            )
+            .unwrap();
+        let hardware = control.wait_for_stop(&mut dispatcher).unwrap();
+        control
+            .step(&mut dispatcher, &hardware.epoch, straight_step())
+            .unwrap();
+        set_low(
+            &mut control.providers[0].provider.registers,
+            RegisterName::Cr3,
+            new_cr3,
+        );
+        dispatcher.fail_wait = Some("step-over wait timed out");
+
+        let error = control.wait_for_stop(&mut dispatcher).unwrap_err();
+
+        assert!(error.to_string().contains("step-over wait timed out"));
+        assert_eq!(control.phase(), LivePhase::Faulted);
+        assert!(!control.fault().unwrap().target_left_paused);
+        assert_eq!(control.providers[0].observed_cr3, Some(new_cr3));
+        for register in [
+            RegisterName::Dr0,
+            RegisterName::Dr1,
+            RegisterName::Dr2,
+            RegisterName::Dr3,
+            RegisterName::Dr6,
+            RegisterName::Dr7,
+        ] {
+            assert_eq!(
+                control
+                    .test_provider()
+                    .registers
+                    .iter()
+                    .find(|value| value.name == register),
+                register_values(BASE_RIP, 0xffff_0ff0, 0x400, 0x46)
+                    .iter()
+                    .find(|value| value.name == register)
+            );
+        }
+        assert!(dispatcher.wait_instructions.last().unwrap().is_empty());
+    }
+
+    #[test]
     fn transition_cr3_guard_failure_faults_after_rebinding_the_stop_root() {
         let mut dispatcher =
             FakeDispatcher::new([observed(StopReason::HardwareBreakpoint { slot: 0 })]);
@@ -4578,6 +4985,9 @@ mod tests {
         ] {
             assert!(validate_step_instruction_class(&guard(bytes)).is_err());
         }
+        assert!(writes_cr3(&guard(&[0x0f, 0x22, 0xdc])).unwrap());
+        assert!(!writes_cr3(&guard(&[0x0f, 0x22, 0xd4])).unwrap());
+        assert!(!writes_cr3(&guard(&[0x0f, 0x20, 0xdc])).unwrap());
     }
 
     #[test]
@@ -4702,6 +5112,13 @@ mod tests {
         InstructionGuard {
             address: HexU64(TARGET_RIP),
             bytes: vec![0x0f, 0x1f, 0x44, 0x00, 0x00],
+        }
+    }
+
+    fn cr3_step_instruction() -> InstructionGuard {
+        InstructionGuard {
+            address: HexU64(TARGET_RIP),
+            bytes: vec![0x0f, 0x22, 0xdc],
         }
     }
 

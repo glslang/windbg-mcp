@@ -325,6 +325,11 @@ pub(crate) enum StopReason {
         slot: u8,
     },
     SingleStep,
+    /// A CR3 write was carried to its linear successor with a temporary execute breakpoint.
+    StepOver {
+        slot: u8,
+        new_cr3: HexU64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -360,7 +365,11 @@ impl HeldEvent {
         if self.advance_instruction_pointer {
             bail!("held event requested native instruction-pointer advance");
         }
-        if matches!(self.reason, StopReason::HardwareBreakpoint { slot } if slot > 3) {
+        if matches!(
+            self.reason,
+            StopReason::HardwareBreakpoint { slot } | StopReason::StepOver { slot, .. }
+                if slot > 3
+        ) {
             bail!("hardware breakpoint slot must be in 0..=3");
         }
         Ok(())

@@ -24,7 +24,7 @@ windbg-mcp.exe --tools session,inspect,crash
 | `--tools` | Tools | Model context |
 |---|---:|---:|
 | *(absent)* — ordinary groups | 66 | 103,579 B |
-| `all` | 78 | 122,929 B |
+| `all` | 78 | 123,244 B |
 | `session,inspect,exec,crash` | 33 | 49,332 B |
 | `session,inspect,crash` | 23 | 34,092 B |
 | `crash` | 13 | 20,515 B |

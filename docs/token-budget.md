@@ -348,10 +348,10 @@ None of these is a bug. They are recorded because they were invisible, and
    |---|---:|---:|---:|
    | `allocator` | 12 | 19,840 | 16.1% |
    | `ioctl` | 11 | 16,088 | 13.1% |
-   | `securekernel` | 12 | 19,350 | 15.7% |
-   | `exec` | 10 | 15,087 | 12.3% |
-   | `session` | 10 | 14,208 | 11.6% |
-   | `inspect` | 10 | 13,485 | 11.0% |
+   | `securekernel` | 12 | 19,665 | 16.0% |
+   | `exec` | 10 | 15,087 | 12.2% |
+   | `session` | 10 | 14,208 | 11.5% |
+   | `inspect` | 10 | 13,485 | 10.9% |
    | `batch` | 1 | 10,308 | 8.4% |
    | `crash` | 3 | 7,473 | 6.1% |
    | `ttd` | 9 | 7,090 | 5.8% |
@@ -359,7 +359,7 @@ None of these is a bug. They are recorded because they were invisible, and
    | `--tools` | tools | model |
    |---|---:|---:|
    | *(absent)* | 66 | 103,579 |
-   | `all` | 78 | 122,929 |
+   | `all` | 78 | 123,244 |
    | `session,inspect,exec,crash` | 33 | 49,332 |
    | `session,inspect,crash` | 23 | 34,092 |
    | `crash` | 13 | 20,515 |

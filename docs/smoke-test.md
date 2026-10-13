@@ -196,8 +196,12 @@ that item.
 **The live Secure Kernel tier is a different, explicitly disposable gate.**
 `WINDBG_MCP_SMOKE_SK_LIVE` names a private JSON file containing `profile`, `control_transport`,
 `live_transport`, `dispatcher_vnd`, `vm_id`, `partition_id`, `expected_cr3`,
-`instruction_address` and `instruction_bytes`; `vp`, `additional_vps`, `read_size` and
-`vtl0_profile` are optional.
+`instruction_address` and `instruction_bytes`; `vp`, `additional_vps`, `read_size`,
+`allow_transition_cr3`, `steps` and `vtl0_profile` are optional. Each `steps` entry may carry the
+`address`, `bytes` and `expected_rips` sent to `sk_live_step`. Its optional harness-only `reason`
+defaults to `single_step`; use `step_over` for a decoded CR3 write. That arm requires the linear
+successor, verifies the source bytes through the old root, and requires the returned reason's
+`new_cr3` to match the retained register snapshot and differ from the preceding stop.
 When `vtl0_profile` is supplied, `vtl0_guest` must name the expected profile `guest` claim for the
 VTL1 VM. The file must also
 carry `"disposable": true`. `vmwp_pid` is an optional mismatch assertion; the server resolves the
