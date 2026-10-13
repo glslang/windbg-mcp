@@ -10778,6 +10778,66 @@ fn a_module_listing_can_resynchronise_the_inventory_before_it_lists_it() {
     );
 }
 
+/// A module refresh with none of its caller's clock left is **refused**, not floored to the reply
+/// headroom and run for nobody.
+///
+/// It takes a walk's budget rather than a command's for the reason a walk does, and one more: a
+/// reload stopped part-way leaves the engine's inventory *smaller* than it went in, so a floored
+/// refresh for a caller who has gone could cost the next caller modules it would otherwise have
+/// listed. A 10s call budget is entirely reply headroom, so this stages with no queue wait. The
+/// listing itself needs no clock and must still answer.
+#[test]
+fn a_module_refresh_with_no_time_left_is_refused_rather_than_run() {
+    let Some(dump) = target_tier() else { return };
+    let mut server = Server::started_with(&[("WINDBG_MCP_CALL_TIMEOUT_SECS", "10")]);
+
+    let opened = server.call_tool("open_dump", json!({ "path": dump }), TARGET_STEP);
+    assert_no_error(&opened, "open_dump");
+    if is_tool_error(&opened) {
+        let error = &opened["result"]["structuredContent"]["error"];
+        assert_eq!(
+            error["category"], "timeout",
+            "`open_dump` failed for a reason this test must not stand down over: {error}"
+        );
+        skip("the sample dump did not open inside a 10s call budget on this machine");
+        return;
+    }
+    let session = session_id_of(&opened["result"]);
+
+    let refused = server.call_tool(
+        "modules",
+        json!({ "session_id": session, "refresh": true, "filter": "nt" }),
+        TARGET_STEP,
+    );
+    assert_no_error(&refused, "modules with no refresh budget");
+    let text = text_of(&refused["result"]);
+    assert!(
+        is_tool_error(&refused) && text.contains("was not run"),
+        "a refresh reaching the engine with no time left should be refused, not floored to the \
+         headroom and run for nobody:\n{text}"
+    );
+    assert_eq!(
+        refused["result"]["structuredContent"]["error"]["category"], "not_run",
+        "and refused as work that never started:\n{refused:#}"
+    );
+    assert!(
+        text.contains("WINDBG_MCP_CALL_TIMEOUT_SECS"),
+        "naming the knob that fixes it:\n{text}"
+    );
+
+    let listed = server.call_tool(
+        "modules",
+        json!({ "session_id": session, "filter": "nt" }),
+        TARGET_STEP,
+    );
+    assert!(
+        !is_tool_error(&listed),
+        "a listing that asked for no refresh needs no clock, and still answers:\n{}",
+        text_of(&listed["result"])
+    );
+    server.tool_text("end_session", json!({ "session_id": session }), TARGET_STEP);
+}
+
 /// **A default register set is the integer registers, on whatever architecture this host is.**
 ///
 /// The `all` argument documents the default as excluding the x87 and vector registers, and it did

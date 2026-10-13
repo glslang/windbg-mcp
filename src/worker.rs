@@ -3192,10 +3192,33 @@ fn execute(
             refresh,
             patience_ms,
         } => {
-            // The caller's own clock, on a bounded command's arithmetic and with its floor: zero
-            // would be *no* bound, so a refresh dequeued at the deadline would run unbounded.
-            let budget = watchdog_budget_ms(Duration::from_millis(u64::from(patience_ms)), spent());
-            modules(e, filter.as_deref(), limit, refresh.then_some(budget))
+            // The caller's own clock on a walk's arithmetic — **no floor**, unlike a command's. A
+            // floored refresh dequeued with nothing left would run the headroom for a caller who
+            // has gone, and a reload stopped part-way leaves the inventory *smaller* than it went
+            // in, so the floor would buy a worse inventory for nobody. Refused instead, as a walk
+            // with no time is; a listing that asked for no refresh needs no clock at all.
+            let patience = Duration::from_millis(u64::from(patience_ms));
+            match (refresh, walk_budget(patience, spent())) {
+                (false, _) => modules(e, filter.as_deref(), limit, None),
+                (true, Some(budget)) => {
+                    modules(e, filter.as_deref(), limit, Some(resolve_budget_ms(budget)))
+                }
+                (true, None) => Err(Failed::categorised(
+                    structured::ErrorCategory::NotRun,
+                    format!(
+                        "This refresh was not run: it reached the engine with {}s of its caller's \
+                         timeout left, which is not enough to resynchronise the module inventory \
+                         and report back — and a resynchronisation stopped part-way leaves the \
+                         inventory smaller than it was. The inventory is unchanged. It waited {}s \
+                         behind other work on this session; issue it when the session is idle, \
+                         or raise the server's call timeout (WINDBG_MCP_CALL_TIMEOUT_SECS — the \
+                         reply itself reserves {}s of headroom).",
+                        patience.saturating_sub(queued).as_secs(),
+                        queued.as_secs(),
+                        WATCHDOG_HEADROOM.as_secs(),
+                    ),
+                )),
+            }
         }
         EngineOp::Backtrace { frames } => backtrace(e, frames as usize),
         EngineOp::Disassemble { address, count } => {
@@ -6752,7 +6775,8 @@ fn read_memory(
 /// one keeps a headroom because its command is already running and the job left is to free the
 /// worker. Here there is nothing to be generous to — 1ms means the resolve is cut short at once,
 /// which is the correct answer for a caller with no time, and it is reported as `NotRun` rather
-/// than as a bad expression.
+/// than as a bad expression. A module refresh's reload takes the same floor for the same reason:
+/// its budget comes from [`walk_budget`], and a sub-millisecond one must still be a bound.
 fn resolve_budget_ms(within: Duration) -> u32 {
     u32::try_from(within.as_millis()).unwrap_or(u32::MAX).max(1)
 }
