@@ -12,13 +12,13 @@ a finished item is usually the part its own proposal got wrong. Each says what i
 what actually landed, and what building it disproved — which is what the next change to that seam
 meets first.
 
-Two kinds of entry are *not* here. An item that is **measured and declined** stays in
+Two kinds of entry are *not* here. An item that is **declined** stays in
 `FOLLOWUPS.md` — nothing was built, and each carries the condition that would reopen it — and
 so does one that has only **half** landed, its entry narrowed to the half that is left rather
 than split in two. **Which items those are is marked on the lines of
 [`FOLLOWUPS.md`](./FOLLOWUPS.md)'s index**, and deliberately not listed again here: this
 paragraph used to carry its own copy of both lists, and by the time the index was written that
-copy was three items behind — it named 27 and 35 where the first class now has 100 as well, and
+copy was three items behind — it named 27 and 35 where the first class by then had 100 as well, and
 50 alone where the second has 2 and 108 with it.
 
 A third kind *is* here and is neither: an item **deleted unbuilt** (76), where the thing it

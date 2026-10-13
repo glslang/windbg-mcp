@@ -25,9 +25,8 @@ deleted, renumbered, or moved without reaching the other file's index fails the 
 reader. It holds **both** indexes to the same rule — every entry in this file is named by the index
 below, at an anchor that resolves, and so is every entry in `DONE.md`.
 
-Two kinds of item stay here rather than moving. One that is **measured and declined**: nothing
-was built, and the entry records both the measurement that settled it and the condition that
-would reopen it. And one that has **half** landed, whose entry is narrowed to the half that is
+Two kinds of item stay here rather than moving. One that is **declined**: nothing was built, and
+the entry records what settled it and the condition that would reopen it. And one that has **half** landed, whose entry is narrowed to the half that is
 left rather than split across two files. **Which items those are is on their index lines
 below**, and is not enumerated here as well: `DONE.md` kept a second copy of both lists and had
 drifted three items behind this one by the time the index was written.
@@ -43,23 +42,23 @@ Items are roughly ordered by how soon they're worth doing, within each cluster.
 ## Index
 
 Every entry in this file, in the order it appears. A line carries a status only where the
-entry's own title does not: **half landed** (the rest of it is still open), **measured and
-declined** (nothing was built, and the entry holds the condition that would reopen it), and
-**blocked** (the measurement that would decide it cannot be taken on this bench). An unmarked
-line is simply open.
+entry's own title does not: **half landed** (the rest of it is still open), **declined**
+(nothing was built, and the entry holds what settled it and the condition that would reopen it),
+and **deferred** (worth doing, and waiting on something this repository cannot supply — a client,
+a licence, a bench — which the entry names). An unmarked line is simply open.
 
 - [Item 2](#2-dbgscope-typed-write-primitives) — [dbgscope] Typed write primitives — **half landed**
 - [Item 3](#3-windbg-mcp--dbgscope-state-injection-confirmation-path-decisionsmd-d4) — [windbg-mcp + dbgscope] State-injection confirmation path (DECISIONS.md D4)
 - [Item 5](#5-windbg-mcp-path-recipe-decode-limits-heuristic-boundary) — [windbg-mcp] Path-recipe decode limits (heuristic boundary)
-- [Item 6](#6-windbg-mcp-concolicsymbolic-buffer-synthesis-decisionsmd-d2--scoped-out) — [windbg-mcp] Concolic/symbolic buffer synthesis (DECISIONS.md D2 — scoped out)
-- [Item 8](#8-windbg-mcp-tasks-extension-iomodelcontextprotocoltasks-sep-2663--measured-and-deferred-2026-09-19) — [windbg-mcp] Tasks extension (`io.modelcontextprotocol/tasks`, SEP-2663) — **measured and deferred** (2026-09-19)
+- [Item 6](#6-windbg-mcp-concolicsymbolic-buffer-synthesis-decisionsmd-d2--declined-2026-07-04) — [windbg-mcp] Concolic/symbolic buffer synthesis (DECISIONS.md D2) — **declined** (2026-07-04)
+- [Item 8](#8-windbg-mcp-tasks-extension-iomodelcontextprotocoltasks-sep-2663--deferred-2026-09-19) — [windbg-mcp] Tasks extension (`io.modelcontextprotocol/tasks`, SEP-2663) — **deferred** (2026-09-19)
 - [Item 9](#9-dbgscope--windbg-mcp-incremental-output-from-a-running-command) — [dbgscope + windbg-mcp] Incremental output from a running command
-- [Item 11](#11-windbg-mcp-mcp-apps-ui-resources--scoped-out) — [windbg-mcp] MCP Apps (`ui://` resources) — scoped out
+- [Item 11](#11-windbg-mcp-mcp-apps-ui-resources--declined-2026-07-29) — [windbg-mcp] MCP Apps (`ui://` resources) — **declined** (2026-07-29)
 - [Item 15](#15-windbg-mcp-make-handle-inheritance-a-property-of-the-spawn-not-of-the-process) — [windbg-mcp] Make handle inheritance a property of the spawn, not of the process
-- [Item 19](#19-windbg-mcp-let-a-debug_batch-step-walk-a-structure) — [windbg-mcp] Let a `debug_batch` step walk a structure
-- [Item 27](#27-windbg-mcp--dbgscope-a-deferred-module-reports-no-pdb-identity--measured-and-declined-2026-08-20) — [windbg-mcp + dbgscope] A deferred module reports no PDB identity — **measured and declined** (2026-08-20)
+- [Item 19](#19-windbg-mcp-let-a-debug_batch-step-walk-a-structure--declined-2026-10-13) — [windbg-mcp] Let a `debug_batch` step walk a structure — **declined** (2026-10-13)
+- [Item 27](#27-windbg-mcp--dbgscope-a-deferred-module-reports-no-pdb-identity--declined-2026-08-20) — [windbg-mcp + dbgscope] A deferred module reports no PDB identity — **declined** (2026-08-20)
 - [Item 33](#33-windbg-mcp-the-lease-grace-assumes-the-server-is-the-slow-party) — [windbg-mcp] The lease grace assumes the server is the slow party
-- [Item 35](#35-windbg-mcp--dbgscope-the-engines-subregister-flag-misses-the-views-that-matter--measured-and-declined-2026-08-22) — [windbg-mcp + dbgscope] The engine's subregister flag misses the views that matter — **measured and declined** (2026-08-22)
+- [Item 35](#35-windbg-mcp--dbgscope-the-engines-subregister-flag-misses-the-views-that-matter--declined-2026-08-22) — [windbg-mcp + dbgscope] The engine's subregister flag misses the views that matter — **declined** (2026-08-22)
 - [Item 39](#39-windbg-mcp-the-eval-measures-single-questions-not-an-investigation) — [windbg-mcp] The eval measures single questions, not an investigation
 - [Item 47](#47-windbg-mcp--dbgscope-the-bounded-wait-is-unmeasured-on-a-ttd-replay-target) — [windbg-mcp + dbgscope] The bounded wait is unmeasured on a TTD replay target
 - [Item 50](#50-windbg-mcp-the-released-binary-is-unsigned--only-the-certificate-is-left) — [windbg-mcp] The released binary is unsigned — only the certificate is left — **half landed**
@@ -71,7 +70,7 @@ line is simply open.
 - [Item 61](#61-windbg-mcp-attribute-the-cve-2026-83498-fix-independently-of-similarity-scores) — [windbg-mcp] Attribute the CVE-2026-83498 fix independently of similarity scores
 - [Item 62](#62-windbg-mcp--binja-windbg-mcp-capture-a-live-securekernel-handoff) — [windbg-mcp + binja-windbg-mcp] Capture a live securekernel handoff
 - [Item 64](#64-binary-ninja-upstream-verify-the-firstsetupdialog-shutdown-fix) — [Binary Ninja upstream] Verify the FirstSetupDialog shutdown fix
-- [Item 65](#65-binja-windbg-mcp-native-ultimate-validation--deferred-due-to-cost) — [binja-windbg-mcp] Native Ultimate validation — deferred due to cost
+- [Item 65](#65-binja-windbg-mcp-native-ultimate-validation--deferred-2026-09-12) — [binja-windbg-mcp] Native Ultimate validation — **deferred** (2026-09-12)
 - [Item 68](#68-windbg-mcp-whether-a-device-can-have-no-security-descriptor-at-all) — [windbg-mcp] Whether a device can have no security descriptor at all
 - [Item 71](#71-windbg-mcp-driver_surface-does-not-say-which-control-code-reaches-which-sink) — [windbg-mcp] `driver_surface` does not say which control code reaches which sink
 - [Item 72](#72-windbg-mcp-the-driver-tools-name-a-module-refresh-they-could-run-themselves) — [windbg-mcp] The driver tools name a module refresh they could run themselves
@@ -81,11 +80,11 @@ line is simply open.
 - [Item 88](#88-windbg-mcp-a-call-that-outlives-its-budget-finishes-its-work-and-has-the-answer-discarded) — [windbg-mcp] A call that outlives its budget finishes its work and has the answer discarded
 - [Item 94](#94-windbg-mcp-disabling-a-breakpoint-has-no-typed-tool) — [windbg-mcp] Disabling a breakpoint has no typed tool
 - [Item 97](#97-dbgscope-an-lfh-block-awaiting-a-delayed-free-is-reported-allocated) — [dbgscope] An LFH block awaiting a delayed free is reported allocated
-- [Item 100](#100-dbgscope-the-vs-chunk-chain-comes-apart-on-29671--the-targets-paging-not-the-build) — [dbgscope] The VS chunk chain comes apart on 29671 — the target's paging, not the build — **measured and declined**
+- [Item 100](#100-dbgscope-the-vs-chunk-chain-comes-apart-on-29671--the-targets-paging-not-the-build) — [dbgscope] The VS chunk chain comes apart on 29671 — the target's paging, not the build — **declined** (2026-09-24)
 - [Item 101](#101-dbgscope-the-vs-chunk-chain-drifts-0x10-and-not-from-where-it-starts) — [dbgscope] The VS chunk chain drifts 0x10, and not from where it starts
 - [Item 104](#104-windbg-mcp-a-fingerprint-field-that-was-refused-is-indistinguishable-from-one-that-does-not-apply) — [windbg-mcp] A fingerprint field that was *refused* is indistinguishable from one that does not apply
 - [Item 105](#105-windbg-mcp-opendump-is-documented-as-replacing-the-target-and-the-one-measurement-of-it-says-it-adds-one) — [windbg-mcp] `.opendump` is documented as replacing the target, and the one measurement of it says it adds one
-- [Item 108](#108-windbg-mcp-a-kmdf-drivers-real-callbacks--step-1-landed-the-frameworks-per-device-config-is-what-is-left) — [windbg-mcp] A KMDF driver's real callbacks — step 1 landed, the framework's per-device config is what is left
+- [Item 108](#108-windbg-mcp-a-kmdf-drivers-real-callbacks--step-1-landed-the-frameworks-per-device-config-is-what-is-left) — [windbg-mcp] A KMDF driver's real callbacks — step 1 landed, the framework's per-device config is what is left — **half landed**
 - [Item 113](#113-windbg-mcp-the-device-descriptor-sweeps-own-figures-do-not-add-up) — [windbg-mcp] The `\Device` descriptor sweep's own figures do not add up
 - [Item 114](#114-dbgscope-a-big-pool-entry-in-no-region-the-walk-discovers) — [dbgscope] A big-pool entry in no region the walk discovers
 - [Item 117](#117-windbg-mcp-the-kd-facade-pipe-has-only-the-default-acl-no-client-authentication-and-no-break-in) — [windbg-mcp] The KD facade pipe has only the default ACL, no client authentication and no break-in
@@ -148,7 +147,7 @@ watched the stack location reach. What still reads a displacement alone is
 structure, and `docs/structured-results.md` says so. Closing that half means giving the recipe pass
 the same tracking, which is the same shape of work one function over.
 
-## 6. [windbg-mcp] Concolic/symbolic buffer synthesis (DECISIONS.md D2 — scoped out)
+## 6. [windbg-mcp] Concolic/symbolic buffer synthesis (DECISIONS.md D2) — **declined** (2026-07-04)
 
 Auto-emit a concrete `(code, buffer, lengths)` by SMT-solving the on-path branch predicates, rather
 than the human/LLM-readable recipe emitted today.
@@ -157,7 +156,7 @@ than the human/LLM-readable recipe emitted today.
   debugger memory snapshot rather than building an in-house solver — kernel state modeling, loops,
   hashing, and stateful protocols make it brittle and a separate project.
 
-## 8. [windbg-mcp] Tasks extension (`io.modelcontextprotocol/tasks`, SEP-2663) — **measured and deferred** (2026-09-19)
+## 8. [windbg-mcp] Tasks extension (`io.modelcontextprotocol/tasks`, SEP-2663) — **deferred** (2026-09-19)
 
 Nothing here speaks tasks today. The hand-written `get_info` advertises
 `ServerCapabilities::builder().enable_tools()` and no `extensions` map, so `tasks/get` /
@@ -340,7 +339,7 @@ client for the duration of a command, so output only lands when the command ends
   swap the worker's queue for DbgEng's internal one and gain nothing. Concurrency *between* targets
   came from item 10 instead.
 
-## 11. [windbg-mcp] MCP Apps (`ui://` resources) — scoped out
+## 11. [windbg-mcp] MCP Apps (`ui://` resources) — **declined** (2026-07-29)
 
 Apps needs a resource surface serving `text/html;profile=mcp-app` over an iframe/postMessage host
 bridge. This server has no resources at all (no `list_resources`/`read_resource`), every tool returns
@@ -396,28 +395,40 @@ and no other spawn site needs to know the rule exists.
   documented, which is what makes this an improvement to *how* the property is held rather than a
   fix to a live hole.
 
-## 19. [windbg-mcp] Let a `debug_batch` step walk a structure
+## 19. [windbg-mcp] Let a `debug_batch` step walk a structure — **declined** (2026-10-13)
 
-`walk_memory` (#103) is a supervisor-validated op like the pool queries, and item 17 already built
-the machinery a batch needs to call one: a `StepAction` variant, a `Debuggee` method, and a
-rendering the step's `expect` checks can match on. It was left out because the two tools answer
-different questions — a batch exists so that a *mutation* is undone on every path, and a walk
-mutates nothing.
+The proposal was a `walk` step: `walk_memory` (#103) run inside a batch, so that a transaction
+patching a driver's dispatch table could assert that every entry was put back. The case for it was
+that such a batch "currently asserts on `execute` text" — the all-or-nothing read `walk_memory`
+exists to replace — so one unreadable entry would fail the assertion for a reason that has nothing
+to do with the restore.
 
-Where it would earn its place is the assertion half. A batch that patches a driver's dispatch table
-and has to prove it put every entry back currently asserts on `execute` text, which is exactly the
-all-or-nothing read this issue removed everywhere else: one unreadable entry and the assertion fails
-for a reason that has nothing to do with the restore. A `walk` step whose `expect` matched on the
-rendered table would state the postcondition as what it is — "these sixteen pointers are these
-sixteen values" — instead of on a command that may not survive being asked.
+**That premise was already false when it was written.** `debug_batch` landed on 2026-08-10
+(`e4a6e7ed`) with two typed ways to state the postcondition, and this item was filed three days
+later with `walk_memory` (`00a09608`) without mentioning either:
 
-Picks up at `batch::StepAction` (the variant and its `owns` keys), `batch::Debuggee::walk`
-alongside `pool`, and `worker::walk_memory`, which already returns the text a check would run
-against. The one design question is the budget: a walk step is up to 1024 reads inside a
-transaction whose whole point is that its rollback still fits, so the step's share has to come out
-of the batch's deadline the way `pool`'s does rather than out of the call's.
+- **The `eval` check**, `{"expr": "poi(<entry>)", "equals": "{{orig}}"}`, against a value an
+  `eval` step captured before the patch. That is "this pointer is this value" stated as itself,
+  with no command text in between. `batch::run_step` stops a step at the first check that does not
+  hold, and the report names that expression and what the debugger answered — so an unreadable
+  entry ends the step *at that entry*, which is the right verdict for a postcondition: an entry the
+  batch cannot read is one it cannot claim to have restored.
+- **The `read_memory` step**, a bounded read that keeps the bytes it reached and says where it
+  stopped.
 
-## 27. [windbg-mcp + dbgscope] A deferred module reports no PDB identity — **measured and declined** (2026-08-20)
+**And the walk's own advantage does not apply to the case.** `walk_memory` carries on past a hole,
+which is what a list, a pointer chain or a handle table with freed entries needs. A dispatch table
+is one contiguous array inside the driver object the batch has just written to; if it could not be
+read, it could not have been patched either.
+
+**What would reopen it** is a transaction that has to follow a pointer chain *after* a mutation and
+assert on what it finds — a list unlinked and relinked, say — where the nodes cannot be named in
+advance as `poi()` checks or covered by one contiguous read. Nothing has asked for that. Building
+it would cost a `StepAction` variant and its `owns` keys, a budget share drawn from the batch's
+deadline the way `pool`'s is (a walk is up to 1024 nodes, inside a transaction whose rollback still
+has to fit), and another variant in `debug_batch`'s input schema on every surface that serves it.
+
+## 27. [windbg-mcp + dbgscope] A deferred module reports no PDB identity — **declined** (2026-08-20)
 
 `modules` carries `pdb` — the GUID, age and symbol-server `key` — only for a module whose symbols
 the engine has **already resolved** (`symbols: pdb` or `dia`). On a freshly opened dump that is one
@@ -507,7 +518,7 @@ does not know to ping is exactly the client this bites.
   a reason, and a client that thinks for seven minutes is a fact about local models rather than
   about this server.
 
-## 35. [windbg-mcp + dbgscope] The engine's subregister flag misses the views that matter — **measured and declined** (2026-08-22)
+## 35. [windbg-mcp + dbgscope] The engine's subregister flag misses the views that matter — **declined** (2026-08-22)
 
 `registers` narrows its default set with `DEBUG_REGISTER_SUB_REGISTER`, and that flag does not mean
 what the filter needs it to mean:
@@ -1039,7 +1050,7 @@ fixed build identified. No installed application was patched.
 - **Where it picks up:** [shutdown investigation](docs/bn-shutdown-investigation.md) and the
   upstream issue, including their native stack evidence. Run one disposable GUI at a time.
 
-## 65. [binja-windbg-mcp] Native Ultimate validation — deferred due to cost
+## 65. [binja-windbg-mcp] Native Ultimate validation — **deferred** (2026-09-12)
 
 Ultimate is unavailable and prohibitively expensive for the user. Purchasing it is not a
 requirement, and its absence does not gate Personal/external BinDiff delivery.
