@@ -89,8 +89,9 @@ failure in that interval faults the session and runs bounded recovery.
 The readable bank is `rip`, `rsp`, `rflags`, `cr3`, `cs`, `dr0` through `dr3`, `dr6`, `dr7`, and
 `vsm_vp_status`. `cr3`, `cs`, and `vsm_vp_status` are read-only. A held event records message type,
 vector, VP, VTL, CPL, dispatcher context, advance flag, and an unclassified debug-exception reason.
-The worker reads DR6 only after publication and reports the validated hardware slot or single-step
-cause in the MCP stop record. Revision 2 accepts only mapped exception type `0x01000002`, vector 1,
+The worker reads DR6 only after publication and reports the validated hardware slot, trap-step, or
+CR3 step-over cause in the MCP stop record. Revision 2 accepts only mapped exception type
+`0x01000002`, vector 1,
 a selected VP at VTL1 CPL0, a nonzero dispatcher context, and native advance clear.
 
 Revision 2 changes the `publish_stop` event reason from the already-classified v1 hardware or step
@@ -142,15 +143,24 @@ The state machine implements both the narrow redirected gate and natural control
    requires the baseline CR3. With transition-CR3 control enabled, a natural hardware stop may
    establish a different nonzero, page-aligned root. The worker binds memory translation to that
    root and re-reads every guarded instruction through it before exposing the stop. Every
-   single-step must retain the same root. One selected VP may use its retained native intercept as
-   the provider-write barrier. With several selected VPs, the worker restores the winner and
+   trap-flag step must retain the same root. A decoded `mov cr3,r64` is the exception described
+   below. One selected VP may use its retained native intercept as the provider-write barrier.
+   With several selected VPs, the worker restores the winner and
    completes its event, gives native completion one watchdog-bounded run slice, detaches, and
    proves a VM-wide pause before it reads or restores a provider that did not own that event;
-6. consume each stop epoch once to arm TF. The first step may reuse the hardware-stop instruction;
+6. consume each stop epoch once to arm a step. The first step may reuse the hardware-stop instruction;
    every later step must re-prove the exact current instruction bytes. A step accepts one default
-   fall-through address or at most four explicit destinations for a branch;
-7. accept a single-step only with DR6.BS set, TF still set in the held state, RF clear, and RIP in
-   that bounded destination set;
+   fall-through address or at most four explicit destinations for a branch. If the decoded bytes
+   are `mov cr3,r64`, the controller instead borrows the stop's owned debug-register slot, clears
+   TF, and arms that slot at the linear successor. The source guard is verified through the old
+   root before release; the destination is deliberately absent from the dispatcher's pre-bind
+   guard set;
+7. accept a trap-flag step only with DR6.BS set, TF still set in the held state, RF clear, and RIP
+   in that bounded destination set. Accept the CR3 step-over only with the borrowed DR6 slot, RIP
+   and that debug register at the successor, and TF/RF clear. Its `step_over` reason carries the
+   newly observed CR3. Bind that root before exposing the stop, and remove the borrowed breakpoint
+   first. A wait expiry or teardown re-reads the possibly changed root under the proved recovery
+   pause before restoring the slot;
 8. restore and verify the debug-register baseline and the baseline TF/RF bits. Redirect mode also
    restores the original RIP, RSP and ordinary flags; natural mode preserves guest execution
    progress. Finally rotate the provider to running and complete only the exact owned native event.
@@ -204,9 +214,12 @@ proved VM pause to keep provider state stable:
    winning DR slot with complete stop evidence and a fresh controller epoch.
 4. `sk_live_registers` and `sk_live_read_memory` inspect only that stopped epoch. The memory path
    uses the validated stop CR3 and refuses an unmapped range whole.
-5. `sk_live_step` consumes the stopped epoch once, clears the hardware breakpoint and arms TF.
-   It may be repeated from any owned stop. Each later step supplies the exact current instruction;
-   the next wait accepts only the supplied bounded destination set.
+5. `sk_live_step` consumes the stopped epoch once and clears the original hardware breakpoint.
+   It arms TF for an ordinary instruction. For a decoded CR3 write in natural mode it instead
+   borrows an owned slot for the linear successor, accepts the resulting root transition, reports
+   `step_over` with `new_cr3`, and removes the borrowed slot before returning the stop. It may be
+   repeated from any owned stop. Each later step supplies the exact current instruction; the next
+   wait accepts only the supplied bounded destination set.
 6. `sk_live_continue` consumes that new epoch, restores and verifies the complete baseline, clears
    execution control and completes the owned event. The session can then be armed again.
 7. `end_session` restores any held state, removes the handler and scratch allocation, and performs
@@ -329,7 +342,7 @@ back after removal. The adapter uses `.detach /h` at the pending native breakpoi
 measured unhandled detach terminates `vmwp`. The delayed `Suspend-VM` completion kick runs on a host
 helper thread and makes no DbgEng call; the engine itself never leaves its owner thread.
 
-The CLI acceptance role performs one guarded hardware stop, one trap-flag step, continue, handler
+The CLI acceptance role performs one guarded hardware stop, one guarded step, continue, handler
 unregister, deferred cleanup, scratch free, and handled detach. The MCP session extends that narrow
 role with natural arming and repeated guarded steps. On 2026-10-03 the redirected one-VP gate passed
 twice, the 16-instruction natural-flow gate passed, and the selected-VP gate passed on VP1 of a

@@ -45,7 +45,7 @@
 //! * **Live Secure Kernel** (`#[ignore]`d and
 //!   `WINDBG_MCP_SMOKE_SK_LIVE=<private JSON config>`) — one exact disposable Hyper-V VM. It
 //!   drives the complete typed MCP lifecycle through a worker: bind, guarded DR0 stop, inspect,
-//!   trap-flag step, restore, continue and teardown. The profile and privileged provider stay
+//!   guarded step, restore, continue and teardown. The profile and privileged provider stay
 //!   outside the repository. Run it alone under the bench health wrapper.
 //! * **Secure Kernel KD** (`#[ignore]`d and
 //!   `WINDBG_MCP_SMOKE_SK_KD=<private JSON config>`) — opens the same disposable VM through the
@@ -20341,7 +20341,7 @@ fn a_live_secure_kernel_session_stops_steps_inspects_resumes_and_closes() {
     };
     let address = required("instruction_address");
     let instruction_bytes = required("instruction_bytes");
-    let open = json!({
+    let mut open = json!({
         "profile": required("profile"),
         "control_transport": required("control_transport"),
         "live_transport": required("live_transport"),
@@ -20352,6 +20352,9 @@ fn a_live_secure_kernel_session_stops_steps_inspects_resumes_and_closes() {
         "vp": config.get("vp").cloned().unwrap_or(json!(0)),
         "expected_cr3": required("expected_cr3")
     });
+    if let Some(allow) = config.get("allow_transition_cr3") {
+        open["allow_transition_cr3"] = allow.clone();
+    }
 
     // `inspect` as well, because the VTL0 half below runs `execute`, which lives there.
     let mut server = Server::started_with_args(&[], &["--tools", "securekernel,inspect"]);
@@ -20459,6 +20462,15 @@ fn a_live_secure_kernel_session_stops_steps_inspects_resumes_and_closes() {
             None if perform_step => vec![&default_step],
             None => Vec::new(),
         };
+        let stop_cr3 = |stop: &Value| {
+            stop["registers"]["values"]
+                .as_array()
+                .and_then(|values| values.iter().find(|value| value["name"] == "cr3"))
+                .and_then(|value| value["low"].as_str())
+                .unwrap_or_else(|| panic!("a live stop carries CR3 register evidence: {stop}"))
+                .to_string()
+        };
+        let mut previous_cr3 = stop_cr3(&hardware);
         let mut final_epoch = hardware_epoch;
         for step in steps {
             let mut arguments = json!({ "session_id": id, "epoch": final_epoch });
@@ -20472,28 +20484,38 @@ fn a_live_secure_kernel_session_stops_steps_inspects_resumes_and_closes() {
             }
             let stepping = server.tool_data("sk_live_step", arguments, TARGET_STEP);
             assert_eq!(stepping["phase"], "running", "{stepping}");
-            let single_step =
+            let step_stop =
                 server.tool_data("sk_live_wait", json!({ "session_id": id }), TARGET_STEP);
+            let expected_reason = step
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("single_step");
             assert_eq!(
-                single_step["event"]["reason"]["reason"], "single_step",
-                "{single_step}"
+                step_stop["event"]["reason"]["reason"], expected_reason,
+                "{step_stop}"
             );
-            assert_ne!(single_step["epoch"], final_epoch, "{single_step}");
+            assert_ne!(step_stop["epoch"], final_epoch, "{step_stop}");
             if let Some(address) = step.get("address") {
-                assert_eq!(
-                    single_step["instruction"]["address"], *address,
-                    "{single_step}"
-                );
+                assert_eq!(step_stop["instruction"]["address"], *address, "{step_stop}");
             }
             if let Some(expected_rips) = step.get("expected_rips") {
+                assert_eq!(step_stop["expected_rips"], *expected_rips, "{step_stop}");
+            }
+            let current_cr3 = stop_cr3(&step_stop);
+            if expected_reason == "step_over" {
                 assert_eq!(
-                    single_step["expected_rips"], *expected_rips,
-                    "{single_step}"
+                    step_stop["event"]["reason"]["new_cr3"], current_cr3,
+                    "the step-over reason must name the root in its retained snapshot: {step_stop}"
+                );
+                assert_ne!(
+                    current_cr3, previous_cr3,
+                    "the configured CR3-changing step did not change roots: {step_stop}"
                 );
             }
-            final_epoch = single_step["epoch"]
+            previous_cr3 = current_cr3;
+            final_epoch = step_stop["epoch"]
                 .as_str()
-                .expect("the single-step stop carries its epoch")
+                .expect("the step stop carries its epoch")
                 .to_string();
         }
         let resumed = server.tool_data(

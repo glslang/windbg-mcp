@@ -555,17 +555,17 @@
       "inputSchema": 343,
       "modelVisible": 491,
       "name": "sk_live_registers",
-      "outputSchema": 4080,
-      "wire": 4734
+      "outputSchema": 4333,
+      "wire": 4987
     },
     {
       "annotations": 123,
-      "description": 273,
-      "inputSchema": 1005,
-      "modelVisible": 1331,
+      "description": 492,
+      "inputSchema": 1101,
+      "modelVisible": 1646,
       "name": "sk_live_step",
       "outputSchema": 1291,
-      "wire": 2776
+      "wire": 3091
     },
     {
       "annotations": 132,
@@ -573,8 +573,8 @@
       "inputSchema": 343,
       "modelVisible": 569,
       "name": "sk_live_wait",
-      "outputSchema": 4080,
-      "wire": 4812
+      "outputSchema": 4333,
+      "wire": 5065
     },
     {
       "annotations": 126,
@@ -705,14 +705,14 @@
   ],
   "totals": {
     "annotations": 8555,
-    "description": 46574,
-    "inputSchema": 72224,
+    "description": 46793,
+    "inputSchema": 72320,
     "instructions": 2022,
-    "modelVisible": 122929,
-    "outputSchema": 213097,
-    "payload": 346848,
+    "modelVisible": 123244,
+    "outputSchema": 213603,
+    "payload": 347669,
     "tools": 78,
-    "wire": 346759,
+    "wire": 347580,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10308
   }

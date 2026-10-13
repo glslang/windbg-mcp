@@ -123,7 +123,8 @@ pub enum EngineOp {
         address: u64,
         size: u32,
     },
-    /// Consume the current stop epoch and arm exactly one trap-flag step.
+    /// Consume the current stop epoch and arm one step. CR3 writes use a bounded successor
+    /// breakpoint; other instructions use trap flag.
     SkLiveStep {
         epoch: crate::skcontrol::StopEpoch,
         guard: crate::sklive::StepGuard,

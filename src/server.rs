@@ -1275,7 +1275,8 @@ pub struct SkLiveStepArgs {
     #[serde(default)]
     pub bytes: Option<String>,
     /// Allowed RIP values after the instruction executes. Omit for address plus byte length;
-    /// branches may name at most four distinct destinations.
+    /// branches may name at most four distinct destinations. A CR3 write is stepped over with a
+    /// temporary breakpoint and accepts only its linear successor.
     #[serde(default)]
     pub expected_rips: Vec<String>,
     /// Which live Secure Kernel session to act on. Omit for the current one.
@@ -4691,9 +4692,12 @@ impl WindbgServer {
         engine_result_for(args.session_id.as_deref(), out)
     }
 
-    /// Consume the current stopped epoch and arm one trap-flag step. The first step can reuse the
-    /// breakpoint guard. For each later step, provide the exact current instruction. A branch can
-    /// provide up to four allowed destinations. Collect the stop with the live wait operation.
+    /// Consume the current stopped epoch and arm one step. Ordinary instructions use trap flag. A
+    /// decoded CR3 write instead borrows the owned debug-register slot for a bounded breakpoint at
+    /// its linear successor; its stop reports a distinct step-over reason and the new CR3. The
+    /// source bytes are still verified through the old root. For each later step, provide the exact
+    /// current instruction. A branch can provide up to four allowed destinations. Collect the stop
+    /// with the live wait operation.
     #[rmcp::tool(
         annotations(
             title = "Step live Secure Kernel",

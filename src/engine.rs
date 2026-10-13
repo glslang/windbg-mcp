@@ -3324,7 +3324,7 @@ impl Sessions {
                 .secure_kernel_pause
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            // A trap-flag step releases one retained event only to arm the next stop. vmwp remains
+            // A live step releases one retained event only to arm the next stop. vmwp remains
             // under debugger control across that interval, so the next retention notice belongs
             // to the same absolute pause window and must not restart its timer.
             if pause.cancel.is_some() {

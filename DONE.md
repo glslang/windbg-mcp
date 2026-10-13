@@ -173,6 +173,7 @@ engine — it adds a target and leaves the current one alone. The entry records 
 - [Item 73](#73-windbg-mcp-a-drivers-import-directory-can-be-in-a-section-the-loader-freed--done-2026-10-09-dbgscope196) — [windbg-mcp] A driver's import directory can be in a section the loader freed — done (2026-10-09, dbgscope#196)
 - [Item 124](#124-windbg-mcp-nothing-asserts-that-a-live-secure-kernel-read-was-of-memory-vtl0-cannot-reach--done-2026-10-11) — [windbg-mcp] Nothing asserts that a live Secure Kernel read was of memory VTL0 cannot reach — done (2026-10-11)
 - [Item 116](#116-windbg-mcp-the-kd-facade-answers-windbg-with-fabricated-state-it-cannot-tell-apart-from-guest-state--done-2026-10-11) — [windbg-mcp] The KD facade answers WinDbg with fabricated state it cannot tell apart from guest state — done (2026-10-11)
+- [Item 123](#123-windbg-mcp-sk_live_step-refuses-a-cr3-changing-instruction-instead-of-stepping-over-it--done-2026-10-12) — [windbg-mcp] `sk_live_step` steps over a CR3-changing instruction — done (2026-10-12)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -10584,3 +10585,112 @@ fixture-bound external audit.
 Final checks: plain `cargo test` passed **1,388 unit tests** and **145 smoke tests** (21 opt-in
 tests ignored); formatting, strict Clippy and the pinned documentation lint passed. The separate
 ignored symbol/stack gate above ran against the disposable VM and passed its external audit.
+
+## 123. [windbg-mcp] `sk_live_step` refuses a CR3-changing instruction instead of stepping over it — **done (2026-10-12)**
+
+**Repo:** `windbg-mcp`. **Origin:** planning a stepped walk through a Secure Kernel syscall entry,
+2026-10-10.
+
+A single-step stop is validated against the CR3 captured when the step was armed: `required` comes
+from `ExpectedStop::SingleStep { cr3, .. }`, and `RegisterSnapshot::from_values` bails with *"the
+stopped CR3 does not match the required address space"* on any mismatch. So an instruction that
+*writes* CR3 cannot be single-stepped at all — the stop it produces is, by construction, in a
+different address space from the one the step began in, and the session faults.
+
+**The requirement is sound and the refusal is the wrong primitive.** It is sound because the live
+memory source reads guest *physical* memory only, so a virtual address is resolved by walking the
+VTL1 page tables from a root (`sk::walk(&reader, root)`), and that walk is what every read at the
+stop goes through — the instruction guard included. A stop in another root would have the server
+reading one address space while the VP executes in another. But the conclusion drawn from it is
+that such an instruction is un-steppable, and it is not: **the server already knows where the next
+instruction starts.** The step request carries the exact instruction `bytes`, and `expected_rips`
+already defaults to address-plus-length from them. So instead of refusing, the step can be
+performed as a *step over* — arm a bounded execution breakpoint at `address + len(bytes)` and
+continue — and the resulting **hardware** stop is explicitly allowed to arrive in a different root,
+where `bind_stop_cr3` → `MemorySource::bind_root` re-walks the space.
+
+**Which is not yet the whole of carrying on correctly, and the ordering is the part to settle
+first.** Every guarded instruction is read *inside the wait*: `VmwpDispatcher::wait_for_stop` calls
+`memory.read_guard_until` for each one (`src/skdispatch.rs`) before anything has bound the stop's
+own root, so those reads go through the root bound **previously**, and `validate_observation` then
+rejects a mismatch as *"a guarded instruction changed before the stop was accepted"*
+(`src/sklive.rs`). For a step-over whose destination is only mapped in the new root that is either
+a read that fails or a byte comparison against a different address space, reported as a guard that
+changed when nothing changed — and the re-verification that would catch it runs *after*
+`bind_stop_cr3`, and only when `allow_transition_cr3` is set. So the destination guard has to be
+read after the root is bound, or be kept out of the pre-bind set, and that is a change to the wait
+rather than to the step. An earlier draft of this entry said the session "carries on correctly on
+the far side" with no mention of the pre-bind read; review was right that nothing had established
+it.
+
+The concrete case this was found on is `KiSystemCall64Shadow`, whose fourth instruction is
+`mov cr3,rsp`. A caller wanting to walk a trustlet's entry into the Secure Kernel has to stop three
+instructions in and give up, or hand-build the breakpoint-and-continue dance itself — which is the
+server's own `sk_live_arm` and `sk_live_continue` being used to work around `sk_live_step`.
+
+- **Why deferred:** two API questions rather than a missing mechanism. A step-over consumes a
+  **debug-register slot**, and natural mode has four that `additional_breakpoints` already competes
+  for — so either the step borrows one and the arm budget shrinks while a step is outstanding, or a
+  step-over is refused when no slot is free, and which of those is right is a decision. And the
+  stop it produces is a hardware stop, so a caller that asked to step gets back a stop whose reason
+  is `hardware_breakpoint`; reporting that unchanged would be misleading, and inventing
+  `single_step` for it would be worse. It likely wants a reason of its own.
+- **What would close it:** `sk_live_step` performing a step-over when the instruction it was given
+  changes the address-space root — detected from the instruction bytes it already receives, `0F 22`
+  with `/r` naming CR3, rather than from a caller's assertion — by arming a bounded breakpoint at
+  the computed next address and continuing; the resulting stop reported with a reason that says a
+  step-over happened and names the new root; the borrowed slot released whether the step-over
+  arrives or the bound expires; and the step's existing guarantee kept intact, so the instruction
+  bytes are still verified through the *old* root before the step and the new root is bound only
+  once the stop is accepted. And — the ordering above — the *destination* guard read out of
+  `wait_for_stop`'s pre-bind set, or taken after `bind_stop_cr3`, so a destination mapped only in
+  the new root is not read through the old one and reported as an instruction that changed.
+- **Where it picks up:** the `ExpectedStop::SingleStep` arm of the stop validation and the step
+  path in `src/sklive.rs`; `bind_stop_cr3`/`bind_stop_cr3_until` and `MemorySource::bind_root` in
+  `src/skdispatch.rs`; `SkLiveStepArgs` in `src/server.rs`; and the slot accounting shared with
+  `SkLiveBreakpointArgs`.
+
+### What closed it (2026-10-12)
+
+The step path now decodes the exact guarded bytes with iced-x86. A `mov` whose destination operand
+is CR3 takes a dedicated `ExpectedStop::StepOver` arm; other control-register moves and reads do
+not. Natural control borrows the slot that produced the current stop (or an already-owned slot
+after a preceding trap step), clears TF/RF, replaces the old arm with one execute breakpoint at the
+decoded instruction's linear successor, and refuses an explicit destination set that says anything
+else. This is a temporary replacement, not a fifth slot, so an arm that already used all four
+debug registers remains steppable.
+
+The source instruction is re-read before any mutation while live memory is still bound to the old
+root. The step-over wait passes no destination instruction to `VmwpDispatcher::wait_for_stop`, so
+the dispatcher cannot read a new-root-only destination through the old page tables. Once the held
+event is published, two matching register snapshots establish a nonzero aligned CR3, memory is
+bound to it, and the stop is accepted only when DR6 names exactly the borrowed slot, RIP and that
+debug register name the successor, and TF/RF are clear. The public reason is `step_over` with the
+slot and `new_cr3`; the stop's `instruction` remains the exact source guard and `expected_rips`
+names the successor.
+
+Before that stop is exposed, the controller disables the borrowed slot and restores its debug
+address from the saved baseline. If the bounded wait expires, teardown begins, or native release
+fails in the gap before the wait, recovery first reads the potentially changed CR3 under its proved
+pause and then restores the same baseline. Thus both the arrived and no-event paths release the
+temporary slot without pretending the new root is the pre-step one. Redirect mode is refused for
+this step because its promise to restore the original complete register snapshot cannot restore
+the read-only CR3; natural mode preserves the real address-space transition.
+
+Focused state-machine tests pin byte-derived CR3-write detection, old-root source verification,
+an empty pre-bind destination guard set, new-root binding, the wire reason, borrowed-slot removal,
+and timeout recovery after the provider already reports the new CR3. The opt-in live tier now
+accepts `allow_transition_cr3` and a per-step expected reason; a configured `step_over` requires
+the reason's `new_cr3` to equal the retained CR3 evidence and differ from the preceding stop.
+
+The ignored MCP live tier passed its selected stop/step/resume lifecycle test. A separate private
+disposable-VM run exercised the CR3 branch at `KiSystemCall64Shadow`: the guarded `mov cr3,rsp`
+returned `step_over`, changed to a distinct aligned root, and the following ordinary step retained
+that root. Continue and teardown succeeded, and the external post-audit confirmed that the debug
+register baseline, TF/RF, LSTAR, guest health, worker lifetime and VM shutdown all returned to their
+expected states. Boot-specific identities, addresses, register values, fixture settings and raw
+evidence remain outside version control under the private test area.
+
+Final local checks: plain `cargo test` passed **1,392 unit tests** and **149 smoke tests** (21
+opt-in tests ignored); formatting, strict Clippy and `git diff --check` passed. The focused
+`cr3_step_over` recovery test also passed again after the live run.
