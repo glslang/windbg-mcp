@@ -1,10 +1,12 @@
 //! The supervisor: session registry and worker-process supervision.
 //!
-//! dbgeng.dll holds **one debuggee session per process**. That is not a binding limitation — it
-//! is why `.opendump` *replaces* the target rather than opening a second one. So a server that
-//! wants more than one session at a time, or that wants to be able to *abandon* one, needs more
-//! than one process. Each open target here gets its own [`crate::worker`] child process, and
-//! this module routes tool calls to them.
+//! dbgeng.dll holds **one debug session per process**, and that is not a binding limitation. A
+//! session can hold several targets — `.opendump` *adds* one rather than replacing the first — but
+//! they share one current target, which every command reads, and one event wait: the `g` that
+//! loads an added dump runs the live process beside it as well (measured in `FOLLOWUPS.md` item
+//! 105, whose cells are in `docs/sessions.md`). So a server that wants more than one session at a
+//! time, or that wants to be able to *abandon* one, needs more than one process. Each open target
+//! here gets its own [`crate::worker`] child process, and this module routes tool calls to them.
 //!
 //! Two things fall out of that, and they are the point:
 //!

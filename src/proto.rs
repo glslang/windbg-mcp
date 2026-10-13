@@ -1416,8 +1416,10 @@ pub enum WorkerMessage {
     /// often not the same op and sometimes not an op at all: a `.opendump` inside a `.if`, a
     /// `.foreach` or an alias names nothing a text scan can match
     /// (`crate::server::changes_debug_target`), and a breakpoint's command runs at a hit this
-    /// server never sees. So the worker compares what the engine holds against what it held at
-    /// the open, after every op, and this is what it says when the two differ.
+    /// server never sees. Even a `.opendump` that runs replaces nothing by itself — it adds a
+    /// target, and the `g` after it is the op that makes that one current (`docs/sessions.md`,
+    /// measured in `FOLLOWUPS.md` item 105). So the worker compares what the engine holds against
+    /// what it held at the open, after every op, and this is what it says when the two differ.
     ///
     /// A milestone rather than part of the reply, for the reason [`Self::Committed`] is one: the
     /// supervisor has to act on it, and — the whole point here — it has to act on it **before**

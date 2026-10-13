@@ -956,13 +956,14 @@ pub trait Debuggee {
     /// 10.0.26100.1742 (ARM64, 2026-09-26, the dev build driven over stdio): a wrapped `.create`
     /// on a launched process is caught, at the **`g`** rather than at the `.create` — the command
     /// only arms it (*"Create will proceed with next execution"*), so the resume is the step that
-    /// changed the process set and the step this names. A wrapped `.opendump` of a second kernel
-    /// dump is **not** caught, and correctly so: `||` then lists two systems with the original
-    /// still current, `? @$ip`, `version` and `lm` all still answer from it, and the fingerprint
-    /// reads the current system — so nothing has been replaced yet, only added. Switching to it
-    /// is what would do it, and `||1s` through `ExecuteWide` fails here with `0x80040205`. The
-    /// list above is the class of commands that can *reach* a replacement, not a list of ones
-    /// that each make one on their own.
+    /// changed the process set and the step this names. A wrapped `.opendump` has the same shape,
+    /// measured on 10.0.29617.1000 through the service and on 10.0.26100.1742 under `cdb`
+    /// (2026-10-13, `FOLLOWUPS.md` item 105): it **adds** a system, with `||` listing two and the
+    /// original still current, so the step running it is correctly not caught; the `g` after it
+    /// loads the new dump and makes it current, and a batch of the two, run through the service,
+    /// stops `TARGET REPLACED` at the `g`. A `||1s` before that `g` is refused (*"Illegal
+    /// debuggee"*, as `cdb` prints it), and on a live kernel the `g` never loads it at all. The list above is the class of commands that can *reach* a
+    /// replacement, not a list of ones that each make one on their own.
     fn replaced(&mut self) -> Held;
 
     /// How long this batch has been running.
@@ -2079,9 +2080,10 @@ fn probe_state(
     // a detached or replaced process is still running somewhere and can be attached to again, and
     // on a live kernel that is the difference between a machine that is up and one that is not.
     // `changes` is what separates them — `.detach`, `q` and `.opendump` name the debug target,
-    // while a resume that ran a program to its end names execution. Note `.opendump` *replaces*
-    // the target, so it reaches here on `changes` alone with `target_gone` false, which is why
-    // that test cannot be dropped in favour of the typed one.
+    // while a resume that ran a program to its end names execution. Note `.opendump` leaves the
+    // old target in place — it adds one, for the next `g` to make current — so it reaches here on
+    // `changes` alone with `target_gone` false, which is why that test cannot be dropped in favour
+    // of the typed one.
     let took_the_target = steps
         .iter()
         .chain(always)
@@ -2582,7 +2584,10 @@ mod tests {
 
         /// Makes the call containing `matching` **replace** the target — the scripted stand-in
         /// for a wrapped `.opendump`, an alias, or a breakpoint command run at a hit, none of
-        /// which the command scan can read.
+        /// which the command scan can read. A real `.opendump` only adds a target and the `g`
+        /// after it makes that one current (`FOLLOWUPS.md` item 105); scripting the replacement on
+        /// the `.opendump` itself folds the two steps into one. That moves which step the report
+        /// names, and the batch reads `replaced` after every step whichever one it is.
         ///
         /// A successful call, like [`Self::ends_the_target_on`] and for the same reason: the step
         /// did what it was asked, so nothing in its result stops the batch. That is the whole
@@ -2666,8 +2671,10 @@ mod tests {
                 self.target_ended = true;
             }
             // Before the `?` for the same reason, and it is the sharper case here: a wrapped
-            // `.opendump` inside a command list can leave the engine on the new target and still
-            // report an error from a later segment.
+            // `.opendump` and a `g` inside one command list can leave the engine on the new target
+            // and still report an error from a later segment — measured on dbgeng 10.0.29617.1000
+            // (`FOLLOWUPS.md` item 105), where `.if (1) { .opendump … }; g; zzzz` answered
+            // `0x80040205` with the second dump current.
             if self
                 .replaces_target_on
                 .as_deref()

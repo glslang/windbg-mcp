@@ -8641,13 +8641,14 @@ fn a_randomised_command_sequence_leaves_the_session_in_one_state_and_the_server_
 /// session that went.
 ///
 /// **This used to need a fallback, and the fallback is what the fuzz was really reporting.** A raw
-/// `execute` that releases or replaces the target — `qd`, `q`, `.detach`, `.kill`, `.opendump` —
-/// *retires* the handle, and retirement refuses every call that supplies it. `end_session` was not
-/// exempt, so a round that drew one of those could not release its session by name; this asked
-/// again without the handle, which routes to whichever session is **current** and only worked here
-/// because the round's session happened to be the newest. That was `FOLLOWUPS.md` item 55, and it
-/// is fixed: a retired handle still names the session even though it no longer names a target, so
-/// `SessionState::accepts_teardown` admits it and there is one road again.
+/// `execute` that releases the target or starts replacing it — `qd`, `q`, `.detach`, `.kill`,
+/// `.opendump` — *retires* the handle, and retirement refuses every call that supplies it.
+/// `end_session` was not exempt, so a round that drew one of those could not release its session
+/// by name; this asked again without the handle, which routes to whichever session is **current**
+/// and only worked here because the round's session happened to be the newest. That was
+/// `FOLLOWUPS.md` item 55, and it is fixed: a retired handle still names the session even though it
+/// no longer names a target, so `SessionState::accepts_teardown` admits it and there is one road
+/// again.
 ///
 /// Which makes this the assertion the fuzz wanted in the first place — **however the sequence left
 /// the session, the handle that opened it ends it** — and it is deliberately not written to accept

@@ -81,7 +81,6 @@ reopen it). An unmarked line is simply open.
 - [Item 100](#100-dbgscope-the-vs-chunk-chain-comes-apart-on-29671--the-targets-paging-not-the-build) — [dbgscope] The VS chunk chain comes apart on 29671 — the target's paging, not the build — **declined** (2026-09-24)
 - [Item 101](#101-dbgscope-the-vs-chunk-chain-drifts-0x10-and-not-from-where-it-starts) — [dbgscope] The VS chunk chain drifts 0x10, and not from where it starts
 - [Item 104](#104-windbg-mcp-a-fingerprint-field-that-was-refused-is-indistinguishable-from-one-that-does-not-apply) — [windbg-mcp] A fingerprint field that was *refused* is indistinguishable from one that does not apply
-- [Item 105](#105-windbg-mcp-opendump-is-documented-as-replacing-the-target-and-the-one-measurement-of-it-says-it-adds-one) — [windbg-mcp] `.opendump` is documented as replacing the target, and the one measurement of it says it adds one
 - [Item 108](#108-windbg-mcp-a-kmdf-drivers-real-callbacks--step-1-landed-the-frameworks-per-device-config-is-what-is-left) — [windbg-mcp] A KMDF driver's real callbacks — step 1 landed, the framework's per-device config is what is left — **half landed**
 - [Item 113](#113-windbg-mcp-the-device-descriptor-sweeps-own-figures-do-not-add-up) — [windbg-mcp] The `\Device` descriptor sweep's own figures do not add up
 - [Item 114](#114-dbgscope-a-big-pool-entry-in-no-region-the-walk-discovers) — [dbgscope] A big-pool entry in no region the walk discovers
@@ -89,6 +88,7 @@ reopen it). An unmarked line is simply open.
 - [Item 121](#121-windbg-mcp-tracing-pool-allocations-on-an-x86-kernel) — [windbg-mcp] Tracing pool allocations on an x86 kernel
 - [Item 122](#122-windbg-mcp-a-live-secure-kernel-session-has-no-image-to-resolve-names-or-instructions-against) — [windbg-mcp] A live Secure Kernel session has no image to resolve names or instructions against
 - [Item 125](#125-windbg-mcp--dbgscope-an-interrupted-replay-is-left-where-ttd-puts-it-not-where-it-had-got-to) — [windbg-mcp + dbgscope] An interrupted replay is left where TTD puts it, not where it had got to
+- [Item 126](#126-dbgscope--windbg-mcp-a-command-that-fails-is-reported-by-its-hresult-alone) — [dbgscope + windbg-mcp] A command that fails is reported by its HRESULT alone
 
 ## 2. [dbgscope] Typed write primitives
 
@@ -1635,42 +1635,6 @@ Two consequences, and they point in opposite directions:
   always-required queries can actually fail on an engine that answers `GetExecutionStatus` — none
   of this is reachable if they cannot, and nothing here has been able to make one do it.
 
-## 105. [windbg-mcp] `.opendump` is documented as replacing the target, and the one measurement of it says it adds one
-
-**Repo:** `windbg-mcp`. **Origin:** two prose sites raised by CodeRabbit on
-[#392](https://github.com/glslang/windbg-mcp/pull/392) after it merged, and fixed there. The wider
-version is this repo contradicting itself: item 102 measured the command it had used as its own
-example of a replacement and found it is not one — driven live over stdio against the dev build
-(dbgeng 10.0.26100.1742, ARM64, 2026-09-26), `.if (1) { .opendump C:\other.dmp }` on a dump session
-left `||` listing **two systems** with the original still current, and `? @$ip`, `version` and `lm`
-all still answering from it. That reading is recorded in `DONE.md`; the *claim* it contradicts is
-still in about a dozen places, including the sentence this server's whole shape is introduced with
-(`docs/architecture.md`'s opening and `src/engine.rs`'s module doc): *"dbgeng.dll holds one
-debuggee session per process … which is why `.opendump` **replaces** the target rather than opening
-a second one"*.
-
-- **Why deferred:** one command, one target kind, one engine build, and a rewrite of that sentence
-  would trade a claim that is wrong on one kind for one that is unmeasured on three. What it wants
-  first is the matrix: `.opendump` on a **dump** session (measured: adds a system), on a **live
-  user-mode** target, on a **live kernel** one, and `.opendump` of the *same* file; and then which
-  command actually switches, which this server has never observed at all — `||1s` through
-  `ExecuteWide` failed here with `0x80040205`, so "the switch is what replaces a target" is
-  currently an inference rather than a reading.
-- **What does not change whatever the matrix says, and is worth writing down before anyone starts.**
-  `server::changes_debug_target` keeps `.opendump` on its list and `batch::retires_handle` keeps
-  pre-retiring for it: over-matching there costs a caller one re-open, the scan cannot see a
-  wrapper anyway, and since item 81 the *actual* retirement is decided by comparing what the engine
-  holds rather than by the command's name. The batch's own reading is likewise unaffected — it
-  compares holdings, so a `.opendump` that adds a system and leaves the current one alone correctly
-  reads as **nothing changed**, which is what the live run showed. So this is a documentation
-  defect with a measurement behind it, not a behaviour one.
-- **Where it picks up:** `docs/architecture.md`'s opening paragraph and `src/engine.rs`'s module
-  doc, which state it as the reason for one worker per session; `docs/sessions.md` (three places),
-  `docs/tool-surface.md`, `src/server.rs`'s `changes_debug_target` and `src/proto.rs`'s op
-  commentary, which use it as the canonical example. The measurement needs the debugger tier plus a
-  live kernel target (`.claude/skills/live-kernel/SKILL.md`), and it should be taken on a build
-  named in the write-up, since this is a per-engine-version answer.
-
 ## 108. [windbg-mcp] A KMDF driver's real callbacks — step 1 landed, the framework's per-device config is what is left
 
 **Repo:** `windbg-mcp`. **Origin:** item 103's S5o gate, 2026-09-29, where it cost a gate's worth of
@@ -2138,6 +2102,43 @@ here `worker::resumed`, `worker::pump_a_resume` and `worker::run_to_address`; `S
 in `tests/mcp_smoke.rs`, whose printed line is the measurement to turn into an assertion once there
 is a behaviour to assert.
 
+## 126. [dbgscope + windbg-mcp] A command that fails is reported by its HRESULT alone
+
+**Repo:** `dbgscope`, then `windbg-mcp`. **Origin:** closing item 105 (2026-10-13), where it is
+why item 102 could record `||1s` failing and not say why.
+
+**What happens.** When DbgEng's `Execute` returns a failure, dbgscope hands back
+`DbgEngError::CommandFailed` with the HRESULT alone and drops the output it had been collecting for
+that call: `execute_fixed_command` and `execute_command_bounded` each return through
+`result.map_err(DbgEngError::CommandFailed)?` before the buffer is read (`src/dbgeng.rs` at the
+pinned `d208798`). The HRESULT does not say much. Through the service build `0.22.0+gbfd1f388` on
+dbgeng 10.0.29617.1000, `execute { "command": "zzzz" }` and `execute { "command": "||1s" }` both
+answer `Debug command failed: An unexpected exception was raised (0x80040205)`, and `cdb` on
+10.0.26100.1742 prints why the second one failed — `^ Illegal debuggee error in '||1s'`, the
+system it names not having been loaded yet. Everything else the command printed before failing goes
+with it, which is the half `walk_memory` was built to work around for one shape of command.
+
+**What it cost.** Item 102 recorded `||1s` failing with `0x80040205` and could not say why, so item
+105 had to list "which command actually switches" as something this server had never observed. The
+engine had said why, and the answer never left the worker. `docs/limitations.md`, `docs/walk-memory.md` and `docs/ttd-walkthrough.md`
+each explain a `0x80040205` by hand.
+
+**What is not measured.** Whether the engine's error line reaches *this* call's output callbacks at
+all. `Execute` is called with `DEBUG_OUTCTL_THIS_CLIENT`, and `cdb` printing the line shows the
+engine emits it, not that it lands in the buffer this path drops. That is the first thing to check:
+a dbgscope example that prints the buffer on the error path, against `||1s` on a session with a
+system added and not yet loaded, and against a mistyped command.
+
+**What would close it.** A failed command carries what was printed beside the HRESULT — a typed
+field on the error rather than text folded into its message, so a structured client can tell the
+engine's reason from this server's — and `execute` and a `debug_batch` command step show it. The
+asymmetry to keep: DbgEng prints most failures and returns *success* (`debug_batch`'s `command`
+step documents that), so this is only about the calls that do return an error.
+
+**Where it picks up.** dbgscope's `src/dbgeng.rs`, every `map_err(DbgEngError::CommandFailed)?` that
+follows an `Execute` with a capture buffer live; then this server's `engine::engine_error` and the
+places `CommandFailed`'s text reaches a caller.
+
 ## Where these items came from
 
 Each cluster above, and what filing it measured. Items named here as *"now in `DONE.md`"* have
@@ -2240,7 +2241,7 @@ calls free and the heap tools call allocated. That run filed two more, both now 
 [`DONE.md`](./DONE.md) — item 96, the pool walker's LFH reading, which it showed is not `nt`'s,
 and the ARM64 pool gate behind it; and item 98, the uncommitted memory that kept every live walk
 measured at `Partial` once the diagnostics were gone, which turned out to want the memory
-manager's answer rather than the allocator's. And item 105 from review on that item's PR after it had merged (2026-09-27): the
+manager's answer rather than the allocator's. And item 105, now in [`DONE.md`](./DONE.md), from review on that item's PR after it had merged (2026-09-27): the
 measurement item 102 took to correct its own example contradicts a claim this server's design is
 introduced with, in about a dozen places that were never swept. And item 104 from closing item 102 (2026-09-26): the target fingerprint spells
 *"this field does not apply"* and *"this field could not be read"* the same way, so two failures
@@ -2297,5 +2298,7 @@ establishes, which found that every assertion is of the Secure Kernel being *rea
 the memory being *protected* (124). Items 123 and 124 are now in [`DONE.md`](./DONE.md).
 Item 125 came from closing item 47 (2026-10-13): asking whether a replay can be broken in at its
 bound found that it can, and that TTD then leaves it somewhere it never reached.
+Item 126 came from closing item 105 the same day: the `||1s` failure item 102 could not explain
+had a reason all along, which `cdb` prints and this server does not pass on.
 `DECISIONS.md`'s 2026-08-02 entries are the bounded-command coverage review that produced
 item 13, now in [`DONE.md`](./DONE.md).

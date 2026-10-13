@@ -2041,6 +2041,15 @@ fn refuse_when_the_target_is_gone(e: &DebugEngine, op: &EngineOp) -> Option<Fail
 /// the file like the other two, so nothing about replacement detection turns on it; what the row
 /// buys is that the opener is *covered* rather than assumed to behave like a dump.
 ///
+/// **A second system on the same file is a switch this cannot see.** These reads answer for
+/// the engine's *current* system, and `.opendump` *adds* a system rather than replacing one — the
+/// `g` after it is what makes the new one current (`FOLLOWUPS.md` item 105). A `.opendump` of the
+/// file the session already holds, then a `g`, leaves the engine on a second system with the same
+/// kind, the same path and no processes, so it reads as the target the session was opened on:
+/// measured on dbgeng 10.0.29617.1000, the handle stayed open. It is the same file read twice, so a
+/// read answers as it did. Whether debugger-side state set on the first system — a `.cxr`, a
+/// `.thread` — follows it is not measured, and a handle never certified that state.
+///
 /// An engine holding **nothing** reads class 0 / qualifier 0 and *refuses* the rest, which is why
 /// [`watch_the_target`] asks `has_target` first and none of this is read there:
 /// `GetNumberDumpFiles` on an engine with no debuggee is an access violation **inside** DbgEng.
@@ -2763,7 +2772,8 @@ fn replacement_sentence(opened_as: &TargetFingerprint, now: &TargetFingerprint) 
          server retires a handle for by name, so it was found by comparing what the engine holds \
          against what it held when this session was opened — a `.if`, a `.foreach`, an alias, or \
          a breakpoint command run at a hit, any of which reaches `.opendump`, `.attach`, \
-         `.create` or `.restart` without naming it"
+         `.create` or `.restart` without naming it, or a `g` that completes one of those an \
+         earlier command armed"
     )
 }
 
@@ -13278,7 +13288,8 @@ mod tests {
             "the same set is the same target however the debugger is pointing"
         );
 
-        // `.opendump` of a user dump from a live process: the qualifier moves.
+        // `.opendump` of a user dump from a live process, once the `g` after it has made the
+        // dump current: the qualifier moves.
         let a_dump = TargetFingerprint {
             kind: kind(DEBUG_CLASS_USER_WINDOWS, DEBUG_USER_WINDOWS_SMALL_DUMP),
             dumps: Some(vec!["C:\\other.dmp".to_string()]),
