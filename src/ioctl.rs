@@ -5014,6 +5014,7 @@ mod tests {
         // Asked before the operands are moved into the value below, and spelled as a `let` for
         // that reason alone.
         let known = statically_zero(mnemonic, &operands);
+        let a64 = a64_writes_flags(mnemonic, &operands);
         Instruction {
             address,
             bytes: String::new(),
@@ -5043,25 +5044,53 @@ mod tests {
             // the flags a known result fixes in `rflags_set`/`rflags_cleared` rather than in
             // `rflags_written`, so x86's `xor r,r` and `sub r,r` answer **false** here -- measured
             // on iced 1.21.0, which also says `xor ah,al`, `xor eax,0`, `xor [rcx],ecx` and
-            // `cmp`/`test`/`and`/`or`/`sbb` of a register with itself are all **true**. A64 is
-            // unaffected: its decoder answers from the encoding's `S` bit, so `subs w9,w9,w9`
-            // writes them and `eor` never does.
+            // `cmp`/`test`/`and`/`or`/`sbb` of a register with itself are all **true**.
             //
             // Two operands and one register name is the whole of the test, which is what keeps it
             // from being a guess about iced: `xor ah,ah` is false and `xor ah,al` is true.
-            writes_flags: matches!(mnemonic, "mul" | "div" | "ccmp" | "ccmn")
-                || (matches!(
-                    effect,
-                    Effect::Compare
-                        | Effect::Test
-                        | Effect::Add
-                        | Effect::Subtract
-                        | Effect::ShiftLeft
-                        | Effect::ShiftRight
-                        | Effect::BitAnd
-                        | Effect::BitOr
-                        | Effect::BitXor
-                ) && !known),
+            //
+            // **And A64's arithmetic is answered by its own rule**, which is `a64_writes_flags`
+            // below: the decoder reads the encoding's `S` bit, so the effect says nothing about it.
+            writes_flags: match a64 {
+                Some(answer) => answer,
+                None => {
+                    matches!(mnemonic, "mul" | "div" | "ccmp" | "ccmn")
+                        || (matches!(
+                            effect,
+                            Effect::Compare
+                                | Effect::Test
+                                | Effect::Add
+                                | Effect::Subtract
+                                | Effect::ShiftLeft
+                                | Effect::ShiftRight
+                                | Effect::BitAnd
+                                | Effect::BitOr
+                                | Effect::BitXor
+                        ) && !known)
+                }
+            },
+        }
+    }
+
+    /// Whether A64's arithmetic writes the flags, or `None` for an instruction that is not A64's
+    /// arithmetic -- every x86 spelling among them.
+    ///
+    /// dbgscope answers this from the encoding's `S` bit and nothing else, so `subs w9,w9,w9`
+    /// writes them, a real `sub w10,w9,#K` writes **none**, and a shift folded into the operands
+    /// costs the effect without costing the flags. Deriving it from the effect, as x86 is derived
+    /// above, made every `sub` in a fixture a flag write on both architectures (`FOLLOWUPS.md`
+    /// item 112).
+    ///
+    /// **The arity is what tells the shared spellings apart**, and it is exact rather than a
+    /// guess: `sub`, `add` and `and` are spelled the same on both, A64's name three operands, and
+    /// x86 has no three-operand form of any of them. The `S` spellings and `sbc` are A64's alone,
+    /// so the mnemonic answers for them whatever the operands are.
+    fn a64_writes_flags(mnemonic: &str, operands: &[Operand]) -> Option<bool> {
+        match mnemonic {
+            "subs" | "ands" | "sbcs" => Some(true),
+            "sbc" => Some(false),
+            "sub" | "add" | "and" if operands.len() >= 3 => Some(false),
+            _ => None,
         }
     }
 
@@ -6434,16 +6463,22 @@ mod tests {
     /// **An ordinary flag write ends the chain, and the loss it leaves is reported the way it
     /// always was** -- which is the half of these rules that must *not* change.
     ///
-    /// `cmp w9,w11` / `ccmpne w9,w10,#4` / `and w9,w9,#0xff` / `b.lo`: the `and` replaces the flags
-    /// the chain left and takes the control code with it, so what the `b.lo` reads is the `and`'s
-    /// answer and not the chain's. This walk has always carried such a loss to the successor edges
+    /// `cmp w9,w11` / `ccmpne w9,w10,#4` / `ands w9,w9,#0xff` / `b.lo`: the `ands` replaces the
+    /// flags the chain left and takes the control code with it, so what the `b.lo` reads is the
+    /// `ands`'s answer and not the chain's. This walk has always carried such a loss to the successor edges
     /// and committed it only where an equality reads it, on x64 as much as here, and the
     /// conditional-compare rules deliberately do not widen that: commit it at the `b.lo` and every
     /// `ja` over a lost code in every driver grows an `untracked` entry it did not have.
     ///
     /// So this is a characterisation of the boundary rather than a rule about chains, and it is
-    /// what pins the clearing: with the chain left standing across the `and`, the site below is
+    /// what pins the clearing: with the chain left standing across the `ands`, the site below is
     /// committed here instead.
+    ///
+    /// **It is the `S` form because only that one writes the flags on A64.** This was spelled
+    /// `and` until `insn` learned the difference (`FOLLOWUPS.md` item 112), and was then the one
+    /// fixture in this module relying on a shape no A64 target produces: a real `and` leaves the
+    /// chain standing, and this test then failed the way the paragraph above says it would, with
+    /// the `ccmp` reported as untracked.
     #[test]
     fn an_ordinary_flag_write_after_a_chain_is_reported_the_way_it_always_was() {
         const DEFAULT: u64 = 0xb00;
@@ -6501,7 +6536,7 @@ mod tests {
             // Writes the flags the chain left, and takes the code with it.
             insn(
                 DISPATCH + 0x20,
-                "and",
+                "ands",
                 vec![reg("w9"), reg("w9"), imm(0xff)],
                 Flow::Fallthrough,
             ),
@@ -14430,6 +14465,37 @@ mod tests {
         );
     }
 
+    /// **`insn` answers a flag write the way each decoder does**: A64's arithmetic from the `S`
+    /// bit, x86's from the effect.
+    ///
+    /// Pinned on the fixture itself because the walk's tests reach only the shapes somebody built,
+    /// and `FOLLOWUPS.md` item 112 was a fixture answering A64 by x86's rule for as long as no
+    /// test happened to build the shape where they differ. The A64 answers are dbgscope's, whose
+    /// decoder sets the field from the `S` bit after any modifier is folded -- so a shifted `subs`
+    /// writes the flags with its effect gone to `Other`, which is what the effect rule gets wrong.
+    #[test]
+    fn the_fixture_answers_a_flag_write_the_way_each_decoder_does() {
+        let flags = |mnemonic: &str, operands: Vec<Operand>| {
+            insn(DISPATCH, mnemonic, operands, Flow::Fallthrough).writes_flags
+        };
+        assert!(!flags("sub", vec![reg("w10"), reg("w9"), imm(0x6dc000)]));
+        assert!(!flags("add", vec![reg("x9"), reg("x9"), imm(0x4e8)]));
+        assert!(!flags("and", vec![reg("w9"), reg("w9"), imm(0xff)]));
+        assert!(flags("subs", vec![reg("w10"), reg("w9"), imm(0x6dc000)]));
+        assert!(
+            flags("subs", vec![reg("w8"), reg("w9"), reg("w10"), lsl(2)]),
+            "a folded shift costs the effect and not the flags"
+        );
+        assert!(flags("cmp", vec![reg("w9"), imm(4)]));
+
+        assert!(flags("sub", vec![reg("ecx"), imm(0x222003)]));
+        assert!(flags("and", vec![reg("eax"), imm(0xff)]));
+        assert!(
+            !flags("sub", vec![reg("ecx"), reg("ecx")]),
+            "while a result x86 knows statically is reported as set and cleared, not written"
+        );
+    }
+
     /// A64's non-`S` arithmetic writes no flags, so it stands in for no flag write.
     ///
     /// `sub w11,w11,w11` computes zero whatever `w11` held — [`decides_zero`] says so, and is
@@ -14441,15 +14507,14 @@ mod tests {
     ///
     /// Raised as a P2 by Codex on [#454](https://github.com/glslang/windbg-mcp/pull/454), against
     /// the round that added the stand-in — so this is a regression caught in review rather than a
-    /// gap, and the fixture has to spell `writes_flags` itself to state it: `sub` is x86's
-    /// spelling too, where it *does* write them, and `insn` derives the field from the effect for
-    /// both. That blindness is `FOLLOWUPS.md` item 112.
+    /// gap. It first had to set `writes_flags` by hand, `insn` then answering `sub` as x86 does;
+    /// `insn` answers A64's arithmetic by its own rule now (`FOLLOWUPS.md` item 112), so the two
+    /// spellings say it themselves.
     #[test]
     fn a64s_non_flag_setting_arithmetic_stands_in_for_no_flag_write() {
         const LAND: u64 = DISPATCH + 0x100;
 
-        let between = |mut instruction: Instruction, writes_flags: bool| {
-            instruction.writes_flags = writes_flags;
+        let between = |mnemonic: &str| {
             let mut block = vec![
                 insn(
                     DISPATCH,
@@ -14482,7 +14547,12 @@ mod tests {
                     Flow::Fallthrough,
                 ),
             ];
-            block.push(instruction);
+            block.push(insn(
+                DISPATCH + 0x1c,
+                mnemonic,
+                vec![reg("w11"), reg("w11"), reg("w11")],
+                Flow::Fallthrough,
+            ));
             block.extend([
                 insn(
                     DISPATCH + 0x20,
@@ -14515,20 +14585,17 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        let sub = insn(
-            DISPATCH + 0x1c,
-            "sub",
-            vec![reg("w11"), reg("w11"), reg("w11")],
-            Flow::Fallthrough,
-        );
         assert_eq!(
-            between(sub.clone(), false),
+            between("sub"),
             vec![(0x22_0003, LAND)],
-            "a `sub` without the `S` bit leaves the flags alone, so the `b.eq` reads the `cmp` and              its case is recovered"
+            "a `sub` without the `S` bit leaves the flags alone, so the `b.eq` reads the `cmp` and \
+             its case is recovered"
         );
         assert!(
-            between(sub, true).is_empty(),
-            "while the `S` form really does replace them, and then the branch is settled and the              compare it would have read is gone — which is the answer for `subs` and must not be              the answer for `sub`"
+            between("subs").is_empty(),
+            "while the `S` form really does replace them, and then the branch is settled and the \
+             compare it would have read is gone — which is the answer for `subs` and must not be \
+             the answer for `sub`"
         );
     }
 

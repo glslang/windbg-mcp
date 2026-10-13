@@ -174,6 +174,7 @@ engine — it adds a target and leaves the current one alone. The entry records 
 - [Item 124](#124-windbg-mcp-nothing-asserts-that-a-live-secure-kernel-read-was-of-memory-vtl0-cannot-reach--done-2026-10-11) — [windbg-mcp] Nothing asserts that a live Secure Kernel read was of memory VTL0 cannot reach — done (2026-10-11)
 - [Item 116](#116-windbg-mcp-the-kd-facade-answers-windbg-with-fabricated-state-it-cannot-tell-apart-from-guest-state--done-2026-10-11) — [windbg-mcp] The KD facade answers WinDbg with fabricated state it cannot tell apart from guest state — done (2026-10-11)
 - [Item 123](#123-windbg-mcp-sk_live_step-refuses-a-cr3-changing-instruction-instead-of-stepping-over-it--done-2026-10-12) — [windbg-mcp] `sk_live_step` steps over a CR3-changing instruction — done (2026-10-12)
+- [Item 112](#112-windbg-mcp-the-ioctl-fixtures-writes_flags-is-architecture-blind--done-2026-10-13) — [windbg-mcp] The IOCTL fixture's `writes_flags` is architecture-blind — done (2026-10-13)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -10694,3 +10695,90 @@ evidence remain outside version control under the private test area.
 Final local checks: plain `cargo test` passed **1,392 unit tests** and **149 smoke tests** (21
 opt-in tests ignored); formatting, strict Clippy and `git diff --check` passed. The focused
 `cr3_step_over` recovery test also passed again after the live run.
+
+## 112. [windbg-mcp] The IOCTL fixture's `writes_flags` is architecture-blind — **done** (2026-10-13)
+
+`insn` in `src/ioctl.rs`'s test module derives `writes_flags` from the [`Effect`] it assigned, so
+every spelling that maps to `Effect::Subtract` writes the flags in a fixture. That is right for x86
+and **wrong for A64**, where only the `S` forms do: dbgscope answers from the encoding's `S` bit, so
+a real `sub w10,w9,#K` writes none and a real `subs` writes them. The two architectures share the
+`sub`, `add` and `and` spellings, so the field cannot be derived from the mnemonic either.
+
+Found while closing item 67 (`DONE.md`), whose regression test needed one A64 instruction with the
+honest answer and sets `writes_flags` on it by hand rather than teaching `insn` the rule --
+`a64s_non_flag_setting_arithmetic_stands_in_for_no_flag_write`.
+
+- **What is not known, and is the whole of the item:** whether any *existing* A64 fixture relies on
+  a non-`S` `sub` leaving a pending compare that a flag-reading branch then consumes. There are 55
+  three-operand arithmetic fixtures in the module and the two sampled while finding this both end
+  in `cbz`, which reads the **register** through `folded_compare` and so is unaffected -- that being
+  the shape a real A64 compare chain has, per `folded_compare`'s own doc. So the suspicion is that
+  the blindness is benign today. It has not been measured, and a sample of two is not the answer.
+- **What would close it:** teach `insn` the distinction -- the honest discriminator is the operand
+  **arity**, exact against both decoders since A64's `sub`/`add`/`and` are three-operand and x86 has
+  no three-operand form, while A64's two-operand `cmp` and `tst` aliases map to `Effect::Compare`
+  and `Effect::Test` and do write them -- then run the suite and read what fails. A fixture that
+  fails is a shape no A64 target produces and wants rewriting to `cbz` or to the `S` spelling; one
+  that passes was never relying on it.
+- **Why deferred:** it is a change to the one constructor every fixture in a 20,000-line module goes
+  through, its blast radius is 55 call sites, and the thing it would correct is a fixture's *claim*
+  rather than the walk's answer. Item 67's own round 5 is the argument for doing it: a fixture that
+  derived `writes_flags` from the effect hid a defect that made that whole change inert on x86, and
+  the fix there was to make `insn` mirror iced for the x86 half. This is the A64 half of the same
+  correction, and leaving the two halves in different states is how the next reader gets it wrong.
+
+**Where it picks up.** `insn`'s `writes_flags` field and `statically_zero` beside it
+(`src/ioctl.rs`), the three-operand fixtures reachable from `grep -n 'vec!\[reg("[wx]'`, and
+`Layout::static_outcome_hides_flag_write`, which is the production side of the same distinction and
+is already exact.
+
+### What landed, and what the entry got wrong (2026-10-13)
+
+**The measurement the entry asked for found one fixture, and it was not the shape the entry was
+looking for.** With `insn` taught the rule, 164 of the module's 165 tests passed and
+`an_ordinary_flag_write_after_a_chain_is_reported_the_way_it_always_was` failed, reporting the
+chain's `ccmp` at `DISPATCH + 0x1c` as `untracked`. Its fixture used `and w9,w9,#0xff` as "an
+ordinary flag write" to *end* a conditional-compare chain -- so what it relied on was a non-`S`
+instruction **replacing** the flags, not a non-`S` `sub` leaving a compare for a branch to read,
+which is the direction the entry went looking in. A real A64 `and` leaves the chain standing, and
+the test then failed exactly the way its own doc comment says it would. It is spelled `ands` now,
+which is the entry's own prescription. The suspicion held for the `sub`s and `add`s: none of the
+fourteen three-operand ones failed.
+
+**The count was wrong.** "55 three-operand arithmetic fixtures" is not what the module held:
+counting every `insn` call by its operand vector on `origin/main` (`775be486`) gives **15**
+three-operand non-`S` ones -- 11 `sub`, 3 `add`, 1 `and` -- plus 7 four-operand `add`s with a folded
+`lsl`, whose effect was already `Other` and whose answer was therefore already `false`, and 3
+three-operand `S` forms. So the blast radius the entry deferred on was 15 call sites, not 55.
+
+**What landed in `insn`** is `a64_writes_flags` beside `statically_zero`, consulted before the x86
+rule and answering `None` for every x86 spelling: `sub`, `add`, `and` and `sbc` write nothing at
+three operands or more, and `subs`, `ands` and `sbcs` write the flags **whatever the operands
+are**. That second half is past what the entry proposed, and it is the mirror of the defect the
+entry filed. A folded shift costs the effect -- `Effect::Other` -- and the effect rule then answers
+`false` for a `subs w8,w9,w10,lsl #2` that dbgscope reports as writing the flags, because its
+decoder applies `.flags()` from the `S` bit after `finish_modifier` (`add_subtract_shifted_register`
+in its `arm64/operand.rs` at the pinned `f5d697b`). No fixture had built that shape, so it had never
+failed.
+
+Two more tests changed with it. `a64s_non_flag_setting_arithmetic_stands_in_for_no_flag_write` takes
+`sub` and `subs` as `insn` now answers them, rather than overriding the field on one instruction.
+Its two assertion messages had also lost a `\` continuation at some point and carried fourteen
+literal spaces mid-sentence; that is fixed in passing. And
+`the_fixture_answers_a_flag_write_the_way_each_decoder_does` pins `insn` itself, because the walk's
+tests only reach the shapes somebody built, and this item was the fixture being wrong for as long as
+nobody built the one where the two architectures differ.
+
+**Each arm is mutation-verified**, on the ARM64 bench at this branch:
+
+- **Arity dropped** (`sub`/`add`/`and` answering `false` at any arity): **15** tests fail. Only
+  two-operand answers differ from the real rule under that mutation, and those forms are x86's, so
+  the arity is what keeps x86 writing the flags. It is load-bearing rather than a precaution.
+- **Rule removed** (the x86 rule for everything, as before): two tests fail,
+  `a64s_non_flag_setting_arithmetic_stands_in_for_no_flag_write` and the direct test. So the A64
+  half is pinned through the walk as well as on the fixture.
+- **The `S` arm removed**: only the direct test fails, on the shifted `subs`. No test pinned that
+  arm until this one.
+
+`Layout::static_outcome_hides_flag_write`, the production side the entry pointed at, is unchanged.
+It was already exact, and this item was only ever about a fixture's claim.
