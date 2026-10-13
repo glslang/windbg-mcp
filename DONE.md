@@ -11067,8 +11067,10 @@ at `0.22.0+gbfd1f388` on dbgeng 10.0.29617.1000, and again through `cdb` and `kd
 - **`||1s` before the `g` is refused**, which is what item 102 saw as `0x80040205`. `cdb` prints
   the engine's reason, `Illegal debuggee error in '||1s'`; this server answers `0x80040205` alone,
   and a mistyped command gets the same code. That is item 126.
-- **The reading item 81 built catches the replacement at the `g`.** Through `execute` the handle is
-  retired at the `g`, as *a different dump or trace file* or *a target of a different kind*. A
+- **With the `.opendump` wrapped, as every cell here was, the reading item 81 built catches the
+  replacement at the `g`.** One that an `execute` command or a batch step names outright is retired
+  by name before it runs, as it always was. Through `execute` the wrapped one's handle is retired at
+  the `g`, as *a different dump or trace file* or *a target of a different kind*. A
   `debug_batch` of a wrapped `.opendump`, a `||` and a `g` stops `TARGET REPLACED at step 3` with
   its cleanup `NOT ATTEMPTED`. And one command list of the two plus a mistyped command,
   `.if (1) { .opendump … }; g; zzzz`, answers an error while leaving the new dump current and the
@@ -11089,7 +11091,7 @@ the section with the table. `docs/tool-surface.md` and `src/proto.rs` change one
 `src/server.rs` changes the operand guard, `set_breakpoint`'s refusal and `changes_debug_target` —
 whose doc comment had come detached from it: `outside_quotes` had been inserted between the two, so
 rustdoc gave that function both paragraphs and this one none. `src/batch.rs` rewrites the paragraph
-item 102 left, which now says the `.opendump` is caught at the `g`. `src/worker.rs`'s fingerprint
+item 102 left, which now says the wrapped `.opendump` is caught at the `g`. `src/worker.rs`'s fingerprint
 doc gains the same-file case, and the sentence a caller reads when a handle is retired now names a
 `g` that completes a command an earlier one armed. One doc comment in `tests/mcp_smoke.rs` changes
 too.
