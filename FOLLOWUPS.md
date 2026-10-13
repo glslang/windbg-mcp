@@ -25,9 +25,10 @@ deleted, renumbered, or moved without reaching the other file's index fails the 
 reader. It holds **both** indexes to the same rule — every entry in this file is named by the index
 below, at an anchor that resolves, and so is every entry in `DONE.md`.
 
-Two kinds of item stay here rather than moving. One that is **declined**: nothing was built, and
-the entry records what settled it and the condition that would reopen it. And one that has **half** landed, whose entry is narrowed to the half that is
-left rather than split across two files. **Which items those are is on their index lines
+Two kinds of item stay here rather than moving. One that is **declined**: what it proposed did
+not land, and the entry records what settled that and the condition that would reopen it. And one
+that has **half** landed, whose entry is narrowed to the half that is left rather than split
+across two files. **Which items those are is on their index lines
 below**, and is not enumerated here as well: `DONE.md` kept a second copy of both lists and had
 drifted three items behind this one by the time the index was written.
 
@@ -42,16 +43,15 @@ Items are roughly ordered by how soon they're worth doing, within each cluster.
 ## Index
 
 Every entry in this file, in the order it appears. A line carries a status only where the
-entry's own title does not: **half landed** (the rest of it is still open), **declined**
-(nothing was built, and the entry holds what settled it and the condition that would reopen it),
-and **deferred** (worth doing, and waiting on something this repository cannot supply — a client,
-a licence, a bench — which the entry names). An unmarked line is simply open.
+entry's own title does not: **half landed** (the rest of it is still open) and **declined**
+(it was decided against, and the entry holds what settled that and the condition that would
+reopen it). An unmarked line is simply open.
 
 - [Item 2](#2-dbgscope-typed-write-primitives) — [dbgscope] Typed write primitives — **half landed**
 - [Item 3](#3-windbg-mcp--dbgscope-state-injection-confirmation-path-decisionsmd-d4) — [windbg-mcp + dbgscope] State-injection confirmation path (DECISIONS.md D4)
 - [Item 5](#5-windbg-mcp-path-recipe-decode-limits-heuristic-boundary) — [windbg-mcp] Path-recipe decode limits (heuristic boundary)
 - [Item 6](#6-windbg-mcp-concolicsymbolic-buffer-synthesis-decisionsmd-d2--declined-2026-07-04) — [windbg-mcp] Concolic/symbolic buffer synthesis (DECISIONS.md D2) — **declined** (2026-07-04)
-- [Item 8](#8-windbg-mcp-tasks-extension-iomodelcontextprotocoltasks-sep-2663--deferred-2026-09-19) — [windbg-mcp] Tasks extension (`io.modelcontextprotocol/tasks`, SEP-2663) — **deferred** (2026-09-19)
+- [Item 8](#8-windbg-mcp-tasks-extension-iomodelcontextprotocoltasks-sep-2663--declined-2026-09-19) — [windbg-mcp] Tasks extension (`io.modelcontextprotocol/tasks`, SEP-2663) — **declined** (2026-09-19)
 - [Item 9](#9-dbgscope--windbg-mcp-incremental-output-from-a-running-command) — [dbgscope + windbg-mcp] Incremental output from a running command
 - [Item 11](#11-windbg-mcp-mcp-apps-ui-resources--declined-2026-07-29) — [windbg-mcp] MCP Apps (`ui://` resources) — **declined** (2026-07-29)
 - [Item 15](#15-windbg-mcp-make-handle-inheritance-a-property-of-the-spawn-not-of-the-process) — [windbg-mcp] Make handle inheritance a property of the spawn, not of the process
@@ -70,7 +70,7 @@ a licence, a bench — which the entry names). An unmarked line is simply open.
 - [Item 61](#61-windbg-mcp-attribute-the-cve-2026-83498-fix-independently-of-similarity-scores) — [windbg-mcp] Attribute the CVE-2026-83498 fix independently of similarity scores
 - [Item 62](#62-windbg-mcp--binja-windbg-mcp-capture-a-live-securekernel-handoff) — [windbg-mcp + binja-windbg-mcp] Capture a live securekernel handoff
 - [Item 64](#64-binary-ninja-upstream-verify-the-firstsetupdialog-shutdown-fix) — [Binary Ninja upstream] Verify the FirstSetupDialog shutdown fix
-- [Item 65](#65-binja-windbg-mcp-native-ultimate-validation--deferred-2026-09-12) — [binja-windbg-mcp] Native Ultimate validation — **deferred** (2026-09-12)
+- [Item 65](#65-binja-windbg-mcp-native-ultimate-validation--declined-2026-09-12) — [binja-windbg-mcp] Native Ultimate validation — **declined** (2026-09-12)
 - [Item 68](#68-windbg-mcp-whether-a-device-can-have-no-security-descriptor-at-all) — [windbg-mcp] Whether a device can have no security descriptor at all
 - [Item 71](#71-windbg-mcp-driver_surface-does-not-say-which-control-code-reaches-which-sink) — [windbg-mcp] `driver_surface` does not say which control code reaches which sink
 - [Item 72](#72-windbg-mcp-the-driver-tools-name-a-module-refresh-they-could-run-themselves) — [windbg-mcp] The driver tools name a module refresh they could run themselves
@@ -156,7 +156,7 @@ than the human/LLM-readable recipe emitted today.
   debugger memory snapshot rather than building an in-house solver — kernel state modeling, loops,
   hashing, and stateful protocols make it brittle and a separate project.
 
-## 8. [windbg-mcp] Tasks extension (`io.modelcontextprotocol/tasks`, SEP-2663) — **deferred** (2026-09-19)
+## 8. [windbg-mcp] Tasks extension (`io.modelcontextprotocol/tasks`, SEP-2663) — **declined** (2026-09-19)
 
 Nothing here speaks tasks today. The hand-written `get_info` advertises
 `ServerCapabilities::builder().enable_tools()` and no `extensions` map, so `tasks/get` /
@@ -407,8 +407,8 @@ to do with the restore.
 (`e4a6e7ed`) with two typed ways to state the postcondition, and this item was filed three days
 later with `walk_memory` (`00a09608`) without mentioning either:
 
-- **The `eval` check**, `{"expr": "poi(<entry>)", "equals": "{{orig}}"}`, against a value an
-  `eval` step captured before the patch. That is "this pointer is this value" stated as itself,
+- **The `eval` check**, `{"check": "eval", "expr": "poi(<entry>)", "equals": "{{orig}}"}`,
+  against a value an `eval` step captured before the patch. That is "this pointer is this value" stated as itself,
   with no command text in between. `batch::run_step` stops a step at the first check that does not
   hold, and the report names that expression and what the debugger answered — so an unreadable
   entry ends the step *at that entry*, which is the right verdict for a postcondition: an entry the
@@ -416,10 +416,10 @@ later with `walk_memory` (`00a09608`) without mentioning either:
 - **The `read_memory` step**, a bounded read that keeps the bytes it reached and says where it
   stopped.
 
-**And the walk's own advantage does not apply to the case.** `walk_memory` carries on past a hole,
-which is what a list, a pointer chain or a handle table with freed entries needs. A dispatch table
-is one contiguous array inside the driver object the batch has just written to; if it could not be
-read, it could not have been patched either.
+**And the walk's own advantage is the wrong behaviour for this question.** `walk_memory` carries
+on past a hole, which is what a list, a pointer chain or a handle table with freed entries needs
+when the question is what is there. A restore's postcondition asks something else, and for it an
+entry that will not read is a failed check, not a hole to step over.
 
 **What would reopen it** is a transaction that has to follow a pointer chain *after* a mutation and
 assert on what it finds — a list unlinked and relinked, say — where the nodes cannot be named in
@@ -1050,7 +1050,7 @@ fixed build identified. No installed application was patched.
 - **Where it picks up:** [shutdown investigation](docs/bn-shutdown-investigation.md) and the
   upstream issue, including their native stack evidence. Run one disposable GUI at a time.
 
-## 65. [binja-windbg-mcp] Native Ultimate validation — **deferred** (2026-09-12)
+## 65. [binja-windbg-mcp] Native Ultimate validation — **declined** (2026-09-12)
 
 Ultimate is unavailable and prohibitively expensive for the user. Purchasing it is not a
 requirement, and its absence does not gate Personal/external BinDiff delivery.

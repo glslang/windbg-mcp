@@ -13,8 +13,8 @@ what actually landed, and what building it disproved — which is what the next 
 meets first.
 
 Two kinds of entry are *not* here. An item that is **declined** stays in
-`FOLLOWUPS.md` — nothing was built, and each carries the condition that would reopen it — and
-so does one that has only **half** landed, its entry narrowed to the half that is left rather
+`FOLLOWUPS.md` — what it proposed did not land, and each carries the condition that would
+reopen it — and so does one that has only **half** landed, its entry narrowed to the half that is left rather
 than split in two. **Which items those are is marked on the lines of
 [`FOLLOWUPS.md`](./FOLLOWUPS.md)'s index**, and deliberately not listed again here: this
 paragraph used to carry its own copy of both lists, and by the time the index was written that
