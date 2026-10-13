@@ -869,13 +869,18 @@ pub struct StopReport {
     /// Whether the target was broken into **on request** rather than stopping on its own. The
     /// position is real either way, but it is where an `interrupt` landed rather than where the
     /// target was going, which is a different answer to "where did this stop?".
+    ///
+    /// **Except on a TTD replay**, where it is not where the break landed either: TTD moves an
+    /// interrupted replay to a position of its own choosing — usually the trace's end, past every
+    /// breakpoint the run had not reached — whatever its own banner says (`FOLLOWUPS.md` item 125).
     pub interrupted: bool,
     /// Whether this call's own wait ran out with the target still going, so the debugger broke it
     /// in at the bound.
     ///
     /// The same "the position is real but it is not a stop the target reached" as
-    /// [`Self::interrupted`], from the other cause — and kept apart from it because the next move
-    /// differs: nobody asked for this one, and running on or allowing longer is what answers it.
+    /// [`Self::interrupted`], with the same exception on a replay, from the other cause — and kept
+    /// apart from it because the next move differs: nobody asked for this one, and running on or
+    /// allowing longer is what answers it.
     /// Defaulted so a record written before this field existed still reads.
     #[serde(default)]
     pub timed_out: bool,

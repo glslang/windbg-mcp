@@ -525,6 +525,14 @@
   `timed_out` is set in the structured result and the text says so. It is not an error and not an
   `interrupt` — nobody asked — and the next move is to run the target on, or to give it something
   to stop at.
+- **On a TTD trace, a replay that is broken in is left where TTD puts it, not where it had got
+  to** — at its bound, through `break_in`, or by `interrupt` alike. TTD's banner says "the current
+  position is approximately how far we had gone"; measured on the ARM64 bench (TTD 1.11.610.0), it
+  is usually the trace's end for a forward run and its start for a reverse one, **past** any
+  breakpoint the run had not reached, and occasionally that breakpoint itself with no hit reported.
+  So after a `timed_out` or `interrupted` stop on a trace, a breakpoint ahead may have been skipped:
+  a `go` that then answers *End of trace reached* is not evidence that it is never hit, and
+  `reverse_go` finds it if it was passed. `FOLLOWUPS.md` item 125.
 - **A raw `execute` of an execution-control command works, and is not the same as the typed tool.**
   `g`, `p`, `t`, `bp X; g` and anything else that reaches execution moves the target: the server
   asks the engine whether a command left it running and pumps it if so, under the same 60s bound.

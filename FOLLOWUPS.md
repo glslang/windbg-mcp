@@ -60,7 +60,6 @@ reopen it). An unmarked line is simply open.
 - [Item 33](#33-windbg-mcp-the-lease-grace-assumes-the-server-is-the-slow-party) — [windbg-mcp] The lease grace assumes the server is the slow party
 - [Item 35](#35-windbg-mcp--dbgscope-the-engines-subregister-flag-misses-the-views-that-matter--declined-2026-08-22) — [windbg-mcp + dbgscope] The engine's subregister flag misses the views that matter — **declined** (2026-08-22)
 - [Item 39](#39-windbg-mcp-the-eval-measures-single-questions-not-an-investigation) — [windbg-mcp] The eval measures single questions, not an investigation
-- [Item 47](#47-windbg-mcp--dbgscope-the-bounded-wait-is-unmeasured-on-a-ttd-replay-target) — [windbg-mcp + dbgscope] The bounded wait is unmeasured on a TTD replay target
 - [Item 50](#50-windbg-mcp-the-released-binary-is-unsigned--only-the-certificate-is-left) — [windbg-mcp] The released binary is unsigned — only the certificate is left — **half landed**
 - [Item 53](#53-windbg-mcp-a-break-raised-after-a-runs-stop-is-built-labels-the-result-cut-short) — [windbg-mcp] A break raised *after* a run's stop is built labels the result cut short
 - [Item 56](#56-windbg-mcp-resolves--expr-is-a-callers-command-on-nobodys-clock) — [windbg-mcp] `resolve`'s `? <expr>` is a caller's command on nobody's clock
@@ -89,6 +88,7 @@ reopen it). An unmarked line is simply open.
 - [Item 117](#117-windbg-mcp-the-kd-facade-pipe-has-only-the-default-acl-no-client-authentication-and-no-break-in) — [windbg-mcp] The KD facade pipe has only the default ACL, no client authentication and no break-in
 - [Item 121](#121-windbg-mcp-tracing-pool-allocations-on-an-x86-kernel) — [windbg-mcp] Tracing pool allocations on an x86 kernel
 - [Item 122](#122-windbg-mcp-a-live-secure-kernel-session-has-no-image-to-resolve-names-or-instructions-against) — [windbg-mcp] A live Secure Kernel session has no image to resolve names or instructions against
+- [Item 125](#125-windbg-mcp--dbgscope-an-interrupted-replay-is-left-where-ttd-puts-it-not-where-it-had-got-to) — [windbg-mcp + dbgscope] An interrupted replay is left where TTD puts it, not where it had got to
 
 ## 2. [dbgscope] Typed write primitives
 
@@ -604,74 +604,6 @@ Two smaller things the same run left open:
 - **One bench, one architecture, for the timings.** Every wall-clock number in that document is an
   ARM64 Mac serving MLX builds. The correctness columns should travel; the timings should not be
   quoted anywhere else.
-
-## 47. [windbg-mcp + dbgscope] The bounded wait is unmeasured on a TTD replay target
-
-**What changed under it.** Fixing [#226](https://github.com/glslang/windbg-mcp/issues/226) made
-`execute_and_wait` use the watchdog-bounded wait — `WaitForEvent(INFINITE)` with a watchdog that
-`SetInterrupt`s at the bound — for **every** target type, where before only a live kernel took it
-and everything else took a finite `WaitForEvent`. That was not a tidy-up: the finite wait returns
-`S_FALSE` on expiry with the target still running and the engine holding no current process/thread,
-and nothing recovers from that, which is the second bug that issue turned out to contain.
-
-**What is measured, and what is not.** Live user-mode is measured both ways on the ARM64 bench — a
-`go` that reaches no stop leaves the session usable, and left it unusable before. Live kernel was
-already on this path and the live-kernel tier exercises it. A dump cannot resume at all, so the wait
-is unreachable there. **TTD replay is the gap**: `go`, `step_back` and the rest of the reverse
-family go through this function, and TTD replay did not work on **that** bench at all
-(item 21 / [#132](https://github.com/glslang/windbg-mcp/issues/132)), so nothing there could ask
-whether `SetInterrupt` unblocks a replay wait the way it unblocks a live one. (Named explicitly
-because "this host" in an item whose measurements are ARM64's has already been read as the x64
-one.)
-
-**That blocker is gone as of 2026-08-29**, and it is the ARM64 bench that changed: item 21 landed,
-the WinDbg payload was bundled beside its release build, and the host now records a trace, opens it
-and steps backward through it. So the gap here is no longer "no bench can ask" — it is that nobody
-has asked. The measurement this item wants can now be taken where every one of its siblings was
-taken, which removes the "generalised from one backend" caveat it raises against itself below.
-
-**Why it is not alarming, and why it is still open.** The watchdog only ever fires at the bound, so
-for every go/step that stops in time the change is a no-op — which is every TTD navigation anyone
-has run. What is unknown is the *timeout* path: a `reverse_go` that reaches no stop within 60s
-either breaks in cleanly or does not, and if it does not, the failure shape is the one this issue
-was about. `run_to_address` has used the same wait for every target type since it was written and
-documents it as working everywhere, but that is a doc comment rather than a measurement, and
-"generalised from one backend" is a mistake this repo has made before
-(`.claude/skills/handoff/SKILL.md`).
-
-**The blocker moved to a different host rather than lifting, and the tier it wanted now exists**
-(2026-08-26). The deferral above is about the **ARM64 bench**, and nothing since has re-checked it.
-What changed is the **x64 bench**: it has the `ttd\` payload beside `target\debug` and
-`target\release` — item 21's unpack recipe — so replay works *there*, and the **TTD tier** records
-a trace, opens it and queries it.
-
-So the prerequisite is satisfied on a machine, just not the one this item was written on. That is
-probably enough, because the gap here is a **target type** and not an architecture — but every
-sibling measurement in this item was taken on ARM64, and an x64 answer inherits the caveat this
-item already cites against itself: "generalised from one backend" is a mistake this repo has made
-before. Whoever closes it should say which bench, and think for a moment about whether the other
-one would answer differently.
-
-(Written down because it was got wrong once already: "this host" was read as the x64 bench, on the
-strength of a TTD tier passing there, and the correction is what produced the paragraph above.)
-
-**What would close it.** Record a trace, `go` past the end of it or `reverse_go` with nothing to
-stop at, and assert the session still answers `registers` afterwards — the same assertion the two
-debugger-tier launch tests make. One test, in the TTD tier, on either bench — the ARM64 one is now
-capable and is where this item's other measurements were taken. **Establish first
-that the bound is reachable at all**: a replay target has ends, so a `go` or a `reverse_go` with no
-breakpoint may simply stop at the trace boundary in well under the 60s bound, in which case the
-timeout path is *unreachable* on this target type rather than untested — which closes this item as
-an answer rather than as a test, and is worth writing down either way. Deciding that costs one
-measurement and is what the next person should do before writing anything.
-
-**Where it picks up.** `dbgscope`'s `DebugEngine::execute_and_wait` and `DebugEngine::pump`
-(`src/dbgeng.rs` — `wait_for_event_bounded` was folded into that one pump by
-[dbgscope#136](https://github.com/glslang/dbgscope/issues/136), and what this item wants to see on a
-replay target is now a `WaitOutcome::Deadline`); `worker::resumed`; and the pair
-`a_raw_execution_control_command_moves_the_target_instead_of_wedging_the_session` /
-`a_resume_that_reaches_no_stop_says_so_and_leaves_the_session_usable` in `tests/mcp_smoke.rs`,
-which are the shape a TTD one would copy.
 
 ---
 
@@ -2138,6 +2070,74 @@ process down mid-run (Hyper-V event 3040, "could not initialize"), ending the gu
   test in `tests/mcp_smoke.rs`; and the live-tier field list in
   [`docs/smoke-test.md`](./docs/smoke-test.md).
 
+## 125. [windbg-mcp + dbgscope] An interrupted replay is left where TTD puts it, not where it had got to
+
+**What happens.** On a TTD replay target, a run that is broken in — at its own bound
+(`timed_out`) or by a `break_in` (`interrupted`) — is not left where the replay was when the break
+landed. TTD prints *"Replay was interrupted by the user. The current position is approximately how
+far we had gone."*, and then, in eleven of thirteen runs measured with a breakpoint ahead, the
+cursor is **past** that breakpoint: at the trace's end for a forward run and at its start for a
+reverse one, wherever the position was read. The other two stopped *at* the breakpoint, with no
+`Breakpoint 0 hit` in the output. Neither is "how far we had gone": a 2 s bound on a replay that
+takes 16.6 s unbounded left the cursor at `Percent: 100.000000`.
+
+**Why it matters more than it looks.** The breakpoint is skipped silently. The stop reads
+`timed_out: true` at the end-of-trace IP, and the *next* `go` answers `TTD: End of trace reached.`
+with `timed_out: false` — an ordinary stop, from which a caller concludes the breakpoint is never
+hit. `reverse_go` then finds it, which is the only recovery, and nothing points there. This
+server's model-visible prose says the opposite: `interrupt`'s description and the detail
+`worker::interrupt_running` returns both say an interrupted operation "returns whatever it had
+reached". On a live target that is true; on a replay it is not. `StopReport::interrupted`'s doc
+comment said the same and now carries the exception; the two client-facing sentences are left for
+the fix, to be reworded against whichever behaviour it lands rather than ahead of it.
+
+**Measured** on the ARM64 bench, 2026-10-13, through the service's shipped tools at
+`0.22.0+gbfd1f388`, TTD 1.11.610.0, `dbgeng` 10.0.29617.1000. The traces are `cmd.exe /c for /L`
+loops of 200,000 and 1,000,000 iterations, and `hostname.exe`:
+
+| Trace | Breakpoint ahead | Unbounded | Broken in | Left at |
+| --- | --- | --- | --- | --- |
+| 692 MB, unindexed | `ntdll!LdrShutdownProcess`, `6E00C:DB3` | hit at 16,760 ms | `continue_async`, `max_run_ms: 2000` — 2,035 ms | `6E01E:0`, the end |
+| same | same | — | `break_in` at about 2.5 s | `6E01E:0`, the end |
+| same, `g-` from the end | `kernel32!BaseThreadInitThunk` | hit at 16,695 ms | `debug_batch` `resume` step, 2,000 ms — 2,049 ms | the start-of-trace IP |
+| 172 MB, **indexed** | `ntdll!LdrShutdownProcess`, `165EB:DB3` | hit at 106 ms | `max_run_ms: 1` — 128 ms | `165FB:0`, the end |
+| `hostname.exe`, two recordings | `LdrShutdownProcess`, then `RtlExitUserProcess` | hit | `max_run_ms: 1`, five runs by hand | the end, all five |
+| `hostname.exe`, the TTD tier's test | `ntdll!RtlExitUserProcess` | hit | `max_run_ms: 1`, four runs | past it twice, **at** it twice |
+
+Every run *without* a breakpoint ahead — five, both directions, bounds of 1 ms to 2 s — was left at
+the boundary too. So it is not the index, not the direction and not who asked for the break, and
+it is not this server: the position is the engine's own (`dx @$curthread.TTD.Position`).
+
+**What would close it is a choice, which is why it was filed rather than done with item 47.**
+
+- **Put the cursor back.** Read the position before a resume on a replay target and, when the run
+  comes back cut short, travel back to it and say so. A cut-short replay has then made no progress
+  — which is the truth, since TTD threw the progress away — no breakpoint is skipped, and the
+  caller retries with a longer bound. It wants a typed position read and seek in dbgscope (a new
+  primitive is a typed method there, never the `execute` text hatch), which TTD exposes through the
+  data model (`@$curthread.TTD.Position` and its `SeekTo`) and dbgscope does not bind yet. All
+  three bounded paths end in dbgscope's `pump` — `execute_and_wait`, `settle`, `run_to_address` —
+  so that is where it belongs, rather than in three callers here.
+- **Report it.** A typed field on the stop saying the position is TTD's rather than where the run
+  was, so a caller knows to reverse. Cheaper, and leaves the trap armed for any caller that does
+  not read the field.
+
+The first is the one that makes "returns whatever it had reached" true on every target; the second
+is what to fall back to if the seek turns out to cost something on a large unindexed trace, which
+nobody has measured.
+
+**Whether the x64 bench answers differently is open** — everything above is ARM64. The tier's test
+prints its landing on every run (`item 125: …` under `--nocapture`), so one run of the tier there
+says.
+
+**Where it picks up.** dbgscope's `DebugEngine::pump` and the three of its callers a run goes
+through, in `src/dbgeng.rs`;
+here `worker::resumed`, `worker::pump_a_resume` and `worker::run_to_address`; `StopReport` in
+`src/structured.rs`; `interrupt`'s description in `src/server.rs` and the detail in
+`worker::interrupt_running`; and `ttd_a_replay_broken_in_at_its_bound_says_so_and_leaves_the_session_usable`
+in `tests/mcp_smoke.rs`, whose printed line is the measurement to turn into an assertion once there
+is a behaviour to assert.
+
 ## Where these items came from
 
 Each cluster above, and what filing it measured. Items named here as *"now in `DONE.md`"* have
@@ -2162,7 +2162,8 @@ the lease grace measured against the wrong slow party (2026-08-22), and then run
 the window and the model as a **grid** rather than as a sighting (2026-08-23) — item 35 from
 measuring what a `registers` answer is actually made of (2026-08-22), item 47 from fixing
 [#226](https://github.com/glslang/windbg-mcp/issues/226), where making every target take the bounded
-wait left one target type nobody on this bench can measure (2026-08-25), item 50 from Windows
+wait left one target type nobody on this bench can measure (2026-08-25 — now in
+[`DONE.md`](./DONE.md), measured on 2026-10-13), item 50 from Windows
 Defender quarantining this project's own binary while the 32-bit worker was being tested
 (2026-08-26), items 52–53 from [#83](https://github.com/glslang/windbg-mcp/issues/83)'s asynchronous
 execution handles, where the invariant that stops a description naming a tool its client cannot call
@@ -2294,5 +2295,7 @@ to resolve names or instruction lengths against (122), a step refused at the ins
 changes CR3 rather than carried over it (123), and a review of what a passing run actually
 establishes, which found that every assertion is of the Secure Kernel being *readable* and none of
 the memory being *protected* (124). Items 123 and 124 are now in [`DONE.md`](./DONE.md).
+Item 125 came from closing item 47 (2026-10-13): asking whether a replay can be broken in at its
+bound found that it can, and that TTD then leaves it somewhere it never reached.
 `DECISIONS.md`'s 2026-08-02 entries are the bounded-command coverage review that produced
 item 13, now in [`DONE.md`](./DONE.md).

@@ -19415,6 +19415,47 @@ fn ttd_resolves_a_relative_target_against_the_recorders_working_directory() {
     let _ = std::fs::remove_dir_all(&out_dir);
 }
 
+/// Opens a recording, standing the tier down for the **one** reason that is the host's: no replay
+/// engine beside the binary.
+///
+/// Returns the session's handle, or `None` having printed a `SKIPPED` line and removed `out_dir`.
+/// Any other `open_trace` failure — a regression, a trace that will not load — fails the test, or
+/// the test passes having replayed nothing, which is the shape [`recorded`] exists to avoid.
+///
+/// Keyed on the server's own diagnostic, not on `0x80070057`. That code is the engine's "the
+/// parameter is incorrect" and a trace that failed to load for some other reason can carry it too;
+/// the sentence below is appended by `worker::explain_trace_failure` only when
+/// `replay_engine_bundled()` is false, which is exactly the condition being excused. A `ttd\` of
+/// the wrong architecture is deliberately *not* excused — it gets the engine's error with no such
+/// sentence, and a misconfigured bundle should be loud.
+fn opened_trace(
+    server: &mut Server,
+    trace: &std::path::Path,
+    out_dir: &std::path::Path,
+) -> Option<String> {
+    let response = server.call_tool(
+        "open_trace",
+        json!({ "path": trace.to_string_lossy() }),
+        TARGET_STEP,
+    );
+    assert_no_error(&response, "tools/call open_trace");
+    if is_tool_error(&response) {
+        let text = text_of(&response["result"]);
+        if text.to_ascii_lowercase().contains("cannot replay") {
+            skip(&format!(
+                "this host recorded a trace it cannot replay: {text}"
+            ));
+            let _ = std::fs::remove_dir_all(out_dir);
+            return None;
+        }
+        panic!("`open_trace` failed for a reason that is not the host's:\n{text}");
+    }
+    Some(
+        maybe_session_id(&response["result"])
+            .unwrap_or_else(|| panic!("`open_trace` opened without minting a handle: {response}")),
+    )
+}
+
 /// Issue #231: a TTD query answers with **records**, not with a column of bare indices.
 ///
 /// `dx` renders one level unless asked for more, and these queries return containers of records,
@@ -19439,38 +19480,9 @@ fn ttd_queries_answer_with_the_fields_they_promise() {
     if recorded(&mut server, &out_dir, json!({ "target": "hostname.exe" })).is_none() {
         return;
     }
-    let trace = recorded_trace(&out_dir);
-
-    let response = server.call_tool(
-        "open_trace",
-        json!({ "path": trace.to_string_lossy() }),
-        TARGET_STEP,
-    );
-    assert_no_error(&response, "tools/call open_trace");
-    if is_tool_error(&response) {
-        let text = text_of(&response["result"]);
-        // Stand down for the **one** reason that is the host's: no replay engine beside the
-        // binary. Any other `open_trace` failure — a regression, a trace that will not load — has
-        // to fail, or this test passes having exercised neither query, which is the shape
-        // [`recorded`] exists to avoid one function above.
-        //
-        // Keyed on the server's own diagnostic, not on `0x80070057`. That code is the engine's
-        // "the parameter is incorrect" and a trace that failed to load for some other reason can
-        // carry it too; the sentence below is appended by `worker::explain_trace_failure` only
-        // when `replay_engine_bundled()` is false, which is exactly the condition being excused.
-        // A `ttd\` of the wrong architecture is deliberately *not* excused — it gets the engine's
-        // error with no such sentence, and a misconfigured bundle should be loud.
-        if text.to_ascii_lowercase().contains("cannot replay") {
-            skip(&format!(
-                "this host recorded a trace it cannot replay: {text}"
-            ));
-            let _ = std::fs::remove_dir_all(&out_dir);
-            return;
-        }
-        panic!("`open_trace` failed for a reason that is not the host's:\n{text}");
-    }
-    let session = maybe_session_id(&response["result"])
-        .unwrap_or_else(|| panic!("`open_trace` opened without minting a handle: {response}"));
+    let Some(session) = opened_trace(&mut server, &recorded_trace(&out_dir), &out_dir) else {
+        return;
+    };
 
     // Events first. Module loads are in every trace, and this is the query that always rendered
     // its fields, so a failure here is about the trace rather than about the depth.
@@ -19505,6 +19517,161 @@ fn ttd_queries_answer_with_the_fields_they_promise() {
         memory.contains("AccessType") && memory.contains("Value"),
         "`ttd_memory` should render each access as a record — the defect was a column of bare \
          indices with the right count and no payload:\n{memory}"
+    );
+
+    server.tool_text("end_session", json!({ "session_id": session }), TARGET_STEP);
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// `FOLLOWUPS.md` item 47: a replay that reaches its bound is broken in, says so, and leaves the
+/// session usable.
+///
+/// Fixing [#226] put every target type on the watchdog-bounded wait, and replay was the one nobody
+/// had asked whether `SetInterrupt` unblocks. It does: TTD prints
+/// `Replay was interrupted by the user`, the pump reports a deadline, and the session goes on
+/// answering and moving. **The bound is reached here through a caller's clock**, because `go`'s is
+/// a minute and the ARM64 bench replays an unindexed trace at about 42 MB a second, so `go` would
+/// need a recording of some 2.5 GB. `continue_async`'s `max_run_ms` reaches it in a millisecond,
+/// through `DebugEngine::settle` — the same `pump` as `execute_and_wait`, whose own caller here is
+/// a `debug_batch` step, and a step's floor is a second against this trace's tenth of one.
+///
+/// Put the finite wait #226 replaced back into `settle` and this fails at `timed_out`, though not
+/// the way #226 did: measured once, that wait did not honour its bound on a replay at all. It ran
+/// 151 ms against a 1 ms bound and came back `S_OK` at the breakpoint — no wedge, and no bound
+/// either.
+///
+/// **Where the interrupted replay is left is printed, not asserted**, and that is item 125. TTD's
+/// banner says "approximately how far we had gone". Measured thirteen times with a breakpoint
+/// ahead, eleven runs were left past it — at the trace's boundary, wherever the position was read,
+/// and reported as nothing in particular — and two at the breakpoint itself, with no
+/// `Breakpoint 0 hit`. Neither is where the replay was when it was broken in, and which a run gets
+/// is TTD's to decide, so an assertion either way would be a coin. The breakpoint is what makes the
+/// line mean something: the unbounded control stops at it, so a cut-short run that is not at it and
+/// then goes on to the end without meeting it has skipped it.
+///
+/// `ntdll!RtlExitUserProcess` because every process passes it once, near the end of the trace, and
+/// it is an export, so it resolves on a host with no symbol server. `run_to_address` is aimed at
+/// the image's own header instead, which nothing executes, so its verdict cannot be a hit whichever
+/// way TTD lands.
+///
+/// [#226]: https://github.com/glslang/windbg-mcp/issues/226
+#[test]
+fn ttd_a_replay_broken_in_at_its_bound_says_so_and_leaves_the_session_usable() {
+    if !ttd_tier() {
+        return;
+    }
+    let out_dir = recording_dir("bound");
+    let mut server = Server::started();
+    if recorded(&mut server, &out_dir, json!({ "target": "hostname.exe" })).is_none() {
+        return;
+    }
+    let Some(session) = opened_trace(&mut server, &recorded_trace(&out_dir), &out_dir) else {
+        return;
+    };
+    let rewind = |server: &mut Server| {
+        server.tool_text(
+            "goto_position",
+            json!({ "session_id": &session, "position": "0" }),
+            TARGET_STEP,
+        );
+    };
+
+    let set = server.tool_data(
+        "set_breakpoint",
+        json!({ "session_id": &session, "expression": "ntdll!RtlExitUserProcess" }),
+        TARGET_STEP,
+    );
+    let exit = address_of(&set["breakpoint"]["address"]);
+
+    // The control, which is what makes "skipped" below mean anything: with nothing bounding it,
+    // the replay stops at the breakpoint.
+    let control = server.tool_data("go", json!({ "session_id": &session }), TARGET_STEP);
+    assert_eq!(
+        address_of(&control["stopped_at"]),
+        exit,
+        "an unbounded `go` should stop where the process exits: {control}"
+    );
+    rewind(&mut server);
+
+    // A millisecond against a replay of about a hundred: the watchdog fires while TTD is still
+    // replaying, so the pump has to come back with a deadline rather than a stop.
+    let started = server.tool_data(
+        "continue_async",
+        json!({ "session_id": &session, "max_run_ms": 1 }),
+        TARGET_STEP,
+    );
+    let execution = started["execution"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a started run mints a handle: {started}"))
+        .to_string();
+    let waited = server.tool_data(
+        "wait_for_stop",
+        json!({ "session_id": &session, "execution": &execution, "timeout_ms": 30000 }),
+        TARGET_STEP,
+    );
+    let stop = &waited["stop"];
+    assert_eq!(
+        stop["timed_out"], true,
+        "a replay broken in at its bound must say so rather than pass for a stop: {waited}"
+    );
+    assert_eq!(stop["target_gone"], false, "{waited}");
+
+    // The item. Read through a typed tool, because the failure #226 found was the engine losing
+    // its current thread, and every one of these goes through it.
+    let after = server.call_tool("registers", json!({ "session_id": &session }), TARGET_STEP);
+    assert!(
+        !is_tool_error(&after),
+        "the session is unusable after a replay that was broken in: {after}"
+    );
+
+    // Item 125: where TTD left it, read off the breakpoint rather than off TTD's position text.
+    // Going on and coming back are asserted, because a session that answers `registers` and then
+    // cannot move is the other half of what #226 found.
+    let left_at = address_of(&stop["stopped_at"]);
+    let on = server.tool_data("go", json!({ "session_id": &session }), TARGET_STEP);
+    assert_eq!(
+        on["timed_out"], false,
+        "the replay should still move forward: {on}"
+    );
+    let landing = if left_at == exit {
+        "AT the breakpoint, with no hit reported"
+    } else if address_of(&on["stopped_at"]) == exit {
+        "SHORT of the breakpoint, which going on then reached"
+    } else {
+        "PAST the breakpoint, which going on never reached"
+    };
+    println!("item 125: a replay broken in at its bound was left {landing}");
+    let back = server.tool_data("reverse_go", json!({ "session_id": &session }), TARGET_STEP);
+    assert_eq!(
+        back["timed_out"], false,
+        "the replay should still move backward: {back}"
+    );
+
+    // And the other bounded wait a caller can aim at a replay: `run_to_address` has documented
+    // that it works on every target type since it was written, which until now was a doc comment.
+    let modules = server.tool_data(
+        "modules",
+        json!({ "session_id": &session, "filter": "hostname" }),
+        TARGET_STEP,
+    );
+    let header = modules["modules"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|module| module["name"].as_str() == Some("hostname"))
+        .map(|module| address_of(&module["start"]))
+        .unwrap_or_else(|| panic!("the recorded program is in its own trace: {modules}"));
+    rewind(&mut server);
+    let run_to = server.tool_data(
+        "run_to_address",
+        json!({ "session_id": &session, "address": format!("0x{header:x}"), "timeout_ms": 1 }),
+        TARGET_STEP,
+    );
+    assert_eq!(run_to["verdict"], "timeout", "{run_to}");
+    let after = server.call_tool("registers", json!({ "session_id": &session }), TARGET_STEP);
+    assert!(
+        !is_tool_error(&after),
+        "the session is unusable after a `run_to_address` that timed out on a replay: {after}"
     );
 
     server.tool_text("end_session", json!({ "session_id": session }), TARGET_STEP);
