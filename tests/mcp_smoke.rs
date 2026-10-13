@@ -20452,11 +20452,13 @@ fn bytes_read(data: &Value) -> Vec<u8> {
 /// The engine switches to x86 once the target stops in 32-bit code, which is why everything here
 /// is read after the breakpoint on `main`, and the switch is asserted rather than assumed.
 ///
-/// **And nothing here steps.** On CI's ARM64 runner, where the fixture runs under x86 emulation,
-/// a `step_over` from the import call reported the call site itself (measured 2026-10-13:
-/// `0xb871e4` against the `0xb871ea` it lands on under the x64 engine) while every breakpoint
-/// armed fired where it was set. The breakpoints are the trace's own mechanism, so the test arms
-/// them and reads what a step would have shown.
+/// **And nothing here steps, or resumes from a breakpoint it stands on.** On CI's ARM64 runner,
+/// where the fixture runs under x86 emulation, a `step_over` from the import call reported the
+/// call site itself (measured 2026-10-13: `0xb871e4` against the `0xb871ea` it lands on under
+/// the x64 engine), and so did a `go` from the breakpoint on that call with the next one armed,
+/// while the resume from `main`'s breakpoint reached the call. The breakpoints are the trace's
+/// own mechanism, so the test arms them, clears the one it stands on before each resume, and
+/// reads what a step would have shown.
 #[test]
 fn an_x86_stdcall_call_holds_its_arguments_at_esp_and_its_result_in_eax() {
     if !launch_tier() {
@@ -20511,6 +20513,25 @@ fn an_x86_stdcall_call_holds_its_arguments_at_esp_and_its_result_in_eax() {
     };
     let dword = |bytes: &[u8], at: usize| -> u64 {
         u64::from(u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()))
+    };
+    // Every resume below clears the breakpoints and arms the one it is going to, so the target
+    // never resumes from a breakpoint still set at its own instruction pointer. On CI's ARM64
+    // runner, under x86 emulation, the resume from the breakpoint on the `call` came back at the
+    // `call` (measured 2026-10-13, twice: as a `step_over`, then as a `go` with the next
+    // breakpoint armed) while the resume from `main`'s breakpoint went on to the call; what
+    // differed is that the second stood on a control transfer, so none here stands on anything.
+    let run_to = |server: &mut Server, address: u64, why: &str| {
+        server.tool_data(
+            "clear_breakpoints",
+            json!({ "session_id": &session, "all": true }),
+            TARGET_STEP,
+        );
+        server.tool_data(
+            "set_breakpoint",
+            json!({ "session_id": &session, "expression": format!("{address:#x}") }),
+            TARGET_STEP,
+        );
+        assert_eq!(stop_at(server, "go"), address, "{why}");
     };
 
     // Past the CRT's start-up to `main`, on the only breakpoint armed: the static CRT has a copy
@@ -20590,16 +20611,7 @@ fn an_x86_stdcall_call_holds_its_arguments_at_esp_and_its_result_in_eax() {
     );
 
     // Three four-byte arguments at `[esp]` up, at the call.
-    server.tool_data(
-        "set_breakpoint",
-        json!({ "session_id": &session, "expression": format!("{site:#x}") }),
-        TARGET_STEP,
-    );
-    assert_eq!(
-        stop_at(&mut server, "go"),
-        site,
-        "stopped on the call instruction"
-    );
+    run_to(&mut server, site, "stopped on the call instruction");
     let esp = register(&mut server, "esp");
     let arguments = read(&mut server, esp, 12);
     let (destination, source, length) = (
@@ -20622,16 +20634,10 @@ fn an_x86_stdcall_call_holds_its_arguments_at_esp_and_its_result_in_eax() {
          against esp {esp:#x}"
     );
     // The return breakpoint, armed as the trace arms it: the call's length past the call.
-    let after = site + 6;
-    server.tool_data(
-        "set_breakpoint",
-        json!({ "session_id": &session, "expression": format!("{after:#x}") }),
-        TARGET_STEP,
-    );
-    assert_eq!(
-        stop_at(&mut server, "go"),
-        after,
-        "the call returns to the instruction after it, which is its own length past it"
+    run_to(
+        &mut server,
+        site + 6,
+        "the call returns to the instruction after it, which is its own length past it",
     );
 
     // At a jump through the slot, the arguments are one slot up. The linker's thunk for the
@@ -20653,16 +20659,7 @@ fn an_x86_stdcall_call_holds_its_arguments_at_esp_and_its_result_in_eax() {
         slot,
         "the thunk jumps through the same slot the call goes through"
     );
-    server.tool_data(
-        "set_breakpoint",
-        json!({ "session_id": &session, "expression": format!("{thunk:#x}") }),
-        TARGET_STEP,
-    );
-    assert_eq!(
-        stop_at(&mut server, "go"),
-        thunk,
-        "stopped on the thunk's jump"
-    );
+    run_to(&mut server, thunk, "stopped on the thunk's jump");
     let esp = register(&mut server, "esp");
     let frame = read(&mut server, esp, 16);
     let entered_from = dword(&frame, 0) - 5;
@@ -20744,15 +20741,10 @@ fn an_x86_stdcall_call_holds_its_arguments_at_esp_and_its_result_in_eax() {
         expected,
         "at the call, before it pushes its return address, `esp` names the first argument"
     );
-    server.tool_data(
-        "set_breakpoint",
-        json!({ "session_id": &session, "expression": format!("{returns_to:#x}") }),
-        TARGET_STEP,
-    );
-    assert_eq!(
-        stop_at(&mut server, "go"),
+    run_to(
+        &mut server,
         returns_to,
-        "the return breakpoint, where the trace reads the result"
+        "the return breakpoint, where the trace reads the result",
     );
     assert_eq!(
         register(&mut server, "eax"),

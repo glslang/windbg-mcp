@@ -1476,11 +1476,13 @@ call, with `eax` holding the computed result at the return breakpoint. The sixte
 the call are the fixture
 `pooltrace::tests::x86_stack_bytes_parse_to_the_arguments_an_allocation_is_read_by` parses.
 
-**Nothing in it steps.** On CI's ARM64 runner the fixture runs under x86 emulation, and there a
-`step_over` from the import call reported the call site itself (measured 2026-10-13, `0xb871e4`
-against the `0xb871ea` it lands on under the x64 engine), while every breakpoint armed fired where
-it was set. The test arms breakpoints — the trace's own mechanism — and reads what a step would
-have shown.
+**Nothing in it steps, or resumes from a breakpoint it stands on.** On CI's ARM64 runner the
+fixture runs under x86 emulation, and there a `step_over` from the import call reported the call
+site itself (measured 2026-10-13, `0xb871e4` against the `0xb871ea` it lands on under the x64
+engine), and so did a `go` from the breakpoint on that call with the next one armed, while the
+resume from `main`'s breakpoint reached the call. The test arms breakpoints — the trace's own
+mechanism — clears the one it stands on before each resume, and reads what a step would have
+shown.
 
 **It runs through the x64 engine's WoW64 view with the effective machine switched to x86**, which
 is the engine an x86 kernel is debugged by too, and not through the 32-bit worker: a `launch` has no
