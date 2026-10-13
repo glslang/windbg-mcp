@@ -100,8 +100,16 @@ a symbol-server download it may not have wanted. `refresh` is the inventory half
 | Fetches PDBs | **no** — what it discovers is `deferred` | yes, one per module |
 | Costs a symbol-server round trip | no | yes, per module |
 | Effect on symbols already loaded | on a **live** target, discards them | loads them |
+| Bounded by the call's clock | yes — one stopped part-way says so in `refresh.stopped` | no |
 
-The last row is the one to plan around, and it is **live-target only**: on a live target a refresh
+**A refresh stopped part-way is worse than none, and says so.** The engine rebuilds its module list
+rather than adding to it, so a reload cut short leaves *part* of the list: on the ARM64 bench's live
+kernel, 20, 43 and 91 of 181 modules for stops at 0.5s, 1s and 2s. `refresh.stopped` carries why —
+`deadline` or `interrupted` — `synchronized` is `false`, and `before` can then exceed `loaded`. Only a
+**cold** refresh is slow enough to stop at all: the first after an attach took 3.9s over 115200-baud
+serial there, and a repeat 57ms, answered from the engine's cache.
+
+The symbols row is the other one to plan around, and it is **live-target only**: on a live target a refresh
 throws away the symbol state the engine was holding and reloads it as needed, so **refresh first
 and load symbols afterwards** — doing it the other way round undoes the reload you just paid for.
 A dump pays none of it. Measured both ways on one host, with the engine's `symsrv.dll` and

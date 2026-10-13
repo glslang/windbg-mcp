@@ -64,6 +64,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A break left pending can no longer empty the next module refresh.** `Execute` discards a
+  pending `SetInterrupt` as a command begins; a reload does not. Measured on the ARM64 bench's live
+  kernel through dbgscope, a reload begun under one returned success in 4ms with the engine holding
+  **no modules** and the break still pending for whatever came after; on a launched process it
+  failed with `0xD000013A` instead. This server's `interrupt` sends nothing to a session with no
+  job, so the route here is narrower -- an interrupt sent to a job whose engine calls never poll for
+  it, leaving the break unread when the job ends -- and that route is read from the code rather than
+  reproduced through the tool. dbgscope's reload methods drain a pending break first
+  (dbgscope#197), which covers `set_symbol_path`'s reload as well.
+
 - **The Secure Kernel KD facade verifies and identifies the state it reports** (item 116).
   Before publishing its pipe it validates the live AMD64 PE header and version-resource build
   against the profile. Its banner maps KD processor 0 to the selected guest VP, and info-level
@@ -160,6 +170,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   caller may already have timed out.
 
 ### Changed
+
+- **`modules { "refresh": true }` is bounded by the call's clock** (`FOLLOWUPS.md` item 54, in
+  `DONE.md`). The resynchronisation is `IDebugSymbols::Reload("")`, a direct engine call nothing
+  could stop short of `interrupt`; `EngineOp::Modules` now carries a `patience_ms` and the worker
+  runs dbgscope's new `reload_symbols_bounded` with it. Measured first, on the ARM64 bench's live
+  kernel over 115200-baud serial: the first refresh after an attach read 181 modules in 3.9s, and a
+  `SetInterrupt` part-way ends one within milliseconds. **A refresh stopped part-way leaves the
+  inventory smaller than it started** -- the engine rebuilds its module list rather than adding to
+  it, so stops at 0.5s, 1s and 2s held 20, 43 and 91 of 181 -- so `refresh.stopped` says why it
+  stopped, `synchronized` is `false`, and the note above the listing names both counts and says the
+  listing is short. Moves the `dbgscope` pin to dbgscope#197.
 
 - **The `rmcp` floor moves to `3.5.1`, and a refusal over `--listen` on `2026-07-28` is answered in
   band.** Before it, a JSON-RPC error a handler returned on the stateless route — this server

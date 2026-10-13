@@ -228,12 +228,19 @@ pub enum EngineOp {
     /// it — defaulted and clamped by the supervisor as every other row cap here is.
     ///
     /// `refresh` resynchronises the engine's inventory with the target before the listing is
-    /// taken ([#85]). **It carries no `patience_ms`**, and that is the same call
-    /// [`Self::Backtrace`] makes and for the same reason: it is a direct engine call rather than
-    /// a command, so no watchdog can cut it short. What bounds it is the caller's own call
-    /// timeout and `interrupt`, which reaches the engine from off the engine thread. What it is
-    /// *not* is a symbol-server operation — the reload is unqualified and unforced, so the
-    /// modules it discovers are deferred rather than fetched.
+    /// taken ([#85]). What it is *not* is a symbol-server operation — the reload is unqualified
+    /// and unforced, so the modules it discovers are deferred rather than fetched.
+    ///
+    /// **It carries a `patience_ms`, and until `FOLLOWUPS.md` item 54 it said why it could not.**
+    /// The reload is a direct engine call rather than a command, which by [`Self::Backtrace`]'s
+    /// rule meant nothing could bound it — and that was an expectation rather than a measurement.
+    /// Measured on a live ARM64 kernel over 115200-baud serial, the one link here slow enough for
+    /// a reload to sit in: `SetInterrupt` ends one within milliseconds, so dbgscope's
+    /// `reload_symbols_bounded` can carry the caller's clock. [`Self::ReadMemory`] made the same
+    /// move for the same reason. The bound only spends anything on a **cold** reload — the first
+    /// after an attach read 181 modules in 3.9s there, and a repeat 57ms from the engine's cache —
+    /// and a reload stopped part-way leaves the inventory *smaller* than it started, which is what
+    /// [`crate::structured::ModuleRefresh::stopped`] is for.
     ///
     /// [#85]: https://github.com/glslang/windbg-mcp/issues/85
     /// [#120]: https://github.com/glslang/windbg-mcp/issues/120
@@ -243,6 +250,7 @@ pub enum EngineOp {
         limit: usize,
         #[serde(default)]
         refresh: bool,
+        patience_ms: u32,
     },
     /// The current thread's call stack, as values and as the listing rendered from them.
     ///
@@ -256,9 +264,8 @@ pub enum EngineOp {
     /// Ctrl+Breaks a *command*; these are direct engine calls, so nothing can cut one short, and
     /// resolving a frame's symbol can block on a symbol server exactly as the raw `k` this
     /// replaced could. Carrying a `patience_ms` would imply a bound that does not exist. The same
-    /// holds for every typed op beside it — [`Self::Modules`], [`Self::Disassemble`],
-    /// [`Self::Registers`] — which is why "bound everything except `index_trace`" is a rule about
-    /// commands and not about tools.
+    /// holds for [`Self::Disassemble`] and [`Self::Registers`] beside it — which is why "bound
+    /// everything except `index_trace`" is a rule about commands and not about tools.
     ///
     /// Which cuts the other way too, and is the half that was missed: a typed op that *does* run a
     /// command carries one. [`Self::SetBreakpoint`] is that case, and
@@ -267,12 +274,15 @@ pub enum EngineOp {
     /// rather than a preference.
     ///
     /// **A claim about what can be bounded, though, and not about `Execute`** — which is how it was
-    /// first written, because for a long time the two coincided. They have come apart twice since.
-    /// `SetBreakpoint` kept its patience when its command became a direct engine call, because
-    /// `SetInterrupt` reaches the symbolic resolve inside it. [`Self::ReadMemory`] gained one with
-    /// no command in sight, because a read taken a page at a time can be stopped between pages
-    /// ([dbgscope#95](https://github.com/glslang/dbgscope/issues/95)). The question to ask of a new
-    /// op is therefore whether anything can stop the call underneath it — not whether it runs text.
+    /// first written, because for a long time the two coincided. They have come apart three times
+    /// since. `SetBreakpoint` kept its patience when its command became a direct engine call,
+    /// because `SetInterrupt` reaches the symbolic resolve inside it. [`Self::ReadMemory`] gained
+    /// one with no command in sight, because a read taken a page at a time can be stopped between
+    /// pages ([dbgscope#95](https://github.com/glslang/dbgscope/issues/95)). And [`Self::Modules`]
+    /// gained one when `SetInterrupt` was measured reaching the reload behind `refresh`, which this
+    /// paragraph had listed as unboundable on the strength of its being a direct call. The question
+    /// to ask of a new op is therefore whether anything can stop the call underneath it — not
+    /// whether it runs text, and not whether it looks as though it could.
     Backtrace {
         /// How many frames to walk. Bounded by the supervisor before it gets here.
         frames: u32,
@@ -701,6 +711,7 @@ impl EngineOp {
             Self::BoundedCommand { patience_ms, .. }
             | Self::SetBreakpoint { patience_ms, .. }
             | Self::ReadMemory { patience_ms, .. }
+            | Self::Modules { patience_ms, .. }
             | Self::Pool { patience_ms, .. }
             | Self::Heap { patience_ms, .. }
             | Self::CrashTriage { patience_ms, .. }
@@ -737,6 +748,9 @@ impl EngineOp {
                 .unwrap_or(DEFAULT_MODULE_ROWS)
                 .clamp(1, MAX_MODULE_ROWS) as usize,
             refresh,
+            // Filled in by the supervisor's pump from the caller's remaining clock, as every
+            // `patience_ms` is (`Self::patience_slot`).
+            patience_ms: 0,
         }
     }
 
@@ -1143,6 +1157,7 @@ mod tests {
                 size: 1024 * 1024,
                 patience_ms: 0,
             },
+            EngineOp::modules(None, None, true),
             EngineOp::Pool {
                 query: PoolOp::census(None, None),
                 patience_ms: 0,
@@ -1227,6 +1242,7 @@ mod tests {
             limit,
             filter,
             refresh,
+            ..
         } = EngineOp::modules(Some("nt".into()), None, false)
         else {
             unreachable!("still a module listing")

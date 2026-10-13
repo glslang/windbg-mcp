@@ -3190,7 +3190,13 @@ fn execute(
             filter,
             limit,
             refresh,
-        } => modules(e, filter.as_deref(), limit, refresh),
+            patience_ms,
+        } => {
+            // The caller's own clock, on a bounded command's arithmetic and with its floor: zero
+            // would be *no* bound, so a refresh dequeued at the deadline would run unbounded.
+            let budget = watchdog_budget_ms(Duration::from_millis(u64::from(patience_ms)), spent());
+            modules(e, filter.as_deref(), limit, refresh.then_some(budget))
+        }
         EngineOp::Backtrace { frames } => backtrace(e, frames as usize),
         EngineOp::Disassemble { address, count } => {
             disassemble(e, address.as_deref(), count as usize)
@@ -4432,12 +4438,13 @@ fn with_pdb_identity(
 ///
 /// **`refresh` runs before any of that**, and the ordering is the whole of it: a listing taken
 /// from an inventory the engine has not resynchronised is a listing of what the *engine* knows
-/// rather than of what the target has loaded ([`resynchronise`]).
+/// rather than of what the target has loaded ([`resynchronise`]). It is the watchdog budget the
+/// refresh may spend, and `None` when none was asked for.
 fn modules(
     e: &DebugEngine,
     filter: Option<&str>,
     limit: usize,
-    refresh: bool,
+    refresh: Option<u32>,
 ) -> Result<Output, Failed> {
     let pattern = filter.map(module_pattern);
     // Asked for first, and its failure does **not** end the call: a stale listing plus a field
@@ -4445,7 +4452,9 @@ fn modules(
     // be the right ones and the caller can see for themselves. What must not happen is the
     // failure going unsaid, which is why [`refresh_note`] renders above the tables rather than
     // into the note under them — the caveat has to arrive before the conclusion it qualifies.
-    let refreshed = refresh.then(|| resynchronise(e)).transpose()?;
+    let refreshed = refresh
+        .map(|budget_ms| resynchronise(e, budget_ms))
+        .transpose()?;
     let loaded = e.modules().map_err(failed)?;
     // Unloaded modules are best-effort: not every Windows version tracks them, the ones that do
     // may have nothing to report, and a listing of what *is* loaded must not fail over what is
@@ -4528,15 +4537,27 @@ fn modules(
 /// about to make: there is nothing to report a refresh against if the inventory cannot be read at
 /// all, and letting it through would only move the identical failure two lines down.
 ///
+/// **Bounded by `budget_ms`, the caller's own clock** (`FOLLOWUPS.md` item 54). Before dbgscope's
+/// `reload_symbols_bounded` nothing could stop this reload short of `interrupt`, and on a slow
+/// link a refresh could outlast the call it was made for with the session held. A reload stopped
+/// part-way is reported in `stopped` rather than as a failure, and it is the one outcome that
+/// makes the listing *worse* than not asking: the engine rebuilds its list rather than adding to
+/// it, so the inventory comes back smaller than it went in. Only a cold reload is slow enough to
+/// reach the bound — the first after an attach, which is exactly when a caller asks for one.
+///
 /// [#85]: https://github.com/glslang/windbg-mcp/issues/85
-fn resynchronise(e: &DebugEngine) -> Result<structured::ModuleRefresh, Failed> {
+fn resynchronise(e: &DebugEngine, budget_ms: u32) -> Result<structured::ModuleRefresh, Failed> {
     let before = e.modules().map_err(failed)?.len();
-    match e.reload_symbols("") {
-        Ok(()) => Ok(structured::ModuleRefresh {
-            synchronized: true,
-            before,
-            error: None,
-        }),
+    match e.reload_symbols_bounded("", budget_ms) {
+        Ok(reload) => {
+            let stopped = reload.cut_short.map(halt_of);
+            Ok(structured::ModuleRefresh {
+                synchronized: stopped.is_none(),
+                before,
+                error: None,
+                stopped,
+            })
+        }
         Err(why) => {
             // Logged as well as reported, because the reported half is a field on a result that
             // still looks like an answer, and the server's own record of a failing engine call
@@ -4546,6 +4567,7 @@ fn resynchronise(e: &DebugEngine) -> Result<structured::ModuleRefresh, Failed> {
                 synchronized: false,
                 before,
                 error: Some(why.to_string()),
+                stopped: None,
             })
         }
     }
@@ -4629,13 +4651,17 @@ fn render_modules(list: &structured::ModuleList) -> String {
 /// The line above a listing that says what the call's `refresh` did — and nothing at all for the
 /// calls that asked for none, which is every default one.
 ///
-/// Three states, because they are three different things to do next. A resynchronisation that
+/// Four states, because they are four different things to do next. A resynchronisation that
 /// **found something** is the case [#85] is about, and it names both counts: a caller who has just
 /// been told the driver is not loaded needs to see that the inventory it was told that from had
 /// one module in it. One that found **nothing new** is worth a line too — it is what turns "the
 /// module is absent" from a guess into an answer, and without it a caller has no way to tell a
-/// refresh that ran from one that was ignored. And one that **failed** is the only line that
-/// carries advice, because it is the only one where the listing under it may be wrong.
+/// refresh that ran from one that was ignored. One that **stopped part-way** names both counts as
+/// well, because there the second can be the *smaller* — the engine rebuilds its list, so a
+/// stopped refresh leaves part of it — and a caller reading "43 now" after "181 before" with no
+/// sentence beside it would take the target to have unloaded drivers. And one that **failed**
+/// carries the engine's reason. The last two carry advice, because they are the ones where the
+/// listing under them may be wrong.
 ///
 /// [#85]: https://github.com/glslang/windbg-mcp/issues/85
 fn refresh_note(refresh: Option<&structured::ModuleRefresh>, loaded: usize) -> Option<String> {
@@ -4658,9 +4684,27 @@ fn refresh_note(refresh: Option<&structured::ModuleRefresh>, loaded: usize) -> O
              than before."
         ));
     }
-    let warning = "**The inventory could not be resynchronised**, so the listing below is whatever \
-                   the engine was already holding and may be missing modules the target has \
-                   loaded — a module absent from it is not evidence it is absent from the target.";
+    if let Some(stopped) = refresh.stopped {
+        let advice = match stopped {
+            structured::WalkHalt::Deadline => {
+                " It used all the time this call had; if a second refresh stops too, raise the \
+                 server's call timeout (WINDBG_MCP_CALL_TIMEOUT_SECS)."
+            }
+            structured::WalkHalt::Interrupted => "",
+        };
+        return Some(format!(
+            "**The inventory resynchronisation {} part-way**, which leaves the engine holding \
+             part of its module list rather than the list it had: it rebuilds the list instead of \
+             adding to it. {} module(s) before, {loaded} now — so the listing below is short, and \
+             a module absent from it is not evidence it is absent from the target. Refresh again \
+             to finish it.{advice}",
+            stopped.phrase(),
+            refresh.before,
+        ));
+    }
+    let warning = "**The inventory could not be resynchronised**, so the listing below may be \
+                   missing modules the target has loaded — a module absent from it is not \
+                   evidence it is absent from the target.";
     // The engine's own words, escaped like every other string that came from outside this server.
     // A failure with no reason is a state this worker does not produce, but the sentence above is
     // the load-bearing half and must not depend on one having survived the trip.
@@ -6600,6 +6644,15 @@ fn location_coordinate(
     })
 }
 
+/// Why a bounded dbgscope call stopped, as the typed answers report it: the call's clock or the
+/// caller's request. One mapping for the read and the module refresh, which report it the same way.
+fn halt_of(cut_short: Interruption) -> structured::WalkHalt {
+    match cut_short {
+        Interruption::Deadline { .. } => structured::WalkHalt::Deadline,
+        Interruption::OnRequest => structured::WalkHalt::Interrupted,
+    }
+}
+
 /// Reads target memory and renders it as a hex dump, **inside `budget_ms`**.
 ///
 /// Free function rather than an inline arm because a batch step reads memory the same way, and a
@@ -6638,10 +6691,7 @@ fn read_memory(
     let read = e
         .read_memory_bounded(addr, size as usize, budget_ms)
         .map_err(es)?;
-    let stopped = read.cut_short.map(|cut_short| match cut_short {
-        Interruption::Deadline { .. } => structured::WalkHalt::Deadline,
-        Interruption::OnRequest => structured::WalkHalt::Interrupted,
-    });
+    let stopped = read.cut_short.map(halt_of);
     // The note is what keeps a short dump from reading as a short *range*. Without it the hexdump
     // below simply ends, and a caller decoding a structure out of it reads the tail from bytes
     // that were never fetched — the failure `MemoryRead::stopped` exists for, arriving through the
@@ -17988,6 +18038,7 @@ mod tests {
             synchronized: true,
             before: 1,
             error: None,
+            stopped: None,
         }));
         assert!(
             found.contains("1 module(s) before, 226 now"),
@@ -18005,6 +18056,7 @@ mod tests {
             synchronized: true,
             before: 226,
             error: None,
+            stopped: None,
         }));
         assert!(
             current.contains("already held all 226"),
@@ -18017,6 +18069,7 @@ mod tests {
             synchronized: false,
             before: 1,
             error: Some("Unable to read PsLoadedModuleList".into()),
+            stopped: None,
         }));
         let (warning, verdict) = (
             failed.find("could not be resynchronised"),
@@ -18033,6 +18086,71 @@ mod tests {
         assert!(
             failed.contains("not evidence it is absent from the target"),
             "…and withdraws the only conclusion the listing would otherwise support:\n{failed}"
+        );
+    }
+
+    /// A refresh stopped part-way says so above the listing, with both counts — because there the
+    /// second can be the smaller one.
+    ///
+    /// The engine rebuilds its module list rather than adding to it, so a reload cut short leaves
+    /// part of the list: measured on a live ARM64 kernel, 43 of 181 for a stop at one second. Read
+    /// without a sentence beside it, "181 before, 43 now" says the target unloaded drivers. And the
+    /// two origins differ in what to do next: a deadline points at the call timeout, a request
+    /// does not, since the caller asked.
+    #[test]
+    fn a_refresh_stopped_part_way_says_the_listing_is_short() {
+        let listing = |stopped| {
+            render_modules(&structured::ModuleList {
+                loaded: 43,
+                matched: 0,
+                unloaded_matched: 0,
+                filter: Some(module_pattern("MessageManager")),
+                modules: Vec::new(),
+                unloaded: Vec::new(),
+                refresh: Some(structured::ModuleRefresh {
+                    synchronized: false,
+                    before: 181,
+                    error: None,
+                    stopped: Some(stopped),
+                }),
+            })
+        };
+
+        let timed_out = listing(structured::WalkHalt::Deadline);
+        let (warning, verdict) = (
+            timed_out.find("ran out of time part-way"),
+            timed_out.find("Nothing matches"),
+        );
+        assert!(
+            warning.is_some() && verdict.is_some() && warning < verdict,
+            "the caveat has to arrive before the conclusion it qualifies:\n{timed_out}"
+        );
+        assert!(
+            timed_out.contains("181 module(s) before, 43 now"),
+            "both counts, the second smaller, with the reason beside them:\n{timed_out}"
+        );
+        assert!(
+            timed_out.contains("not evidence it is absent from the target"),
+            "…and the one conclusion the short listing would otherwise support is withdrawn:\n{timed_out}"
+        );
+        assert!(
+            timed_out.contains("WINDBG_MCP_CALL_TIMEOUT_SECS"),
+            "a refresh that ran out of time says where the time comes from:\n{timed_out}"
+        );
+        assert!(
+            !timed_out.contains("could not be resynchronised"),
+            "a stop is not a failure, and the two are told apart:\n{timed_out}"
+        );
+
+        let asked = listing(structured::WalkHalt::Interrupted);
+        assert!(
+            asked.contains("was interrupted part-way")
+                && asked.contains("181 module(s) before, 43 now"),
+            "an interrupted refresh says so, with the same counts:\n{asked}"
+        );
+        assert!(
+            !asked.contains("WINDBG_MCP_CALL_TIMEOUT_SECS"),
+            "a caller who asked for the stop is not sent to the call timeout:\n{asked}"
         );
     }
 
@@ -18056,6 +18174,7 @@ mod tests {
                 error: Some(
                     "no\n0xfffff80389200000  0xfffff8038a650000  smuggled  pdb".to_string(),
                 ),
+                stopped: None,
             }),
         });
         assert!(

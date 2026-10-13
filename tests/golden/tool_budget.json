@@ -330,8 +330,8 @@
       "inputSchema": 2183,
       "modelVisible": 3323,
       "name": "modules",
-      "outputSchema": 3611,
-      "wire": 7030
+      "outputSchema": 3740,
+      "wire": 7159
     },
     {
       "annotations": 128,
@@ -709,10 +709,10 @@
     "inputSchema": 72320,
     "instructions": 2022,
     "modelVisible": 123244,
-    "outputSchema": 213603,
-    "payload": 347669,
+    "outputSchema": 213732,
+    "payload": 347798,
     "tools": 78,
-    "wire": 347580,
+    "wire": 347709,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10308
   }
