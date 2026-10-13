@@ -1,9 +1,13 @@
 # Architecture
 
-**One debug session per process.** dbgeng.dll holds a single debuggee session per process — that is
-why `.opendump` *replaces* the target rather than opening a second one — so this server runs the MCP
-protocol in a **supervisor** process and each open target in its own **engine worker** child
-process. Two things follow, and they are why it is built this way:
+**One debug session per process.** dbgeng.dll holds a single debug session per process. That session
+can hold more than one target — `.opendump` *adds* one rather than replacing the first — but every
+target in it shares one *current* target, which is what every command reads, and one event wait: the
+`g` that loads an added dump runs the live process beside it as well
+([measured](sessions.md#what-opendump-does-to-a-session)). Two targets in one process therefore
+cannot be driven independently, so this server runs the MCP protocol in a **supervisor** process and
+each open target in its own **engine worker** child process. Two things follow, and they are why it
+is built this way:
 
 - **A session that cannot be unwound costs a process, not the server.** A live-kernel attach waits
   for its target with `WaitForEvent(INFINITE)`, and nothing can interrupt a wait that has not yet

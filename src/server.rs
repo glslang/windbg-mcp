@@ -2122,10 +2122,10 @@ pub(crate) enum Quotes {
 ///
 /// The typed tools build commands by interpolation — `u {address}`, `bp {expression}`,
 /// `!drvobj {name} 7` — and DbgEng reads `;` as a command separator. So an operand of
-/// `rip; .opendump C:\other.dmp` turns `disassemble` into a target swap: it runs a
-/// session-control command from a tool that advertises `readOnlyHint: true`, and it does
-/// it without going through the [`changes_debug_target`] check, leaving every outstanding
-/// handle pointing at a target that is no longer loaded.
+/// `rip; .opendump C:\other.dmp` turns `disassemble` into the first half of a target swap: it
+/// runs a session-control command — one that adds a target for the next `g` to make current —
+/// from a tool that advertises `readOnlyHint: true`, and it does it without going through the
+/// [`changes_debug_target`] check.
 ///
 /// These parameters are documented as *operands*, never command lists, so refusing the
 /// separator costs nothing real: `execute` exists for anything that genuinely needs to
@@ -2534,33 +2534,6 @@ fn ttd_memory_command(start: u64, end: u64, mode: Option<&str>) -> String {
     }
 }
 
-/// Does this raw `execute` command replace or release the debug target?
-///
-/// The typed tools announce their own transitions, but `execute` is an escape hatch: a
-/// caller can `.opendump` a different file, or `.detach`, and every handle issued for the
-/// old target is then meaningless. Matching the first token of each segment catches the
-/// session-control commands by name.
-///
-/// Segments are split on `;` **and line breaks**, because DbgEng treats both as command
-/// boundaries — [`reject_command_breakers`] refuses both in typed operands for exactly that
-/// reason, and a scanner that honoured only `;` would let `r\n.opendump other.dmp` through
-/// while seeing nothing but `r`.
-///
-/// This is deliberately **best-effort, biased toward retiring the handle**. Over-matching
-/// costs a caller one re-open; under-matching would let a stale handle pass, which is the
-/// failure this mechanism exists to prevent. It cannot be exhaustive — DbgEng has more ways
-/// to reach the target than a name list can enumerate.
-///
-/// **It is the early defence rather than the only one, and it is early for a reason that the
-/// backstop cannot supply.** `execute` retires *before* the command runs, because a `.detach`
-/// that reports an error may still have detached — so something has to decide from the text, and
-/// a name list is what can. What it cannot see is a wrapper (`.if`, `.foreach`, `.block`, `j`,
-/// `z`) or an alias, which resolves at execution time, so no reading of the text before it runs
-/// is complete. Those are caught **afterwards** instead, by the worker comparing what its engine
-/// holds against what it held at the open (`worker`'s `watch_the_target`, `FOLLOWUPS.md` item
-/// 81). So this staying incomplete is no longer the same thing as a handle outliving its target:
-/// the two together are what make a handle mean something everywhere, and neither replaces the
-/// other.
 /// A command with its **quoted** spans blanked out, so a listed name inside a string is not read
 /// as one.
 ///
@@ -2635,6 +2608,36 @@ pub(crate) fn outside_quotes(command: &str) -> String {
     }
 }
 
+/// Does this raw `execute` command release the debug target, or start replacing it?
+///
+/// The typed tools announce their own transitions, but `execute` is an escape hatch: a
+/// caller can `.detach`, or `.opendump` a different file — which adds a target for the next `g`
+/// to make current rather than replacing anything itself (`docs/sessions.md`, measured in
+/// `FOLLOWUPS.md` item 105) — and every handle issued for the old target is then meaningless.
+/// Matching the first token of each segment catches the session-control commands by name, which
+/// for `.opendump` is early on purpose: the handle is retired at the command that arms the swap
+/// rather than at the `g` that makes it.
+///
+/// Segments are split on `;` **and line breaks**, because DbgEng treats both as command
+/// boundaries — [`reject_command_breakers`] refuses both in typed operands for exactly that
+/// reason, and a scanner that honoured only `;` would let `r\n.opendump other.dmp` through
+/// while seeing nothing but `r`.
+///
+/// This is deliberately **best-effort, biased toward retiring the handle**. Over-matching
+/// costs a caller one re-open; under-matching would let a stale handle pass, which is the
+/// failure this mechanism exists to prevent. It cannot be exhaustive — DbgEng has more ways
+/// to reach the target than a name list can enumerate.
+///
+/// **It is the early defence rather than the only one, and it is early for a reason that the
+/// backstop cannot supply.** `execute` retires *before* the command runs, because a `.detach`
+/// that reports an error may still have detached — so something has to decide from the text, and
+/// a name list is what can. What it cannot see is a wrapper (`.if`, `.foreach`, `.block`, `j`,
+/// `z`) or an alias, which resolves at execution time, so no reading of the text before it runs
+/// is complete. Those are caught **afterwards** instead, by the worker comparing what its engine
+/// holds against what it held at the open (`worker`'s `watch_the_target`, `FOLLOWUPS.md` item
+/// 81). So this staying incomplete is no longer the same thing as a handle outliving its target:
+/// the two together are what make a handle mean something everywhere, and neither replaces the
+/// other.
 pub(crate) fn changes_debug_target(command: &str) -> bool {
     /// Session-control commands: open, attach to, release, or terminate a target.
     const RETIRES_SESSION: &[&str] = &[
@@ -5629,8 +5632,8 @@ impl WindbgServer {
         // command is about to run, so it retires the handle first — a `.detach` that reports an
         // error may still have detached. A breakpoint's command runs at **hit** time, which may be
         // never, may be minutes later, and is not something this server observes: there is no
-        // moment at which it could retire the handle, so a `.opendump` here would replace the
-        // target while every outstanding handle still read as live.
+        // moment at which it could retire the handle, so a `.opendump` here would add a target
+        // for the next resume to make current while every outstanding handle still read as live.
         //
         // This closes the path this parameter opens. It does **not** close the same hole through
         // raw text — `execute` with `bp nt!Foo ".detach"` reaches it, and has all along, because

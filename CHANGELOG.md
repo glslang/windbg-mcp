@@ -287,6 +287,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the run had not reached, so a `go` after a `timed_out` or `interrupted` stop on a trace can
   report the end of the trace with a breakpoint sitting behind it.
 
+- **`.opendump` adds a target; the `g` after it is what replaces one.** `FOLLOWUPS.md` item 105:
+  this server's design was introduced, in `docs/architecture.md` and the supervisor's module doc,
+  with *"dbgeng.dll holds one debuggee session per process … which is why `.opendump` replaces the
+  target"*, and in every case measured on two engine builds it does not. It adds a second system
+  and leaves the first current; the next `g` loads it and makes it current — on a launched process
+  running the process too — and on a live kernel the added dump never loads at all. A handle is retired at that
+  `g`, through `execute` and inside a `debug_batch` alike. The reason for a worker per target is now
+  stated as what was measured — one current target and one event wait per session — and
+  `docs/sessions.md` carries the cells. The sentence a caller reads when a handle is retired by
+  that reading now names a `g` completing an earlier command as one of the ways it happens.
+
 ## [0.22.0] - 2026-10-07
 
 ### Fixed

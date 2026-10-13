@@ -116,8 +116,8 @@ The typed tools build debugger commands by interpolation (`u {address}`, `bp {ex
 except `dx`, whose data-model expressions use quoted literals legitimately.
 
 Two things go wrong without that. DbgEng treats `;` as a command separator, so
-`disassemble { address: "rip; .opendump C:\other.dmp" }` would replace the debug target from a tool
-that reports itself read-only. And `bp <location> "command"` is real WinDbg syntax — `ioctl_trace`
+`disassemble { address: "rip; .opendump C:\other.dmp" }` would add a debug target, for the next `g`
+to make current, from a tool that reports itself read-only. And `bp <location> "command"` is real WinDbg syntax — `ioctl_trace`
 builds exactly that form — so a quote in a breakpoint location arms a command that runs on every
 hit, replacing the target at some arbitrary later moment, outside any tool call and outside anything
 that could retire the session handle.

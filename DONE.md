@@ -96,6 +96,11 @@ bound it thought might be unreachable on a replay is reached by any caller's clo
 wedge it was guarding against is not how the old finite wait failed there — measured once, that
 wait ignored its bound outright. What measuring it found instead is item 125, that TTD leaves an
 interrupted replay somewhere it never reached.
+**Item 105** (2026-10-13) is here because the matrix it asked for moved the replacement rather than
+confirming it: in every case measured `.opendump` made none on its own and the `g` after it did —
+the shape `.create` has — and on a live kernel nothing did. And the failure it cited as unexplained
+had been explained by the engine all along, in a line `cdb` prints and this server does not pass on
+— item 126.
 
 ## What is in here
 
@@ -182,6 +187,7 @@ interrupted replay somewhere it never reached.
 - [Item 112](#112-windbg-mcp-the-ioctl-fixtures-writes_flags-is-architecture-blind--done-2026-10-13) — [windbg-mcp] The IOCTL fixture's `writes_flags` is architecture-blind — done (2026-10-13)
 - [Item 54](#54-dbgscope--windbg-mcp-modules--refresh-true--has-no-wall-clock-bound--done-2026-10-13-dbgscope197) — [dbgscope + windbg-mcp] `modules { "refresh": true }` has no wall-clock bound — done (2026-10-13, dbgscope#197)
 - [Item 47](#47-windbg-mcp--dbgscope-the-bounded-wait-is-unmeasured-on-a-ttd-replay-target--done-2026-10-13) — [windbg-mcp + dbgscope] The bounded wait is unmeasured on a TTD replay target — done (2026-10-13)
+- [Item 105](#105-windbg-mcp-opendump-is-documented-as-replacing-the-target-and-the-one-measurement-of-it-says-it-adds-one--done-2026-10-13) — [windbg-mcp] `.opendump` is documented as replacing the target, and the one measurement of it says it adds one — done (2026-10-13)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -11004,3 +11010,99 @@ trace's boundary wherever the position was read — a 2 s bound on a 16.6 s repl
 the next `go` stop at the end of the trace as though the breakpoint were never reached. It is not
 this item's defect and not one a test can pin, since which landing a run gets is TTD's to choose;
 the test prints it, and item 125 holds the measurements and the two shapes a fix could take.
+
+## 105. [windbg-mcp] `.opendump` is documented as replacing the target, and the one measurement of it says it adds one — **done** (2026-10-13)
+
+**Repo:** `windbg-mcp`. **Origin:** two prose sites raised by CodeRabbit on
+[#392](https://github.com/glslang/windbg-mcp/pull/392) after it merged, and fixed there. The wider
+version is this repo contradicting itself: item 102 measured the command it had used as its own
+example of a replacement and found it is not one — driven live over stdio against the dev build
+(dbgeng 10.0.26100.1742, ARM64, 2026-09-26), `.if (1) { .opendump C:\other.dmp }` on a dump session
+left `||` listing **two systems** with the original still current, and `? @$ip`, `version` and `lm`
+all still answering from it. That reading is recorded in `DONE.md`; the *claim* it contradicts is
+still in about a dozen places, including the sentence this server's whole shape is introduced with
+(`docs/architecture.md`'s opening and `src/engine.rs`'s module doc): *"dbgeng.dll holds one
+debuggee session per process … which is why `.opendump` **replaces** the target rather than opening
+a second one"*.
+
+- **Why deferred:** one command, one target kind, one engine build, and a rewrite of that sentence
+  would trade a claim that is wrong on one kind for one that is unmeasured on three. What it wants
+  first is the matrix: `.opendump` on a **dump** session (measured: adds a system), on a **live
+  user-mode** target, on a **live kernel** one, and `.opendump` of the *same* file; and then which
+  command actually switches, which this server has never observed at all — `||1s` through
+  `ExecuteWide` failed here with `0x80040205`, so "the switch is what replaces a target" is
+  currently an inference rather than a reading.
+- **What does not change whatever the matrix says, and is worth writing down before anyone starts.**
+  `server::changes_debug_target` keeps `.opendump` on its list and `batch::retires_handle` keeps
+  pre-retiring for it: over-matching there costs a caller one re-open, the scan cannot see a
+  wrapper anyway, and since item 81 the *actual* retirement is decided by comparing what the engine
+  holds rather than by the command's name. The batch's own reading is likewise unaffected — it
+  compares holdings, so a `.opendump` that adds a system and leaves the current one alone correctly
+  reads as **nothing changed**, which is what the live run showed. So this is a documentation
+  defect with a measurement behind it, not a behaviour one.
+- **Where it picks up:** `docs/architecture.md`'s opening paragraph and `src/engine.rs`'s module
+  doc, which state it as the reason for one worker per session; `docs/sessions.md` (three places),
+  `docs/tool-surface.md`, `src/server.rs`'s `changes_debug_target` and `src/proto.rs`'s op
+  commentary, which use it as the canonical example. The measurement needs the debugger tier plus a
+  live kernel target (`.claude/skills/live-kernel/SKILL.md`), and it should be taken on a build
+  named in the write-up, since this is a per-engine-version answer.
+
+### What closed it (2026-10-13)
+
+**The matrix, taken on two engine builds.** On the ARM64 bench, through the service's shipped tools
+at `0.22.0+gbfd1f388` on dbgeng 10.0.29617.1000, and again through `cdb` and `kd` on the SDK's
+10.0.26100.1742 — the build item 102 measured on. Every cell asked on both agrees. The table is in
+`docs/sessions.md`, under *What `.opendump` does to a session*; in short:
+
+- **In no case measured does `.opendump` replace anything on its own.** On a kernel dump, a user
+  dump, a launched process and a live kernel alike it adds a system, `||` lists both, and the original stays current.
+  Opening the *same* file again adds a second system on the same path.
+- **The `g` after it is the replacement**, the shape item 102 found for `.create`. On a dump or a
+  user-mode session the `g` loads the added dump and makes it current, and on a launched process it
+  runs the process as well — from its initial breakpoint to `NtMapViewOfSection+0x4`, with a second
+  thread — until the dump's load event stops it. `||Ns` then switches either way.
+- **On a live kernel nothing replaces it.** The `g` runs the kernel and the dump never loads: not
+  across a 60 s run broken in at this server's bound, nor at a breakpoint hit under `kd`, and `||1s`
+  is still refused afterwards. The handle stays open, correctly.
+- **`||1s` before the `g` is refused**, which is what item 102 saw as `0x80040205`. `cdb` prints
+  the engine's reason, `Illegal debuggee error in '||1s'`; this server answers `0x80040205` alone,
+  and a mistyped command gets the same code. That is item 126.
+- **The reading item 81 built catches the replacement at the `g`.** Through `execute` the handle is
+  retired at the `g`, as *a different dump or trace file* or *a target of a different kind*. A
+  `debug_batch` of a wrapped `.opendump`, a `||` and a `g` stops `TARGET REPLACED at step 3` with
+  its cleanup `NOT ATTEMPTED`. And one command list of the two plus a mistyped command,
+  `.if (1) { .opendump … }; g; zzzz`, answers an error while leaving the new dump current and the
+  handle retired.
+- **A switch the reading cannot see**: the same file reopened and `g`'d leaves a second system
+  with the same kind, the same path and no processes, so the handle stays open. It reads the same
+  file; whether debugger-side state such as a `.cxr` follows it is not measured.
+- **`end_session` was unaffected.** A launched process was terminated with the dump current and
+  again with the process made current first; the live kernel was resumed and detached, and the
+  guest answered afterwards.
+
+**What was rewritten.** The claim, in the places this entry named and in those a sweep for other
+wordings of it found. `docs/architecture.md`'s opening and `src/engine.rs`'s module doc now give the
+reason one session per process forces a worker per target — a session's targets share one current
+target and one event wait, and the `g` that loads an added dump runs the live process beside it —
+rather than a replacement that does not happen. `docs/sessions.md` changes in three places and gains
+the section with the table. `docs/tool-surface.md` and `src/proto.rs` change one sentence each.
+`src/server.rs` changes the operand guard, `set_breakpoint`'s refusal and `changes_debug_target` —
+whose doc comment had come detached from it: `outside_quotes` had been inserted between the two, so
+rustdoc gave that function both paragraphs and this one none. `src/batch.rs` rewrites the paragraph
+item 102 left, which now says the `.opendump` is caught at the `g`. `src/worker.rs`'s fingerprint
+doc gains the same-file case, and the sentence a caller reads when a handle is retired now names a
+`g` that completes a command an earlier one armed. One doc comment in `tests/mcp_smoke.rs` changes
+too.
+
+**What was not rewritten, deliberately.** `changes_debug_target` keeps `.opendump` and
+`batch::retires_handle` keeps pre-retiring for it, as this entry said they should: on every row the
+retirement is early, and on the live-kernel row it is for a replacement that never comes, which
+costs a caller one re-open. `execute`'s own description still says a command that "replaces or
+releases the target (`.opendump`, …) retires the current `session_id`". It is model-visible, the
+retirement it describes is accurate, and rewording it moves the surface figures
+`every_documented_surface_figure_matches_the_served_surface` checks, for a distinction the sessions
+doc now carries. Item 10 above and `CHANGELOG.md` still say `.opendump` replaces the target: they
+record what was believed when they were written.
+
+**What this did not establish.** Two engine builds on one ARM64 host, serial KD rather than KDNET,
+and one target of each kind. An attached process and a TTD trace were not asked.

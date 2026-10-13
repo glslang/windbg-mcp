@@ -51,8 +51,8 @@ still accept work. That is the pre-handle behaviour and it still holds. What sup
 is that the call can never land on a target you did not open — it fails loudly instead.
 
 The asymmetry is worth knowing, because it is where the guarantee earns its keep. A raw `execute`
-that replaces or releases the target (`.opendump`, `.attach`, `.detach`) leaves the session
-**retired**: a call naming its handle is refused, while a call naming nothing is still routed there,
+that releases the target or starts replacing it (`.opendump`, `.attach`, `.detach`) leaves the
+session **retired**: a call naming its handle is refused, while a call naming nothing is still routed there,
 because the worker is genuinely the server's current target and a caller who asked for no guarantee
 gets what is in front of them. So omitting the id is not merely "whatever is current" — it is also
 "whatever that target has since become".
@@ -285,7 +285,7 @@ These safeguards do not resolve the underlying DbgEng wait behavior; see the
 [Microsoft report draft](dbgeng-exit-report.md) for evidence and limitations.
 
 Two caveats, both in the command hatches, and both now confined to a single session. The typed tools
-announce their own transitions, but `execute` can replace its session's target directly
+announce their own transitions, but `execute` can release its session's target or start replacing it
 (`.opendump`, `.attach`, `.detach`, `.kill`, `.restart`, `.abandon`, `.remote`, `q`/`qd`/`qq`), and
 those commands **retire** that session's handle: calls passing it are refused, while calls that pass
 no id still reach the worker. `dx` is the second hatch — the data model reaches
@@ -303,7 +303,9 @@ handle between a caller's check and its call.
 **What makes a handle mean something even where those matches miss is that the engine is asked
 afterwards.** A command can reach `.opendump` without naming it — inside `.if`, `.foreach`,
 `.block`, `j` or `z`, or through an alias, which resolves only when it runs — and a breakpoint's
-command runs at a **hit**, which is not a moment this server can retire a handle at in advance. So
+command runs at a **hit**, which is not a moment this server can retire a handle at in advance.
+(A `.opendump` that runs unseen does not replace anything by itself, either: it *adds* a target, and
+the `g` after it is what makes that one current — [below](#what-opendump-does-to-a-session).) So
 the engine process takes a reading of what it is holding when the target is opened — what kind of
 target DbgEng says it is, which dump or trace files the session is open on, which processes it
 holds (user-mode only), and, for a live kernel, the connection it is dialled on — and compares it
@@ -344,3 +346,50 @@ on the list above, so it **retires the handle before it runs** — that is the o
 ends in a retired handle, not a stale-session error. What ends in a stale-session error is a target
 that went without this server being able to see it coming: a launched program running to
 completion, or a `.detach` hidden inside a wrapper where the scan cannot read it.
+
+## What `.opendump` does to a session
+
+Not what this page, and the code's own comments, said for months. `.opendump` was written up as the
+command that *replaces* a session's target, and in none of the cases measured below does it do that
+on its own: it **adds** a second target — a *system*, in DbgEng's word, which `||` lists — and leaves the first one current. The
+first `g` afterwards is what loads the new one and makes it current; on a live kernel it does not
+become current at all. Measured 2026-10-13 on the ARM64 bench, through the service build
+`0.22.0+gbfd1f388` on dbgeng 10.0.29617.1000, and again through `cdb` and `kd` on the SDK's
+10.0.26100.1742:
+
+| The session holds | After `.opendump <file>` | `\|\|1s` before a `g` | The next `g` | The handle |
+|---|---|---|---|---|
+| a kernel dump, adding another | two systems in `\|\|`; the original still current and `? @$ip` still answering from it | refused | loads the new dump and makes it current; `\|\|0s` and `\|\|1s` then switch either way | retired at the `g`: *a different dump or trace file* |
+| a user dump, adding a kernel dump | two systems, the original current | not tried | the same | retired at the `g`: *a target of a different kind* |
+| a kernel dump, adding **the same file** | a second system on the same path | not tried | makes the second one current | **not** retired (below) |
+| a launched process, adding a user dump | two systems, the process current | refused | runs the process until the dump's load event stops it — from its initial breakpoint to `NtMapViewOfSection+0x4`, with a second thread — and the dump is current | retired at the `g`: *a target of a different kind* |
+| a live kernel over serial, adding a kernel dump | two systems, the kernel current | refused | runs the kernel, and the dump **never loads** — not across a 60 s run broken in at this server's bound, nor at a breakpoint hit under `kd` — so `\|\|1s` is still refused after it | not retired: nothing changed |
+
+Where both builds were asked they agree. The handle column is this server's and so was read on
+29617 only, as was the user-dump row; a `||1s` before the `g` was tried through the service on the
+first row only, and the other refusals in that column are `cdb`'s and `kd`'s. *Refused* is DbgEng's
+`Illegal debuggee error in '||1s'`, which reaches a caller of this server as `0x80040205` alone —
+the code a mistyped command gets too, so on its own it says nothing about why (`FOLLOWUPS.md` item
+126).
+
+**So the replacement is the `g`, which is the shape `.create` has** (`DONE.md` item 102: *"Create
+will proceed with next execution"*). The reading of what the engine holds catches it there, through
+`execute` and inside a `debug_batch` alike: a batch of a wrapped `.opendump`, a `||` and a `g` stops
+with `TARGET REPLACED at step 3`, its cleanup `NOT ATTEMPTED` and the session `DETACHED/REPLACED by
+g`. A raw `execute` naming `.opendump` still retires the handle before it runs. On every row above
+that retirement is early, and on the live-kernel row it is for a replacement that never comes — a
+caller re-opens once for nothing, which is the direction the name list is biased in on purpose.
+
+**A switch the reading cannot see.** `.opendump` of the file the session already holds, then a
+`g`, leaves the engine current on a second system with the same kind, the same path and no
+processes — and those are what the reading compares, so it reads as the same target. It is the same
+file read twice, so a read answers as it did. Not measured: whether debugger-side state set on the
+first system, a `.cxr` or `.thread` context, follows it; a handle never certified that state.
+
+**And `end_session` releases what the session holds whichever target is current.** A launched
+process was terminated with the dump current, and again with the process made current first
+(`target_left_running: false`, the process gone both times); the live kernel was resumed and
+detached with the dump added (`target_left_running: true`, and the guest answered afterwards).
+
+**What this is not evidence for:** two engine builds on one ARM64 host, serial KD rather than KDNET,
+and one target of each kind. An *attached* process and a TTD trace were not asked.
