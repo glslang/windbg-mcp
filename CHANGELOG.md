@@ -31,8 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The arguments are read where the target's convention puts them: x64's and ARM64's registers,
   or on x86 the stack at the call, each argument its own width — `ExAllocatePool2`'s 64-bit
   `POOL_FLAGS` takes two slots, so its size and tag sit at `+8` and `+12` where
-  `ExAllocatePoolWithTag`'s are at `+4` and `+8` — with a tail jump's arguments one slot up, past
-  the return address already there. An address read from x86's registers — `esp` before the read,
+  `ExAllocatePoolWithTag`'s are at `+4` and `+8` — with a jump's arguments one slot up, past the
+  return address already there, wherever the jump sits: a tail call's, or the linker's import
+  thunk entered by a `call`, which is where the slot was measured. An address read from x86's
+  registers — `esp` before the read,
   `eax` after the call — is sign-extended from its 32 bits, which is the form the engine keeps a
   32-bit target's addresses in and says a recovered one must take; measured 2026-10-13 on a 32-bit
   process with its stack above 2 GB, the engine read a zero-extended address as readily, so this is
