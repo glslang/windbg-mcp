@@ -20249,6 +20249,408 @@ fn a_32_bit_managed_process_is_attached_by_an_engine_that_can_load_its_sos() {
     ran("the 32-bit managed attach tier");
 }
 
+/// A 32-bit C program whose two calls are the shapes a pool trace reads on x86.
+///
+/// `RtlMoveMemory` is a **kernel32 import called through the import address table** — the
+/// `call dword ptr [__imp_…]` the hazard scan names by its slot — with three four-byte arguments,
+/// which is `ExAllocatePoolWithTag`'s stack shape. The header's `RtlMoveMemory` is a macro over
+/// `memmove`, a CRT call and not an import, so it is undefined and the import declared by hand.
+/// `take3` takes a **64-bit first argument** and two 32-bit ones, which is `ExAllocatePool2`'s,
+/// and is called with values whose every byte is distinct from its neighbours' so a slot read at
+/// the wrong offset cannot pass. The buffer holds fifteen known bytes and a NUL so a pointer
+/// argument can be checked by reading what it points at.
+///
+/// Eight iterations, because the test stops in the first one to learn an address and in the
+/// second to read at it; the `Sleep` keeps the process for `end_session` to terminate.
+const X86_STDCALL_FIXTURE: &str = r#"
+#include <windows.h>
+
+#undef RtlMoveMemory
+__declspec(dllimport) void __stdcall RtlMoveMemory(void *destination, const void *source, size_t length);
+
+__declspec(noinline) unsigned long __stdcall take3(unsigned __int64 flags, size_t size, unsigned long tag)
+{
+    return (unsigned long)(flags >> 32) + (unsigned long)size + tag;
+}
+
+static volatile unsigned long sink;
+
+int main(void)
+{
+    char source[16] = "0123456789abcde";
+    char destination[16];
+    int i;
+    for (i = 0; i < 8; i++) {
+        RtlMoveMemory(destination, source, 0x10);
+        sink += take3(0x1122334455667788ui64, 0x40, 0x6b636148);
+        sink += destination[i];
+    }
+    Sleep(60000);
+    return 0;
+}
+"#;
+
+/// The x86 C toolchain's environment script, from the Visual Studio installation `vswhere`
+/// names, or `None` on a host with no VC tools — which stands the test down rather than failing
+/// it, the way a missing `csc.exe` does for the tier beside it.
+///
+/// `vswhere` rather than a pinned installation path: this bench has Build Tools 18 under
+/// `Program Files (x86)`, CI's runner has an Enterprise 2022 under `Program Files`, and a path
+/// written from either is a silent skip on the other.
+fn vcvars32() -> Option<std::path::PathBuf> {
+    let vswhere = std::path::PathBuf::from(std::env::var_os("ProgramFiles(x86)")?)
+        .join("Microsoft Visual Studio")
+        .join("Installer")
+        .join("vswhere.exe");
+    let found = Command::new(vswhere)
+        .args([
+            "-latest",
+            "-products",
+            "*",
+            "-requires",
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-property",
+            "installationPath",
+        ])
+        .output()
+        .ok()?;
+    let installation = String::from_utf8_lossy(&found.stdout).trim().to_string();
+    if installation.is_empty() {
+        return None;
+    }
+    let script = std::path::PathBuf::from(installation)
+        .join("VC")
+        .join("Auxiliary")
+        .join("Build")
+        .join("vcvars32.bat");
+    script.is_file().then_some(script)
+}
+
+/// The compiled 32-bit C fixture, built once; `None` where there is no x86 C compiler.
+///
+/// Through a batch file rather than a `cmd /c "… && …"` line, because the environment script's
+/// path has spaces and `cmd`'s rule for a quoted command line that itself holds quotes is the
+/// kind of thing that works on one host. `/MT` so the program depends on no runtime DLL, `/Od` so
+/// the calls are the calls written, `/Zi` for the PDB that names `take3`.
+fn x86_stdcall_fixture() -> Option<&'static std::path::Path> {
+    static FIXTURE: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    FIXTURE
+        .get_or_init(|| {
+            let vcvars = vcvars32()?;
+            let dir = x86_fixture_dir();
+            std::fs::write(dir.join("x86stdcall.c"), X86_STDCALL_FIXTURE)
+                .expect("write the fixture source");
+            let script = dir.join("build-x86stdcall.cmd");
+            std::fs::write(
+                &script,
+                format!(
+                    "@echo off\r\ncall \"{}\" >nul\r\ncd /d \"{}\"\r\n\
+                     cl /nologo /Zi /Od /MT /W3 /Fe:x86stdcall.exe x86stdcall.c\r\n",
+                    vcvars.display(),
+                    dir.display()
+                ),
+            )
+            .expect("write the build script");
+            let built = Command::new("cmd")
+                .arg("/c")
+                .arg(&script)
+                .output()
+                .expect("run the C compiler");
+            let exe = dir.join("x86stdcall.exe");
+            assert!(
+                built.status.success() && exe.is_file(),
+                "the 32-bit C fixture did not compile:\n{}\n{}",
+                String::from_utf8_lossy(&built.stdout),
+                String::from_utf8_lossy(&built.stderr)
+            );
+            Some(exe)
+        })
+        .as_deref()
+}
+
+/// The bytes `read_memory` answered, from its hex string.
+fn bytes_read(data: &Value) -> Vec<u8> {
+    let hex = data["data"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a memory read carries its bytes as hex: {data}"));
+    (0..hex.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).expect("hex bytes"))
+        .collect()
+}
+
+/// **At an x86 `__stdcall` call, `esp` names the first argument and the arguments follow it each
+/// its own width; after the call, the result is in `eax`.** This is what the pool trace reads on
+/// an x86 kernel (`FOLLOWUPS.md` item 121), measured here on a 32-bit *user-mode* process because
+/// no x86 kernel target exists on this project's bench — the convention is the compiler's and
+/// is the same in both modes, which is the whole of what this test can say and the reason item
+/// 121 is still open for the live trace itself.
+///
+/// Three things it pins, each one the trace relies on without being able to check:
+///
+/// - **The hazard scan finds an x86 import call and names its slot.** `driver_hazards` on the
+///   fixture lists `RtlMoveMemory` with a call site, and the six bytes at that site are
+///   `ff 15` followed by the very slot the scan listed — so `called_slot` read the absolute
+///   displacement x86 encodes, where x64 encodes a RIP-relative one, and the PE32 import walk
+///   named the slot. Unmeasured until now: item 121 said so.
+/// - **Three four-byte arguments at `[esp]`, `[esp+4]`, `[esp+8]`** — the pointer arguments are
+///   checked by what they point at, the length by its value — and the return breakpoint's
+///   address, the call's length past it, is where a `step_over` lands.
+/// - **A 64-bit first argument takes two slots, low first**, so the two after it are at `+8`
+///   and `+12`: `ExAllocatePool2`'s `POOL_FLAGS`. The same sixteen bytes read at `[esp+4]` on
+///   entry to the callee — the call having pushed its return address — and at `[esp]` at the
+///   call, which is where the trace reads. And `eax` holds the result at the instruction after
+///   the call, which is what the trace's return breakpoint reads.
+///
+/// The sixteen bytes read at the call are the fixture bytes
+/// `pooltrace::tests::x86_stack_bytes_parse_to_the_arguments_an_allocation_is_read_by` parses,
+/// so the parser is tested against what the stack held rather than what a header says it holds.
+///
+/// **Through the x64 engine with its effective machine switched to x86**, which is the engine an
+/// x86 *kernel* is debugged by too, and not through the 32-bit worker: a `launch` has no process
+/// to ask the architecture of before it spawns, so it always takes this build's own image
+/// (`EngineOp::opening`), and the target is a WoW64 process to it. That costs one ordering, which
+/// the first draft of this test got wrong: the initial break is in the **64-bit** loader, where
+/// the effective machine is x64 and the scan decoded the 32-bit image as x64 code — `ff 15` is
+/// RIP-relative there — and listed the import with no call site at all (measured, 2026-10-13).
+/// The engine switches to x86 once the target stops in 32-bit code, which is why everything here
+/// is read after the breakpoint on `main`, and the switch is asserted rather than assumed.
+#[test]
+fn an_x86_stdcall_call_holds_its_arguments_at_esp_and_its_result_in_eax() {
+    if !launch_tier() {
+        return;
+    }
+    let Some(fixture) = x86_stdcall_fixture() else {
+        skip("this host has no 32-bit C compiler, so this tier cannot make itself a target");
+        return;
+    };
+    let mut server = Server::started();
+    let opened = server.tool_data(
+        "launch",
+        json!({ "command_line": fixture.to_string_lossy() }),
+        TARGET_STEP,
+    );
+    let session = opened["session_id"]
+        .as_str()
+        .expect("an opener mints a handle")
+        .to_string();
+    let image = address_of(&opened["summary"]["primary_module"]["start"])
+        ..address_of(&opened["summary"]["primary_module"]["end"]);
+
+    let register = |server: &mut Server, name: &str| -> u64 {
+        let registers =
+            server.tool_data("registers", json!({ "session_id": &session }), TARGET_STEP);
+        let found = registers["registers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|r| r["name"] == name)
+            .cloned()
+            .unwrap_or_else(|| panic!("`{name}` is an x86 integer register: {registers}"));
+        address_of(&found["value"])
+    };
+    let read = |server: &mut Server, address: u64, size: u32| -> Vec<u8> {
+        let data = server.tool_data(
+            "read_memory",
+            json!({ "session_id": &session, "address": format!("{address:#x}"), "size": size }),
+            TARGET_STEP,
+        );
+        let bytes = bytes_read(&data);
+        assert_eq!(bytes.len(), size as usize, "a short read: {data}");
+        bytes
+    };
+    let stop_at = |server: &mut Server, tool: &str| -> u64 {
+        let stop = server.tool_data(tool, json!({ "session_id": &session }), TARGET_STEP);
+        assert_ne!(
+            stop["target_gone"], true,
+            "the fixture ended under `{tool}`: {stop}"
+        );
+        address_of(&stop["stopped_at"])
+    };
+    let dword = |bytes: &[u8], at: usize| -> u64 {
+        u64::from(u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()))
+    };
+
+    // Past the CRT's start-up to `main`, on the only breakpoint armed: the static CRT has a copy
+    // site of its own, which the scan below lists beside `main`'s, and nothing stops there.
+    //
+    // **A WoW64 process has two initial breaks under the x64 engine** -- the 64-bit loader's,
+    // which the launch stopped at, and then the 32-bit loader's, in `ntdll` and not in the
+    // fixture -- so the first `go` lands there (measured: `0x775b8b88`), and `main` is the first
+    // stop inside the image.
+    server.tool_data(
+        "set_breakpoint",
+        json!({ "session_id": &session, "expression": "x86stdcall!main" }),
+        TARGET_STEP,
+    );
+    let mut main = stop_at(&mut server, "go");
+    for _ in 0..2 {
+        if image.contains(&main) {
+            break;
+        }
+        main = stop_at(&mut server, "go");
+    }
+    assert!(
+        image.contains(&main),
+        "`go` never reached `main` in {image:x?}: stopped at {main:#x}"
+    );
+    // Stopped in 32-bit code, the engine's effective machine is x86: its integer set is `eip`
+    // and `esp`, not `rip` and `rsp`. Everything below reads by those names.
+    let registers = server.tool_data("registers", json!({ "session_id": &session }), TARGET_STEP);
+    let names: Vec<&str> = registers["registers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| r["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"eip") && names.contains(&"esp") && !names.contains(&"rip"),
+        "the engine should be reading the target as x86 at `main`: {names:?}"
+    );
+    assert_eq!(address_of(&registers["instruction_pointer"]), main);
+
+    // The scan on a PE32 image with x86 code: the import call site, and the slot it goes through.
+    let hazards = server.tool_data(
+        "driver_hazards",
+        json!({ "session_id": &session, "module": "x86stdcall" }),
+        TARGET_STEP,
+    );
+    let copy = hazards["sinks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|sink| sink["name"] == "RtlMoveMemory")
+        .unwrap_or_else(|| panic!("the fixture imports RtlMoveMemory from kernel32: {hazards}"));
+    assert_eq!(copy["kind"], "buffer_copy", "{copy}");
+    // `main`'s own call: the one nearest above its entry. At `/Od` the function is under 0x100
+    // bytes, and the CRT's site is tens of kilobytes away.
+    let site = copy["call_sites"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|site| address_of(&site["address"]))
+        .filter(|&site| site > main && site - main < 0x100)
+        .min()
+        .unwrap_or_else(|| {
+            panic!("no call to RtlMoveMemory was found in `main` at {main:#x}: {hazards}")
+        });
+    let slot = address_of(&copy["slots"][0]);
+    let encoding = read(&mut server, site, 6);
+    assert_eq!(
+        &encoding[..2],
+        [0xff, 0x15],
+        "an x86 import call is `call dword ptr [abs32]`, opcode ff /2: {encoding:02x?}"
+    );
+    assert_eq!(
+        dword(&encoding, 2),
+        slot,
+        "the absolute displacement the scan read as the slot is the one the instruction encodes"
+    );
+
+    // Three four-byte arguments at `[esp]` up, at the call.
+    server.tool_data(
+        "set_breakpoint",
+        json!({ "session_id": &session, "expression": format!("{site:#x}") }),
+        TARGET_STEP,
+    );
+    assert_eq!(
+        stop_at(&mut server, "go"),
+        site,
+        "stopped on the call instruction"
+    );
+    let esp = register(&mut server, "esp");
+    let arguments = read(&mut server, esp, 12);
+    let (destination, source, length) = (
+        dword(&arguments, 0),
+        dword(&arguments, 4),
+        dword(&arguments, 8),
+    );
+    assert_eq!(
+        length, 0x10,
+        "the third argument at [esp+8]: {arguments:02x?}"
+    );
+    assert_eq!(
+        read(&mut server, source, 15),
+        b"0123456789abcde",
+        "the second argument at [esp+4] points at the source buffer"
+    );
+    assert!(
+        destination != source && destination.abs_diff(esp) < 0x1000,
+        "the first argument at [esp] is the destination buffer on this frame: {destination:#x} \
+         against esp {esp:#x}"
+    );
+    assert_eq!(
+        stop_at(&mut server, "step_over"),
+        site + 6,
+        "the call returns to the instruction after it, which is its own length past it"
+    );
+
+    // A 64-bit first argument, seen on entry to the callee and then at the call itself.
+    server.tool_data(
+        "set_breakpoint",
+        json!({ "session_id": &session, "expression": "x86stdcall!take3" }),
+        TARGET_STEP,
+    );
+    let entry = stop_at(&mut server, "go");
+    let esp = register(&mut server, "esp");
+    let frame = read(&mut server, esp, 20);
+    let returns_to = dword(&frame, 0);
+    let expected: [u8; 16] = [
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // 0x1122334455667788, low slot first
+        0x40, 0x00, 0x00, 0x00, // 0x40
+        0x48, 0x61, 0x63, 0x6b, // 0x6b636148, `Hack`
+    ];
+    assert_eq!(
+        &frame[4..],
+        expected,
+        "on entry the arguments are above the return address: {frame:02x?}"
+    );
+    let call = returns_to - 5;
+    assert_eq!(
+        read(&mut server, call, 1),
+        [0xe8],
+        "the return address is the instruction after a direct `call rel32`, opcode e8"
+    );
+    server.tool_data(
+        "clear_breakpoints",
+        json!({ "session_id": &session, "all": true }),
+        TARGET_STEP,
+    );
+    server.tool_data(
+        "set_breakpoint",
+        json!({ "session_id": &session, "expression": format!("{call:#x}") }),
+        TARGET_STEP,
+    );
+    assert_eq!(
+        stop_at(&mut server, "go"),
+        call,
+        "the next iteration's call, with the breakpoint inside the callee gone"
+    );
+    let esp = register(&mut server, "esp");
+    assert_eq!(
+        read(&mut server, esp, 16),
+        expected,
+        "at the call, before it pushes its return address, `esp` names the first argument"
+    );
+    assert_eq!(stop_at(&mut server, "step_over"), returns_to);
+    assert_eq!(
+        register(&mut server, "eax"),
+        (0x1122_3344u64 + 0x40 + 0x6b63_6148) & 0xffff_ffff,
+        "the result is in eax at the instruction after the call"
+    );
+    println!(
+        "x86 __stdcall measured through the x64 engine's x86 view: take3 at {entry:#x}, called \
+         from {call:#x}; RtlMoveMemory called at {site:#x} through slot {slot:#x}"
+    );
+
+    server.tool_data(
+        "end_session",
+        json!({ "session_id": &session }),
+        TARGET_STEP,
+    );
+    ran("the x86 __stdcall convention, measured at a call in a 32-bit process");
+}
+
 #[test]
 fn bridge_location_and_memory_share_the_module_coordinate() {
     let Some(dump) = target_tier() else {

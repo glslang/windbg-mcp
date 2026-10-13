@@ -21,9 +21,9 @@ adding the debugger tier takes it to ~60s, most of it two tests waiting out real
 grace, and a call staying silent long enough to have to report that it is still running.
 
 **The pass count is the same either way**, because each gate is inside its own test: `cargo test
---test mcp_smoke` reports the same number passed with the tier off as with it on — 114 on
-2026-09-17, against ~2s and ~66s respectively, but it moves whenever a test is added, so re-derive
-it rather than reading it here. (A plain `cargo test` runs the unit tests beside it and prints a
+--test mcp_smoke` reports the same number passed with the tier off as with it on — 150 on
+2026-10-13 (114 on 2026-09-17), against ~7s and ~66s respectively, but it moves whenever a test is
+added, so re-derive it rather than reading it here. (A plain `cargo test` runs the unit tests beside it and prints a
 result line per binary, so it is this harness's own line to read.) The runtime is what tells the two
 runs apart, and `--nocapture` is what prints the `SKIPPED` reason — a run that reports every test
 green having taken a second covered no debugger claim at all.
@@ -41,7 +41,7 @@ clock says *some* tier had work to do; which one is a `RAN:`/`SKIPPED` line, not
 | Tier | Gate | Needs | Catches |
 | --- | --- | --- | --- |
 | **Protocol** | always | no debugger, no target, and no network off this machine — it does bind a loopback port for the listener | transport, revision negotiation, tool-surface drift, and the listener's lease up to the point a session is opened |
-| **Debugger** | `WINDBG_MCP_SMOKE_DUMP=1` | `dbgeng.dll`, the checked-in sample dump, and a live user-mode target for the eleven that want one — `cmd.exe` for the ten that launch, `ping` for the one that attaches | `dbgscope` / DbgEng regressions, a lease expiry releasing a real engine worker, driving execution on a live user-mode target synchronously and asynchronously, what ending a session does to it, and — over a seeded randomised sequence — that a session is always in one of its three states and never half-answering |
+| **Debugger** | `WINDBG_MCP_SMOKE_DUMP=1` | `dbgeng.dll`, the checked-in sample dump, and a live user-mode target for the fifteen that want one (counted 2026-10-13) — `cmd.exe` for the thirteen that launch it, `ping` for the one that attaches, and a 32-bit C program the harness compiles with the host's x86 toolchain for the one that measures x86's calling convention, which stands down without one | `dbgscope` / DbgEng regressions, a lease expiry releasing a real engine worker, driving execution on a live user-mode target synchronously and asynchronously, what ending a session does to it, and — over a seeded randomised sequence — that a session is always in one of its three states and never half-answering |
 | **Bounded command** | `--ignored` | `dbgeng.dll`, the sample dump, ~1 minute | the watchdog wiring, which now spans two processes |
 | **Live kernel** | `--ignored` + `WINDBG_MCP_SMOKE_KERNEL` | a live kernel target you can freeze — KDNET, or serial | that a kernel attach *lands*, coexists, and is let go — by `end_session` and by a disconnect; and that a `debug_batch` which patches a byte of the running kernel puts it back |
 | **Live hypervisor** | `--ignored` + `WINDBG_MCP_SMOKE_HYPERVISOR_PROFILE`; two more variables below | a disposable Microsoft hypervisor target, reached by its own configured profile | separate detach-only tests for default and experimental announcement attach; broader identity, inspection, step, and breakpoint-management test; [runbook, independent health checks, and limits](hypervisor-debugging.md#validation) |
@@ -1444,6 +1444,41 @@ Either refusal passes, because which one arrives is the routing's business — a
 an x86 machine (`machine 0x14c`), a 64-bit one reads `_TEB.WowTebOffset` (`+0x2000` at the first
 break on ARM64 26100.1, where the effective machine still reads ARM64). It stands down on a host
 with no private `ntdll` PDB, like the test above, since the TEB field comes from that PDB.
+
+## The x86 calling convention, measured at a call
+
+**`an_x86_stdcall_call_holds_its_arguments_at_esp_and_its_result_in_eax`** rides the debugger tier
+on a 32-bit C program it compiles itself, and is what the pool trace's x86 reader rests on
+(`FOLLOWUPS.md` item 121): at a `__stdcall` call `esp` names the first argument and the arguments
+follow it each its own width, and the result is in `eax` at the instruction after the call. It is
+a measurement of the **convention** on a 32-bit *user-mode* process, because this project's bench
+has no x86 kernel — the convention is the compiler's and is the same in both modes, which is all
+the test can say, and why item 121 stays open for the live trace itself.
+
+It pins three things the trace relies on. The hazard scan on a PE32 image with x86 code lists
+`RtlMoveMemory` — a kernel32 import called through the import address table, declared by hand
+because the header's `RtlMoveMemory` is a macro over `memmove` — with a call site in `main`, and
+the six bytes there are `ff 15` followed by the very slot the scan listed, so `called_slot` read
+the absolute displacement x86 encodes where x64 encodes a RIP-relative one. Three four-byte
+arguments at `[esp]`, `[esp+4]` and `[esp+8]`, the pointers checked by what they point at, and a
+`step_over` landing six bytes past the call, which is where the trace's return breakpoint goes.
+And a 64-bit first argument taking two slots, low first, with the two after it at `+8` and `+12`
+— `ExAllocatePool2`'s `POOL_FLAGS` — read at `[esp+4]` on entry to the callee and at `[esp]` at
+the call, with `eax` holding the computed result after it. The sixteen bytes read at the call are
+the fixture `pooltrace::tests::x86_stack_bytes_parse_to_the_arguments_an_allocation_is_read_by`
+parses.
+
+**It runs through the x64 engine's WoW64 view with the effective machine switched to x86**, which
+is the engine an x86 kernel is debugged by too, and not through the 32-bit worker: a `launch` has no
+process to ask the architecture of before it spawns, so it takes this build's own image. Two
+orderings follow, both measured on 2026-10-13. A WoW64 process has **two** initial breaks under
+that engine — the 64-bit loader's, where the launch stops, then the 32-bit loader's in `ntdll` —
+so the first `go` lands in `ntdll` and `main` is the first stop inside the image. And at the
+64-bit break the effective machine is x64, so `driver_hazards` decoded the 32-bit image as x64
+code and listed the import with **no call site** (`ff 15` is RIP-relative there); the scan is
+taken after the stop in 32-bit code, and the register names assert the switch. The gate is the C
+toolchain: `vswhere` names the installation and `vcvars32.bat` sets it up, so a host with no VC
+tools stands down with a `SKIPPED` line rather than failing.
 
 ## The bounded-command tier
 

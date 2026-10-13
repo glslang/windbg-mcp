@@ -28,8 +28,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   what was not recorded; `stop: true` disarms it, removing only the breakpoints that carry its
   mark — a `$$ pool_trace <n>` comment as their command, which is how the trace tells its own from
   one the engine gave a reused id — and leaving it armed, saying what is left, if any will not go.
-  x64 and ARM64 only: an x86 kernel passes the arguments on the stack and is refused
-  (`FOLLOWUPS.md` item 121). It rests on dbgscope's breakpoint callback
+  The arguments are read where the target's convention puts them: x64's and ARM64's registers,
+  or on x86 the stack at the call, each argument its own width — `ExAllocatePool2`'s 64-bit
+  `POOL_FLAGS` takes two slots, so its size and tag sit at `+8` and `+12` where
+  `ExAllocatePoolWithTag`'s are at `+4` and `+8` — with a tail jump's arguments one slot up, past
+  the return address already there. The x86 reader is measured at a `__stdcall` call in a 32-bit
+  user-mode process (`mcp_smoke`'s
+  `an_x86_stdcall_call_holds_its_arguments_at_esp_and_its_result_in_eax`, 2026-10-13: the three
+  slots, the two-slot 64-bit argument, `eax` after the call, and the hazard scan naming the
+  `call dword ptr [abs32]` site by its slot) and not against an x86 kernel, of which this
+  project's bench has none; `FOLLOWUPS.md` item 121 holds that half. A machine this build does not
+  know is still refused. It rests on dbgscope's breakpoint callback
   ([dbgscope#195](https://github.com/glslang/dbgscope/pull/195)), which returns a `DEBUG_STATUS_*`
   through the error half of a windows-rs `Result<()>` because the generated trait gives an
   implementer no other way to. Measured on the ARM64 bench's live HEVD over serial KD, 2026-10-09:

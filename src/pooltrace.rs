@@ -1,16 +1,16 @@
 //! A live trace of the pool allocations one driver makes: the engine-free half.
 //!
 //! The worker arms two breakpoints per allocator call site in a driver -- one **on the call**, where
-//! the arguments are in their registers, and one **after it**, where the returned pointer is -- and
-//! registers a breakpoint callback that hands each hit here and answers the engine with what this
-//! decides: [`BreakpointAction::Go`] so the target runs on, or [`BreakpointAction::Break`] once the
-//! trace is full, so it stops rather than trapping on every allocation after the last one it can
-//! record.
+//! the arguments are readable (in registers on x64 and ARM64, on the stack on x86), and one **after
+//! it**, where the returned pointer is -- and registers a breakpoint callback that hands each hit
+//! here and answers the engine with what this decides: [`BreakpointAction::Go`] so the target runs
+//! on, or [`BreakpointAction::Break`] once the trace is full, so it stops rather than trapping on
+//! every allocation after the last one it can record.
 //!
 //! **Why this is a state machine of its own.** Everything that decides what a hit means -- which
-//! breakpoint is whose, which call a return belongs to, when the trace is full -- is here, behind
-//! plain values, so it is tested without an engine. The callback in the worker reads registers and
-//! calls in; it decides nothing.
+//! breakpoint is whose, which call a return belongs to, when the trace is full, where on an x86
+//! stack each argument is -- is here, behind plain values, so it is tested without an engine. The
+//! callback in the worker reads registers and memory and calls in; it decides nothing.
 //!
 //! **What a hit costs, which is why the trace is scoped to one driver's call sites.** Every hit is
 //! a trap: on a live kernel, a round trip over the KD link before the target runs on, measured at
@@ -38,10 +38,25 @@ pub enum KindArgument {
     Type,
 }
 
+impl KindArgument {
+    /// How many bytes the argument is **on an x86 stack**, which is the one place its width
+    /// decides where the arguments after it are. `POOL_FLAGS` is a `ULONG64` and takes two
+    /// four-byte slots; `POOL_TYPE` is an enumeration and takes one. In a register the width does
+    /// not arise: a 64-bit register holds either.
+    pub fn x86_width(self) -> u64 {
+        match self {
+            Self::Flags => 8,
+            Self::Type => 4,
+        }
+    }
+}
+
 /// Where a pool allocator's arguments are, by position in the calling convention.
 ///
-/// The first three integer arguments arrive in registers on both architectures this traces --
-/// `rcx`, `rdx`, `r8` on x64 and `x0`, `x1`, `x2` on ARM64 -- so a position is a register.
+/// The first three integer arguments arrive in registers on x64 and ARM64 -- `rcx`, `rdx`, `r8`
+/// and `x0`, `x1`, `x2` -- so there a position is a register. On x86 the kernel's exports are
+/// `__stdcall` and every argument is on the stack, where a position is a byte offset that depends
+/// on the widths of the arguments before it: [`Self::x86_stack`] is that arithmetic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Layout {
     /// The flags or pool type, always the first argument.
@@ -50,6 +65,91 @@ pub struct Layout {
     pub size: usize,
     /// The tag, where the allocator takes one: always the third.
     pub tag: Option<usize>,
+}
+
+/// One argument's place on an x86 stack at the call: its offset from the first argument, and its
+/// width in bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StackSlot {
+    pub offset: u64,
+    pub width: u64,
+}
+
+/// A pool allocator's first three arguments as a `__stdcall` call lays them out on an x86 stack.
+///
+/// **Measured from the first argument**, which is where `esp` points at a `call` instruction --
+/// the return address is pushed by the call itself, so it is not there yet. A site that **jumps**
+/// to the allocator is the other way round: its own return address is already at `[esp]`, and
+/// the arguments start four bytes up. The worker adds that four; this does not know which kind of
+/// site it is describing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StackArguments {
+    /// The flags or pool type, at offset zero: eight bytes for `POOL_FLAGS`, four for `POOL_TYPE`.
+    pub kind: StackSlot,
+    /// The byte count, a four-byte `SIZE_T`, immediately after it.
+    pub size: StackSlot,
+    /// The four-byte tag after that, where the allocator takes one.
+    pub tag: Option<StackSlot>,
+    /// How many bytes from the first argument hold all of them: one read covers every argument.
+    pub bytes: usize,
+}
+
+impl Layout {
+    /// Where this allocator's arguments are on an x86 stack at the call.
+    ///
+    /// The offsets follow from the widths and nothing else, which is the whole reason the layout
+    /// carries widths: `ExAllocatePool2`'s size is at `+8` and its tag at `+12`, because its
+    /// `POOL_FLAGS` takes two slots, where `ExAllocatePoolWithTag`'s are at `+4` and `+8`.
+    pub fn x86_stack(&self) -> StackArguments {
+        let kind = StackSlot {
+            offset: 0,
+            width: self.kind.x86_width(),
+        };
+        let size = StackSlot {
+            offset: kind.width,
+            width: 4,
+        };
+        let tag = self.tag.map(|_| StackSlot {
+            offset: size.offset + size.width,
+            width: 4,
+        });
+        let end = tag.unwrap_or(size);
+        StackArguments {
+            kind,
+            size,
+            tag,
+            bytes: (end.offset + end.width) as usize,
+        }
+    }
+}
+
+/// The first three arguments as an x86 call made them, from `bytes` read at the first argument.
+///
+/// Each is widened to the `u64` the register-passing architectures record, so the read side
+/// treats a traced allocation the same whichever way it was read: an eight-byte `POOL_FLAGS` is
+/// its two slots little-endian, low slot first, and a four-byte argument is zero-extended. A tag
+/// the allocator does not take is zero, as it is where a register would be read for nothing.
+///
+/// `None` for a read shorter than the layout needs, which is a hit the worker counts as
+/// unreadable rather than records with an argument invented from short bytes.
+pub fn arguments_from_stack(layout: Layout, bytes: &[u8]) -> Option<[u64; 3]> {
+    let slots = layout.x86_stack();
+    let read = |slot: StackSlot| -> Option<u64> {
+        let start = usize::try_from(slot.offset).ok()?;
+        let width = usize::try_from(slot.width).ok()?;
+        let field = bytes.get(start..start.checked_add(width)?)?;
+        let mut value = [0u8; 8];
+        value.get_mut(..field.len())?.copy_from_slice(field);
+        Some(u64::from_le_bytes(value))
+    };
+    Some([
+        read(slots.kind)?,
+        read(slots.size)?,
+        match slots.tag {
+            Some(tag) => read(tag)?,
+            None => 0,
+        },
+    ])
 }
 
 /// The layout of a pool allocator's arguments, or `None` for a name that is not one.
@@ -120,8 +220,9 @@ pub struct Allocation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Pending {
     sequence: u64,
-    /// `None` for a call whose argument registers would not read. It holds its place all the
-    /// same, so the return that belongs to it pairs with it rather than with the call beneath.
+    /// `None` for a call whose arguments would not read -- registers, or the stack on x86. It
+    /// holds its place all the same, so the return that belongs to it pairs with it rather than
+    /// with the call beneath.
     arguments: Option<[u64; 3]>,
 }
 
@@ -155,7 +256,8 @@ pub struct Recorder {
     next_sequence: u64,
     /// Allocations seen after the trace filled, counted rather than recorded.
     dropped: u64,
-    /// Hits whose registers could not be read, counted rather than recorded.
+    /// Hits whose arguments or result could not be read -- registers, or the stack on x86 --
+    /// counted rather than recorded.
     unreadable: u64,
     /// Calls given up on while waiting for their return -- past [`MAX_PENDING`], or abandoned when
     /// a hit at their site could not say which thread it was on.
@@ -706,5 +808,82 @@ mod tests {
         );
         assert_eq!(layout_of("MmAllocateContiguousMemory"), None);
         assert_eq!(layout_of("MmAllocateNonCachedMemory"), None);
+    }
+
+    /// **On an x86 stack the offsets follow from the widths**, and the width that matters is the
+    /// first argument's: `POOL_FLAGS` is a `ULONG64` and takes two slots, so `ExAllocatePool2`'s
+    /// size and tag sit four bytes further up than `ExAllocatePoolWithTag`'s. A layout that named
+    /// positions alone -- which this one did, when every position was a register -- would read
+    /// `ExAllocatePool2`'s flags' high half as its size.
+    #[test]
+    fn x86_stack_offsets_follow_the_widths_of_the_arguments_before_them() {
+        let flags = layout_of("ExAllocatePool2").unwrap().x86_stack();
+        assert_eq!((flags.kind.offset, flags.kind.width), (0, 8));
+        assert_eq!((flags.size.offset, flags.size.width), (8, 4));
+        assert_eq!(flags.tag.map(|tag| (tag.offset, tag.width)), Some((12, 4)));
+        assert_eq!(flags.bytes, 16);
+        assert_eq!(
+            layout_of("ExAllocatePool3").unwrap().x86_stack(),
+            flags,
+            "ExAllocatePool3's first three arguments are ExAllocatePool2's"
+        );
+
+        let tagged = layout_of("ExAllocatePoolWithTag").unwrap().x86_stack();
+        assert_eq!((tagged.kind.offset, tagged.kind.width), (0, 4));
+        assert_eq!((tagged.size.offset, tagged.size.width), (4, 4));
+        assert_eq!(tagged.tag.map(|tag| (tag.offset, tag.width)), Some((8, 4)));
+        assert_eq!(tagged.bytes, 12);
+        assert_eq!(
+            layout_of("ExAllocatePoolWithQuotaTag").unwrap().x86_stack(),
+            tagged
+        );
+
+        let untagged = layout_of("ExAllocatePool").unwrap().x86_stack();
+        assert_eq!((untagged.size.offset, untagged.size.width), (4, 4));
+        assert_eq!(untagged.tag, None);
+        assert_eq!(untagged.bytes, 8, "two arguments, nothing read past them");
+    }
+
+    /// **The bytes at `esp` at an x86 `__stdcall` call are the arguments in order, each its own
+    /// width**, and this is what they parse to. The sixteen bytes are the ones read from `esp`
+    /// at a `call` in a 32-bit process on this project's bench, where the callee takes a
+    /// `(ULONG64, SIZE_T, ULONG)` -- `ExAllocatePool2`'s shape -- and was called with
+    /// `0x1122334455667788`, `0x40` and the tag `Hack` (`mcp_smoke`'s
+    /// `an_x86_stdcall_call_holds_its_arguments_at_esp_and_its_result_in_eax`, which takes the
+    /// reading). The 64-bit argument is its low slot first, so the two slots assemble to the
+    /// value little-endian as one; the four-byte ones are zero-extended.
+    #[test]
+    fn x86_stack_bytes_parse_to_the_arguments_an_allocation_is_read_by() {
+        let at_esp: [u8; 16] = [
+            0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // POOL_FLAGS, two slots
+            0x40, 0x00, 0x00, 0x00, // SIZE_T
+            0x48, 0x61, 0x63, 0x6b, // the tag, 'Hack' in memory order
+        ];
+        assert_eq!(
+            arguments_from_stack(layout_of("ExAllocatePool2").unwrap(), &at_esp),
+            Some([0x1122_3344_5566_7788, 0x40, 0x6b63_6148])
+        );
+        // The same bytes read by a one-slot layout are a different call: a `POOL_TYPE` of
+        // `0x55667788`, a size of `0x11223344` and a tag of `0x40` -- which is exactly the misread
+        // the widths exist to prevent, and shows the layout rather than the bytes decides.
+        assert_eq!(
+            arguments_from_stack(layout_of("ExAllocatePoolWithTag").unwrap(), &at_esp),
+            Some([0x5566_7788, 0x1122_3344, 0x40])
+        );
+        assert_eq!(
+            arguments_from_stack(layout_of("ExAllocatePool").unwrap(), &at_esp[..8]),
+            Some([0x5566_7788, 0x1122_3344, 0]),
+            "an allocator with no tag records zero for it, as a register read would not be made"
+        );
+    }
+
+    /// A read shorter than the layout needs is no arguments at all, not arguments padded with
+    /// zero: a hit the worker counts as unreadable rather than records with a size of zero.
+    #[test]
+    fn a_short_stack_read_is_not_arguments() {
+        let layout = layout_of("ExAllocatePool2").unwrap();
+        assert_eq!(arguments_from_stack(layout, &[0; 15]), None);
+        assert_eq!(arguments_from_stack(layout, &[]), None);
+        assert!(arguments_from_stack(layout, &[0; 16]).is_some());
     }
 }

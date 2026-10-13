@@ -9080,11 +9080,14 @@ fn also_reachable(set: dbgscope::dbgeng::InstructionSet) -> &'static str {
 /// **Only valid at the entry**, before a step or a call clobbers the register — which is a property
 /// of the answer and not of this function, and is why both callers say so.
 ///
-/// x86 is derived from the documented `__stdcall` frame rather than measured: at entry the return
-/// address is at `@esp`, `DeviceObject` at `+4` and `Irp` at `+8`. No x86 *kernel* target exists on
-/// this bench to check it against, and that is said here rather than left for a reader to assume
-/// the figure was taken from one. The x64 and ARM64 forms are measured against real dispatch
-/// routines.
+/// x86 is the documented `__stdcall` frame -- at entry the return address is at `@esp`,
+/// `DeviceObject` at `+4` and `Irp` at `+8` -- measured in a 32-bit **user-mode** process and not
+/// against a dispatch routine: `mcp_smoke`'s
+/// `an_x86_stdcall_call_holds_its_arguments_at_esp_and_its_result_in_eax` reads a `__stdcall`
+/// callee's frame on entry and finds the return address at `[esp]` and the arguments from `+4`.
+/// No x86 *kernel* target exists on this bench to check the dispatch case against, and that is
+/// said here rather than left for a reader to assume the figure was taken from one. The x64 and
+/// ARM64 forms are measured against real dispatch routines.
 /// Which structure offsets and register names an IOCTL map reads the target through.
 ///
 /// **Extracted so that the selection is testable on its own**, which is the half a test of
@@ -9421,21 +9424,80 @@ pub(crate) struct PoolTrace {
     locations: Vec<structured::CodeLocation>,
 }
 
-/// The registers a call's first three integer arguments arrive in, and the one it returns in, or
-/// `None` for an architecture that does not pass them in registers.
-///
-/// **x86 is the `None`, and that is a refusal rather than a fallback.** Its kernel calls are
-/// `__stdcall`, so the arguments are on the stack and nothing in a register is one: read as x64's,
-/// every hit would record three unrelated values as a size, a tag and a pool type. Tracing it
-/// means reading the stack at the call, which is `FOLLOWUPS.md` item 121.
-fn call_registers(
-    set: dbgscope::dbgeng::InstructionSet,
-) -> Option<([&'static str; 3], &'static str)> {
+/// Where a pool allocator's first three integer arguments are at the call, and where its result
+/// is after it -- the target's calling convention, as far as this trace needs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Convention {
+    /// In registers: x64's `rcx`, `rdx`, `r8` and `rax`; ARM64's `x0`–`x2` and `x0`.
+    Registers {
+        arguments: [&'static str; 3],
+        result: &'static str,
+    },
+    /// On the stack, from the stack pointer up, each argument its own width: x86's `__stdcall`,
+    /// which every kernel export is. The result is in `eax`.
+    ///
+    /// **The stack pointer names the first argument at a `call`**, because the call has not yet
+    /// pushed the return address. At a `jmp` to the allocator it has -- the jumping function's own
+    /// return address is at `[esp]` -- so the arguments start a slot up, which the callback adds
+    /// for a site that does not return. The offsets within the arguments are
+    /// [`crate::pooltrace::Layout::x86_stack`]'s, where `POOL_FLAGS` takes two slots.
+    ///
+    /// **Derived from the convention and measured in user mode, not against an x86 kernel.**
+    /// `mcp_smoke`'s `an_x86_stdcall_call_holds_its_arguments_at_esp_and_its_result_in_eax`
+    /// stops a 32-bit process at a `__stdcall` call and reads what this reads; no x86 kernel
+    /// target exists on this project's bench, so a live trace on one is `FOLLOWUPS.md` item 121's
+    /// remaining half.
+    Stack {
+        stack_pointer: &'static str,
+        result: &'static str,
+    },
+}
+
+/// The calling convention a pool trace reads a target by, or `None` for a machine this build
+/// does not know -- which is refused rather than read as x64's, where every hit would record three
+/// unrelated values as a size, a tag and a pool type. That fallback is what the first version did
+/// for anything that was not ARM64, and it was x86 that review caught it on.
+fn convention(set: dbgscope::dbgeng::InstructionSet) -> Option<Convention> {
     use dbgscope::dbgeng::InstructionSet;
     match set {
-        InstructionSet::Amd64 => Some((["rcx", "rdx", "r8"], "rax")),
-        InstructionSet::Arm64 => Some((["x0", "x1", "x2"], "x0")),
-        InstructionSet::X86 | InstructionSet::Other(_) => None,
+        InstructionSet::Amd64 => Some(Convention::Registers {
+            arguments: ["rcx", "rdx", "r8"],
+            result: "rax",
+        }),
+        InstructionSet::Arm64 => Some(Convention::Registers {
+            arguments: ["x0", "x1", "x2"],
+            result: "x0",
+        }),
+        InstructionSet::X86 => Some(Convention::Stack {
+            stack_pointer: "esp",
+            result: "eax",
+        }),
+        InstructionSet::Other(_) => None,
+    }
+}
+
+/// A call's first three arguments, read as `convention` says: the registers, or on x86 the stack
+/// at `[esp]` -- or at `[esp+4]` for a site that **jumps** to the allocator, whose own return
+/// address is already there. `None` where any of it would not read.
+fn call_arguments(
+    engine: &DebugEngine,
+    convention: Convention,
+    layout: crate::pooltrace::Layout,
+    returns: bool,
+) -> Option<[u64; 3]> {
+    match convention {
+        Convention::Registers { arguments, .. } => {
+            let read = |index: usize| engine.integer_register(arguments[index]).ok();
+            Some([read(0)?, read(1)?, read(2)?])
+        }
+        Convention::Stack { stack_pointer, .. } => {
+            let first = engine
+                .integer_register(stack_pointer)
+                .ok()?
+                .checked_add(if returns { 0 } else { 4 })?;
+            let bytes = engine.read_memory(first, layout.x86_stack().bytes).ok()?;
+            crate::pooltrace::arguments_from_stack(layout, &bytes)
+        }
     }
 }
 
@@ -9539,16 +9601,20 @@ fn arm_pool_trace(
         ));
     }
     let instruction_set = e.instruction_set();
-    let Some((arguments, returned)) = call_registers(instruction_set) else {
+    let Some(convention) = convention(instruction_set) else {
         return Err(Failed::categorised(
             structured::ErrorCategory::InvalidArgument,
             format!(
-                "a pool trace reads an allocator's arguments from the registers x64 and ARM64 \
-                 pass them in, and this target is machine {}, which passes them on the stack. \
-                 Nothing was armed.",
+                "a pool trace reads an allocator's arguments where the target's calling \
+                 convention puts them -- x64's and ARM64's registers, x86's stack -- and this \
+                 target is machine {}, whose convention this build does not know. Nothing was \
+                 armed.",
                 machine_label(instruction_set)
             ),
         ));
+    };
+    let result_register = match convention {
+        Convention::Registers { result, .. } | Convention::Stack { result, .. } => result,
     };
     let (base, loaded_size) = loaded_module_named(e, module)?;
     let scan = scan_driver(e, module, base, loaded_size, deadline)?;
@@ -9744,14 +9810,16 @@ fn arm_pool_trace(
                     return recorder.threadless(site);
                 };
                 if at_call {
-                    let read = |index: usize| engine.integer_register(arguments[index]).ok();
-                    let read = match (read(0), read(1), read(2)) {
-                        (Some(a), Some(b), Some(c)) => Some([a, b, c]),
-                        _ => None,
-                    };
+                    // The site's allocator says how wide each argument is, and whether the site
+                    // returns says where on an x86 stack the first one is -- neither matters to a
+                    // register read, and both decide a stack one.
+                    let read = recorder.sites().get(site).and_then(|site| {
+                        let layout = crate::pooltrace::layout_of(&site.allocator)?;
+                        call_arguments(engine, convention, layout, site.returns_to.is_some())
+                    });
                     recorder.entry(site, thread, read)
                 } else {
-                    recorder.returned(site, thread, engine.integer_register(returned).ok())
+                    recorder.returned(site, thread, engine.integer_register(result_register).ok())
                 }
             });
         if let Err(why) = e.set_breakpoint_callback(callback) {
@@ -9992,7 +10060,7 @@ fn render_pool_trace(report: &structured::PoolTrace) -> String {
         }),
         (report.unreadable_hits > 0).then(|| {
             format!(
-                "{} hit(s) whose registers could not be read",
+                "{} hit(s) whose arguments or result could not be read",
                 report.unreadable_hits
             )
         }),
@@ -14402,22 +14470,35 @@ mod tests {
     }
 
     /// **A pool trace reads arguments from registers only where the architecture passes them
-    /// there.** x86's kernel calls are `__stdcall`, so its registers hold no argument at the call;
-    /// the trace is refused there (`FOLLOWUPS.md` item 121) rather than falling through to x64's,
-    /// which is what the first version did for anything that was not ARM64.
+    /// there, and from the stack where it does not.** x86's kernel calls are `__stdcall`, so its
+    /// registers hold no argument at the call: it is read at `esp` (`FOLLOWUPS.md` item 121)
+    /// rather than falling through to x64's registers, which is what the first version did for
+    /// anything that was not ARM64. A machine this build does not know is still refused.
     #[test]
-    fn a_pool_trace_reads_registers_only_where_arguments_arrive_in_them() {
+    fn a_pool_trace_reads_arguments_where_the_convention_puts_them() {
         use dbgscope::dbgeng::InstructionSet;
         assert_eq!(
-            call_registers(InstructionSet::Amd64),
-            Some((["rcx", "rdx", "r8"], "rax"))
+            convention(InstructionSet::Amd64),
+            Some(Convention::Registers {
+                arguments: ["rcx", "rdx", "r8"],
+                result: "rax"
+            })
         );
         assert_eq!(
-            call_registers(InstructionSet::Arm64),
-            Some((["x0", "x1", "x2"], "x0"))
+            convention(InstructionSet::Arm64),
+            Some(Convention::Registers {
+                arguments: ["x0", "x1", "x2"],
+                result: "x0"
+            })
         );
-        assert_eq!(call_registers(InstructionSet::X86), None);
-        assert_eq!(call_registers(InstructionSet::Other(0x1c4)), None);
+        assert_eq!(
+            convention(InstructionSet::X86),
+            Some(Convention::Stack {
+                stack_pointer: "esp",
+                result: "eax"
+            })
+        );
+        assert_eq!(convention(InstructionSet::Other(0x1c4)), None);
     }
 
     /// **A traced allocation's arguments are read by its allocator's layout**, which is the one

@@ -85,10 +85,11 @@ reopen it). An unmarked line is simply open.
 - [Item 113](#113-windbg-mcp-the-device-descriptor-sweeps-own-figures-do-not-add-up) — [windbg-mcp] The `\Device` descriptor sweep's own figures do not add up
 - [Item 114](#114-dbgscope-a-big-pool-entry-in-no-region-the-walk-discovers) — [dbgscope] A big-pool entry in no region the walk discovers
 - [Item 117](#117-windbg-mcp-the-kd-facade-pipe-has-only-the-default-acl-no-client-authentication-and-no-break-in) — [windbg-mcp] The KD facade pipe has only the default ACL, no client authentication and no break-in
-- [Item 121](#121-windbg-mcp-tracing-pool-allocations-on-an-x86-kernel) — [windbg-mcp] Tracing pool allocations on an x86 kernel
+- [Item 121](#121-windbg-mcp-tracing-pool-allocations-on-an-x86-kernel) — [windbg-mcp] Tracing pool allocations on an x86 kernel — **half landed** (the x86 reader, measured in user mode, 2026-10-13; a trace on a live x86 kernel is what is left)
 - [Item 122](#122-windbg-mcp-a-live-secure-kernel-session-has-no-image-to-resolve-names-or-instructions-against) — [windbg-mcp] A live Secure Kernel session has no image to resolve names or instructions against
 - [Item 125](#125-windbg-mcp--dbgscope-an-interrupted-replay-is-left-where-ttd-puts-it-not-where-it-had-got-to) — [windbg-mcp + dbgscope] An interrupted replay is left where TTD puts it, not where it had got to
 - [Item 126](#126-dbgscope--windbg-mcp-a-command-that-fails-is-reported-by-its-hresult-alone) — [dbgscope + windbg-mcp] A command that fails is reported by its HRESULT alone
+- [Item 127](#127-windbg-mcp-the-code-scans-decode-by-the-stops-effective-machine-not-the-images) — [windbg-mcp] The code scans decode by the stop's effective machine, not the image's
 
 ## 2. [dbgscope] Typed write primitives
 
@@ -1902,40 +1903,73 @@ reconnect result. The exact builds, runs and limits are recorded in
 
 ## 121. [windbg-mcp] Tracing pool allocations on an x86 kernel
 
-`pool_trace` reads an allocator's arguments from registers at the call and its result from the
-return register after it -- `rcx`, `rdx`, `r8` and `rax` on x64, `x0`–`x2` and `x0` on ARM64
-(`worker::call_registers`). An x86 kernel passes neither way: its exports are `__stdcall`, so the
-arguments are on the stack, and read as x64's registers every hit would record three unrelated
-values as a size, a tag and a pool type. So an x86 target is **refused** before anything is scanned
-or armed, rather than traced wrongly. Raised by review on
-[#473](https://github.com/glslang/windbg-mcp/pull/473), where the first version fell through to
-x64's registers for anything that was not ARM64.
+**Half landed, 2026-10-13: the x86 reader is built and measured in user mode; a trace on a live
+x86 kernel has still never been armed.** What is left is the second half, and this entry is
+narrowed to it.
 
-- **What it would take.** A second reader for the call, not a change to the first. The breakpoint
-  is on the `call` instruction, so the return address is not yet pushed and the arguments start at
-  `[esp]`; the result is in `eax` at the return, by which time `__stdcall` has popped them.
-- **The layout stops being a list of positions**, which is the part that is easy to get wrong.
-  `crate::pooltrace::Layout` names arguments by index because on x64 and ARM64 an index is a
-  register. On x86 it is a stack offset, and the offsets depend on the widths before it:
-  `ExAllocatePool2`'s `POOL_FLAGS` is a `ULONG64` and takes **two** slots, so its size is at
-  `[esp+8]` and its tag at `[esp+12]`, where `ExAllocatePoolWithTag`'s `POOL_TYPE` takes one and
-  puts them at `[esp+4]` and `[esp+8]`. The layout needs byte offsets per architecture, or a width
-  per argument.
-- **The cost moves too.** A register read is microseconds; this is a 16-byte memory read per call,
-  measured at about 1 ms for 8 uncached bytes over the ARM64 bench's serial link -- small beside a
-  trap's ~25 ms, but it is a read that can fail, and a hit whose stack will not read belongs in
-  `unreadable_hits` like one whose registers will not.
-- **Unmeasured and needing a target:** whether the hazard scan finds an x86 driver's call sites at
-  all -- `call dword ptr [__imp_…]` names its slot by absolute address, which `called_slot` reads,
-  but nothing has run it against a 32-bit kernel.
-- **Why deferred:** there is no x86 kernel to measure against. The ARM64 bench's debuggee is
-  Windows 11, which ships no x86 edition, so the target is a 32-bit Windows 10 guest -- and
-  `ExAllocatePool2` exists there only from 2004 on -- which no bench here is recorded as having.
-  Building the reader without one would ship a stack layout nobody has checked.
+`pool_trace` read an allocator's arguments from registers at the call and its result from the
+return register after it -- `rcx`, `rdx`, `r8` and `rax` on x64, `x0`–`x2` and `x0` on ARM64 --
+and an x86 kernel passes neither way: its exports are `__stdcall`, so the arguments are on the
+stack, and read as x64's registers every hit would have recorded three unrelated values as a size,
+a tag and a pool type. So x86 was **refused** before anything was scanned or armed. Raised by
+review on [#473](https://github.com/glslang/windbg-mcp/pull/473), where the first version fell
+through to x64's registers for anything that was not ARM64.
 
-**Where it picks up.** `call_registers` and the refusal in `arm_pool_trace` (`src/worker.rs`),
-`Layout` and `layout_of` in `src/pooltrace.rs`, and the callback in `arm_pool_trace`, which is where
-an x86 entry would read the stack instead of three registers.
+**What landed.** `worker::call_registers` became `worker::Convention` -- `Registers` for x64 and
+ARM64, `Stack` for x86, `None` (still refused) for a machine the build does not know -- and
+`call_arguments` reads a `Stack` site at `[esp]`, or at `[esp+4]` for a site that *jumps* to the
+allocator, whose own return address is already on the stack. The layout stopped being a list of
+positions: `pooltrace::Layout::x86_stack` derives byte offsets from widths, so `ExAllocatePool2`'s
+`POOL_FLAGS` -- a `ULONG64`, two slots -- puts its size at `+8` and its tag at `+12` where
+`ExAllocatePoolWithTag`'s are at `+4` and `+8`, and `pooltrace::arguments_from_stack` parses one
+read of exactly those bytes into the `[u64; 3]` the read side already consumes. A short read is
+`None`, counted in `unreadable_hits` like a register that would not read.
+
+**What the measurement established**, through `mcp_smoke`'s
+`an_x86_stdcall_call_holds_its_arguments_at_esp_and_its_result_in_eax` on a 32-bit C program the
+harness compiles, driven by the x64 engine with its effective machine switched to x86 -- the engine
+an x86 kernel is debugged by too: at a `__stdcall` call `esp` names the first argument and three
+four-byte arguments are at `[esp]`, `[esp+4]`, `[esp+8]`; a 64-bit first argument takes two slots,
+low first, with the next two at `+8` and `+12`, read at `[esp]` at the call and at `[esp+4]` on
+entry to the callee; `eax` holds the result at the instruction after the call, which is the call's
+own length past it; and the hazard scan on a PE32 image lists `RtlMoveMemory`'s
+`call dword ptr [abs32]` site by the very slot the six bytes encode, so `called_slot` reads x86's
+absolute displacement as it reads x64's RIP-relative one -- the bullet this entry had as
+*unmeasured*. The sixteen bytes read at the call are the fixture
+`pooltrace::tests::x86_stack_bytes_parse_to_the_arguments_an_allocation_is_read_by` parses
+([`docs/smoke-test.md`](./docs/smoke-test.md), *The x86 calling convention, measured at a call*).
+
+- **What it does not establish, which is the open half.** The convention is the compiler's and is
+  the same in both modes, but nothing has run the *trace* on an x86 kernel: `pool_trace` refuses a
+  user-mode target, so `call_arguments`' engine half -- the `esp` read, the memory read and the
+  `+4` at a tail jump -- has run inside no breakpoint callback, and the tail-jump offset in
+  particular is derived from the convention and measured nowhere, the fixture having no site that
+  jumps. Nor has the scan read a real 32-bit **driver**: the import-address-table fallback for a
+  freed import directory is untried on a PE32 image, `ExAllocatePool2` exists on 32-bit Windows 10
+  only from 2004 on, and whether `current_thread_data_offset` is the `KTHREAD` on an x86 kernel is
+  assumed from x64.
+- **The cost moves too.** A register read is microseconds; this is a 12- or 16-byte memory read per
+  call, measured at about 1 ms for 8 uncached bytes over the ARM64 bench's serial link -- small
+  beside a trap's ~25 ms, but it is a read that can fail, and it is counted where a register that
+  would not read is.
+- **Why the rest is deferred:** there is no x86 kernel to measure against. The ARM64 bench's
+  debuggee is Windows 11, which ships no x86 edition, so the target is a 32-bit Windows 10 guest
+  (2004 or later for `ExAllocatePool2`). Checked 2026-10-13 on the x64 bench: `Get-VM` lists six
+  guests, all x64; the only ISO on disk is a Windows 11 x64 one; the WDK carries kernel libraries
+  for x64 and ARM64 only, so an x86 HEVD would come from its release rather than this
+  toolchain; and C: and D: have about 11 GB free each, against a 3-4 GB ISO and a guest to install.
+  A Gen 1 guest with serial KD over a named pipe would do, and the live-kernel tier's shape would
+  then transfer: arm on HEVD's x86 build, fire the IOCTLs from the guest, read.
+- **A side finding, filed as item 127:** at the x64 engine's first initial break in a WoW64
+  process the effective machine is x64, and the scan decoded the 32-bit image as x64 code --
+  listing the import with no call site at all. The measurement reads after the stop in 32-bit code
+  for that reason, and the test says so.
+
+**Where it picks up.** `Convention`, `call_arguments` and the refusal in `arm_pool_trace`
+(`src/worker.rs`); `Layout::x86_stack` and `arguments_from_stack` in `src/pooltrace.rs`; the
+measurement in `tests/mcp_smoke.rs` and its section in `docs/smoke-test.md`; and the sentence in
+[`docs/limitations.md`](./docs/limitations.md) that says the reader is measured in user mode, which
+is the sentence a live run would retire.
 ## 122. [windbg-mcp] A live Secure Kernel session has no image to resolve names or instructions against
 
 **Repo:** `windbg-mcp`. **Origin:** a live VTL1 stop/step run against an HVCI image-validation
@@ -2138,6 +2172,38 @@ step documents that), so this is only about the calls that do return an error.
 **Where it picks up.** dbgscope's `src/dbgeng.rs`, every `map_err(DbgEngError::CommandFailed)?` that
 follows an `Execute` with a capture buffer live; then this server's `engine::engine_error` and the
 places `CommandFailed`'s text reaches a caller.
+## 127. [windbg-mcp] The code scans decode by the stop's effective machine, not the image's
+
+**Repo:** `windbg-mcp`. **Origin:** item 121's measurement, 2026-10-13.
+
+`driver_hazards` on a 32-bit image in a WoW64 process, asked at the x64 engine's **first** initial
+break -- the 64-bit loader's, in the 64-bit `ntdll` -- listed the `RtlMoveMemory` import with its
+slot and **zero** call sites. The same call after the target had stopped in 32-bit code listed two,
+one of them `main`'s. Nothing about the image had changed between the two: what changed was
+`GetEffectiveProcessorType`, which `scan_driver` passes to the scan as the mnemonic vocabulary and
+which dbgscope's `decode_range` uses to pick the decoder's bitness. Decoded as x64, x86's
+`ff 15 disp32` is a RIP-relative `call qword ptr [rip+disp]` rather than `call dword ptr [abs32]`,
+so the operand's address lands nowhere near an import slot, and the scan reports a driver that
+calls none of its sensitive imports -- the answer shaped like a clean image that the module's own
+doc comment warns about, produced here by an ordering rather than by a target.
+
+The same read is made by every scan on this seam -- `ioctl_map`, `xrefs_to`,
+`reachable_from_dispatch` and the pool trace's own arm all take `e.instruction_set()` -- and the
+image already in hand says what it is: `pe::read_image` has parsed its optional header, whose magic
+is `pe::Bitness`. On a kernel target the two cannot disagree, one machine being the whole target;
+on a WoW64 process they disagree at exactly the stop a `launch` hands back.
+
+- **What would close it:** decode a scanned image by its **own** bitness rather than the stop's --
+  which is a dbgscope primitive, since `decode_range` takes the engine's effective machine and
+  offers no way to name one -- or, cheaper and narrower, refuse the scan when the image's machine
+  and the effective one disagree, saying which stop would make them agree. The first is the fix;
+  the second is what keeps the wrong answer from being an answer until then.
+- **Why deferred:** item 121's measurement reads after the stop in 32-bit code and asserts the
+  switch, so nothing checked in depends on the ordering, and no kernel target can reach it. It is
+  a user-mode defect in tools whose subject is drivers.
+- **Where it picks up:** `scan_driver` and the `instruction_set()` reads beside it in
+  `src/worker.rs`; `DebugEngine::decode_range` in dbgscope, which would grow a bitness argument;
+  and the measurement's own ordering comment in `tests/mcp_smoke.rs`, which is the reproduction.
 
 ## Where these items came from
 
@@ -2285,7 +2351,11 @@ ordered ladder rather than a defect per rung (119). The review itself is private
 `target/private/`, because it cites the bench's runners and logs.
 Item 121 came from review round 1 on [#473](https://github.com/glslang/windbg-mcp/pull/473)
 (2026-10-09), the pool allocation trace, which read x64's argument registers on any target that was
-not ARM64; the round refused x86 and filed the reader it would need.
+not ARM64; the round refused x86 and filed the reader it would need. The reader landed on
+2026-10-13, measured on a 32-bit user-mode process for want of an x86 kernel, and the item holds
+the live half. Item 127 came out of taking that measurement: the scan's first answer at a WoW64
+launch's initial break listed the import with no call site, because the stop's effective machine
+and not the image's decided the decoder.
 Item 120, now in [`DONE.md`](./DONE.md), came from checking that review against the stated product
 goal the same day: the standalone KD role and the MCP live-control session were alternative owners,
 so the server could not create, observe or release the WinDbg-facing session it presented to an
