@@ -20262,11 +20262,18 @@ fn a_32_bit_managed_process_is_attached_by_an_engine_that_can_load_its_sos() {
 ///
 /// Eight iterations, because the test stops in the first one to learn an address and in the
 /// second to read at it; the `Sleep` keeps the process for `end_session` to terminate.
+///
+/// `copy_through_thunk` is in a **second translation unit**, [`X86_THUNK_FIXTURE`], which declares
+/// `RtlMoveMemory` *without* `dllimport`: its call then goes to the import library's thunk,
+/// `jmp dword ptr [slot]` — a jump through the slot the scan lists beside `main`'s call, entered
+/// by a `call` and so with a return address at `[esp]`, which is the site shape the trace reads
+/// one slot up. One source cannot declare the import both ways.
 const X86_STDCALL_FIXTURE: &str = r#"
 #include <windows.h>
 
 #undef RtlMoveMemory
 __declspec(dllimport) void __stdcall RtlMoveMemory(void *destination, const void *source, size_t length);
+void __stdcall copy_through_thunk(void *destination, const void *source, size_t length);
 
 __declspec(noinline) unsigned long __stdcall take3(unsigned __int64 flags, size_t size, unsigned long tag)
 {
@@ -20282,11 +20289,27 @@ int main(void)
     int i;
     for (i = 0; i < 8; i++) {
         RtlMoveMemory(destination, source, 0x10);
+        copy_through_thunk(destination, source, 0x10);
         sink += take3(0x1122334455667788ui64, 0x40, 0x6b636148);
         sink += destination[i];
     }
     Sleep(60000);
     return 0;
+}
+"#;
+
+/// The fixture's second translation unit: the same import declared without `dllimport`, so the
+/// linker reaches it through its thunk — the jump through the slot that [`X86_STDCALL_FIXTURE`]
+/// explains.
+const X86_THUNK_FIXTURE: &str = r#"
+#include <windows.h>
+
+#undef RtlMoveMemory
+void __stdcall RtlMoveMemory(void *destination, const void *source, size_t length);
+
+__declspec(noinline) void __stdcall copy_through_thunk(void *destination, const void *source, size_t length)
+{
+    RtlMoveMemory(destination, source, length);
 }
 "#;
 
@@ -20340,12 +20363,17 @@ fn x86_stdcall_fixture() -> Option<&'static std::path::Path> {
             let dir = x86_fixture_dir();
             std::fs::write(dir.join("x86stdcall.c"), X86_STDCALL_FIXTURE)
                 .expect("write the fixture source");
+            std::fs::write(dir.join("x86thunk.c"), X86_THUNK_FIXTURE)
+                .expect("write the fixture's second source");
             let script = dir.join("build-x86stdcall.cmd");
+            // `/INCREMENTAL:NO`, so a call between the two sources is a direct `call rel32` and
+            // not a hop through the incremental linker's own jump table.
             std::fs::write(
                 &script,
                 format!(
                     "@echo off\r\ncall \"{}\" >nul\r\ncd /d \"{}\"\r\n\
-                     cl /nologo /Zi /Od /MT /W3 /Fe:x86stdcall.exe x86stdcall.c\r\n",
+                     cl /nologo /Zi /Od /MT /W3 /Fe:x86stdcall.exe x86stdcall.c x86thunk.c \
+                     /link /INCREMENTAL:NO\r\n",
                     vcvars.display(),
                     dir.display()
                 ),
@@ -20394,8 +20422,16 @@ fn bytes_read(data: &Value) -> Vec<u8> {
 ///   displacement x86 encodes, where x64 encodes a RIP-relative one, and the PE32 import walk
 ///   named the slot. Unmeasured until now: item 121 said so.
 /// - **Three four-byte arguments at `[esp]`, `[esp+4]`, `[esp+8]`** — the pointer arguments are
-///   checked by what they point at, the length by its value — and the return breakpoint's
-///   address, the call's length past it, is where a `step_over` lands.
+///   checked by what they point at, the length by its value — and a breakpoint the call's length
+///   past it, armed the way the trace arms its return breakpoint, is where the target stops next.
+/// - **At a jump through the slot, the arguments are one slot up.** The linker's import thunk
+///   for the `RtlMoveMemory` the second source declares without `dllimport` is
+///   `jmp dword ptr [slot]`, entered by a `call` from the function that uses it, so `[esp]` holds
+///   that call's return address and the three arguments follow at `[esp+4]` — what the trace
+///   reads at a site that does not return. The slot is added wherever such a jump sits, not only
+///   at a function's tail: a jump into a callee that pops its own arguments has a return address
+///   at `[esp]` or the callee's `ret` has nowhere to go, and this thunk sits under a caller whose
+///   frame is still up.
 /// - **A 64-bit first argument takes two slots, low first**, so the two after it are at `+8`
 ///   and `+12`: `ExAllocatePool2`'s `POOL_FLAGS`. The same sixteen bytes read at `[esp+4]` on
 ///   entry to the callee — the call having pushed its return address — and at `[esp]` at the
@@ -20415,6 +20451,12 @@ fn bytes_read(data: &Value) -> Vec<u8> {
 /// RIP-relative there — and listed the import with no call site at all (measured, 2026-10-13).
 /// The engine switches to x86 once the target stops in 32-bit code, which is why everything here
 /// is read after the breakpoint on `main`, and the switch is asserted rather than assumed.
+///
+/// **And nothing here steps.** On CI's ARM64 runner, where the fixture runs under x86 emulation,
+/// a `step_over` from the import call reported the call site itself (measured 2026-10-13:
+/// `0xb871e4` against the `0xb871ea` it lands on under the x64 engine) while every breakpoint
+/// armed fired where it was set. The breakpoints are the trace's own mechanism, so the test arms
+/// them and reads what a step would have shown.
 #[test]
 fn an_x86_stdcall_call_holds_its_arguments_at_esp_and_its_result_in_eax() {
     if !launch_tier() {
@@ -20579,10 +20621,80 @@ fn an_x86_stdcall_call_holds_its_arguments_at_esp_and_its_result_in_eax() {
         "the first argument at [esp] is the destination buffer on this frame: {destination:#x} \
          against esp {esp:#x}"
     );
+    // The return breakpoint, armed as the trace arms it: the call's length past the call.
+    let after = site + 6;
+    server.tool_data(
+        "set_breakpoint",
+        json!({ "session_id": &session, "expression": format!("{after:#x}") }),
+        TARGET_STEP,
+    );
     assert_eq!(
-        stop_at(&mut server, "step_over"),
-        site + 6,
+        stop_at(&mut server, "go"),
+        after,
         "the call returns to the instruction after it, which is its own length past it"
+    );
+
+    // At a jump through the slot, the arguments are one slot up. The linker's thunk for the
+    // `RtlMoveMemory` the second source declares without `dllimport` is `jmp dword ptr [slot]`,
+    // opcode ff /4, entered by a `call` -- so `[esp]` is that call's return address and the
+    // arguments follow it, which is what the trace reads at a site that does not return.
+    let thunk = copy["call_sites"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|site| address_of(&site["address"]))
+        .filter(|&candidate| candidate != site)
+        .find(|&candidate| read(&mut server, candidate, 2) == [0xff, 0x25])
+        .unwrap_or_else(|| {
+            panic!("no jump through RtlMoveMemory's slot was listed, so the import thunk was not found: {hazards}")
+        });
+    assert_eq!(
+        dword(&read(&mut server, thunk, 6), 2),
+        slot,
+        "the thunk jumps through the same slot the call goes through"
+    );
+    server.tool_data(
+        "set_breakpoint",
+        json!({ "session_id": &session, "expression": format!("{thunk:#x}") }),
+        TARGET_STEP,
+    );
+    assert_eq!(
+        stop_at(&mut server, "go"),
+        thunk,
+        "stopped on the thunk's jump"
+    );
+    let esp = register(&mut server, "esp");
+    let frame = read(&mut server, esp, 16);
+    let entered_from = dword(&frame, 0) - 5;
+    assert_eq!(
+        read(&mut server, entered_from, 1),
+        [0xe8],
+        "at the jump, [esp] holds the return address of the `call rel32` that entered the thunk"
+    );
+    assert!(
+        image.contains(&entered_from),
+        "that call is the fixture's own, under a frame still up: {entered_from:#x} outside \
+         {image:x?}"
+    );
+    assert_eq!(
+        dword(&frame, 12),
+        0x10,
+        "the third argument at [esp+12]: {frame:02x?}"
+    );
+    assert_eq!(
+        read(&mut server, dword(&frame, 8), 15),
+        b"0123456789abcde",
+        "the second argument at [esp+8] points at the source buffer"
+    );
+    assert!(
+        dword(&frame, 4) != dword(&frame, 8) && dword(&frame, 4).abs_diff(esp) < 0x1000,
+        "the first argument at [esp+4] is the destination buffer on this frame: {frame:02x?} \
+         against esp {esp:#x}"
+    );
+    server.tool_data(
+        "clear_breakpoints",
+        json!({ "session_id": &session, "all": true }),
+        TARGET_STEP,
     );
 
     // A 64-bit first argument, seen on entry to the callee and then at the call itself.
@@ -20632,7 +20744,16 @@ fn an_x86_stdcall_call_holds_its_arguments_at_esp_and_its_result_in_eax() {
         expected,
         "at the call, before it pushes its return address, `esp` names the first argument"
     );
-    assert_eq!(stop_at(&mut server, "step_over"), returns_to);
+    server.tool_data(
+        "set_breakpoint",
+        json!({ "session_id": &session, "expression": format!("{returns_to:#x}") }),
+        TARGET_STEP,
+    );
+    assert_eq!(
+        stop_at(&mut server, "go"),
+        returns_to,
+        "the return breakpoint, where the trace reads the result"
+    );
     assert_eq!(
         register(&mut server, "eax"),
         (0x1122_3344u64 + 0x40 + 0x6b63_6148) & 0xffff_ffff,
@@ -20640,7 +20761,8 @@ fn an_x86_stdcall_call_holds_its_arguments_at_esp_and_its_result_in_eax() {
     );
     println!(
         "x86 __stdcall measured through the x64 engine's x86 view: take3 at {entry:#x}, called \
-         from {call:#x}; RtlMoveMemory called at {site:#x} through slot {slot:#x}"
+         from {call:#x}; RtlMoveMemory called at {site:#x} and jumped to at {thunk:#x}, both \
+         through slot {slot:#x}"
     );
 
     server.tool_data(

@@ -1461,12 +1461,26 @@ because the header's `RtlMoveMemory` is a macro over `memmove` — with a call s
 the six bytes there are `ff 15` followed by the very slot the scan listed, so `called_slot` read
 the absolute displacement x86 encodes where x64 encodes a RIP-relative one. Three four-byte
 arguments at `[esp]`, `[esp+4]` and `[esp+8]`, the pointers checked by what they point at, and a
-`step_over` landing six bytes past the call, which is where the trace's return breakpoint goes.
-And a 64-bit first argument taking two slots, low first, with the two after it at `+8` and `+12`
-— `ExAllocatePool2`'s `POOL_FLAGS` — read at `[esp+4]` on entry to the callee and at `[esp]` at
-the call, with `eax` holding the computed result after it. The sixteen bytes read at the call are
-the fixture `pooltrace::tests::x86_stack_bytes_parse_to_the_arguments_an_allocation_is_read_by`
-parses.
+breakpoint six bytes past the call, armed the way the trace arms its return breakpoint, being
+where the target stops next. **At a jump through the slot, the same arguments one slot up**: the
+fixture's second source declares `RtlMoveMemory` without `dllimport`, so the linker reaches it
+through its import thunk — `jmp dword ptr [slot]`, which the scan lists as a second site — and at
+that jump `[esp]` holds the return address of the `call rel32` that entered the thunk, from a
+function whose frame is still up, with the three arguments at `[esp+4]` on. That is the `+4` the
+trace adds at a site that does not return, measured rather than derived (it was derived until
+2026-10-13), and it holds wherever such a jump sits: a jump into a callee that pops its own
+arguments has a return address at `[esp]` or the callee's `ret` has nowhere to go. And a 64-bit
+first argument taking two slots, low first, with the two after it at `+8` and `+12` —
+`ExAllocatePool2`'s `POOL_FLAGS` — read at `[esp+4]` on entry to the callee and at `[esp]` at the
+call, with `eax` holding the computed result at the return breakpoint. The sixteen bytes read at
+the call are the fixture
+`pooltrace::tests::x86_stack_bytes_parse_to_the_arguments_an_allocation_is_read_by` parses.
+
+**Nothing in it steps.** On CI's ARM64 runner the fixture runs under x86 emulation, and there a
+`step_over` from the import call reported the call site itself (measured 2026-10-13, `0xb871e4`
+against the `0xb871ea` it lands on under the x64 engine), while every breakpoint armed fired where
+it was set. The test arms breakpoints — the trace's own mechanism — and reads what a step would
+have shown.
 
 **It runs through the x64 engine's WoW64 view with the effective machine switched to x86**, which
 is the engine an x86 kernel is debugged by too, and not through the 32-bit worker: a `launch` has no

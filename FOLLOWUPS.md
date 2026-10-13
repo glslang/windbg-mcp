@@ -1942,9 +1942,10 @@ absolute displacement as it reads x64's RIP-relative one -- the bullet this entr
 - **What it does not establish, which is the open half.** The convention is the compiler's and is
   the same in both modes, but nothing has run the *trace* on an x86 kernel: `pool_trace` refuses a
   user-mode target, so `call_arguments`' engine half -- the `esp` read, the memory read and the
-  `+4` at a tail jump -- has run inside no breakpoint callback, and the tail-jump offset in
-  particular is derived from the convention and measured nowhere, the fixture having no site that
-  jumps. The sign extension of `esp` and `eax` is the engine's documented rule for a 32-bit
+  `+4` at a jump -- has run inside no breakpoint callback. The `+4` itself is measured since
+  2026-10-13, at the linker's import thunk in the fixture's second source (a `jmp` through the
+  slot entered by a `call`, under a frame still up), and no longer only derived. The sign
+  extension of `esp` and `eax` is the engine's documented rule for a 32-bit
   target, measured on a 32-bit user-mode process in the 32-bit engine -- where a zero-extended
   upper-half address read as well as the sign-extended one -- and on no x86 kernel. Nor has the
   scan read a real 32-bit **driver**: the import-address-table fallback for a freed import
