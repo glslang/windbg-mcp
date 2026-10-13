@@ -237,9 +237,13 @@
   about whether the allocator freed anything. `pool_chunk` also
   reports the **neighbouring** chunks, which is what tells you what a reclaim would land next to. `pool_diagnostics` returns the walk's own diagnostics filtered by substring: a real walk emits tens of thousands across a hundred-plus categories, so any per-call summary truncates and the one line explaining a specific heap is never in the truncated head — filter by a heap address or a phrase to reach it.
 - The **pool trace** (`pool_trace`, `pool_trace_read`) records allocations rather than walking
-  them, so it needs a **live** x64 or ARM64 kernel and a target that runs. It reads the allocator's
-  arguments from registers, and an x86 kernel passes them on the stack, so x86 is refused rather
-  than traced wrongly (`FOLLOWUPS.md` item 121). It traps only the traced driver's own
+  them, so it needs a **live** kernel and a target that runs. It reads the allocator's arguments
+  where the calling convention puts them — x64's and ARM64's registers, or on x86 the stack at
+  the call, where `ExAllocatePool2`'s 64-bit `POOL_FLAGS` takes two slots — and a machine this
+  build does not know is refused rather than read as x64. **The x86 reader is measured against a
+  32-bit user-mode process and not against an x86 kernel**, of which this project's bench has
+  none: the convention is the compiler's and is the same in both modes, but no trace has yet been
+  armed on a 32-bit kernel (`FOLLOWUPS.md` item 121). It traps only the traced driver's own
   call sites, two breakpoint stops per allocation, each a round trip over the KD link — about 25 ms
   on 115200-baud serial — so it suits a driver's handful of allocations rather than a hot path.
   The call sites are the ones `driver_hazards` finds for `ExAllocatePool`, `ExAllocatePool2`,

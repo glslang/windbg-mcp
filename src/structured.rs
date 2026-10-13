@@ -3542,7 +3542,8 @@ pub struct PoolTrace {
     /// unwound past, never returns to it -- or ones at a site where a hit could not say which
     /// thread it was on.
     pub unpaired_calls: u64,
-    /// Hits whose registers could not be read, counted rather than recorded.
+    /// Hits whose arguments or result could not be read -- registers, or on x86 the stack at the
+    /// call -- counted rather than recorded.
     pub unreadable_hits: u64,
     /// Breakpoints this trace set that the session no longer holds -- removed by something else,
     /// such as clearing every breakpoint -- so the sites they were on have recorded nothing since.
