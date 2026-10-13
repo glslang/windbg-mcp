@@ -63,7 +63,6 @@ reopen it). An unmarked line is simply open.
 - [Item 47](#47-windbg-mcp--dbgscope-the-bounded-wait-is-unmeasured-on-a-ttd-replay-target) — [windbg-mcp + dbgscope] The bounded wait is unmeasured on a TTD replay target
 - [Item 50](#50-windbg-mcp-the-released-binary-is-unsigned--only-the-certificate-is-left) — [windbg-mcp] The released binary is unsigned — only the certificate is left — **half landed**
 - [Item 53](#53-windbg-mcp-a-break-raised-after-a-runs-stop-is-built-labels-the-result-cut-short) — [windbg-mcp] A break raised *after* a run's stop is built labels the result cut short
-- [Item 54](#54-dbgscope--windbg-mcp-modules--refresh-true--has-no-wall-clock-bound) — [dbgscope + windbg-mcp] `modules { "refresh": true }` has no wall-clock bound
 - [Item 56](#56-windbg-mcp-resolves--expr-is-a-callers-command-on-nobodys-clock) — [windbg-mcp] `resolve`'s `? <expr>` is a caller's command on nobody's clock
 - [Item 58](#58-dbgscope--windbg-mcp-geteffectiveprocessortype-is-the-question-and-is-not-bound) — [dbgscope + windbg-mcp] `GetEffectiveProcessorType` is the question, and is not bound
 - [Item 59](#59-dbgscope--windbg-mcp-nothing-can-ask-which-thread-the-engine-has-selected) — [dbgscope + windbg-mcp] Nothing can ask which thread the engine has selected
@@ -825,58 +824,6 @@ other way (`|| self.broken()`), correctly for a batch, which is worth reading be
 `src/worker.rs`, `stop_report` beside them, and `Ran::ran_told` for the path that already consults
 the late-break flag.
 
-## 54. [dbgscope + windbg-mcp] `modules { "refresh": true }` has no wall-clock bound
-
-**What it is.** The resynchronisation behind `refresh`
-([#85](https://github.com/glslang/windbg-mcp/issues/85)) is `IDebugSymbols::Reload("")` — a direct
-engine call, not a command — so no watchdog can cut it short and `EngineOp::Modules` carries no
-`patience_ms`. What bounds it is the caller's own call timeout and `interrupt`, which reaches the
-engine from off the engine thread. That is the same position `EngineOp::Backtrace` is in, and its
-doc comment says so for the same reason: carrying a `patience_ms` would imply a bound that does not
-exist.
-
-**Why it was deferred.** The acceptance criterion it was written against is about *symbol-server*
-cost, and that one is closed by construction: the reload is unqualified and unforced, so what it
-discovers is `deferred` and nothing is fetched. What is left is the time the reload itself takes,
-which is a walk of the target's loaded-module list. Measured on the CTF guest over KDNET on
-2026-08-30, that is imperceptible — a whole `modules { "refresh": true }` inside a test that ran in
-1.96s including attach and detach. The wire it would be slow on is the one this repo already
-documents as unusable for a pool walk: **115200-baud serial**, where a per-module round trip is
-tens of milliseconds and 158 modules is a wait with no upper bound and no way to tell it from a
-hung debugger.
-
-**What would close it.** A bounded `Reload` in dbgscope — arm the crate's `Watchdog` around the
-call, as `execute_command_bounded` and `settle` already do, and report an interruption the way they
-do rather than as an error. `SetInterrupt` is expected to reach a `Reload` (a person Ctrl+Breaks
-one in WinDbg), but that is an expectation and not a measurement: **measure it first**, because a
-bound that cannot actually break the call in is worse than no bound, and dbgscope's watchdog tests
-arm one over a counter precisely so this can be tried without a debuggee. Then give
-`EngineOp::Modules` a `patience_ms` and add it to `EngineOp::patience_slot`'s match — the arm whose
-absence silently gave `Self::Pool` dbgscope's default walk budget instead of this server's
-deadline.
-
-**What [dbgscope#95](https://github.com/glslang/dbgscope/issues/95) settled, and what it did not**
-(2026-09-17). That issue asked the identical question of `read_memory` — a direct engine call with
-no bound, where the watchdog was the obvious answer and nobody had measured whether `SetInterrupt`
-reaches one. It could not be measured: the target it needs is a live kernel behind a link slow
-enough for the call to sit in, and this bench had none. So it did **not** arm a watchdog on an
-expectation, and shipped a different lever instead — read the range a page at a time and check the
-deadline between chunks ([#332](https://github.com/glslang/windbg-mcp/pull/332)).
-
-That lever does not transfer here. `Reload("")` is one opaque engine call with nothing to split, so
-there is nothing to poll between, and the measurement this item asks for stays the only thing that
-decides it. What does transfer is the second half of the paragraph above: `EngineOp::ReadMemory`
-carries a `patience_ms` and is in `patience_slot`'s match, so there is a worked example of that
-change rather than a description of one. And the doctrine it rests on has been corrected in
-`EngineOp::Backtrace`'s doc — the absence of a `patience_ms` is a claim about whether the call
-underneath can be **stopped**, not about whether the op runs a command, which is the form this
-item's first paragraph was already stating it in.
-
-**Where it picks up.** `worker::resynchronise` and `EngineOp::Modules` in `src/proto.rs`,
-`DebugEngine::reload_symbols` and `Watchdog` in dbgscope's `src/dbgeng.rs`, and
-`execute_command_bounded` beside it for the shape a bounded direct call takes here.
-`DebugEngine::read_memory_bounded` is the shape an *unbounded* direct call takes when the watchdog
-cannot be shown to reach it, and `EngineOp::ReadMemory` is the `patience_ms` half already done.
 ## 56. [windbg-mcp] `resolve`'s `? <expr>` is a caller's command on nobody's clock
 
 `worker::resolve` evaluates an address expression by running `? <expr>` through
@@ -1173,21 +1120,27 @@ lower bound it is, and `unattributed_image` now says the inventory looks like a 
 names the refresh. What they do not do is *run* it, so a caller gets a poorer answer and a second
 call to make.
 
-- **Why deferred:** resynchronising has **no wall-clock bound** of its own -- that is item 54, still
-  open -- so starting one inside a deadline-bounded composite is a way to spend a caller's whole
-  budget on a call nothing can cut short. Fixing item 54 first makes this safe; doing it before
-  makes the composite's deadline a fiction.
+- **Why deferred:** resynchronising had **no wall-clock bound** of its own, so starting one inside
+  a deadline-bounded composite would have spent a caller's whole budget on a call nothing could cut
+  short. Item 54 closed that on 2026-10-13 (`DONE.md`): a refresh now carries its call's clock. What
+  it found changes this item's shape rather than merely unblocking it -- **a refresh cut short
+  leaves the inventory smaller than it started**, because the engine rebuilds its list rather than
+  adding to it (20, 43 and 91 of 181 modules for stops at 0.5s, 1s and 2s on the ARM64 bench). So a
+  composite that starts one with too little of its budget left can make the very lookup it was for
+  worse, and only a cold refresh is slow enough for that: the first after an attach took 3.9s over
+  serial there, a repeat 57ms.
 - **What would close it:** a bounded refresh, run **once** and only where a module lookup has
   already failed, with the result reported (a section that says "the inventory was resynchronised
-  and the module was still not there" is a different answer from one that never looked). It should
-  stay opt-outable: a caller driving many tools over one attach wants to pay for it once, not per
-  tool.
+  and the module was still not there" is a different answer from one that never looked) -- and one
+  that stopped part-way reported as *that*, since it leaves the composite worse placed than before
+  it asked. It should stay opt-outable: a caller driving many tools over one attach wants to pay for
+  it once, not per tool.
 - **How it was found:** running the live-kernel tier for `driver_surface` after
   [#314](https://github.com/glslang/windbg-mcp/pull/314) merged, which is the only tier where a
   module inventory can be stale at all -- a dump's is complete the moment it opens (2026-09-13).
 
 **Where it picks up.** `unattributed_image` and `scan_of` in `src/worker.rs`, `modules`'s own
-`refresh` in the same file, and item 54 for the bound it needs.
+`refresh` in the same file, and `resynchronise` for the bound item 54 gave it.
 
 ## 74. [windbg-mcp] The driver tools report no pool tags
 
@@ -1379,8 +1332,9 @@ So the set cannot be read off a field, and this entry does not pretend to have i
 part of the work, and the audit is unstarted.** It names ops that *are* in scope and deliberately
 certifies **none** as out — all five of those findings were about an op this entry had **excluded**,
 and not one about an op it had included, so the exclusions are the half that cannot be written here
-honestly. In scope, non-exhaustively: `Modules` (item 54 — `Reload("")` has no
-wall-clock bound and is a wait with no upper bound on 115200-baud serial), `SymbolPath`
+honestly. In scope, non-exhaustively: `Modules` (its reload carries the caller's clock
+since item 54 closed, but the reads that build the listing after it -- the unloaded half, each
+row's PDB identity -- are on no clock), `SymbolPath`
 (`reload_symbols` plus a raw `.sympath`, and the tool reached for *because* symbols are not
 resolving, i.e. against the slow source), `ExceptionTriage`, `Backtrace`, `Registers`,
 `Disassemble`, `CurrentLocation`, `UnboundedCommand`, and `CrashTriage` and `RunToAddress` by the

@@ -1583,7 +1583,9 @@ about. This is the other half — an attach that lands:
   that call reaches a target whose module list the debugger did not watch being built. A generic
   KDNET target carries no fixture, so what is claimed here is the mechanism rather than a find: the
   reload runs, reports `synchronized`, and leaves a listing at least as complete as the one before
-  it — a refresh that *lost* modules would be worse than no refresh at all. The `before`/`after`
+  it — a refresh that *lost* modules would be worse than no refresh at all, which is exactly what a
+  refresh stopped part-way does (the engine rebuilds its list), so this asserts one that finished
+  inside the call's clock rather than one that was cut short. The `before`/`after`
   counts are printed under `--nocapture`, and on the bench this was written against they read
   `1 module(s) before the refresh, 158 after` — which is the size of the gap on a fresh attach,
   measured rather than argued. Finding a *named* module that was missing is the CTF tier's claim,

@@ -5278,11 +5278,7 @@ mod tests {
                 size: 16,
                 patience_ms: 0,
             },
-            EngineOp::Modules {
-                filter: None,
-                limit: 16,
-                refresh: false,
-            },
+            EngineOp::modules(None, Some(16), false),
             EngineOp::Breakpoints,
         ] {
             let refused = refuse_op_on_kind(SessionKind::SecureKernel, &op)

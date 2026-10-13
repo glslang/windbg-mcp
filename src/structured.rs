@@ -1181,9 +1181,10 @@ pub struct ModuleList {
 /// (measured either way — see `worker::resynchronise`).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ModuleRefresh {
-    /// Whether the engine resynchronised. When this is `false` the listing beside it is whatever
-    /// the engine was already holding, which may be stale — and is exactly the state that reads
-    /// as "the driver is not loaded" when the driver is loaded.
+    /// Whether the engine resynchronised. When this is `false` the listing beside it may be
+    /// missing modules the target has loaded — which is exactly the state that reads as "the
+    /// driver is not loaded" when the driver is loaded. [`Self::stopped`] and [`Self::error`] say
+    /// which of the two ways it got there.
     pub synchronized: bool,
     /// How many modules the engine listed **before** the resynchronisation, against
     /// [`ModuleList::loaded`] after it.
@@ -1195,9 +1196,20 @@ pub struct ModuleRefresh {
     /// target whose inventory was already current the two are equal, which is an answer rather
     /// than a wasted call.
     pub before: usize,
-    /// Why the resynchronisation failed, in the engine's own words. Absent when it succeeded.
+    /// Why the resynchronisation failed, in the engine's own words. Absent when it succeeded, and
+    /// when it was [`Self::stopped`] rather than failing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Why the resynchronisation stopped before it finished, when it did: the call's clock ran
+    /// out, or the caller interrupted it.
+    ///
+    /// **A refresh cut short leaves the inventory smaller, not merely stale.** The engine discards
+    /// its module list and rebuilds it, so one stopped part-way holds part of the list — measured
+    /// on a live ARM64 kernel over serial, 20, 43 and 91 of 181 modules for stops at 0.5s, 1s and
+    /// 2s, against 181 held going in (dbgscope's `reload_symbols_bounded`). So `before` can exceed
+    /// [`ModuleList::loaded`] here, and the listing stays that short until a refresh finishes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped: Option<WalkHalt>,
 }
 
 impl ModuleInfo {

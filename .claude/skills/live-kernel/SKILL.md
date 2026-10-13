@@ -108,7 +108,7 @@ loaded before the debugger dialled in is in the target and absent from `lm` — 
 "not loaded". The gap is not small: measured on the CTF guest 2026-08-30, a fresh attach held
 **1** module and a refresh found **158**. `IDebugSymbols::Reload("")` resynchronises the list and leaves symbols deferred;
 `/f` additionally fetches every PDB. `modules { "refresh": true }` is the first half on its own
-(`worker::resynchronise`). Three things bite when editing it:
+(`worker::resynchronise`). Four things bite when editing it:
 
 - **The refresh costs the symbol state, on a live target and not on a dump.** Measured both ways
   (2026-08-30, engine DLLs bundled): a launched `cmd.exe` goes all-five-`pdb` after a `.reload /f`
@@ -125,6 +125,15 @@ loaded before the debugger dialled in is in the target and absent from `lm` — 
   unqualified `.reload /f` resynchronises the inventory as a side effect, so a `modules` call after
   it passes whether or not `refresh` does anything at all. Moving it back below the symbol setup
   keeps the test green and deletes what it is for.
+- **The refresh is bounded, and a refresh the bound stops makes the inventory smaller.** Measured
+  on the ARM64 bench over 115200-baud serial (2026-10-13, dbgscope's
+  `examples/reload_interrupt_probe.rs`): the first refresh after an attach read 181 modules in
+  3.9s, and one stopped at 0.5s, 1s and 2s left 20, 43 and 91 — the engine discards its list and
+  rebuilds it. A repeat took 57ms from the engine's cache, so to measure a stop again you need a
+  fresh attach or a `.cache flushall` first. And a break left pending — raised with nothing
+  bounded running to read it — used to make the next refresh return success with **0** modules;
+  dbgscope drains it now, and that is the first thing to suspect if a refresh ever reports an
+  empty inventory again.
 - **A failed refresh is reported, not raised**, and the note goes *above* the tables. A caveat
   under a listing arrives after the conclusion it was there to prevent, which is the exact failure
   the issue is about.
