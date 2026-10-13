@@ -22228,7 +22228,10 @@ fn a_secure_kernel_capture_opens_as_a_session_and_answers_about_its_vtl1() {
     let Some((capture, image)) = secure_kernel_tier() else {
         return;
     };
-    let mut server = Server::started_with_args(&[], &["--tools", "securekernel"]);
+    // `inspect` beside `securekernel`, because the gate assertion below calls `read_memory` to be
+    // refused by the *session's kind* — a surface without it answers the surface refusal first,
+    // which is a `-32602` naming `--tools` and never reaches the funnel this test is about.
+    let mut server = Server::started_with_args(&[], &["--tools", "securekernel,inspect"]);
     let opened = server.tool_data(
         "open_sk_capture",
         json!({ "vmrs": capture, "image": image, "cross_check": true }),
