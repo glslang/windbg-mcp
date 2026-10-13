@@ -44,8 +44,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   implementer no other way to. Measured on the ARM64 bench's live HEVD over serial KD, 2026-10-09:
   two `ExAllocatePoolWithTag` sites armed in 0.3–1.7 s, four `CREATE_ARW_HELPER_OBJECT` IOCTLs from the
   guest, and eight allocations recorded — 0x10 and 0x20 bytes alternating, tag `Hack`,
-  `NonPagedPoolNx`, one thread per IOCTL — with the eighth stopping the target at its return. The
-  limits are in `docs/limitations.md`.
+  `NonPagedPoolNx`, one thread per IOCTL — with the eighth stopping the target at its return. And
+  on x64, 2026-10-13, against HEVD's x64 build on the x64 bench's `ctf-vm` (26100, four
+  processors) over KDNET: all fourteen `ExAllocatePoolWithTag` sites armed, the imports named from
+  the import address table with `INIT` discarded, four `ALLOCATE_UAF_OBJECT_NON_PAGED_POOL[_NX]`
+  IOCTLs from a client in the guest, and four allocations recorded — 0x70 bytes `NonPagedPoolNx`
+  twice from one site, then 0x60 bytes `NonPagedPool` twice from another, tag `Hack`, all on the
+  client's one thread — with the fourth stopping the target at its return, where `rax` held the
+  address the trace had recorded for it, and nothing unreadable. The x64 run was answered by the
+  registered release server, `0.22.0+g49ebc8f7`, whose tree is `main`'s `ae26c1e` and whose pool
+  trace is therefore the one as merged, not this entry's convention rework; the rework reads the
+  same three argument registers and result register on x64 (a unit test pins which) and has itself
+  been on no x64 wire. The limits are in `docs/limitations.md`.
 
 - **The Secure Kernel KD facade of 0.22.0 is recorded** (`FOLLOWUPS.md` item 115, now in
   `DONE.md`). [#463](https://github.com/glslang/windbg-mcp/pull/463) shipped
