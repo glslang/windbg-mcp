@@ -417,9 +417,10 @@ later with `walk_memory` (`00a09608`) without mentioning either:
   stopped.
 
 **And the walk's own advantage is the wrong behaviour for this question.** `walk_memory` carries
-on past a hole, which is what a list, a pointer chain or a handle table with freed entries needs
-when the question is what is there. A restore's postcondition asks something else, and for it an
-entry that will not read is a failed check, not a hole to step over.
+on past a hole in an address list or an array — a handle table with freed entries, say — which is
+what is wanted when the question is what is there; a chain whose link will not read stops there.
+A restore's postcondition asks something else, and for it an entry that will not read is a failed
+check, not a hole to step over.
 
 **What would reopen it** is a transaction that has to follow a pointer chain *after* a mutation and
 assert on what it finds — a list unlinked and relinked, say — where the nodes cannot be named in
