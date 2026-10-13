@@ -357,7 +357,7 @@ become current at all. Measured 2026-10-13 on the ARM64 bench, through the servi
 `0.22.0+gbfd1f388` on dbgeng 10.0.29617.1000, and again through `cdb` and `kd` on the SDK's
 10.0.26100.1742:
 
-| The session holds | After `.opendump <file>` | `\|\|1s` before a `g` | The next `g` | The handle |
+| The session holds | After `.opendump <file>` | `\|\|1s` before a `g` | The next `g` | The handle, with the `.opendump` wrapped |
 |---|---|---|---|---|
 | a kernel dump, adding another | two systems in `\|\|`; the original still current and `? @$ip` still answering from it | refused | loads the new dump and makes it current; `\|\|0s` and `\|\|1s` then switch either way | retired at the `g`: *a different dump or trace file* |
 | a user dump, adding a kernel dump | two systems, the original current | not tried | the same | retired at the `g`: *a target of a different kind* |
@@ -376,9 +376,11 @@ the code a mistyped command gets too, so on its own it says nothing about why (`
 will proceed with next execution"*). The reading of what the engine holds catches it there, through
 `execute` and inside a `debug_batch` alike: a batch of a wrapped `.opendump`, a `||` and a `g` stops
 with `TARGET REPLACED at step 3`, its cleanup `NOT ATTEMPTED` and the session `DETACHED/REPLACED by
-g`. A raw `execute` naming `.opendump` still retires the handle before it runs. On every row above
-that retirement is early, and on the live-kernel row it is for a replacement that never comes — a
-caller re-opens once for nothing, which is the direction the name list is biased in on purpose.
+g`. An `execute` command or a `debug_batch` step that names `.opendump` outright still retires the
+handle before it runs; every row above wrapped it in `.if (1) { … }` so that it would not. Set
+against those rows, that retirement is always early, and on the live-kernel row it is for a
+replacement that never comes — a caller re-opens once for nothing, which is the direction the name
+list is biased in on purpose.
 
 **A switch the reading cannot see.** `.opendump` of the file the session already holds, then a
 `g`, leaves the engine current on a second system with the same kind, the same path and no
