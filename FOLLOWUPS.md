@@ -90,6 +90,8 @@ reopen it). An unmarked line is simply open.
 - [Item 125](#125-windbg-mcp--dbgscope-an-interrupted-replay-is-left-where-ttd-puts-it-not-where-it-had-got-to) — [windbg-mcp + dbgscope] An interrupted replay is left where TTD puts it, not where it had got to
 - [Item 126](#126-dbgscope--windbg-mcp-a-command-that-fails-is-reported-by-its-hresult-alone) — [dbgscope + windbg-mcp] A command that fails is reported by its HRESULT alone
 - [Item 127](#127-windbg-mcp-the-code-scans-decode-by-the-stops-effective-machine-not-the-images) — [windbg-mcp] The code scans decode by the stop's effective machine, not the image's
+- [Item 128](#128-windbg-mcp-the-ttd-tier-records-whichever-hostname-the-shells-path-resolves) — [windbg-mcp] The TTD tier records whichever hostname the shell's PATH resolves
+- [Item 129](#129-windbg-mcp-the-live-secure-kernel-tier-takes-a-boots-coordinates-from-a-private-prep-the-kd-gate-discovers-for-itself) — [windbg-mcp] The live Secure Kernel tier takes a boot's coordinates from a private prep the KD gate discovers for itself
 
 ## 2. [dbgscope] Typed write primitives
 
@@ -1900,6 +1902,15 @@ the terminated kd retained its pipe until idle expiry. The controller then resto
 successfully. The separate passing symbol/stack gate uses MCP teardown and establishes no forced
 reconnect result. The exact builds, runs and limits are recorded in
 [item 116's close](./DONE.md#116-windbg-mcp-the-kd-facade-answers-windbg-with-fabricated-state-it-cannot-tell-apart-from-guest-state--done-2026-10-11).
+**Reproduced 2026-10-13** on the dev build at `008bfa6` plus
+[#494](https://github.com/glslang/windbg-mcp/pull/494), a fresh K3 boot and the redirect-mode
+smoke config: `a_managed_secure_kernel_kd_session_steps_in_windbg_and_releases_through_mcp` ran
+its `lm`/`t`/`r` script, terminated the authenticated client, and then read the session as
+`released` where it waits for `reconnecting` — "KD disconnect lost the retained session: released",
+80.5 s in all, the 60 s `idle_timeout_ms` having run out while the terminated kd still held its
+pipe. The controller released cleanly: the VM stayed running with a healthy heartbeat and no
+worker, provider or debugger survived. So the lifecycle test is red on this bench for the reason
+recorded above, and a green run of it is what would retire this paragraph.
 
 ## 121. [windbg-mcp] Tracing pool allocations on an x86 kernel
 
@@ -2131,9 +2142,12 @@ The first is the one that makes "returns whatever it had reached" true on every 
 is what to fall back to if the seek turns out to cost something on a large unindexed trace, which
 nobody has measured.
 
-**Whether the x64 bench answers differently is open** — everything above is ARM64. The tier's test
-prints its landing on every run (`item 125: …` under `--nocapture`), so one run of the tier there
-says.
+**The x64 bench answers the same way** (2026-10-13, the dev build at `008bfa6`, the tier run from
+PowerShell): the test's own line read `item 125: a replay broken in at its bound was left PAST the
+breakpoint, which going on never reached` — the eleven-of-thirteen case above, on a `hostname.exe`
+trace. One run, so it says the behaviour is not ARM64's alone and nothing about how often each
+landing occurs there. The tier's test prints its landing on every run (`item 125: …` under
+`--nocapture`).
 
 **Where it picks up.** dbgscope's `DebugEngine::pump` and the three of its callers a run goes
 through, in `src/dbgeng.rs`;
@@ -2211,6 +2225,105 @@ on a WoW64 process they disagree at exactly the stop a `launch` hands back.
 - **Where it picks up:** `scan_driver` and the `instruction_set()` reads beside it in
   `src/worker.rs`; `DebugEngine::decode_range` in dbgscope, which would grow a bitness argument;
   and the measurement's own ordering comment in `tests/mcp_smoke.rs`, which is the reproduction.
+
+## 128. [windbg-mcp] The TTD tier records whichever hostname the shell's PATH resolves
+
+**What happens.** Three of the TTD tier's five tests ask `record_trace` for `hostname.exe` by bare
+name — `ttd_records_a_target_that_finishes_inside_the_startup_watch_as_complete`,
+`ttd_queries_answer_with_the_fields_they_promise` and
+`ttd_a_replay_broken_in_at_its_bound_says_so_and_leaves_the_session_usable` — so which program is
+recorded is whatever the PATH the harness inherited resolves. Launched from Git Bash, whose PATH
+puts `/usr/bin` ahead of System32, that is Git's MSYS `hostname.exe`, and the third test fails its
+own **control**: an unbounded `go` with a breakpoint on `ntdll!RtlExitUserProcess` runs to
+`TTD: End of trace reached` instead of stopping. Measured 2026-10-13 on the x64 bench, on two
+fresh recordings: the opened trace names `C:\Program Files\Git\usr\bin\hostname.exe`,
+`ttd_calls ntdll!RtlExitUserProcess` returns nothing, and `ttd_calls ntdll!NtTerminateProcess`
+returns one call from a `kernelbase` return address at `122A:176` — the Cygwin runtime terminates
+the process directly and never passes the export the test breaks on. From PowerShell, which
+resolves `C:\WINDOWS\system32\HOSTNAME.EXE`, the same five tests pass in 1.14 s.
+
+**Why it matters more than a shell preference.** The other two tests pass on either binary — a
+recording completes and a module base reads back whichever `hostname.exe` it was — so a green tier
+from bash has recorded the wrong program for one of them and said nothing, which is the shape of
+[#235](https://github.com/glslang/windbg-mcp/pull/235)'s relative-target finding and the reason
+`ttd_resolves_a_relative_target_against_the_recorders_working_directory` asserts the trace's name.
+And that fourth test already does the right thing: it copies its fixture from
+`%SystemRoot%\System32\hostname.exe` by path, so the fix is three call sites catching up with the
+one beside them.
+
+- **What would close it:** name the System32 path at the three `recorded(...)` calls, from
+  `SystemRoot` as the fixture copy does, so the recorded program is a property of the test rather
+  than of the shell. The run from bash is the mutation check — it fails the control before and
+  must pass after — and the `tiers` skill's "PowerShell, not `VAR=1 cmd`" line gains the reason it
+  was missing.
+- **Why deferred:** found during the release run of 2026-10-13, after the tier had been re-run
+  green from PowerShell, and the fix is a test-only change that wants its own measured round
+  rather than a line in a release-prep commit.
+- **Where it picks up:** the three `recorded(&mut server, &out_dir, json!({ "target":
+  "hostname.exe" }))` calls in `tests/mcp_smoke.rs`, and the `SystemRoot` join a few lines above
+  the relative-target test's `std::fs::copy`.
+
+## 129. [windbg-mcp] The live Secure Kernel tier takes a boot's coordinates from a private prep the KD gate discovers for itself
+
+**What happens.** `a_live_secure_kernel_session_stops_steps_inspects_resumes_and_closes` makes
+`vmwp_pid`, `dispatcher_vnd`, `partition_id` and `instruction_address` **required** in its config,
+and every one of them is a property of one boot: the worker pid and the partition change with each
+start, the dispatcher pointer with each worker, and the instruction is a VTL1 virtual address — the
+Secure Kernel's base plus an RVA, and the base moves. The managed KD gate beside it
+(`managed_secure_kernel_kd_gate`) **forbids** exactly those fields plus `expected_cr3` and
+`kernel_base`, "because discovering those is part of the gate", and takes its instruction as a
+build-relative RVA with a byte guard from the profile's `secure_kernel_kd.initial`. The server
+treats the live opener's copies as assertions and resolves the worker from `vm_id` for both openers
+alike (`skdispatch::resolve_vmwp_pid`, called from `open_sk_live_control` and `open_sk_kd`), so the
+requirement is the test's, not the server's. The live tier is therefore runnable only through a
+private prep under `target/private` that boots the VM, attaches `cdb` to `vmwp` and hijacks a
+thread to read the dispatcher and partition, pauses the guest, samples both VPs' CR3 until they
+converge, and writes the config.
+
+**What that cost on 2026-10-13**, driving both tiers for the release run. Three such preps exist
+and they disagree with the policy and with each other. `prepare_natural_flow_acceptance.py` writes
+transports as bare `python … --partition-id 0x9d --expected-cr3 0x1201000`, which the 9 October
+policy's templates — absolute interpreter, quoted paths, a `{partition_id}` placeholder, no
+`--expected-cr3` — refuse as a near miss, so its output from 3 October is unusable.
+`prepare_rust_adapter.py`, which the KD tier's post-release audit depends on, hands the sentinel
+reader a module constant `EXPECTED_CR3 = 0x1201000` while that boot's VTL1 root was `0x2601000`
+(the scheduler prep's convergence and hvlib's own `reported SK CR3` agreed); it was run through a
+wrapper that discovers the root first. Only `prepare_scheduler_selected_acceptance.py` writes the
+policy's form. The KD symbol-gate test has no prepared config — `symbol_path` appears in none — and
+ran on one derived by hand (`arm_mode: natural`, a `srv*` path at the store holding the 26100.9457
+`securekernel.pdb`) — and failed before its pipe was published, "the debugger wait reached its
+deadline" after the opener's 60 s window, because the profile's guarded initial RVA `0xB12B` is
+`securekernel!SkmiFreeNar+0x5cb`, a five-byte `nop` in the memory manager's NAR-free path that an
+idle guest does not reach in a minute. Redirect mode fires on it at once by construction; a natural
+stop needs an ambient entry, which is what the private runner arms and no KD config names. The
+live tier's VTL0 half printed `NOT ASSERTED`, because no prep writes the
+`vtl0_profile`/`vtl0_guest` pair item 124 needs. And the `cdb` hijack **killed `vmwp`** — the
+runner's own comment records one earlier kill, as Hyper-V event 3040: right after the partition
+discovery's `.detach /h`, `vmwp.exe` faulted `0x80000003`, Hyper-V logged event 14070 "quit
+unexpectedly" and restarted the VM two seconds later on a new worker, and the prep died reading the
+dead partition's registers (`HV_STATUS 0x000d`) with its bench stop swallowed. A retry worked. The
+tier then passed on the retry's input in 39 s, and its audit — three healthy same-pid samples, both
+VPs' debug registers back at baseline, TF/RF clear, the guarded text unchanged — passed too; every
+workaround above is a measurement of the gap, not a fix of it.
+
+- **What would close it:** give the live tier the KD gate's shape. Forbid the five boot-specific
+  fields and let the server's discovery supply them, as it already does for the opener; take the
+  guarded instruction and its slots as RVAs with byte guards, resolved against the base the
+  live-memory provider reports, the way `open_sk_kd` resolves the profile's `initial.rva`; and have
+  the audit read the root the provider reported rather than a constant. The private prep then
+  reduces to booting the VM, both tiers' configs become static files — including the symbol-gate
+  one and the `vtl0_profile`/`vtl0_guest` pair — and the thread hijack that kills `vmwp` is not
+  run at all, since the server discovers the dispatcher without it. `docs/smoke-test.md` then
+  names the steps rather than "the bench's wrapper".
+- **Why deferred:** it is a change to the tier's contract and to the address form `sk_live_arm`
+  takes, with a run on the disposable VM per round, and the release run had a passing path through
+  the workarounds. Item 122 (no image to resolve against) is adjacent: an RVA form is half of what
+  it asks for.
+- **Where it picks up:** `secure_kernel_live_tier` and the `required(...)` reads under it in
+  `tests/mcp_smoke.rs`, against `managed_secure_kernel_kd_gate`'s forbidden list; `open_sk_kd`'s
+  use of `secure_kernel_kd.initial` in `src/server.rs` and `skdispatch::discover_identity`; the
+  VTL0 block the live test runs only when configured; and, outside the repository, the three preps
+  and `run_k4_stop_step.py`'s `discover_dispatcher`/`discover_partition` under `target/private`.
 
 ## Where these items came from
 
@@ -2377,5 +2490,12 @@ Item 125 came from closing item 47 (2026-10-13): asking whether a replay can be 
 bound found that it can, and that TTD then leaves it somewhere it never reached.
 Item 126 came from closing item 105 the same day: the `||1s` failure item 102 could not explain
 had a reason all along, which `cdb` prints and this server does not pass on.
+Items 128 and 129 came from the release test run of 2026-10-13, which ran every tier including the
+four live ones: the TTD tier failing its own control when launched from Git Bash, which had
+recorded the MSYS `hostname.exe` (128), and the two Secure Kernel tiers being reachable only
+through private preps whose boot-specific values, policy shape and thread-hijacking discovery each
+cost a workaround that day (129). The same run found the capture tier red since the 9 October
+hardening narrowed its server's surface, fixed on
+[#494](https://github.com/glslang/windbg-mcp/pull/494).
 `DECISIONS.md`'s 2026-08-02 entries are the bounded-command coverage review that produced
 item 13, now in [`DONE.md`](./DONE.md).
