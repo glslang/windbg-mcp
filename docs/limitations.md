@@ -240,10 +240,12 @@
   them, so it needs a **live** kernel and a target that runs. It reads the allocator's arguments
   where the calling convention puts them — x64's and ARM64's registers, or on x86 the stack at
   the call, where `ExAllocatePool2`'s 64-bit `POOL_FLAGS` takes two slots — and a machine this
-  build does not know is refused rather than read as x64. **The x86 reader is measured against a
-  32-bit user-mode process and not against an x86 kernel**, of which this project's bench has
-  none: the convention is the compiler's and is the same in both modes, but no trace has yet been
-  armed on a 32-bit kernel (`FOLLOWUPS.md` item 121). It traps only the traced driver's own
+  build does not know is refused rather than read as x64. The register readers are measured on
+  live kernels, ARM64 on 2026-10-09 and x64 on 2026-10-13, and the readings are in
+  `CHANGELOG.md`'s entry for the trace; **the x86 reader is measured against a 32-bit user-mode
+  process and not against an x86 kernel**, of which this project's bench has none: the convention
+  is the compiler's and is the same in both modes, but no trace has yet been armed on a 32-bit
+  kernel (`FOLLOWUPS.md` item 121). It traps only the traced driver's own
   call sites, two breakpoint stops per allocation, each a round trip over the KD link — about 25 ms
   on 115200-baud serial — so it suits a driver's handful of allocations rather than a hot path.
   The call sites are the ones `driver_hazards` finds for `ExAllocatePool`, `ExAllocatePool2`,

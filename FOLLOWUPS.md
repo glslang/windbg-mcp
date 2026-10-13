@@ -1959,7 +1959,10 @@ absolute displacement as it reads x64's RIP-relative one -- the bullet this entr
   for x64 and ARM64 only, so an x86 HEVD would come from its release rather than this
   toolchain; and C: and D: have about 11 GB free each, against a 3-4 GB ISO and a guest to install.
   A Gen 1 guest with serial KD over a named pipe would do, and the live-kernel tier's shape would
-  then transfer: arm on HEVD's x86 build, fire the IOCTLs from the guest, read.
+  then transfer: arm on HEVD's x86 build, fire the IOCTLs from the guest, read. That shape ran on
+  x64 on 2026-10-13 -- `ctf-vm`'s HEVD, fourteen sites armed, four allocations recorded, nothing
+  unreadable; the reading is in `CHANGELOG.md`'s pool-trace entry -- so the live trace is measured
+  on x64 and ARM64 and unmeasured only here.
 - **A side finding, filed as item 127:** at the x64 engine's first initial break in a WoW64
   process the effective machine is x64, and the scan decoded the 32-bit image as x64 code --
   listing the import with no call site at all. The measurement reads after the stop in 32-bit code
