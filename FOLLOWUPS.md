@@ -1944,10 +1944,13 @@ absolute displacement as it reads x64's RIP-relative one -- the bullet this entr
   user-mode target, so `call_arguments`' engine half -- the `esp` read, the memory read and the
   `+4` at a tail jump -- has run inside no breakpoint callback, and the tail-jump offset in
   particular is derived from the convention and measured nowhere, the fixture having no site that
-  jumps. Nor has the scan read a real 32-bit **driver**: the import-address-table fallback for a
-  freed import directory is untried on a PE32 image, `ExAllocatePool2` exists on 32-bit Windows 10
-  only from 2004 on, and whether `current_thread_data_offset` is the `KTHREAD` on an x86 kernel is
-  assumed from x64.
+  jumps. The sign extension of `esp` and `eax` is the engine's documented rule for a 32-bit
+  target, measured on a 32-bit user-mode process in the 32-bit engine -- where a zero-extended
+  upper-half address read as well as the sign-extended one -- and on no x86 kernel. Nor has the
+  scan read a real 32-bit **driver**: the import-address-table fallback for a freed import
+  directory is untried on a PE32 image, `ExAllocatePool2` exists on 32-bit Windows 10 only from
+  2004 on, and whether `current_thread_data_offset` is the `KTHREAD` on an x86 kernel is assumed
+  from x64.
 - **The cost moves too.** A register read is microseconds; this is a 12- or 16-byte memory read per
   call, measured at about 1 ms for 8 uncached bytes over the ARM64 bench's serial link -- small
   beside a trap's ~25 ms, but it is a read that can fail, and it is counted where a register that

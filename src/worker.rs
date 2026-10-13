@@ -9453,6 +9453,29 @@ enum Convention {
     },
 }
 
+impl Convention {
+    /// An address recovered from the target's registers, in the form the engine keeps it: on x86
+    /// **sign-extended** from its 32 bits, and otherwise as it is.
+    ///
+    /// DbgEng exposes a 32-bit target's addresses as sign-extended 64-bit values, and its *Memory*
+    /// page says one recovered from a register or from memory "must be sign-extended to 64 bits
+    /// before it can be used in the debugger engine API" -- while `integer_register` widens a
+    /// 32-bit register with zeros. Measured 2026-10-13 on a large-address-aware 32-bit process
+    /// through the 32-bit worker, its stack above 2 GB: `esp` read `0x00000000ffa8fe54` here where
+    /// `? @esp` printed `-5702060 = ffa8fe54`, and a four-byte read at its top-down page answered
+    /// the same bytes whichever way the address was spelled. So on that path the read itself did
+    /// not need this; the pointer the trace records is still put in the engine's form, which is
+    /// the contract and what joins it to every other address the engine reports. On x64 the same
+    /// bit pattern below 4 GB is an ordinary user-mode address and is left alone. No x86 kernel has
+    /// been asked (`FOLLOWUPS.md` item 121).
+    fn address(self, value: u64) -> u64 {
+        match self {
+            Self::Registers { .. } => value,
+            Self::Stack { .. } => (value as u32 as i32 as i64) as u64,
+        }
+    }
+}
+
 /// The calling convention a pool trace reads a target by, or `None` for a machine this build
 /// does not know -- which is refused rather than read as x64's, where every hit would record three
 /// unrelated values as a size, a tag and a pool type. That fallback is what the first version did
@@ -9491,9 +9514,8 @@ fn call_arguments(
             Some([read(0)?, read(1)?, read(2)?])
         }
         Convention::Stack { stack_pointer, .. } => {
-            let first = engine
-                .integer_register(stack_pointer)
-                .ok()?
+            let first = convention
+                .address(engine.integer_register(stack_pointer).ok()?)
                 .checked_add(if returns { 0 } else { 4 })?;
             let bytes = engine.read_memory(first, layout.x86_stack().bytes).ok()?;
             crate::pooltrace::arguments_from_stack(layout, &bytes)
@@ -9819,7 +9841,14 @@ fn arm_pool_trace(
                     });
                     recorder.entry(site, thread, read)
                 } else {
-                    recorder.returned(site, thread, engine.integer_register(result_register).ok())
+                    recorder.returned(
+                        site,
+                        thread,
+                        engine
+                            .integer_register(result_register)
+                            .ok()
+                            .map(|value| convention.address(value)),
+                    )
                 }
             });
         if let Err(why) = e.set_breakpoint_callback(callback) {
@@ -14499,6 +14528,26 @@ mod tests {
             })
         );
         assert_eq!(convention(InstructionSet::Other(0x1c4)), None);
+    }
+
+    /// **An address read from an x86 register is sign-extended, and one read from x64's is not.**
+    /// The values are the 2026-10-13 measurement's: `esp` above 2 GB in a 32-bit process, which
+    /// the engine holds as `0xffffffffffa8fe54` and `integer_register` hands back with zeros above
+    /// it. The same bits on x64 are a user-mode address below 4 GB and must stay as they are, which
+    /// is why this is the convention's and not the register reader's.
+    #[test]
+    fn an_x86_address_is_sign_extended_from_its_register_and_an_x64_one_is_not() {
+        use dbgscope::dbgeng::InstructionSet;
+        let x86 = convention(InstructionSet::X86).expect("x86 has a convention");
+        assert_eq!(x86.address(0xffa8_fe54), 0xffff_ffff_ffa8_fe54);
+        assert_eq!(
+            x86.address(0x7ffe_0000),
+            0x7ffe_0000,
+            "below 2 GB is unchanged"
+        );
+        let x64 = convention(InstructionSet::Amd64).expect("x64 has a convention");
+        assert_eq!(x64.address(0xffa8_fe54), 0xffa8_fe54);
+        assert_eq!(x64.address(0xffff_c386_c12c_0770), 0xffff_c386_c12c_0770);
     }
 
     /// **A traced allocation's arguments are read by its allocator's layout**, which is the one

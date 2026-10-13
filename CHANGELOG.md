@@ -32,7 +32,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or on x86 the stack at the call, each argument its own width — `ExAllocatePool2`'s 64-bit
   `POOL_FLAGS` takes two slots, so its size and tag sit at `+8` and `+12` where
   `ExAllocatePoolWithTag`'s are at `+4` and `+8` — with a tail jump's arguments one slot up, past
-  the return address already there. The x86 reader is measured at a `__stdcall` call in a 32-bit
+  the return address already there. An address read from x86's registers — `esp` before the read,
+  `eax` after the call — is sign-extended from its 32 bits, which is the form the engine keeps a
+  32-bit target's addresses in and says a recovered one must take; measured 2026-10-13 on a 32-bit
+  process with its stack above 2 GB, the engine read a zero-extended address as readily, so this is
+  the contract and the join to the addresses the engine reports rather than a read that had failed.
+  The x86 reader is measured at a `__stdcall` call in a 32-bit
   user-mode process (`mcp_smoke`'s
   `an_x86_stdcall_call_holds_its_arguments_at_esp_and_its_result_in_eax`, 2026-10-13: the three
   slots, the two-slot 64-bit argument, `eax` after the call, and the hazard scan naming the
