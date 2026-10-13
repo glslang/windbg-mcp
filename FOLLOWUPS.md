@@ -2266,13 +2266,16 @@ one beside them.
 ## 129. [windbg-mcp] The live Secure Kernel tier takes a boot's coordinates from a private prep the KD gate discovers for itself
 
 **What happens.** `a_live_secure_kernel_session_stops_steps_inspects_resumes_and_closes` makes
-`vmwp_pid`, `dispatcher_vnd`, `partition_id` and `instruction_address` **required** in its config,
-and every one of them is a property of one boot: the worker pid and the partition change with each
-start, the dispatcher pointer with each worker, and the instruction is a VTL1 virtual address — the
-Secure Kernel's base plus an RVA, and the base moves. The managed KD gate beside it
-(`managed_secure_kernel_kd_gate`) **forbids** exactly those fields plus `expected_cr3` and
-`kernel_base`, "because discovering those is part of the gate", and takes its instruction as a
-build-relative RVA with a byte guard from the profile's `secure_kernel_kd.initial`. The server
+`vmwp_pid`, `dispatcher_vnd`, `partition_id`, `expected_cr3` and `instruction_address` **required**
+in its config — `expected_cr3` may be `null`, which is what the one conformant prep writes, but the
+key has to be there — and every one of them is a coordinate of one boot: the worker pid and the
+partition change with each start, the dispatcher pointer with each worker, the root is whatever
+the provider discovers, and the instruction is a VTL1 virtual address — the Secure Kernel's base
+plus an RVA, and the base moves. The managed KD gate beside it (`managed_secure_kernel_kd_gate`)
+**forbids** `vmwp_pid`, `dispatcher_vnd`, `partition_id`, `expected_cr3` and `kernel_base`,
+"because discovering those is part of the gate", and has no instruction address to forbid: it
+takes its instruction as a build-relative RVA with a byte guard from the profile's
+`secure_kernel_kd.initial`. The server
 treats the live opener's copies as assertions and resolves the worker from `vm_id` for both openers
 alike (`skdispatch::resolve_vmwp_pid`, called from `open_sk_live_control` and `open_sk_kd`), so the
 requirement is the test's, not the server's. The live tier is therefore runnable only through a
@@ -2306,8 +2309,9 @@ tier then passed on the retry's input in 39 s, and its audit — three healthy s
 VPs' debug registers back at baseline, TF/RF clear, the guarded text unchanged — passed too; every
 workaround above is a measurement of the gap, not a fix of it.
 
-- **What would close it:** give the live tier the KD gate's shape. Forbid the five boot-specific
-  fields and let the server's discovery supply them, as it already does for the opener; take the
+- **What would close it:** give the live tier the KD gate's shape. Forbid the KD gate's five —
+  `vmwp_pid`, `dispatcher_vnd`, `partition_id`, `expected_cr3`, `kernel_base` — and let the
+  server's discovery supply them, as it already does for the opener; take the
   guarded instruction and its slots as RVAs with byte guards, resolved against the base the
   live-memory provider reports, the way `open_sk_kd` resolves the profile's `initial.rva`; and have
   the audit read the root the provider reported rather than a constant. The private prep then
