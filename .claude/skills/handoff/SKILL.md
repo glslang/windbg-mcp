@@ -90,7 +90,7 @@ on #159 and #170, *"what is covered, what is not"* on #155.
 - **`DONE.md`** — the same entries once they land, kept in full and **under the number they were
   filed with**. Closing an item is therefore a *move*: out of `FOLLOWUPS.md`, out of its cluster
   list, and into `DONE.md` **with an index line**, which is the only list of what has closed. An
-  item that is **half** landed or **measured and declined** stays put — the first because the entry
+  item that is **half** landed or **declined** stays put — the first because the entry
   narrows to what is left, the second because nothing was built and the reopening condition is the
   content.
 
