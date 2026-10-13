@@ -88,8 +88,9 @@ Two consequences worth carrying:
 
 **Why nothing caught any of it.** Every tier that drives execution was the live-kernel one, which
 was already on the bounded wait; a dump cannot `go`, and no tier launched a process. The debugger
-tier now does (`launch_tier`, two tests in `tests/mcp_smoke.rs`). The one target type still
-unmeasured on this path is **TTD replay** — `FOLLOWUPS.md` item 47.
+tier now does (`launch_tier`, two tests in `tests/mcp_smoke.rs`). **TTD replay** was the last target
+type unmeasured on this path, and is measured now (`FOLLOWUPS.md` item 47, on the ARM64 bench):
+`SetInterrupt` unblocks a replay wait in both directions and the session goes on answering.
 
 **And after touching anything in this seam, run the fuzz** —
 `a_randomised_command_sequence_leaves_the_session_in_one_state_and_the_server_serving`, which is
@@ -113,17 +114,19 @@ routing, because it is the case where the two gates a handle passes have to wide
 Backing either half out alone was tried, and the end-to-end test fails identically both ways, since
 widening one only moves the refusal to a place with no caller to explain it to.
 
-**Its blocker moved rather than lifted, and which host it is about is the whole of the distinction.**
-Item 47 defers on "replay does not work on this host at all", and the sentence before it names the
-**ARM64 bench** — so that is the host, and nothing since has re-checked it. What is new is a
-*different* machine: the **x64 bench** has the `ttd\` payload beside `target\debug` and
-`target\release` (item 21's unpack recipe), and the TTD tier records a trace, opens it and queries
-it there. Item 47's gap is a **target type**, not an architecture, so an x64 measurement would
-answer it — but its sibling measurements were all taken on ARM64, and "generalised from one
-backend" is the mistake item 47's own text cites. Say which bench, in the item, whenever this
-moves. Before writing that test at all, note that a `go` or `reverse_go` on a replay target may
-simply stop at the trace boundary, in which case the bound is unreachable rather than untested and
-that is itself the answer.
+**A replay broken in is not left where it was, and the stop cannot say so** (`FOLLOWUPS.md` item
+125). TTD moves an interrupted replay to a position of its own choosing — usually the trace's end,
+or its start going backward, past every breakpoint the run had not reached; now and then that
+breakpoint itself with no hit reported — whatever its banner claims. So `StopReport`'s "the
+position is real" holds on a live target and not on a trace, and three things follow for this seam.
+A test cannot assert the landing, being TTD's choice (eleven of thirteen past, two at), which is
+why `ttd_a_replay_broken_in_at_its_bound_says_so_and_leaves_the_session_usable` prints it. A
+replay's bound is reached only through a **caller's** clock — `go`'s minute wants an unindexed
+trace of some 2.5 GB on the ARM64 bench — so a test of it uses `continue_async`, `run_to_address` or
+a batch step. And the one time the pre-#226 finite wait was put back, it ignored its bound on a
+replay outright (151 ms against 1 ms, `S_OK` at the breakpoint), so "a finite wait wedges the
+session" is measured on live targets and not on traces. All of it is ARM64; the x64 bench has not
+been asked.
 
 **And a live target has a lifetime, which is what makes a launch test different from every other
 one here.** A dump does not go away mid-test; a process does. `go` on `cmd.exe /c ping -n 30` runs

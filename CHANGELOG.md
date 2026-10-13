@@ -275,6 +275,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session loads changes. The alternative — moving the plugin into a subdirectory — would move
   every installed copy's binary, and was not taken.
 
+### Documentation
+
+- **A TTD replay broken in at its bound is measured now, and where it is left is written down.**
+  `FOLLOWUPS.md` item 47: fixing [#226](https://github.com/glslang/windbg-mcp/issues/226) put every
+  target type on the watchdog-bounded wait, and replay was the one nobody had asked. On the ARM64
+  bench `SetInterrupt` does stop a replay — at a `continue_async`, `run_to_address` or `debug_batch`
+  bound, forward and backward — and the session goes on answering and moving; the TTD tier now
+  records a trace and asserts it. What that found is in `docs/limitations.md` and item 125: TTD
+  leaves an interrupted replay where it chooses, usually at the trace's end and past any breakpoint
+  the run had not reached, so a `go` after a `timed_out` or `interrupted` stop on a trace can
+  report the end of the trace with a breakpoint sitting behind it.
+
 ## [0.22.0] - 2026-10-07
 
 ### Fixed

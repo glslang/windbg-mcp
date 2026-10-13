@@ -1954,7 +1954,7 @@ the primary failure before rerunning.
 $env:WINDBG_MCP_SMOKE_TTD = "1"; cargo test --test mcp_smoke -- --nocapture ttd
 ```
 
-Four tests, and the tier they belong to exists because **all three of the defects it covers
+Five tests. Four of them are why the tier exists: **all three of the defects they cover
 shipped** — `ttd_calls` and `ttd_memory` had returned blank rows since the initial commit, and
 `record_trace` could neither pass an argument nor report a short recording as anything but a
 failure. Nothing caught any of it, for a reason that is structural rather than an oversight: a
@@ -1986,6 +1986,7 @@ such sentence, and a misconfigured bundle should be loud.
 | `ttd_records_the_program_a_target_with_arguments_names` | #232 — `cmd.exe /c dir …` records, instead of TTD looking for a file with that whole name | recording at all (the old behaviour could not), plus the trace being named `cmd*`, since TTD names a trace after the program it launched |
 | `ttd_resolves_a_relative_target_against_the_recorders_working_directory` | the [#235](https://github.com/glslang/windbg-mcp/pull/235) review finding — a relative target is probed where the *recorder* runs, not where the server does | a fixture copied to `<work_dir>\a program.exe` and recorded as `.\a program.exe`; the trace must be named `a program*`, because the defect recorded **`a.exe`** and reported success |
 | `ttd_queries_answer_with_the_fields_they_promise` | #231 — a query returns records, not a column of bare indices | `ttd_events` and `ttd_memory` must render field names (`ModuleLoaded`, `AccessType`, `Value`); the address is a module base, read every time an image is mapped |
+| `ttd_a_replay_broken_in_at_its_bound_says_so_and_leaves_the_session_usable` | `FOLLOWUPS.md` item 47 — a replay that reaches its bound is broken in, says so, and leaves the session answering and moving; `run_to_address` answers `timeout` on one | `continue_async` with a 1 ms bound on `hostname.exe`'s trace, then `registers`, `go` and `reverse_go`; `run_to_address` aimed at the image's header, which nothing executes. Where TTD left the cut-short run is **printed** (`item 125: …`), not asserted — it is TTD's choice, and usually past the breakpoint the unbounded control stops at |
 
 **The queries are the two that need no symbols**, on purpose: the fields are then a property of the
 query rather than of what the host can resolve, so the tier does not stand down on a machine with
@@ -1998,6 +1999,11 @@ green tier means anything: `-r1` for the depth (both queries blank, and `ttd_eve
 assertion that fires), the unconditional early-exit failure, `.arg(target)` for the whole command
 line, and the probe against this process's directory — which fails with `` `a01.run` is not a
 recording of `a program.exe` ``, the wrong-program recording exactly as it was first measured.
+The fifth was checked the same way: with dbgscope's `settle` pumping a finite wait again — the
+shape [#226](https://github.com/glslang/windbg-mcp/issues/226) replaced — it fails at
+`timed_out`. Not because the session wedged: in that one run the wait ignored its bound, running
+151 ms against 1 ms and answering `S_OK` at the breakpoint, so the old code did not bound the
+replay at all.
 
 ## The user-mode fault fixtures
 
@@ -2256,13 +2262,14 @@ does not reach.
   `examples/drive_kernel_test.ps1 -Connection "net:port=<n>,key=<w.x.y.z>"`: attach,
   `bp nt!NtCreateFile`, `go` to it, resume, detach. See the KDNET gotchas in `.claude/skills/live-kernel/SKILL.md` before
   diagnosing a hang.
-- **TTD** — recording and the two queries are the [TTD tier](#the-ttd-tier) now, which is where to
-  start; it needs a WinDbg engine payload next to the binary to replay what it records (System32's
-  rejects a `.run` with `0x80070057`, and the tier stands that half down rather than failing).
-  What is left by hand is what the tier does not reach: **reverse execution** (`reverse_go`,
-  `step_back`, `step_over_back`, `goto_position`) on a trace, and `ttd_calls` against **resolved
-  symbols** — which the tier avoids deliberately, so that it does not stand down on a host with no
-  symbol server. The worked example is
+- **TTD** — recording, the two queries and a bounded replay are the [TTD tier](#the-ttd-tier) now,
+  which is where to start; it needs a WinDbg engine payload next to the binary to replay what it
+  records (System32's rejects a `.run` with `0x80070057`, and the tier stands that half down rather
+  than failing). What is left by hand is what the tier does not reach: **reverse stepping**
+  (`step_back`, `step_over_back`) on a trace — `reverse_go` and `goto_position` are driven by the
+  bound test, but only far enough to show the session still moves — and `ttd_calls` against
+  **resolved symbols**, which the tier avoids deliberately, so that it does not stand down on a host
+  with no symbol server. The worked example is
   [`docs/flareauthenticator-ttd-walkthrough.md`](flareauthenticator-ttd-walkthrough.md). **Read a
   row, do not count them**: issue #231 was two of these tools rendering the right number of rows
   with nothing in any of them, which a count cannot tell from a query that matched.
