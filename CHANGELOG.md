@@ -174,7 +174,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`modules { "refresh": true }` is bounded by the call's clock** (`FOLLOWUPS.md` item 54, in
   `DONE.md`). The resynchronisation is `IDebugSymbols::Reload("")`, a direct engine call nothing
   could stop short of `interrupt`; `EngineOp::Modules` now carries a `patience_ms` and the worker
-  runs dbgscope's new `reload_symbols_bounded` with it. Measured first, on the ARM64 bench's live
+  runs dbgscope's new `reload_symbols_bounded` with it -- or refuses the refresh as `not_run` when
+  it reaches the engine with none of the caller's clock left, rather than running it for nobody. Measured first, on the ARM64 bench's live
   kernel over 115200-baud serial: the first refresh after an attach read 181 modules in 3.9s, and a
   `SetInterrupt` part-way ends one within milliseconds. **A refresh stopped part-way leaves the
   inventory smaller than it started** -- the engine rebuilds its module list rather than adding to

@@ -10847,7 +10847,11 @@ first raise, failing `0xD000013A` (`STATUS_CONTROL_C_EXIT`). So
 [dbgscope#197](https://github.com/glslang/dbgscope/pull/197) adds `reload_symbols_bounded` →
 `SymbolReload { cut_short }`, the bounded command's shape around a direct call, and
 `EngineOp::Modules` carries a `patience_ms` that `patience_slot` hands out and the worker spends
-through `watchdog_budget_ms`, exactly as `ReadMemory`'s is. Bounds of 0.5s, 1s and 2s returned at
+through `walk_budget` — **not** `watchdog_budget_ms`, as `ReadMemory`'s is and as this entry's first
+draft did. That one floors at the 15s headroom, and review on #490 pointed out what the floor buys
+here: a refresh dequeued with its caller's clock spent would still run, for nobody, and could leave
+the inventory smaller than it found it. So a refresh with no time left is refused as `NotRun`, the
+way a walk with none is, and one with time gets a bound of at least 1ms. Bounds of 0.5s, 1s and 2s returned at
 517ms, 1,074ms and 2,005ms; a host's request at 1s and 2s, within 2ms of being raised; a 60s bound on
 the same cold reload took the same 3.9s and reported nothing. `an_op_that_carries_a_deadline_hands_it_to_the_pump`
 lists the op now, so a slot dropped from the match fails it.
@@ -10875,7 +10879,8 @@ lists the op now, so a slot dropped from the match fails it.
   `interrupt` sends nothing to a session with no job (`worker::interrupt_running`), so its route
   to that state is narrower — an interrupt sent to a job whose engine calls never poll for one,
   which ends with the break unread — and that route is read from the code, not reproduced through
-  the tool. Both dbgscope reload methods drain a pending break first now, which also covers
+  the tool. Both dbgscope reload methods drain a pending break that no operation owns first now
+(one an enclosing operation owns is left for it, from dbgscope#197's first review), which also covers
   `set_symbol_path`'s reload. dbgscope's `test_a_pending_break_does_not_empty_the_next_reload`
   fails with the drains backed out (measured).
 
