@@ -2005,6 +2005,13 @@ the primary failure before rerunning.
 $env:WINDBG_MCP_SMOKE_TTD = "1"; cargo test --test mcp_smoke -- --nocapture ttd
 ```
 
+**Run it from PowerShell, or from any shell whose `hostname.exe` is System32's.** Three of the five
+record `hostname.exe` by bare name, and Git Bash's PATH resolves that to Git's MSYS copy, which
+exits through `NtTerminateProcess` and never passes `ntdll!RtlExitUserProcess` — so the break-in
+test's control, an unbounded `go` to that export, runs to the end of the trace instead. Measured
+2026-10-13 on two recordings; `FOLLOWUPS.md` item 128 is the fix, which the relative-target test
+below already has for its own fixture.
+
 Five tests. Four of them are why the tier exists: **all three of the defects they cover
 shipped** — `ttd_calls` and `ttd_memory` had returned blank rows since the initial commit, and
 `record_trace` could neither pass an argument nor report a short recording as anything but a
