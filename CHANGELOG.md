@@ -34,7 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.for` loop printed before the read that ended it. The result's text now carries what the engine
   printed, then this server's line with the code; the typed half carries it as a new
   `error.engine_output` beside `error.message`, which stays this server's account alone. A
-  `debug_batch` step that fails shows it as that step's output. Needs dbgscope#198.
+  `debug_batch` step the debugger refused shows it as that step's output, and the report's typed
+  half as the step's own `engine_output` beside `detail`. A command that failed as an `interrupt`
+  landed keeps it too, under the `interrupted` category. Needs dbgscope#198.
 
 ### Documentation
 

@@ -11628,13 +11628,18 @@ fn a_refused_command_answers_with_what_the_engine_printed() {
         TARGET_STEP,
     );
     let text = text_of(&batch["result"]);
-    assert_eq!(
-        batch["result"]["structuredContent"]["steps"][0]["result"], "failed",
-        "{text}"
-    );
+    let step = &batch["result"]["structuredContent"]["steps"][0];
+    assert_eq!(step["result"], "failed", "{text}");
     assert!(
         text.contains("| Couldn't resolve error at 'nowhere!Nope'"),
         "the refused step does not show the engine's reason: {text}"
+    );
+    // And the typed half carries it as the step's own, for a client that keeps that half alone.
+    assert!(
+        step["engine_output"]
+            .as_str()
+            .is_some_and(|printed| printed.contains("Couldn't resolve error at 'nowhere!Nope'")),
+        "the typed step lost the engine's reason: {step}"
     );
 
     let go = server.call_tool("go", json!({ "session_id": &session }), TARGET_STEP);
