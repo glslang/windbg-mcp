@@ -11447,19 +11447,26 @@ onto a five-read stretch between polls it had never landed on. **Every `layout.f
 moves**, since one more field is resolved — `bbc9a6daae9ff7a2` → `38566b14fd9f4b50` on
 `ctf-vm`, and the two pinned in dbgscope's back-compat test were re-recorded with the reason.
 Here, the live-kernel tier's `compare_vs_page_end_placement` puts both halves to the engine: no
-small VS chunk may have its header at offset `0xff0`, and `!pool` must read a header at every
-page-aligned one the walk reports, with the walk's tag and sixteen bytes more than its usable
-size. Sampled from the walk, deliberately and against the grain of the two oracles beside it,
+small VS chunk of a heap carrying the flag may have its header at offset `0xff0` — the flag read
+per heap with `dx`, since a heap without it keeps a header there legitimately, which Codex raised
+on #499 — and `!pool` must read a header at every page-aligned one the walk reports, with the
+walk's tag and sixteen bytes more than its usable size. Sampled from the walk, deliberately and against the grain of the two oracles beside it,
 because this defect is one the walk's own answer shows — as a class of header offsets the
 allocator cannot produce. Run both ways against `ctf-vm` the day it was written: on the old pin
 it fails with 255 small VS chunks at `0xff0`, every one under the zero tag (347 s, the guest
 released cleanly); on the new pin it passes, four page-start headers agreeing with `!pool` and
-231 small VS chunks checked with none at `0xff0` (242 s).
+744 small VS chunks across the three heaps the census reaches — nonpaged NX, paged and
+prototype paged, each reading the flag set — checked with none at `0xff0` (270 s).
 
 **What this did not establish.**
 
 - **A target without the flag.** None measured; the walk's reading of one is the control test's
-  fixture, not a kernel.
+  fixture, not a kernel, and the tier's page-end assertion withholds itself on such a heap rather
+  than having been seen to.
+- **A chunk with no unit to skip.** Review found that a two-header chunk at offset `0xfe0` — the
+  smallest free remainder a split leaves — had its user block placed at its own end; it is read in
+  place now, and an *allocated* one that short, which the allocator's extra unit says cannot
+  happen, is reported. Not seen on either kernel; pinned by a fixture.
 - **29671 (`lab-nt`) was measured the same day, and carries the same rule with a different
   signature.** Both pool heaps' `Config` read `0x3` — `PageAlignLargeAllocs` is `Pos 0` on that
   PDB too, and `Config` is at `+4` — and the walk's zero-tagged chunks are the class: the first
