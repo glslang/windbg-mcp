@@ -69,19 +69,26 @@ protection" if you stop there.
    the PRs that land, and a PR can land without one: cutting 0.23.0 found four user-visible changes
    since the tag with no entry at all — a new tool, a group turned opt-in, a startup policy every
    Secure Kernel opener now needs, and an argument default that moved — three of them in commits
-   whose message was one line, so nothing but the tree said so. Three diffs find what reading the
+   whose message was one line, so nothing but the tree said so. Four diffs find what reading the
    section cannot, and each name they print that the section does not mention is an entry to write:
 
    ```console
    diff <(git show v<last>:tests/golden/tools_list.json | grep -o '"name": *"[a-z_0-9]*"' | sort -u) \
         <(grep -o '"name": *"[a-z_0-9]*"' tests/golden/tools_list.json | sort -u)   # tools added
    git diff v<last>..main -- DONE.md | grep '^+## '                                  # items closed
-   git diff v<last>..main -- src/server.rs | grep -E '^[-+].*(#\[default\]|Defaults to)'  # defaults moved
+   git diff v<last>..main -- src | grep -A1 -E '^[-+]\s*#\[default\]'                   # defaults moved
+   git diff v<last>..main -- src/server.rs | grep -E '^[-+].*Defaults to'               # defaults stated
    ```
 
-   The third is the coarsest — it reads doc comments — and it is the one that prints the arm mode's
-   move from `redirect` to `natural`, which no item heading names; cutting 0.23.0 found that one by
-   reading an item's body to the end, which is the slow way and the one that gets skipped.
+   The third prints an enum's `#[default]` leaving one variant and landing on another — on
+   `v0.22.0..main` it shows `Redirect` losing it and `Natural` gaining it — and has to read all of
+   `src`, because an argument's enum lives beside its subsystem rather than in `src/server.rs`,
+   where the attribute never appears. The fourth is the coarse one: it reads doc comments, so it
+   catches a default that only prose states (*Defaults to 30 seconds*) and prints a line for every
+   new argument that has one. Neither is `#[serde(default)]`, which marks a field as *optional* and
+   on the same range prints seventeen lines, none of them a value that moved. The arm mode is the
+   case to remember: no item heading names it, and cutting 0.23.0 found it by reading an item's
+   body to the end, which is the slow way and the one that gets skipped.
 3. **Dry-run both guards locally**, rather than by eye. They are twenty lines into
    [`release.yml`](../.github/workflows/release.yml) and take a second in `pwsh` — but copy them
    with one change, or the dry-run is worse than not running it. The workflow reads the tag from
