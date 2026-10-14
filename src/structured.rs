@@ -265,8 +265,8 @@ pub struct FailureDetail {
     /// segments of the command printed, and the line saying why. Kept apart from `message`
     /// because the code in that says little on its own — `0x80040205` answers a mistyped command,
     /// an argument naming nothing and `||1s` on a system not yet loaded alike. Present only on a
-    /// `debugger` failure of a command the caller's own text reached, and only when the engine
-    /// printed something.
+    /// `debugger` failure of a command the caller's own text reached, or an `interrupted` one whose
+    /// command failed as the break landed, and only when the engine printed something.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub engine_output: Option<String>,
     /// The session the failure is about, where the failure has one — including the openers
@@ -349,7 +349,7 @@ impl ErrorCategory {
             EngineError::Timeout(_) => Self::Timeout,
             EngineError::Stale(_) => Self::StaleSession,
             EngineError::Lost(_) => Self::WorkerLost,
-            EngineError::Interrupted(_) => Self::Interrupted,
+            EngineError::Interrupted { .. } => Self::Interrupted,
             EngineError::NotRun(_) => Self::NotRun,
             EngineError::InvalidArgument(_) => Self::InvalidArgument,
             EngineError::TargetRunning(_) => Self::TargetRunning,
@@ -4562,6 +4562,11 @@ pub struct BatchStepInfo {
     /// that did not hold, or why the step was never attempted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// What the debugger printed when it refused this step's action: its own reason, where
+    /// `detail` is this server's. The same text as the step's output in the report, clipped the
+    /// same way. Absent when the action was not refused, or the engine printed nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine_output: Option<String>,
     /// What this step changed, where the executor recognised a mutation. Recorded whether or not
     /// the step then succeeded — a command that errors may already have written.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4664,6 +4669,10 @@ impl From<&crate::batch::StepOutcome> for BatchStepInfo {
             action: step.rendered.clone(),
             result,
             detail,
+            // Read off the refusal, not off `result`: a step whose assertions could not be checked
+            // is `Failed` too, and its output is the action's answer rather than the engine's
+            // reason.
+            engine_output: (step.refused && !step.output.is_empty()).then(|| step.output.clone()),
             changes: step.changes.clone(),
             cut_short: step.cut_short,
             target_gone: step.target_gone,
@@ -5484,7 +5493,10 @@ mod tests {
                 "worker_lost",
             ),
             (
-                EngineError::Interrupted("no".into()),
+                EngineError::Interrupted {
+                    message: "no".into(),
+                    engine_output: None,
+                },
                 ErrorCategory::Interrupted,
                 "interrupted",
             ),

@@ -11289,7 +11289,7 @@ it holds nothing for, `dq`, `dps` and `db` print `????????` and `dt` prints `Mem
   refuses the text or the wait after it fails. The message is unchanged. `CommandFailed` stays for
   the failures that have no capture, so branches open against it keep compiling.
 - **The wire.** `proto::Failed::engine_output`. The supervisor's `engine_error` keeps it for a
-  `debugger` failure alone, as `EngineError::DebuggerWithOutput`.
+  `debugger` failure, as `EngineError::DebuggerWithOutput`, and for an `interrupted` one.
 - **The result.** The typed half gains `error.engine_output` beside `error.message`, which stays
   this server's account. The text shows the engine's output first, then the message, the order
   they happened in.
@@ -11297,25 +11297,36 @@ it holds nothing for, `dq`, `dps` and `db` print `????????` and `dt` prints `Mem
   appends to the message. That covers `execute`, `irp_stack`, and `debug_batch`'s `command` and
   `eval` steps. `go`, the steps, `run_to_address` and `continue_async` take
   `worker::engine_failed`, as does a batch `resume` step.
-- **The batch.** A failed batch step shows the engine's text as that step's output. An assertion
+- **The batch.** A step the debugger refused shows the engine's text as that step's output, and the
+  typed report carries it as the step's own `engine_output` beside `detail`. The step is marked
+  `refused` where the refusal happens, because a step whose assertions could not be checked is
+  `failed` too, and its output is the action's answer rather than the engine's reason. An assertion
   whose expression fails, and the probe of where the session stopped, quote it in their reasons.
+- **An interruption.** A command that failed as an `interrupt` landed is reported as
+  `interrupted` and keeps its `engine_output`: `worker::cut_short` recategorises the failure in
+  place, and `EngineError::Interrupted` carries the output across. This and the batch's typed field
+  came from review on #498: the first version rebuilt an interrupted failure from its message
+  alone, and kept a refused step's text out of the typed report.
 
 **Tests.**
 
 - **`a_refused_command_answers_with_what_the_engine_printed`** is the dump tier, end to end. A
   `.for` loop through `execute` whose third pass reads an unmapped address fails and carries
   `row 0` to `row 2` and `Memory access error`, in the text and in `engine_output`, with `message`
-  left without them. A batch step of `? nowhere!Nope` fails with the engine's reason as its output.
+  left without them. A batch step of `? nowhere!Nope` fails with the engine's reason as its output
+  and as the typed step's `engine_output`.
   `go` on the dump says `No runnable debuggees`.
 - **dbgscope's `test_a_refused_command_keeps_what_the_engine_printed`** drives the three paths a
   caller's text takes against a launched process. It passes on the inbox 10.0.26100.1 and fails at
   each path with that path's change backed out.
-- **Unit tests** cover the batch's rendering, the assertion's reason, the supervisor's mapping,
-  and the result's two halves.
+- **Unit tests** cover the batch's rendering and its typed step, the assertion's reason, the
+  interruption, the supervisor's mapping, and the result's two halves. A step that fails on an
+  answer it could not use carries no `engine_output`.
 
 **The cost.** Every output schema gains the optional field: +43 B on each of the 63 tools that
-declare one. That is +2,709 B of `outputSchema`, which no model reads, and the whole `tools/list`
-payload is 350,462 B against its 355,000 B ceiling. The model-visible surface went down, 123,244 → 123,199 B,
+declare one. That is +2,709 B of `outputSchema`, which no model reads, and the batch step's own
+field adds 43 B more to `debug_batch`'s. The whole `tools/list` payload is 350,505 B against its
+355,000 B ceiling. The model-visible surface went down, 123,244 → 123,199 B,
 because two descriptions got shorter while being corrected.
 
 **What else this corrected.**
@@ -11340,8 +11351,6 @@ because two descriptions got shorter while being corrected.
 - **The engine's own fixed queries.** `vertarget`, `.sympath` and the like still map through
   `failed`. Their failure is this server's to report, and their echo is noise to a caller who never
   wrote them.
-- **The batch's typed report gains no field.** It holds no step's output, failed or not, so the
-  engine's text goes where every step's does, and `detail` stays this server's account.
 - **The settle's own failure.** When the settle after a command fails, and when a failed command
   left the target running and the pump captured something, that text still folds into `message`
   as before. `engine_output` is the failing command's own capture and nothing else.

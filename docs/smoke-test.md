@@ -881,7 +881,8 @@ processes, so they need real ones:
   reads the same unmapped address has to fail **and** carry `row 0` to `row 2` and the engine's
   `Memory access error` — in the text, and in the typed half as `error.engine_output`, with
   `error.message` left as this server's account alone. A `debug_batch` step of `? nowhere!Nope`
-  has to fail with `Couldn't resolve error at 'nowhere!Nope'` as its output, and `go` on the dump
+  has to fail with `Couldn't resolve error at 'nowhere!Nope'` as its output and as the typed step's
+  `engine_output`, and `go` on the dump
   has to say `No runnable debuggees`. All three answered `0x80040205` and nothing else before,
   which is the code for each of them, so the engine's line is the only thing that tells them apart.
 - *A pool walk takes this server's deadline, not the walker's default.* Asserted against the

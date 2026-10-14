@@ -294,7 +294,16 @@ pub enum EngineError {
     Lost(String),
     /// The work was stopped on request. Not a failure of the target, and reported as one for as
     /// long as the worker could only send a message: somebody asked for this.
-    Interrupted(String),
+    ///
+    /// `engine_output` is what the engine printed when the operation stopped was a command that
+    /// failed as the break landed — the rows a loop had reached, which are the partial result an
+    /// interrupt is asked for. A field here rather than a second variant like
+    /// [`Self::DebuggerWithOutput`], because this one is built in one place, [`engine_error`], and
+    /// not from sentences of this server's all over the supervisor.
+    Interrupted {
+        message: String,
+        engine_output: Option<String>,
+    },
     /// The work was never started — too little of the caller's budget was left to do it and
     /// report back. Distinct from [`Self::Timeout`] in the way that matters: nothing ran, so
     /// nothing changed, and a retry is unambiguous.
@@ -334,12 +343,19 @@ impl fmt::Display for EngineError {
             Self::DebuggerWithOutput {
                 message,
                 engine_output,
+            }
+            | Self::Interrupted {
+                message,
+                engine_output: Some(engine_output),
             } => write!(f, "{}\n{message}", engine_output.trim_end()),
             Self::Debugger(m)
             | Self::Timeout(m)
             | Self::Stale(m)
             | Self::Lost(m)
-            | Self::Interrupted(m)
+            | Self::Interrupted {
+                message: m,
+                engine_output: None,
+            }
             | Self::NotRun(m)
             | Self::InvalidArgument(m)
             | Self::TargetRunning(m)
@@ -351,8 +367,9 @@ impl fmt::Display for EngineError {
 impl EngineError {
     /// This server's account of the failure, without what the debugger printed.
     ///
-    /// The whole of [`fmt::Display`] for every variant but [`Self::DebuggerWithOutput`], whose
-    /// rendering puts the engine's text above this.
+    /// The whole of [`fmt::Display`] unless the failure carries what the engine printed — a
+    /// [`Self::DebuggerWithOutput`], or an [`Self::Interrupted`] with output — whose rendering
+    /// puts the engine's text above this.
     pub fn message(&self) -> &str {
         match self {
             Self::DebuggerWithOutput { message, .. }
@@ -360,7 +377,7 @@ impl EngineError {
             | Self::Timeout(message)
             | Self::Stale(message)
             | Self::Lost(message)
-            | Self::Interrupted(message)
+            | Self::Interrupted { message, .. }
             | Self::NotRun(message)
             | Self::InvalidArgument(message)
             | Self::TargetRunning(message)
@@ -372,6 +389,7 @@ impl EngineError {
     pub fn engine_output(&self) -> Option<&str> {
         match self {
             Self::DebuggerWithOutput { engine_output, .. } => Some(engine_output),
+            Self::Interrupted { engine_output, .. } => engine_output.as_deref(),
             _ => None,
         }
     }
@@ -396,13 +414,19 @@ fn engine_error(failed: crate::proto::Failed) -> EngineError {
     use crate::structured::ErrorCategory;
     match failed.category {
         Some(ErrorCategory::RecoveryRequired) => EngineError::RecoveryRequired(failed.message),
-        Some(ErrorCategory::Interrupted) => EngineError::Interrupted(failed.message),
+        // An interruption keeps what was printed too: `worker::cut_short` recategorises a command
+        // that failed as the break landed without dropping its capture, and the rows it reached are
+        // the partial result the caller interrupted for.
+        Some(ErrorCategory::Interrupted) => EngineError::Interrupted {
+            message: failed.message,
+            engine_output: failed.engine_output,
+        },
         Some(ErrorCategory::NotRun) => EngineError::NotRun(failed.message),
         Some(ErrorCategory::InvalidArgument) => EngineError::InvalidArgument(failed.message),
         Some(ErrorCategory::StaleSession) => EngineError::Stale(failed.message),
-        // The one category whose failure is the debugger's own, and so the one that keeps what it
-        // printed: the arms above are this server's statements about the call, and a worker
-        // attaches engine output to none of them (`Failed::printed` names no category).
+        // The category whose failure is the debugger's own, and so the other one that keeps what
+        // it printed: the rest of the arms above are this server's statements about the call, and
+        // a worker attaches engine output to none of them (`Failed::printed` names no category).
         _ => match failed.engine_output {
             Some(engine_output) => EngineError::DebuggerWithOutput {
                 message: failed.message,
@@ -5290,11 +5314,12 @@ fn record_secure_kernel_kd_phase(session: &Session, phase: SecureKernelKdPhase) 
 mod tests {
     use super::*;
 
-    /// A failure from the worker keeps what the engine printed when it is the debugger's own, and
-    /// only then (`FOLLOWUPS.md` item 126). Every other category is this server's statement about
-    /// the call, so output arriving beside one is not something to show as the engine's reason.
+    /// A failure from the worker keeps what the engine printed when it is the debugger's own, or
+    /// an interrupted command's, and only then (`FOLLOWUPS.md` item 126). Every other category is
+    /// this server's statement about the call, so output arriving beside one is not something to
+    /// show as the engine's reason.
     #[test]
-    fn engine_error_keeps_what_the_engine_printed_on_a_debugger_failure_alone() {
+    fn engine_error_keeps_what_the_engine_printed_on_a_debugger_or_interrupted_failure() {
         let printed = "zzzz\nCouldn't resolve error at 'zzz'\n";
         let refused = crate::proto::Failed::printed("Debug command failed", Some(printed));
         match engine_error(refused) {
@@ -5313,9 +5338,26 @@ mod tests {
             "stopped on request",
         );
         interrupted.engine_output = Some(printed.into());
+        let interrupted = engine_error(interrupted);
+        assert_eq!(interrupted.message(), "stopped on request");
+        assert_eq!(
+            interrupted.engine_output(),
+            Some(printed),
+            "an interrupted command's rows were dropped: {interrupted:?}"
+        );
+        assert_eq!(
+            interrupted.to_string(),
+            format!("{}\nstopped on request", printed.trim_end())
+        );
+
+        let mut refused = crate::proto::Failed::categorised(
+            crate::structured::ErrorCategory::InvalidArgument,
+            "no such register",
+        );
+        refused.engine_output = Some(printed.into());
         assert!(matches!(
-            engine_error(interrupted),
-            EngineError::Interrupted(message) if message == "stopped on request"
+            engine_error(refused),
+            EngineError::InvalidArgument(message) if message == "no such register"
         ));
 
         // Blank output is no output.

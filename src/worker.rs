@@ -1752,11 +1752,15 @@ fn cut_short(result: Result<Output, Failed>) -> Result<Output, Failed> {
         }
         // The category matters as much as the note: an interrupted operation reported as a
         // debugger failure tells its caller the target misbehaved, when what happened is that
-        // somebody — quite possibly that same caller — asked for it to stop.
-        Err(failed) => Err(Failed::categorised(
-            structured::ErrorCategory::Interrupted,
-            format!("{}\n\n{NOTE}", failed.message),
-        )),
+        // somebody — quite possibly that same caller — asked for it to stop. Recategorised in
+        // place rather than rebuilt from the message, so what the engine printed before the break
+        // stays with it (`FOLLOWUPS.md` item 126) — the rows a loop had reached are the partial
+        // result an interrupt is asked for.
+        Err(failed) => Err(Failed {
+            category: Some(structured::ErrorCategory::Interrupted),
+            message: format!("{}\n\n{NOTE}", failed.message),
+            ..failed
+        }),
     }
 }
 
@@ -17603,6 +17607,21 @@ mod tests {
         assert!(err.message.starts_with("Memory access error"), "{err:?}");
         assert!(err.message.contains("interrupted on request"), "{err:?}");
         assert_eq!(err.category, Some(structured::ErrorCategory::Interrupted));
+    }
+
+    /// A failure the break turned into an interruption keeps what the engine printed before it:
+    /// the rows a loop had reached are the partial result, and the message stays this server's.
+    #[test]
+    fn an_interrupted_failure_keeps_what_the_engine_printed() {
+        let err = cut_short(Err(Failed::printed(
+            "Debug command failed: An unexpected exception was raised (0x80040205)",
+            Some("row 0\nrow 1\n"),
+        )))
+        .expect_err("still a failure");
+        assert_eq!(err.category, Some(structured::ErrorCategory::Interrupted));
+        assert_eq!(err.engine_output.as_deref(), Some("row 0\nrow 1\n"));
+        assert!(!err.message.contains("row 0"), "{err:?}");
+        assert!(err.message.contains("interrupted on request"), "{err:?}");
     }
 
     /// An operation interrupted before it printed anything still explains itself, rather than

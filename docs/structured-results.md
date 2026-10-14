@@ -154,9 +154,11 @@ tools that run the target — also carries `engine_output`: what the engine prin
 starting with its echo of the command and ending with the line saying why. It is kept apart from
 `message`, which is this server's account, because the code in that says little on its own:
 `0x80040205` answers a mistyped command, an argument naming nothing, `g` on a dump and `||1s` on a
-system not yet loaded alike, and only the engine's line says which. The result's text shows both,
-the engine's first. A `debug_batch` step that fails shows the same text as that step's output.
-`FOLLOWUPS.md` item 126 has the measurements.
+system not yet loaded alike, and only the engine's line says which. An `interrupted` failure
+carries it too when the command failed as the break landed, and there it holds what the command had
+printed before the break. The result's text shows both, the engine's first. A `debug_batch` step the
+debugger refused shows the same text as that step's output, and the report's typed half carries it
+as that step's own `engine_output`, beside `detail`. `FOLLOWUPS.md` item 126 has the measurements.
 
 ## Binary Ninja bridge contracts
 

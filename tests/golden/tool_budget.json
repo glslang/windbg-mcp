@@ -96,8 +96,8 @@
       "inputSchema": 7998,
       "modelVisible": 10296,
       "name": "debug_batch",
-      "outputSchema": 3609,
-      "wire": 14070
+      "outputSchema": 3652,
+      "wire": 14113
     },
     {
       "annotations": 85,
@@ -709,10 +709,10 @@
     "inputSchema": 72308,
     "instructions": 2022,
     "modelVisible": 123199,
-    "outputSchema": 216441,
-    "payload": 350462,
+    "outputSchema": 216484,
+    "payload": 350505,
     "tools": 78,
-    "wire": 350373,
+    "wire": 350416,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10296
   }

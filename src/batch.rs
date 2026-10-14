@@ -1121,6 +1121,12 @@ pub struct StepOutcome {
     pub changes: Option<String>,
     pub result: StepResult,
     pub output: String,
+    /// The debugger refused this step's action, so [`Self::output`] is what the engine printed as
+    /// it did — its own reason — rather than an answer (`FOLLOWUPS.md` item 126). Not the same fact
+    /// as a [`StepResult::Failed`]: a step whose assertions could not be checked fails too, and its
+    /// output is the action's answer. The typed report hands the text on as the engine's only
+    /// where this is set.
+    pub refused: bool,
     /// A break somebody asked for landed while this step was running, so its output is what the
     /// step had reached rather than what it would have produced.
     ///
@@ -1149,6 +1155,7 @@ impl StepOutcome {
             changes: None,
             result: StepResult::Skipped(why.into()),
             output: String::new(),
+            refused: false,
             cut_short: false,
             target_gone: false,
         }
@@ -1836,6 +1843,7 @@ fn run_step(
                     changes,
                     result,
                     output,
+                    refused: true,
                     cut_short: false,
                     // **A step can fail and still have ended the target**, and nothing it returns can
                     // say so: `raw_command`'s own contract is that a command failing part-way may
@@ -1948,6 +1956,7 @@ fn run_step(
             changes,
             result,
             output: clip(&output, cap),
+            refused: false,
             cut_short,
             target_gone,
         },
@@ -4534,6 +4543,14 @@ mod tests {
 
         let report = run(&mut d, &batch, BUDGET);
         assert_eq!(report.outcome, BatchOutcome::Failed { at: 1 });
+        // The engine answered and the *step* failed, so what it printed is the action's answer and
+        // not a refusal — the typed half must not hand it on as the engine's reason.
+        assert!(
+            crate::structured::BatchStepInfo::from(&report.steps[0])
+                .engine_output
+                .is_none(),
+            "an answer the step could not use is not the engine refusing it"
+        );
     }
 
     /// A step the engine refuses shows what the engine printed, beside the code it refused with.
@@ -4566,6 +4583,17 @@ mod tests {
         assert!(
             text.contains("| Couldn't resolve error at 'zzz'"),
             "the engine's reason is not in the report: {text}"
+        );
+
+        // And the typed half carries it as the engine's, beside the server's detail.
+        let typed = crate::structured::BatchStepInfo::from(&report.steps[0]);
+        assert_eq!(typed.detail.as_deref(), Some(refused));
+        let printed = typed
+            .engine_output
+            .expect("the typed step lost the engine's reason");
+        assert!(
+            printed.contains("Couldn't resolve error at 'zzz'"),
+            "{printed}"
         );
     }
 
