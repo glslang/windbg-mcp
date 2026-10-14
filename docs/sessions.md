@@ -123,8 +123,10 @@ limits are recorded there rather than here.
 `open_sk_live_control` opens a dedicated control session for selected VTL1 VPs in a running,
 disposable VBS VM. The caller supplies a primary `vp` and may add distinct `additional_vps`; every
 provider shares the exact VM GUID, discovered partition ID and VTL1 CR3. The caller also supplies
-the `vmwp` PID, dispatcher address, an exact-build adapter profile, a register-control provider
-command and a live memory transport command. The repository supplies neither privileged provider.
+an exact-build adapter profile, a register-control provider command and a live memory transport
+command, each of which the server's startup policy must admit; the `vmwp` PID, dispatcher address,
+partition ID and CR3 are discovered by the worker, and a caller that supplies one supplies a
+mismatch assertion rather than an input. The repository supplies neither privileged provider.
 The worker validates the request, profile and register provider's declared identity and
 capabilities before it accepts the session; opening itself does not change guest execution. The
 first `sk_live_arm` pauses the VM,
@@ -160,11 +162,13 @@ capacity reclamation, lease expiry, shutdown and supervisor loss. The unresolved
 further control work and cannot be treated as released. Inspect or discard the disposable VM out of
 band before allowing another controller to own it.
 
-The same controller can be driven by an installed WinDbg instead of these tools, through the
-`--sk-kd-target` command-line role: a serial KD facade over a local named pipe that is **not** a
-session — it speaks no MCP, appears nowhere in `session_status`, and ends when the debugger
-disconnects or quits, running the controller's normal close.
-[`docs/secure-kernel/kd-facade.md`](secure-kernel/kd-facade.md) has what it can and cannot do.
+The same controller can be driven by an installed WinDbg instead of these tools. `open_sk_kd` opens
+it as a session of its own: a serial KD facade over a generated local named pipe, where WinDbg holds
+the execution lease and MCP keeps `session_status`, `server_log` and `end_session`, which runs the
+controller's normal close. The older `--sk-kd-target` command-line role remains for diagnosis and is
+**not** a session — it speaks no MCP, appears nowhere in `session_status`, and ends when the
+debugger disconnects or quits, running that same close.
+[`docs/secure-kernel/kd-facade.md`](secure-kernel/kd-facade.md) has what either can and cannot do.
 
 ## Running a target asynchronously
 

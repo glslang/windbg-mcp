@@ -114,7 +114,7 @@ native analysis of it works and always has — and says so in the opener's `limi
 
 ## Tools
 
-Seventy-six tools in nine `--tools` groups; the rows below split some of those groups by theme. The
+Seventy-eight tools in nine `--tools` groups; the rows below split some of those groups by theme. The
 `--tools` column is the name that selects one — see
 [Serving fewer tools](docs/tool-surface.md#serving-fewer-tools---tools).
 
