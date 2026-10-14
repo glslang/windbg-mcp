@@ -3971,28 +3971,23 @@ fn raw_command(e: &DebugEngine, command: &str, budget_ms: u32) -> Result<Command
     let started = Instant::now();
     let ran = e.execute_command_bounded(command, budget_ms);
     query::invalidate_allocator_snapshots();
-    // Taken before the failure becomes text, because text is all the rest of this has room for:
-    // the settle below appends its own sentences to the message, and what the engine printed has
-    // to stay apart from them (`FOLLOWUPS.md` item 126). Only the command's own failure has any —
-    // a settle that fails after a command that succeeded folds that command's output into its
-    // message, as it always has.
-    let printed = ran
-        .as_ref()
-        .err()
-        .and_then(DbgEngError::output)
-        .map(str::to_string);
-    settled(e, command, budget_ms, started, ran.map_err(es))
-        .map_err(|why| Failed::printed(why, printed.as_deref()))
+    // A `Failed` from here on rather than text, because the settle below has sentences of its own
+    // to add and what the engine printed has to stay apart from them (`FOLLOWUPS.md` item 126).
+    settled(e, command, budget_ms, started, ran.map_err(engine_failed))
 }
 
 /// [`raw_command`] after the command has run: the settle, and what it makes of the result.
+///
+/// **What the engine printed during the pump is the engine's, whichever way the call ends**: on a
+/// success it follows the command's output, and on a failure it joins the command's capture in
+/// [`Failed::engine_output`] while this server's sentences about the run join the message.
 fn settled(
     e: &DebugEngine,
     command: &str,
     budget_ms: u32,
     started: Instant,
-    result: Result<CommandRun, String>,
-) -> Result<CommandRun, String> {
+    result: Result<CommandRun, Failed>,
+) -> Result<CommandRun, Failed> {
     // Capped at the ordinary execution wait, and again at what is left of the caller's clock.
     //
     // [`EXEC_WAIT_MS`] because a raw `g` that reaches no stop should cost what `go` costs and not
@@ -4021,9 +4016,9 @@ fn settled(
     }
     let settled = match e.settle(settle_ms) {
         Ok(settled) => settled,
-        Err(why) => return settle_failed(e, result, &es(why)),
+        Err(why) => return settle_failed(e, result, why),
     };
-    let Some(settled) = settled else {
+    let Some(mut settled) = settled else {
         return result;
     };
     // Read before `settled` is consumed below.
@@ -4045,13 +4040,16 @@ fn settled(
     // is "now stopped" somewhere: there is no position to read, and the sentence would describe a
     // session that no longer exists.
     let ending = settled.target_gone;
-    let pumped = match ending {
+    // The pump's capture apart from this server's sentences about the run, so a failed command can
+    // keep the two apart. A successful one shows them in this order either way.
+    let printed = std::mem::take(&mut settled.output);
+    let said = match ending {
         true => told_moving(settled),
         false => appended(told_moving(settled), Some(moved_note(e, forced))),
     };
     match result {
         Ok(mut run) => {
-            run.output = appended(run.output, Some(pumped));
+            run.output = appended(run.output, Some(appended(printed, Some(said))));
             // The pump's ending belongs to the run this returns, not only to its prose. The
             // command's own `target_gone` is false here — it was the *pump* that watched the
             // target leave — so without this a `debug_batch` `{"op": "command", "command": "g"}`
@@ -4060,10 +4058,25 @@ fn settled(
             run.target_gone |= ending;
             Ok(run)
         }
-        // The command failed *and* left the target running. Both facts, in the one channel an
-        // error has: dropping the second would report a session as untouched when it was pumped.
-        Err(why) => Err(appended(why, Some(pumped))),
+        // The command failed *and* left the target running. Both facts: dropping the second would
+        // report a session as untouched when it was pumped.
+        Err(why) => Err(with_printed(why, Some(printed)).and_note(&said)),
     }
+}
+
+/// `failed` with what the engine printed after it — a pump's capture — joined to its own.
+///
+/// Blank is nothing, as [`Failed::printed`] has it: a pump that printed only line breaks leaves
+/// the field as it was rather than turning an absent one into whitespace.
+fn with_printed(mut failed: Failed, more: Option<String>) -> Failed {
+    let Some(more) = more.filter(|text| !text.trim().is_empty()) else {
+        return failed;
+    };
+    failed.engine_output = Some(appended(
+        failed.engine_output.take().unwrap_or_default(),
+        Some(more),
+    ));
+    failed
 }
 
 /// Where a raw command left the target, for the note above.
@@ -4111,7 +4124,7 @@ fn settle_verdict(running: Result<bool, String>, why: &str) -> SettleVerdict {
         Ok(true) => SettleVerdict::Damaged(format!(
             "The command ran, and it left the target running. Pumping it to a stop failed \
              ({why}), and the engine still reports it running, so execution control on this \
-             session will fail until the target stops. The command's own output follows."
+             session will fail until the target stops."
         )),
         Ok(false) => SettleVerdict::Fine,
         // Reported as not knowing rather than guessed at, which is this server's rule everywhere
@@ -4124,23 +4137,41 @@ fn settle_verdict(running: Result<bool, String>, why: &str) -> SettleVerdict {
     }
 }
 
-/// [`settle_verdict`] applied to what the command itself answered.
+/// [`settle_verdict`] applied to what the command itself answered, and to what the pump printed
+/// before it failed.
 ///
 /// The output survives every branch, including the one that becomes an error: a caller whose
-/// session is damaged still needs to see what the command printed, and this is the only copy.
+/// session is damaged still needs to see what the command printed, and this is the only copy. So
+/// does the pump's, which is the engine's too and comes after the command's — on a success it
+/// follows the output, and on a failure it joins [`Failed::engine_output`] (`FOLLOWUPS.md` item
+/// 126), where the command's own already is.
 fn settled_or(
     verdict: SettleVerdict,
-    result: Result<CommandRun, String>,
-) -> Result<CommandRun, String> {
+    result: Result<CommandRun, Failed>,
+    pumped: Option<String>,
+) -> Result<CommandRun, Failed> {
+    let result = match result {
+        Ok(mut run) => {
+            run.output = appended(run.output, pumped.filter(|text| !text.trim().is_empty()));
+            Ok(run)
+        }
+        Err(failed) => Err(with_printed(failed, pumped)),
+    };
     match verdict {
         SettleVerdict::Fine => result,
-        SettleVerdict::Damaged(said) => Err(appended(said, output_of(result))),
+        SettleVerdict::Damaged(said) => Err(match result {
+            Ok(run) => Failed::printed(said, Some(&run.output)),
+            Err(failed) => Failed {
+                message: appended(said, Some(failed.message)),
+                ..failed
+            },
+        }),
         SettleVerdict::Unknown(note) => match result {
             Ok(mut run) => {
                 run.output = appended(run.output, Some(note));
                 Ok(run)
             }
-            Err(command_failed) => Err(appended(command_failed, Some(note))),
+            Err(command_failed) => Err(command_failed.and_note(&note)),
         },
     }
 }
@@ -4148,10 +4179,14 @@ fn settled_or(
 /// Asks the engine what a failed settle left behind, and answers accordingly.
 fn settle_failed(
     e: &DebugEngine,
-    result: Result<CommandRun, String>,
-    why: &str,
-) -> Result<CommandRun, String> {
-    let verdict = settle_verdict(e.is_running().map_err(es), why);
+    result: Result<CommandRun, Failed>,
+    why: DbgEngError,
+) -> Result<CommandRun, Failed> {
+    // What the pump captured before it failed, which dbgscope hands back on the error rather than
+    // in a run that never completed.
+    let pumped = why.output().map(str::to_string);
+    let why = why.to_string();
+    let verdict = settle_verdict(e.is_running().map_err(es), &why);
     match &verdict {
         SettleVerdict::Damaged(_) => tracing::warn!(
             "worker: the settle after a raw command failed and the target is still running: {why}"
@@ -4163,16 +4198,7 @@ fn settle_failed(
             "worker: the settle after a raw command failed and the run state is unreadable: {why}"
         ),
     }
-    settled_or(verdict, result)
-}
-
-/// A command's text whichever way it ended, for a message that has to carry both.
-fn output_of(result: Result<CommandRun, String>) -> Option<String> {
-    Some(match result {
-        Ok(run) => run.output,
-        Err(why) => why,
-    })
-    .filter(|text| !text.trim().is_empty())
+    settled_or(verdict, result, pumped)
 }
 
 /// Milliseconds since `started`, saturating — the shape every budget subtraction here wants.
@@ -4307,12 +4333,8 @@ fn pump_a_resume(
         // obvious: the run is over and the command's own text is all of it.
         Ok(None) => ran(String::new()),
         Err(why) => {
-            let why = es(why);
             tracing::warn!("worker: pumping a resumed target failed ({why})");
-            return match settle_failed(e, Ok(ran(echo)), &why) {
-                Ok(run) => Ok(stopped(e, command, run)),
-                Err(text) => Err(Failed::from(text)),
-            };
+            return settle_failed(e, Ok(ran(echo)), why).map(|run| stopped(e, command, run));
         }
     };
     Ok(stopped(
@@ -19355,15 +19377,28 @@ mod tests {
             })
         };
 
-        let damaged = settled_or(SettleVerdict::Damaged("still running".into()), ran())
+        // A damaged session is an error whose message is this server's account and whose engine
+        // output is what the command printed (`FOLLOWUPS.md` item 126).
+        let damaged = settled_or(SettleVerdict::Damaged("still running".into()), ran(), None)
             .expect_err("a damaged session is an error");
-        assert!(damaged.contains("still running"), "{damaged}");
-        assert!(damaged.contains("the command said this"), "{damaged}");
+        assert!(damaged.message.contains("still running"), "{damaged:?}");
+        assert!(
+            !damaged.message.contains("the command said this"),
+            "{damaged:?}"
+        );
+        assert!(
+            damaged
+                .engine_output
+                .as_deref()
+                .is_some_and(|printed| printed.contains("the command said this")),
+            "{damaged:?}"
+        );
 
-        let fine = settled_or(SettleVerdict::Fine, ran()).expect("a fine session is not an error");
+        let fine =
+            settled_or(SettleVerdict::Fine, ran(), None).expect("a fine session is not an error");
         assert_eq!(fine.output, "0:000> the command said this");
 
-        let unknown = settled_or(SettleVerdict::Unknown("cannot say".into()), ran())
+        let unknown = settled_or(SettleVerdict::Unknown("cannot say".into()), ran(), None)
             .expect("not knowing is not the command failing");
         assert!(
             unknown.output.contains("the command said this"),
@@ -19371,15 +19406,81 @@ mod tests {
         );
         assert!(unknown.output.contains("cannot say"), "{unknown:?}");
 
-        // And when the command itself failed, both facts reach the caller through the one channel
-        // an error has.
+        // And when the command itself failed, both facts reach the caller, and what it printed
+        // stays the engine's.
         let both = settled_or(
             SettleVerdict::Unknown("cannot say".into()),
-            Err("the command failed".to_string()),
+            Err(Failed::printed("the command failed", Some("zzzz\n"))),
+            None,
         )
         .expect_err("a failed command stays failed");
-        assert!(both.contains("the command failed"), "{both}");
-        assert!(both.contains("cannot say"), "{both}");
+        assert!(both.message.contains("the command failed"), "{both:?}");
+        assert!(both.message.contains("cannot say"), "{both:?}");
+        assert_eq!(both.engine_output.as_deref(), Some("zzzz\n"));
+    }
+
+    /// What the pump printed before it failed is the engine's too, and survives every verdict:
+    /// after the command's output on a success, and in `engine_output` beside the command's own
+    /// capture on a failure — never in the message, and never dropped. dbgscope hands it back on
+    /// the settle's error, which is the only place it is.
+    #[test]
+    fn a_failed_settle_keeps_what_the_pump_printed() {
+        let pumped = || Some("Breakpoint 0 hit\n".to_string());
+        let ran = || {
+            Ok(CommandRun {
+                output: "0:000> g".to_string(),
+                cut_short: None,
+                target_gone: false,
+            })
+        };
+
+        let fine = settled_or(SettleVerdict::Fine, ran(), pumped()).expect("fine");
+        assert_eq!(fine.output, "0:000> g\nBreakpoint 0 hit\n");
+
+        let unknown =
+            settled_or(SettleVerdict::Unknown("cannot say".into()), ran(), pumped()).expect("ok");
+        assert!(unknown.output.contains("Breakpoint 0 hit"), "{unknown:?}");
+
+        let damaged = settled_or(
+            SettleVerdict::Damaged("still running".into()),
+            ran(),
+            pumped(),
+        )
+        .expect_err("a damaged session is an error");
+        assert_eq!(
+            damaged.engine_output.as_deref(),
+            Some("0:000> g\nBreakpoint 0 hit\n")
+        );
+        assert!(!damaged.message.contains("Breakpoint 0 hit"), "{damaged:?}");
+
+        let refused = settled_or(
+            SettleVerdict::Damaged("still running".into()),
+            Err(Failed::printed(
+                "Debug command failed",
+                Some("g; zzzz\nCouldn't resolve error at 'zzzz'\n"),
+            )),
+            pumped(),
+        )
+        .expect_err("a failed command stays failed");
+        assert_eq!(
+            refused.engine_output.as_deref(),
+            Some("g; zzzz\nCouldn't resolve error at 'zzzz'\nBreakpoint 0 hit\n"),
+            "the command's capture, then the pump's"
+        );
+        assert!(refused.message.contains("still running"), "{refused:?}");
+        assert!(
+            refused.message.contains("Debug command failed"),
+            "{refused:?}"
+        );
+
+        // A pump that printed nothing but line breaks adds nothing.
+        let blank = settled_or(
+            SettleVerdict::Fine,
+            Err(Failed::printed("Debug command failed", None)),
+            Some("\n\n".to_string()),
+        )
+        .expect_err("still failed");
+        assert_eq!(blank.engine_output, None);
     }
 
     /// And it claims only what it can know.

@@ -262,7 +262,8 @@ pub struct FailureDetail {
     /// `engine_output` above it when there is one.
     pub message: String,
     /// What the debugger printed during the command that failed: its echo, whatever earlier
-    /// segments of the command printed, and the line saying why. Kept apart from `message`
+    /// segments of the command printed, and the line saying why — then, where the command left
+    /// the target running, what the pump to a stop printed after it. Kept apart from `message`
     /// because the code in that says little on its own — `0x80040205` answers a mistyped command,
     /// an argument naming nothing and `||1s` on a system not yet loaded alike. Present only on a
     /// `debugger` failure of a command the caller's own text reached, or an `interrupted` one whose
