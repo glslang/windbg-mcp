@@ -106,9 +106,10 @@ offending frame. No elevation needed; works on System32's engine.
 - **Symbols matter most here.** A stack of raw addresses tells you little — get
   `(pdb symbols)` working ([setup.md](setup.md)) before drawing conclusions.
 - **Minidumps are partial.** `read_memory` can fail for pages not captured in the dump;
-  that's the dump's limitation, not a tool error. A `dt`/`dq`/`dps` against an *uncaptured*
-  page raises `An unexpected exception was raised (0x80040205)` (not a clean read error), and a
-  full-struct `dt` can hit it just by following a pointer into a missing page — read the one
+  that's the dump's limitation, not a tool error. A `dq`/`dps`/`db` of an *uncaptured* page prints
+  `????????` and a `dt` prints `Memory read error <address>` — both succeed, so the question marks
+  are the answer. A dereference in an expression (`? poi(<addr>)`, a `.for` loop's `poi`) fails
+  instead, with `0x80040205` and the engine's `Memory access error` line beside it. Read the one
   field you need (`dt nt!_DRIVER_OBJECT <addr> DriverName`) and prefer the addresses
   `!ext.analyze` already resolved (PDO, IRP, DRIVER_OBJECT live in the triage data). To read the
   same field across many objects, use `walk_memory` rather than a `.for` loop: one uncaptured page

@@ -375,9 +375,10 @@ become current at all. Measured 2026-10-13 on the ARM64 bench, through the servi
 Where both builds were asked they agree. The handle column is this server's and so was read on
 29617 only, as was the user-dump row; a `||1s` before the `g` was tried through the service on the
 first row only, and the other refusals in that column are `cdb`'s and `kd`'s. *Refused* is DbgEng's
-`Illegal debuggee error in '||1s'`, which reaches a caller of this server as `0x80040205` alone —
-the code a mistyped command gets too, so on its own it says nothing about why (`FOLLOWUPS.md` item
-126).
+`Illegal debuggee error in '||1s'`. On the build this table was read on it reached a caller of this
+server as `0x80040205` alone — the code a mistyped command gets too, so on its own it said nothing
+about why. Since `FOLLOWUPS.md` item 126 the engine's line arrives beside the code, in the result's
+text and its `engine_output`.
 
 **So the replacement is the `g`, which is the shape `.create` has** (`DONE.md` item 102: *"Create
 will proceed with next execution"*). The reading of what the engine holds catches it there, through

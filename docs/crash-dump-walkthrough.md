@@ -222,22 +222,28 @@ test with sleep / fast-startup disabled.
 
 ## 5. Pitfall: partial minidumps and `0x80040205`
 
-This is a small triage minidump, so most of the pool isn't captured. Reads of non-captured
-pages don't return a clean "memory read error" — the engine raises an exception that the
-server surfaces as:
+This is a small triage minidump, so most of the pool isn't captured, and what a read of a missing
+page does depends on what is reading it. A dereference the expression evaluator has to make — a
+`poi(…)` in `?`, in a breakpoint condition, in a `.for` loop — fails the whole command:
 
 ```text
+? poi(ffffc00000000000)
+Memory access error at ')'
 Debug command failed: An unexpected exception was raised (0x80040205)
 ```
 
-`dq`/`dps` of an uncaptured range, or a full-struct `dt` that has to follow a pointer into
-a missing page, will hit this. **Query the exact field you need** (e.g.
+The first two lines are the engine's echo and its reason, and they reach the caller beside the code
+(`FOLLOWUPS.md` item 126); until then the last line was all there was. A *display* command does not
+fail at all. Measured against this dump on dbgeng 10.0.29617.1000, at addresses it holds nothing for
+(`0x1000`, `0xffffc00000000000`), `dq`, `dps` and `db` print `????????` and `dt` prints
+`Memory read error <address>`, and every one of them returns success — so a row of question marks is
+the dump's answer, not a failed call. **Query the exact field you need** (e.g.
 `dt _DRIVER_OBJECT <addr> DriverName`) rather than dumping whole structures, and prefer the
 addresses `!analyze` hands you (PDO, IRP, DRIVER_OBJECT) — those are in the triage data.
 
 Reading one field across *many* objects is where this bites hardest: inside a `.for` loop the
 first uncaptured page ends the whole script, so a table with one missing page in it comes back
-empty rather than nearly complete. Use **`walk_memory`** for that — it reads each value on its
+only as far as that page rather than nearly complete. Use **`walk_memory`** for that — it reads each value on its
 own, marks the ones it could not read, and walks the rest:
 
 ```jsonc

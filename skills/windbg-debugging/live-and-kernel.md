@@ -94,8 +94,8 @@ all, so ending the session takes it; `attach_process` is the route that is.
 - **`read_memory` is numeric/hex only.** Use `execute` → `db @rip` for register/symbol
   expressions.
 - **Walk driver lists and handle tables with `walk_memory`, not a `.for` loop.** A freed node
-  whose page has gone takes a MASM loop down with `0x80040205` and no partial output; the walk
-  marks it and continues, and a chain reports the node whose link would not read. Fields of one
+  whose page has gone takes a MASM loop down with `0x80040205` at that node — the rows before it
+  come back with the error, none after it; the walk marks it and continues, and a chain reports the node whose link would not read. Fields of one
   structure cost a single read per node, which matters over KDNET.
 - **`go` is bounded by the per-call timeout** (~60s). A long-running live target may not
   reach a breakpoint within one call; on a live kernel it is force-broken at the cap.

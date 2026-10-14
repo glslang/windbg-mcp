@@ -129,6 +129,24 @@ fn typed_error(
     ))
 }
 
+/// [`typed_error`] for a session's failure, keeping what the debugger printed apart from this
+/// server's account in the typed half while the text shows both, the engine's first.
+fn engine_failure(
+    e: &EngineError,
+    session_id: Option<String>,
+) -> Result<CallToolResult, ErrorData> {
+    let structured: Outcome<()> = Outcome::failed_printing(
+        ErrorCategory::of(e),
+        e.message(),
+        e.engine_output(),
+        session_id,
+    );
+    Ok(with_structured(
+        CallToolResult::error(vec![ContentBlock::text(e.to_string())]),
+        payload(structured),
+    ))
+}
+
 /// Serializes a structured payload, saying so if it cannot.
 ///
 /// A tool that declares an `outputSchema` and answers with text alone is a contract broken, and
@@ -364,6 +382,7 @@ fn open_failure(
         error: structured::FailureDetail {
             category,
             message: message.clone(),
+            engine_output: None,
             session_id,
         },
         target,
@@ -469,11 +488,7 @@ fn engine_result_for(
             CallToolResult::success(vec![ContentBlock::text(out.text)]),
             out.data,
         )),
-        Err(e) => typed_error(
-            ErrorCategory::of(&e),
-            e.to_string(),
-            session_id.map(str::to_string),
-        ),
+        Err(e) => engine_failure(&e, session_id.map(str::to_string)),
     }
 }
 
@@ -500,13 +515,7 @@ fn batch_result(
         Ok(out) => out,
         // The batch never ran: refused before it started, a stale handle, a worker that died. The
         // ordinary failure rendering, with its own category.
-        Err(e) => {
-            return typed_error(
-                ErrorCategory::of(&e),
-                e.to_string(),
-                session_id.map(str::to_string),
-            );
-        }
+        Err(e) => return engine_failure(&e, session_id.map(str::to_string)),
     };
     let settled = out.data.as_ref().is_some_and(batch_settled);
     let content = vec![ContentBlock::text(out.text)];
@@ -5253,7 +5262,7 @@ impl WindbgServer {
     /// address ending the walk**.
     /// This is the tool for a list, a handle table or a pointer array where some entries are
     /// freed: a MASM `.for` loop through a raw command aborts on the first unmapped dereference
-    /// with `0x80040205` and no partial output, which loses exactly the node worth looking at.
+    /// with `0x80040205`, and no node after that one is read.
     /// Here an unreadable value is `null` in its own field, an unreadable node is counted, and
     /// the walk carries on.
     /// Three ways to name the nodes, one of them required: `addresses` (an explicit list — the
@@ -5852,7 +5861,7 @@ impl WindbgServer {
     ) -> Result<CallToolResult, ErrorData> {
         let session = match self.sessions.resolve(args.session_id.as_deref()) {
             Ok(session) => session,
-            Err(e) => return typed_error(ErrorCategory::of(&e), e.to_string(), args.session_id),
+            Err(e) => return engine_failure(&e, args.session_id),
         };
         let bound = Duration::from_millis(u64::from(
             args.max_run_ms
@@ -5865,7 +5874,7 @@ impl WindbgServer {
             .await;
         match started {
             Ok(started) => structured_result(describe_started(&started), started),
-            Err(e) => typed_error(ErrorCategory::of(&e), e.to_string(), args.session_id),
+            Err(e) => engine_failure(&e, args.session_id),
         }
     }
 
@@ -5900,7 +5909,7 @@ impl WindbgServer {
             .resolve_for_execution_read(args.session_id.as_deref())
         {
             Ok(session) => session,
-            Err(e) => return typed_error(ErrorCategory::of(&e), e.to_string(), args.session_id),
+            Err(e) => return engine_failure(&e, args.session_id),
         };
         // Capped below the server's own call timeout, with a margin: a wait allowed to run the
         // whole budget would have the *call* expire instead of answering, which is the one outcome
@@ -5917,7 +5926,7 @@ impl WindbgServer {
             .await
         {
             Ok(waited) => structured_result(describe_stop_wait(&waited), waited),
-            Err(e) => typed_error(ErrorCategory::of(&e), e.to_string(), args.session_id),
+            Err(e) => engine_failure(&e, args.session_id),
         }
     }
 
@@ -5954,7 +5963,7 @@ impl WindbgServer {
     ) -> Result<CallToolResult, ErrorData> {
         let session = match self.sessions.resolve(args.session_id.as_deref()) {
             Ok(session) => session,
-            Err(e) => return typed_error(ErrorCategory::of(&e), e.to_string(), args.session_id),
+            Err(e) => return engine_failure(&e, args.session_id),
         };
         match self
             .sessions
@@ -5962,7 +5971,7 @@ impl WindbgServer {
             .await
         {
             Ok(requested) => structured_result(requested.detail.clone(), requested),
-            Err(e) => typed_error(ErrorCategory::of(&e), e.to_string(), args.session_id),
+            Err(e) => engine_failure(&e, args.session_id),
         }
     }
 
@@ -9265,6 +9274,10 @@ mod tests {
     fn session_scoped_failures_are_tool_errors_not_protocol_errors() {
         for e in [
             EngineError::Debugger("no such symbol".into()),
+            EngineError::DebuggerWithOutput {
+                message: "Debug command failed: (0x80040205)".into(),
+                engine_output: "zzzz\nCouldn't resolve error at 'zzz'\n".into(),
+            },
             EngineError::Timeout("timed out".into()),
             EngineError::Stale("that session is closed".into()),
             EngineError::Lost("the worker exited".into()),
@@ -9279,6 +9292,46 @@ mod tests {
                 "the explanation must survive: {rendered}"
             );
         }
+    }
+
+    /// A command the debugger refused answers with what the engine printed, in both halves and
+    /// kept apart in the typed one (`FOLLOWUPS.md` item 126).
+    ///
+    /// The text is for a reader, so it has both, in the order they happened: the engine's echo
+    /// and its reason, then this server's line with the code. The typed half is for a program,
+    /// so `message` is this server's account alone and `engine_output` the engine's — a client
+    /// can tell which said what without splitting a string.
+    #[test]
+    fn a_refused_command_carries_what_the_engine_printed() {
+        let refused = "Debug command failed: An unexpected exception was raised (0x80040205)";
+        let printed = "||1s\n           ^ Illegal debuggee error in '||1s'\n";
+        let r = engine_result_for(
+            Some("sess-3"),
+            Err(EngineError::DebuggerWithOutput {
+                message: refused.into(),
+                engine_output: printed.into(),
+            }),
+        )
+        .expect("must not surface as a protocol error");
+        assert_eq!(r.is_error, Some(true));
+        let text = r
+            .content
+            .iter()
+            .find_map(|b| b.as_text().map(|t| t.text.clone()))
+            .expect("a text block");
+        assert_eq!(text, format!("{}\n{refused}", printed.trim_end()));
+        let data = r.structured_content.expect("a typed half");
+        assert_eq!(data["status"], "error");
+        assert_eq!(data["error"]["category"], "debugger");
+        assert_eq!(data["error"]["message"], refused);
+        assert_eq!(data["error"]["engine_output"], printed);
+        assert_eq!(data["error"]["session_id"], "sess-3");
+
+        // And a failure with nothing printed has no such field, rather than an empty one.
+        let r = engine_result(Err(EngineError::Debugger("no such symbol".into())))
+            .expect("must not surface as a protocol error");
+        let data = r.structured_content.expect("a typed half");
+        assert!(data["error"].get("engine_output").is_none(), "{data}");
     }
 
     /// A malformed batch must be refused *before* it reaches a session, and as a tool error the

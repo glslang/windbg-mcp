@@ -1,10 +1,11 @@
 # Walking a structure (`walk_memory`)
 
-Walking a kernel list through `execute` is all-or-nothing. A single unmapped dereference inside a
-MASM `.for` loop ends the whole script with `An unexpected exception was raised (0x80040205)` — no
-rows, no iteration number, no indication of how many nodes were classified before it. In pool and
-use-after-free work that is precisely backwards: "some of these nodes are freed" is the normal case,
-and the pointer that will not read is usually the one worth looking at
+Walking a kernel list through `execute` stops at the first hole. A single unmapped dereference inside
+a MASM `.for` loop ends the whole script with `An unexpected exception was raised (0x80040205)`, and
+no node after it is read. What the loop printed before it does come back now, beside the engine's
+`Memory access error` line (`FOLLOWUPS.md` item 126) — until then the failure carried no rows at all.
+In pool and use-after-free work stopping there is precisely backwards: "some of these nodes are
+freed" is the normal case, and the pointer that will not read is usually the one worth looking at
 ([#103](https://github.com/glslang/windbg-mcp/issues/103)).
 
 `walk_memory` reads each value on its own, so a hole is a row rather than an end. Three ways to name

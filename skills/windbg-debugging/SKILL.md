@@ -189,8 +189,9 @@ where its stderr is not on your screen.
 - **`read_memory` takes a numeric/`0x`-hex address only.** For a register/symbol
   expression use `execute` with `db`/`dd` (e.g. `db @rip`).
 - **Never walk a list with a MASM `.for` loop — use `walk_memory`.** One unmapped `poi` aborts
-  the *whole* script with `0x80040205` and returns nothing, so a table with one freed entry in it
-  tells you only that something failed. `walk_memory` marks the hole and keeps going. Name the
+  the *whole* script with `0x80040205`: the rows printed before it come back with the error, and
+  nothing after it is read, so a table with one freed entry in it is walked only up to that entry.
+  `walk_memory` marks the hole and keeps going. Name the
   nodes with `addresses` (an explicit list), `start` + `stride` (an array), or `start` +
   `next_offset` (a chain), and `fields` to read out of each; offsets may be negative, so a pool
   header at `-16` is an argument. A chain is the one walk a hole stops — it says which node —

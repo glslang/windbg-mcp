@@ -6,8 +6,8 @@
       "inputSchema": 1262,
       "modelVisible": 2631,
       "name": "attach_kernel",
-      "outputSchema": 4659,
-      "wire": 7444
+      "outputSchema": 4702,
+      "wire": 7487
     },
     {
       "annotations": 122,
@@ -15,8 +15,8 @@
       "inputSchema": 103,
       "modelVisible": 400,
       "name": "attach_kernel_local",
-      "outputSchema": 4659,
-      "wire": 5212
+      "outputSchema": 4702,
+      "wire": 5255
     },
     {
       "annotations": 117,
@@ -24,8 +24,8 @@
       "inputSchema": 233,
       "modelVisible": 576,
       "name": "attach_process",
-      "outputSchema": 4659,
-      "wire": 5383
+      "outputSchema": 4702,
+      "wire": 5426
     },
     {
       "annotations": 68,
@@ -33,8 +33,8 @@
       "inputSchema": 492,
       "modelVisible": 1152,
       "name": "backtrace",
-      "outputSchema": 1607,
-      "wire": 2858
+      "outputSchema": 1650,
+      "wire": 2901
     },
     {
       "annotations": 114,
@@ -42,8 +42,8 @@
       "inputSchema": 495,
       "modelVisible": 1414,
       "name": "break_in",
-      "outputSchema": 1307,
-      "wire": 2866
+      "outputSchema": 1350,
+      "wire": 2909
     },
     {
       "annotations": 115,
@@ -51,8 +51,8 @@
       "inputSchema": 343,
       "modelVisible": 886,
       "name": "breakpoints",
-      "outputSchema": 2396,
-      "wire": 3428
+      "outputSchema": 2439,
+      "wire": 3471
     },
     {
       "annotations": 117,
@@ -60,8 +60,8 @@
       "inputSchema": 691,
       "modelVisible": 1186,
       "name": "clear_breakpoints",
-      "outputSchema": 2768,
-      "wire": 4102
+      "outputSchema": 2811,
+      "wire": 4145
     },
     {
       "annotations": 124,
@@ -69,8 +69,8 @@
       "inputSchema": 669,
       "modelVisible": 2016,
       "name": "continue_async",
-      "outputSchema": 1413,
-      "wire": 3584
+      "outputSchema": 1456,
+      "wire": 3627
     },
     {
       "annotations": 117,
@@ -78,8 +78,8 @@
       "inputSchema": 1296,
       "modelVisible": 2924,
       "name": "crash_triage",
-      "outputSchema": 2617,
-      "wire": 5689
+      "outputSchema": 2660,
+      "wire": 5732
     },
     {
       "annotations": 69,
@@ -87,17 +87,17 @@
       "inputSchema": 343,
       "modelVisible": 489,
       "name": "current_location",
-      "outputSchema": 2330,
-      "wire": 2919
+      "outputSchema": 2373,
+      "wire": 2962
     },
     {
       "annotations": 134,
       "description": 2246,
-      "inputSchema": 8010,
-      "modelVisible": 10308,
+      "inputSchema": 7998,
+      "modelVisible": 10296,
       "name": "debug_batch",
-      "outputSchema": 3566,
-      "wire": 14039
+      "outputSchema": 3609,
+      "wire": 14070
     },
     {
       "annotations": 85,
@@ -105,8 +105,8 @@
       "inputSchema": 495,
       "modelVisible": 1311,
       "name": "decode_error_reporting",
-      "outputSchema": 1831,
-      "wire": 3258
+      "outputSchema": 1874,
+      "wire": 3301
     },
     {
       "annotations": 79,
@@ -132,8 +132,8 @@
       "inputSchema": 752,
       "modelVisible": 1442,
       "name": "device_security",
-      "outputSchema": 3894,
-      "wire": 5449
+      "outputSchema": 3937,
+      "wire": 5492
     },
     {
       "annotations": 64,
@@ -141,8 +141,8 @@
       "inputSchema": 658,
       "modelVisible": 1500,
       "name": "disassemble",
-      "outputSchema": 1584,
-      "wire": 3179
+      "outputSchema": 1627,
+      "wire": 3222
     },
     {
       "annotations": 113,
@@ -150,8 +150,8 @@
       "inputSchema": 597,
       "modelVisible": 1342,
       "name": "driver_hazards",
-      "outputSchema": 4386,
-      "wire": 5872
+      "outputSchema": 4429,
+      "wire": 5915
     },
     {
       "annotations": 74,
@@ -168,8 +168,8 @@
       "inputSchema": 652,
       "modelVisible": 1735,
       "name": "driver_surface",
-      "outputSchema": 11909,
-      "wire": 13793
+      "outputSchema": 11952,
+      "wire": 13836
     },
     {
       "annotations": 130,
@@ -186,8 +186,8 @@
       "inputSchema": 527,
       "modelVisible": 1679,
       "name": "end_session",
-      "outputSchema": 1453,
-      "wire": 3279
+      "outputSchema": 1496,
+      "wire": 3322
     },
     {
       "annotations": 123,
@@ -195,8 +195,8 @@
       "inputSchema": 1373,
       "modelVisible": 3238,
       "name": "exception_triage",
-      "outputSchema": 3878,
-      "wire": 7270
+      "outputSchema": 3921,
+      "wire": 7313
     },
     {
       "annotations": 124,
@@ -213,8 +213,8 @@
       "inputSchema": 343,
       "modelVisible": 469,
       "name": "go",
-      "outputSchema": 1524,
-      "wire": 2142
+      "outputSchema": 1567,
+      "wire": 2185
     },
     {
       "annotations": 118,
@@ -231,8 +231,8 @@
       "inputSchema": 1196,
       "modelVisible": 1482,
       "name": "heap_allocations",
-      "outputSchema": 5792,
-      "wire": 7433
+      "outputSchema": 5835,
+      "wire": 7476
     },
     {
       "annotations": 124,
@@ -240,8 +240,8 @@
       "inputSchema": 647,
       "modelVisible": 902,
       "name": "heap_census",
-      "outputSchema": 5626,
-      "wire": 6683
+      "outputSchema": 5669,
+      "wire": 6726
     },
     {
       "annotations": 126,
@@ -249,8 +249,8 @@
       "inputSchema": 522,
       "modelVisible": 939,
       "name": "heap_chunk",
-      "outputSchema": 5982,
-      "wire": 7078
+      "outputSchema": 6025,
+      "wire": 7121
     },
     {
       "annotations": 130,
@@ -258,8 +258,8 @@
       "inputSchema": 791,
       "modelVisible": 1116,
       "name": "heap_diagnostics",
-      "outputSchema": 5380,
-      "wire": 6657
+      "outputSchema": 5423,
+      "wire": 6700
     },
     {
       "annotations": 119,
@@ -267,8 +267,8 @@
       "inputSchema": 494,
       "modelVisible": 855,
       "name": "heap_list",
-      "outputSchema": 5244,
-      "wire": 6249
+      "outputSchema": 5287,
+      "wire": 6292
     },
     {
       "annotations": 120,
@@ -294,8 +294,8 @@
       "inputSchema": 592,
       "modelVisible": 1397,
       "name": "ioctl_map",
-      "outputSchema": 4618,
-      "wire": 6135
+      "outputSchema": 4661,
+      "wire": 6178
     },
     {
       "annotations": 124,
@@ -303,8 +303,8 @@
       "inputSchema": 507,
       "modelVisible": 1171,
       "name": "ioctl_trace",
-      "outputSchema": 2585,
-      "wire": 3911
+      "outputSchema": 2628,
+      "wire": 3954
     },
     {
       "annotations": 76,
@@ -321,8 +321,8 @@
       "inputSchema": 258,
       "modelVisible": 615,
       "name": "launch",
-      "outputSchema": 4659,
-      "wire": 5434
+      "outputSchema": 4702,
+      "wire": 5477
     },
     {
       "annotations": 65,
@@ -330,8 +330,8 @@
       "inputSchema": 2183,
       "modelVisible": 3323,
       "name": "modules",
-      "outputSchema": 3740,
-      "wire": 7159
+      "outputSchema": 3783,
+      "wire": 7202
     },
     {
       "annotations": 128,
@@ -339,8 +339,8 @@
       "inputSchema": 240,
       "modelVisible": 747,
       "name": "open_dump",
-      "outputSchema": 4659,
-      "wire": 5565
+      "outputSchema": 4702,
+      "wire": 5608
     },
     {
       "annotations": 129,
@@ -348,8 +348,8 @@
       "inputSchema": 2433,
       "modelVisible": 3947,
       "name": "open_sk_capture",
-      "outputSchema": 9801,
-      "wire": 13908
+      "outputSchema": 9844,
+      "wire": 13951
     },
     {
       "annotations": 121,
@@ -357,8 +357,8 @@
       "inputSchema": 2283,
       "modelVisible": 2600,
       "name": "open_sk_kd",
-      "outputSchema": 4659,
-      "wire": 7411
+      "outputSchema": 4702,
+      "wire": 7454
     },
     {
       "annotations": 132,
@@ -366,8 +366,8 @@
       "inputSchema": 2472,
       "modelVisible": 2902,
       "name": "open_sk_live_control",
-      "outputSchema": 4659,
-      "wire": 7724
+      "outputSchema": 4702,
+      "wire": 7767
     },
     {
       "annotations": 114,
@@ -375,8 +375,8 @@
       "inputSchema": 240,
       "modelVisible": 563,
       "name": "open_trace",
-      "outputSchema": 4659,
-      "wire": 5367
+      "outputSchema": 4702,
+      "wire": 5410
     },
     {
       "annotations": 123,
@@ -384,8 +384,8 @@
       "inputSchema": 631,
       "modelVisible": 1067,
       "name": "pool_census",
-      "outputSchema": 4936,
-      "wire": 6157
+      "outputSchema": 4979,
+      "wire": 6200
     },
     {
       "annotations": 129,
@@ -393,8 +393,8 @@
       "inputSchema": 789,
       "modelVisible": 1790,
       "name": "pool_chunk",
-      "outputSchema": 5744,
-      "wire": 7694
+      "outputSchema": 5787,
+      "wire": 7737
     },
     {
       "annotations": 127,
@@ -402,8 +402,8 @@
       "inputSchema": 860,
       "modelVisible": 2021,
       "name": "pool_diagnostics",
-      "outputSchema": 4873,
-      "wire": 7052
+      "outputSchema": 4916,
+      "wire": 7095
     },
     {
       "annotations": 122,
@@ -411,8 +411,8 @@
       "inputSchema": 1837,
       "modelVisible": 2596,
       "name": "pool_find_tag",
-      "outputSchema": 5796,
-      "wire": 8545
+      "outputSchema": 5839,
+      "wire": 8588
     },
     {
       "annotations": 133,
@@ -420,8 +420,8 @@
       "inputSchema": 688,
       "modelVisible": 1883,
       "name": "pool_trace",
-      "outputSchema": 2411,
-      "wire": 4458
+      "outputSchema": 2454,
+      "wire": 4501
     },
     {
       "annotations": 117,
@@ -429,8 +429,8 @@
       "inputSchema": 504,
       "modelVisible": 1051,
       "name": "pool_trace_read",
-      "outputSchema": 2537,
-      "wire": 3736
+      "outputSchema": 2580,
+      "wire": 3779
     },
     {
       "annotations": 90,
@@ -438,8 +438,8 @@
       "inputSchema": 2057,
       "modelVisible": 2776,
       "name": "reachable_from_dispatch",
-      "outputSchema": 5156,
-      "wire": 8053
+      "outputSchema": 5199,
+      "wire": 8096
     },
     {
       "annotations": 64,
@@ -447,8 +447,8 @@
       "inputSchema": 1617,
       "modelVisible": 1728,
       "name": "read_memory",
-      "outputSchema": 1485,
-      "wire": 3308
+      "outputSchema": 1528,
+      "wire": 3351
     },
     {
       "annotations": 120,
@@ -465,8 +465,8 @@
       "inputSchema": 659,
       "modelVisible": 1037,
       "name": "registers",
-      "outputSchema": 2203,
-      "wire": 3338
+      "outputSchema": 2246,
+      "wire": 3381
     },
     {
       "annotations": 123,
@@ -474,8 +474,8 @@
       "inputSchema": 343,
       "modelVisible": 480,
       "name": "reverse_go",
-      "outputSchema": 1524,
-      "wire": 2158
+      "outputSchema": 1567,
+      "wire": 2201
     },
     {
       "annotations": 114,
@@ -483,8 +483,8 @@
       "inputSchema": 1823,
       "modelVisible": 2407,
       "name": "run_to_address",
-      "outputSchema": 1552,
-      "wire": 4104
+      "outputSchema": 1595,
+      "wire": 4147
     },
     {
       "annotations": 75,
@@ -492,8 +492,8 @@
       "inputSchema": 1637,
       "modelVisible": 2628,
       "name": "server_log",
-      "outputSchema": 1926,
-      "wire": 4660
+      "outputSchema": 1969,
+      "wire": 4703
     },
     {
       "annotations": 73,
@@ -501,8 +501,8 @@
       "inputSchema": 343,
       "modelVisible": 1416,
       "name": "session_status",
-      "outputSchema": 4418,
-      "wire": 5938
+      "outputSchema": 4461,
+      "wire": 5981
     },
     {
       "annotations": 114,
@@ -510,8 +510,8 @@
       "inputSchema": 3474,
       "modelVisible": 4284,
       "name": "set_breakpoint",
-      "outputSchema": 2585,
-      "wire": 7014
+      "outputSchema": 2628,
+      "wire": 7057
     },
     {
       "annotations": 123,
@@ -528,8 +528,8 @@
       "inputSchema": 2089,
       "modelVisible": 2412,
       "name": "sk_live_arm",
-      "outputSchema": 1291,
-      "wire": 3861
+      "outputSchema": 1334,
+      "wire": 3904
     },
     {
       "annotations": 127,
@@ -537,8 +537,8 @@
       "inputSchema": 401,
       "modelVisible": 614,
       "name": "sk_live_continue",
-      "outputSchema": 1291,
-      "wire": 2063
+      "outputSchema": 1334,
+      "wire": 2106
     },
     {
       "annotations": 129,
@@ -546,8 +546,8 @@
       "inputSchema": 543,
       "modelVisible": 786,
       "name": "sk_live_read_memory",
-      "outputSchema": 1446,
-      "wire": 2392
+      "outputSchema": 1489,
+      "wire": 2435
     },
     {
       "annotations": 132,
@@ -555,8 +555,8 @@
       "inputSchema": 343,
       "modelVisible": 491,
       "name": "sk_live_registers",
-      "outputSchema": 4333,
-      "wire": 4987
+      "outputSchema": 4376,
+      "wire": 5030
     },
     {
       "annotations": 123,
@@ -564,8 +564,8 @@
       "inputSchema": 1101,
       "modelVisible": 1646,
       "name": "sk_live_step",
-      "outputSchema": 1291,
-      "wire": 3091
+      "outputSchema": 1334,
+      "wire": 3134
     },
     {
       "annotations": 132,
@@ -573,8 +573,8 @@
       "inputSchema": 343,
       "modelVisible": 569,
       "name": "sk_live_wait",
-      "outputSchema": 4333,
-      "wire": 5065
+      "outputSchema": 4376,
+      "wire": 5108
     },
     {
       "annotations": 126,
@@ -582,8 +582,8 @@
       "inputSchema": 343,
       "modelVisible": 869,
       "name": "sk_modules",
-      "outputSchema": 1739,
-      "wire": 2765
+      "outputSchema": 1782,
+      "wire": 2808
     },
     {
       "annotations": 124,
@@ -591,8 +591,8 @@
       "inputSchema": 608,
       "modelVisible": 1334,
       "name": "sk_read_memory",
-      "outputSchema": 1434,
-      "wire": 2923
+      "outputSchema": 1477,
+      "wire": 2966
     },
     {
       "annotations": 129,
@@ -600,8 +600,8 @@
       "inputSchema": 546,
       "modelVisible": 1495,
       "name": "sk_symbol",
-      "outputSchema": 1375,
-      "wire": 3030
+      "outputSchema": 1418,
+      "wire": 3073
     },
     {
       "annotations": 116,
@@ -609,8 +609,8 @@
       "inputSchema": 343,
       "modelVisible": 467,
       "name": "step_back",
-      "outputSchema": 1524,
-      "wire": 2138
+      "outputSchema": 1567,
+      "wire": 2181
     },
     {
       "annotations": 109,
@@ -618,8 +618,8 @@
       "inputSchema": 343,
       "modelVisible": 427,
       "name": "step_into",
-      "outputSchema": 1524,
-      "wire": 2091
+      "outputSchema": 1567,
+      "wire": 2134
     },
     {
       "annotations": 109,
@@ -627,8 +627,8 @@
       "inputSchema": 343,
       "modelVisible": 439,
       "name": "step_over",
-      "outputSchema": 1524,
-      "wire": 2103
+      "outputSchema": 1567,
+      "wire": 2146
     },
     {
       "annotations": 121,
@@ -636,8 +636,8 @@
       "inputSchema": 343,
       "modelVisible": 470,
       "name": "step_over_back",
-      "outputSchema": 1524,
-      "wire": 2146
+      "outputSchema": 1567,
+      "wire": 2189
     },
     {
       "annotations": 65,
@@ -681,17 +681,17 @@
       "inputSchema": 850,
       "modelVisible": 1559,
       "name": "wait_for_stop",
-      "outputSchema": 1886,
-      "wire": 3551
+      "outputSchema": 1929,
+      "wire": 3594
     },
     {
       "annotations": 125,
-      "description": 1315,
+      "description": 1282,
       "inputSchema": 2771,
-      "modelVisible": 4138,
+      "modelVisible": 4105,
       "name": "walk_memory",
-      "outputSchema": 3060,
-      "wire": 7354
+      "outputSchema": 3103,
+      "wire": 7364
     },
     {
       "annotations": 102,
@@ -699,21 +699,21 @@
       "inputSchema": 1163,
       "modelVisible": 2784,
       "name": "xrefs_to",
-      "outputSchema": 2508,
-      "wire": 5425
+      "outputSchema": 2551,
+      "wire": 5468
     }
   ],
   "totals": {
     "annotations": 8555,
-    "description": 46793,
-    "inputSchema": 72320,
+    "description": 46760,
+    "inputSchema": 72308,
     "instructions": 2022,
-    "modelVisible": 123244,
-    "outputSchema": 213732,
-    "payload": 347798,
+    "modelVisible": 123199,
+    "outputSchema": 216441,
+    "payload": 350462,
     "tools": 78,
-    "wire": 347709,
+    "wire": 350373,
     "worstTool": "debug_batch",
-    "worstToolModelVisible": 10308
+    "worstToolModelVisible": 10296
   }
 }

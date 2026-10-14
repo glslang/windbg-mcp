@@ -21,6 +21,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   32-bit code with the effective machine already x86.) The call reached the pinned `dbgscope` on
   2026-09-10; no dependency moves here.
 
+### Fixed
+
+- **A command the engine refuses answers with what the engine printed.** `FOLLOWUPS.md` item 126.
+  A failed `execute`, `irp_stack`, `go`, step, `run_to_address` or `continue_async` used to answer
+  `Debug command failed: An unexpected exception was raised (0x80040205)` and nothing else. That
+  code is DbgEng's answer to a mistyped command, to an argument naming nothing, to `g` on a dump and
+  to `||1s` on a system not yet loaded alike, while the engine's own line saying which —
+  `Couldn't resolve error at 'nowhere!Nope'`, `^ No runnable debuggees error in 'g'`,
+  `^ Illegal debuggee error in '||1s'` — was printed into the call's capture and dropped with it
+  (measured on dbgeng 10.0.29617.1000 and 10.0.26100.1742, ARM64, alike). So were the rows a
+  `.for` loop printed before the read that ended it. The result's text now carries what the engine
+  printed, then this server's line with the code; the typed half carries it as a new
+  `error.engine_output` beside `error.message`, which stays this server's account alone. A
+  `debug_batch` step that fails shows it as that step's output. Needs dbgscope#198.
+
+### Documentation
+
+- **The `debug_batch` `command` step's example of a failure that returns success was one that
+  fails.** It said a command printing `Couldn't resolve error at 'nt!Nope'` is a step that
+  succeeded; an unresolvable argument fails `Execute` with `0x80040205` on both engine builds
+  measured. The example is now `dt` of a missing type, which does print and succeed.
+- **A partial minidump's unreadable page fails only an expression's dereference.** The crash-dump
+  walkthrough, `docs/limitations.md` and the shipped skill said `dq`, `dps` and `dt` of an
+  uncaptured page raise `0x80040205`. Measured against the walkthrough's own dump on dbgeng
+  10.0.29617.1000, they print `????????` or `Memory read error <address>` and succeed; `? poi(…)`
+  and a `.for` loop's `poi` are what fail.
+
 ## [0.23.0] - 2026-10-14
 
 ### Added
