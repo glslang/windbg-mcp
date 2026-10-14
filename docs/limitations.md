@@ -461,10 +461,12 @@
   that can say 32 about a dump of a WoW64 process that a 64-bit writer took, once the engine is on
   its 32-bit side (`.effmach x86`); until it was asked (`FOLLOWUPS.md` item 58) such a dump's
   throws read as `other` with nothing recovered. A 64-bit answer from it decides nothing, and the
-  reason is a measurement rather than caution: an uncaught 32-bit throw stops the engine on its
-  **second chance in 64-bit code** — `wow64!Wow64pNotifyDebugger`, 2026-10-14 — where the
-  effective machine reads x64 and the record is the three-parameter 32-bit throw's. The process's
-  own width, from the OS, is what reads it right there.
+  reason is a measurement rather than caution: under the x64 engine, an uncaught 32-bit throw
+  stops it on its **second chance in 64-bit code** — `wow64!Wow64pNotifyDebugger`, 2026-10-14 —
+  where the effective machine reads x64 and the record is the three-parameter 32-bit throw's. The
+  process's own width, from the OS, is what reads it right there. (ARM64, emulating x86, reports
+  the same stop from the 32-bit `KERNELBASE!RaiseException`, with the effective machine already
+  x86.)
 - **`exception_triage`'s stack comes from the stored crash context where the target has one.** That
   is what `.ecxr` adopts, walked without `.ecxr`'s effect on the session, so the caller's selected
   thread and frame are left alone — which is what lets the tool be read-only where `crash_triage`

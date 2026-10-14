@@ -1505,24 +1505,29 @@ engine's effective machine (`GetEffectiveProcessorType`) first, and believes a 3
 it alone. It pins the two readings taken on 2026-10-14 that decided the shape of that rule, and the
 one answer it changed.
 
-**An uncaught 32-bit throw stops the engine in 64-bit code.** The second-chance stop a `go` hands
-back is in `wow64!Wow64pNotifyDebugger` (asserted by frame 0's module), where the effective machine
-is the host's and the record is the 32-bit throw's: three parameters, with `0x80670015` recovered
-as a reported throw. The item had recorded the initial break as the only stop where the effective
-machine and the process disagree, and that break as carrying no throw to decode; this stop carries
-one, and the process's own width — from the OS — is what reads it right. So a 64-bit answer from
-the effective machine decides nothing, and the test asserts that the decision was `Bits32` with the
-OS answering and the engine *not* decoding for a 32-bit machine. Which host machine it did decode
-for is deliberately not pinned: CI's ARM64 runner runs the same fixture under emulation, and the
-answer there is ARM64.
+**Under the x64 engine, an uncaught 32-bit throw stops it in 64-bit code.** The second-chance stop
+a `go` hands back is in `wow64!Wow64pNotifyDebugger`, where the effective machine is x64 and the
+record is the 32-bit throw's: three parameters, with `0x80670015` recovered as a reported throw.
+The item had recorded the initial break as the only stop where the effective machine and the
+process disagree, and that break as carrying no throw to decode; this stop carries one, and the
+process's own width — from the OS — is what reads it right. So a 64-bit answer from the effective
+machine decides nothing, and on that side the test asserts that the decision was `Bits32` with the
+OS answering and the engine *not* decoding for a 32-bit machine. **Which side the stop is reported
+from is the host's**: CI's ARM64 runner, emulating x86, reports the same stop from the 32-bit
+`KERNELBASE!RaiseException` with an all-32-bit stack — measured 2026-10-14 on this test's first
+run there, which had pinned `wow64` and failed — and on that side the engine already decodes for
+x86 and the OS is not asked. The test reads frame 0's module, says which side it got, refuses a
+third answer, and asserts that side's shape.
 
 **A dump of that stop, written by the engine with `.dump /ma`, is decoded right only on the 32-bit
-side.** Reopened, its header says the writer's machine and its process is gone, so neither older
-source can say 32 and the throw reads as `other` with nothing recovered — which is the control, and
-what the build before this change answered on this dump. After `.effmach x86` the same triage reads
-`cpp_throw` with the same HRESULT, from the effective machine alone and with the OS not asked. The
-dump is made and deleted by the test, because what it pins is the writer's width against the
-process's rather than a file.
+side.** The dump is taken from the host's side — on the 32-bit side the test runs `.effmach .`
+first, and on reopening it checks the engine does not already decode for x86, so a 32-bit dump
+fails naming the cause rather than passing as a control. Reopened, its header says the writer's
+machine and its process is gone, so neither older source can say 32 and the throw reads as `other`
+with nothing recovered — which is the control, and what the build before this change answered on
+this dump. After `.effmach x86` the same triage reads `cpp_throw` with the same HRESULT, from the
+effective machine alone and with the OS not asked. The dump is made and deleted by the test,
+because what it pins is the writer's width against the process's rather than a file.
 
 **The decisions are read off the server's stderr**, under `RUST_LOG=windbg_mcp=debug`: which
 source answered is a worker log line, nothing in the result carries the width, and `server_log`'s
@@ -1530,7 +1535,10 @@ ring is bounded and busy at that level. There are four, not three, because the f
 the 32-bit loader's initial break and the test triages there too: that one reads `Bits32` with the
 engine already decoding for x86 and the OS **not asked** — `may_ask_the_os`'s skip, seen from
 outside — and the last three are the readings above. The gate is the C++ toolchain, found the way
-the test above finds it; a host with no VC tools stands down with a `SKIPPED` line.
+the test above finds it; a host with no VC tools stands down with a `SKIPPED` line. The fixture is
+built in a subdirectory of its own, because two `cl /Zi` runs sharing a directory share the
+compiler's `vc140.pdb`, and the two tests that build one run concurrently: measured on the first
+such run, the C fixture failed with `C1041`. A third `cl` fixture gets a third directory.
 
 ## The bounded-command tier
 

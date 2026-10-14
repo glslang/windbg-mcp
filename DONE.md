@@ -11161,8 +11161,8 @@ reason is a measurement the entry's own cost paragraph got wrong.** "The two dis
 initial breakpoint of a WoW64 launch … that break carries no C++ throw to decode." Measured
 2026-10-14 by launching `docs/samples/cppthrow.cpp` built 32-bit under the x64 engine (dbgeng
 10.0.29617.1000, through the registered server at `0.22.0+g008bfa65`): the stop a `go` hands back
-on its uncaught throw is the **second chance**, delivered from `wow64!Wow64pNotifyDebugger` —
-64-bit code, `.effmach` reading `x64 (AMD64)` — with the record the 32-bit throw's: three
+on its uncaught throw is the **second chance**, delivered under the x64 engine from
+`wow64!Wow64pNotifyDebugger` — 64-bit code, `.effmach` reading `x64 (AMD64)` — with the record the 32-bit throw's: three
 parameters, magic `0x19930520`, the object and `ThrowInfo` at 32-bit addresses. The pair of older
 sources decodes it right (`cpp_throw`, `0x80670015` recovered and corroborated) because the OS says
 x86. Had the effective machine been authoritative as proposed, that stop — the ordinary one for
@@ -11184,9 +11184,22 @@ the result carries the width — which also shows a fourth: at the 32-bit loader
 engine already decodes for x86 and the OS is not asked at all, the process open `may_ask_the_os`
 now saves. `docs/smoke-test.md` has the section.
 
-**What this did not establish.** One x64 host and one engine build; the dump the engine itself
-writes, not one from Task Manager or `procdump`, whose headers were not read; and a TTD trace of a
-WoW64 process was not asked. The 32-bit worker was not exercised, because a `launch` always takes
-the 64-bit image — which is the case this was about. And a first-chance stop was not measured:
-the engine's default for a C++ exception is to stop on the second, and that is the stop a caller
-gets.
+**What the first CI run added (2026-10-14, [#497](https://github.com/glslang/windbg-mcp/pull/497)).**
+Two things, both from the tier the test rides. **Which side the second-chance stop is reported from
+is the host's**: CI's ARM64 runner, emulating x86, reports it from the 32-bit
+`KERNELBASE!RaiseException` with an all-32-bit stack (`_CxxThrowException`, `inner`, `middle`,
+`main`, then `KERNEL32!$push_thunk$cdecl$u$u` and `ntdllWoW`), where the engine already decodes
+for x86 — so the sentence above about 64-bit code is an x64 fact, the test's first version pinned
+`wow64` and failed there, and the test now reads which side it got and asserts that side's shape,
+putting the engine back on the host's machine before it takes the dump. And **two `cl /Zi` runs in
+one directory contend for the compiler's `vc140.pdb`**: Codex raised it, and the first local run
+of the two fixture-building tests together reproduced it (`C1041`) before both CI tiers did — the
+existing C fixture's build failed, not the new one's. The C++ fixture builds in a subdirectory of
+its own.
+
+**What this did not establish.** Two hosts — the x64 bench on one engine build, CI's x64 and
+ARM64 runners — and the dump the engine itself writes, not one from Task Manager or `procdump`,
+whose headers were not read; a TTD trace of a WoW64 process was not asked. The 32-bit worker was
+not exercised, because a `launch` always takes the 64-bit image — which is the case this was
+about. And a first-chance stop was not measured: the engine's default for a C++ exception is to
+stop on the second, and that is the stop a caller gets.
