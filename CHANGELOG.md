@@ -23,6 +23,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A VS pool chunk whose user block the allocator moved off a page end is placed where `!pool`
+  places it.** `FOLLOWUPS.md` item 101. Under `_HEAP_VS_CONTEXT.Config.Flags.PageAlignLargeAllocs`
+  — set on both pool heaps of the two kernels measured, 26100.33438 and 29671 —
+  `nt!RtlpHpVsContextAllocate` hands out
+  `chunk + 0x20` rather than `chunk + 0x10` when the former is page-aligned, so a chunk whose
+  header sits at page offset `0xfe0` has its `_POOL_HEADER` at the next page start, and the walk
+  read the unit before it — two stale free-tree pointers — as the header. What a caller saw: a
+  tag that was the top half of a kernel address (`0x84e7ffff`, 1,275 paged chunks and 1.9 MB on
+  one boot of `ctf-vm`, 2026-10-14) — or the zero tag where the skipped unit reads as zeroes,
+  which on the 29671 lab guest was every one of 300 sampled zero-tagged small VS chunks, each
+  with its header at offset `0xff0` — `pool_chunk` on the real data answering a chunk sixteen bytes
+  early, sixteen bytes long and untagged, and `pool_find_tag` on the real tag missing every such
+  chunk. dbgscope reads the flag from each heap's context now
+  ([dbgscope#199](https://github.com/glslang/dbgscope/pull/199)), and **every
+  `layout.fingerprint` moves** with the field it resolves — `bbc9a6daae9ff7a2` →
+  `38566b14fd9f4b50` on that kernel. The live-kernel tier's `compare_vs_page_end_placement` puts
+  both halves to the engine: no small VS chunk with its header in a page's last sixteen bytes,
+  and `!pool` reading a header at every page-aligned one the walk reports, with the walk's tag
+  and sixteen bytes more than its usable size. Run both ways against `ctf-vm`: 255 chunks at
+  `0xff0` on the old pin, none of 231 on the new, with four page-start headers agreeing with
+  `!pool`. Needs dbgscope#199.
+
 - **A command the engine refuses answers with what the engine printed.** `FOLLOWUPS.md` item 126.
   A failed `execute`, `irp_stack`, `go`, step, `run_to_address` or `continue_async` used to answer
   `Debug command failed: An unexpected exception was raised (0x80040205)` and nothing else. That

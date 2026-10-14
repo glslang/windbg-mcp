@@ -1817,6 +1817,20 @@ about. This is the other half — an attach that lands:
   same fault, and the exemption would have been how this tier went on passing over the thing it
   was written for.
 
+  **And a third, sampled from the walk on purpose.** `compare_vs_page_end_placement` is about
+  `FOLLOWUPS.md` item 101: under `PageAlignLargeAllocs`, which both pool heaps carry on the two
+  kernels this was measured against (26100.33438 and 29671), the allocator never hands out a VS user block in
+  a page's last sixteen bytes, so a small VS chunk whose header sits at offset `0xfe0` has its
+  `_POOL_HEADER` at the next page start. A kernel without the flag fails the first assertion, and
+  that is a finding to record here rather than exempt. The walk put it at `0xff0` instead until dbgscope read the flag — 1,275
+  chunks on one boot, each with two stale tree pointers decoded as the header. That defect is
+  visible in the walk's own answer, as a class of header offsets the allocator cannot produce,
+  which is why this one samples `pool_find_tag` where the two above refuse to: it asserts that no
+  small VS chunk has its header at `0xff0`, then asks `!pool` about up to
+  `POOL_ORACLE_PAGE_START_SAMPLES` page-aligned ones and requires a header there with the walk's
+  tag and sixteen bytes more than its usable size. Big-pool chunks are excluded from both halves
+  by their size, since their page-aligned start comes from the table and not from a header.
+
   **It costs a quarter of an hour, and the reason is worth knowing before adding queries here.**
   Measured **1,032s** on 2026-10-07 against the 29671 lab guest (941,412 chunks), windbg-mcp
   `e92b4b8` on dbgscope `0287238`; the same test took **2,665s** against the same guest the day
