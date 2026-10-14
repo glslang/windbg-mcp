@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-10-14
+
 ### Added
 
 - **Live Secure Kernel control can arm several selected VPs.** `open_sk_live_control` accepts
@@ -88,7 +90,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Suspend-VM` covers arming, disarming and recovery and the stop is held by the retained
   intercept with `vmwp` debugger-stopped.
 
+- **`open_sk_kd`: an installed WinDbg in front of the live Secure Kernel controller, as a session
+  this server owns** (`FOLLOWUPS.md` item 120, now in `DONE.md`). The `--sk-kd-target` role 0.22.0
+  shipped was a command-line program with no session id, nothing in `session_status` and no way to
+  end it through MCP; it stays as a compatibility and diagnostic entry point. The tool starts a
+  dedicated engine worker that discovers the boot's `vmwp` PID, dispatcher VND and partition id on
+  its own engine thread, takes the initial guarded instruction from the exact-build profile as a
+  Secure Kernel RVA and byte guard and resolves it against the base the live-memory provider
+  reports, reads the live PE header and version resource there and refuses a build the profile
+  does not name, reserves the VM and the `vmwp` PID, generates the pipe name from the system RNG,
+  and answers with a session id and the exact connection string,
+  `kd -k com:pipe,port=\\.\pipe\<generated-name>,resets=0`. WinDbg then holds the sole execution
+  lease — context and virtual reads at a stop, a fall-through `t`, up to four hardware breakpoints
+  and a `g` to one (implemented, not measured live), `q`; software breakpoints and memory or
+  register writes are refused — each translated into the guarded operations the seven `sk_live_*`
+  tools make. MCP keeps the lifecycle: `session_status` reports `discovering`, `arming`,
+  `waiting_for_peer`, `stopped`, `running`, `reconnecting`, `releasing`, `released` or
+  `recovery_required`; `end_session` cancels a connect or active wait and runs the proved
+  controller teardown; `interrupt` is refused, since no running-state break-in route has passed
+  item 117. Connect and idle bounds default to 30 and 300 seconds, a peer disconnect while stopped
+  opens a bounded reconnect window, and expiry of any bound — the absolute pause bound below
+  included — runs the same fail-closed teardown. `vmwp_pid`, `dispatcher_vnd`, `partition_id` and
+  `expected_cr3` are optional mismatch assertions rather than inputs. Measured 2026-10-07 on the
+  disposable K3 VM with kd 10.0.26100.6584: `lm m securekernel`, `t`, `r`, `q`, MCP release, three
+  same-PID health samples through 60 seconds, clean VTL1 debug registers and unchanged Secure
+  Kernel text; and at a natural timer stop with a prepared symbol cache,
+  `securekernel!KiTimerInterrupt` resolved inside the enumerated image range and `k 4` gave two
+  symbolised Secure Kernel frames. What a forced disconnect leads to is **not** established: on
+  2026-10-11 the terminated kd kept its pipe until idle expiry (item 117). The matrix of what each
+  WinDbg operation does — measured live, answered from compatibility state, implemented but
+  unmeasured, or refused — is in `docs/secure-kernel/kd-facade.md` (item 119).
+
 ### Fixed
+
+- **`sk_live_step` steps over an instruction that writes CR3 instead of refusing it**
+  (`FOLLOWUPS.md` item 123, now in `DONE.md`). A single-step stop is validated against the root it
+  was armed in, soundly — every read at a stop walks VTL1's page tables from one root — which made
+  an instruction that changes the root unsteppable: the stop it produces is in another address
+  space by construction. The server already knows where the next instruction starts, from the
+  step's own `bytes`, so a decoded CR3 write in natural mode now borrows an owned debug-register
+  slot for the linear successor and continues rather than arming TF. The hardware stop that
+  follows is accepted only when DR6 names that slot, RIP and the register name the successor and
+  TF/RF are clear; two matching register reads then establish a nonzero aligned root, memory is
+  re-bound to it, and the slot is disabled and its baseline address restored before the stop is
+  exposed. The stop's reason is `step_over`, carrying `new_cr3`; `expected_rips` accepts only the
+  successor; a wait expiry or teardown re-reads the possibly changed root under the proved
+  recovery pause before restoring the slot. Redirect mode refuses it, since its promise to restore
+  the complete saved snapshot cannot restore a read-only CR3. Measured 2026-10-12 on the
+  disposable VM at VTL1's `KiSystemCall64Shadow`: the guarded `mov cr3,rsp` returned `step_over`
+  with a distinct aligned root, the next ordinary step kept that root, continue and teardown
+  succeeded, and the external audit found the debug-register baseline, TF/RF, LSTAR, guest health,
+  worker lifetime and VM shutdown as expected. The live tier accepts `allow_transition_cr3` and a
+  per-step expected reason.
 
 - **A break left pending can no longer empty the next module refresh.** `Execute` discards a
   pending `SetInterrupt` as a command begins; a reload does not. Measured on the ARM64 bench's live
@@ -196,6 +249,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   caller may already have timed out.
 
 ### Changed
+
+- **The `securekernel` group is an extra, and a run that says nothing is no longer served it**
+  (`FOLLOWUPS.md` items 106 and 118, both in `DONE.md`). An omitted `--tools` serves the eight
+  ordinary groups — 66 tools, 103,579 B of model-visible surface measured 2026-10-12 — and
+  `--tools all` is what now means every tool, 78 of them and 123,244 B. The twelve `securekernel`
+  tools arrive only when a spec names the group or names them, and a call to one from a client
+  without it is refused `-32602` naming `--tools`, which reads as a configuration mistake and is
+  one. The reason is the setup the group needs — a checkpoint, the SDK, a disposable VBS guest and
+  two providers this repository does not ship — against a cost every caller paid: 19,665 B at the
+  start of each conversation, for tools a crash-dump reader cannot use. On stdio the command line
+  is the only place to widen it, because a tools spec in the environment is a listener *client's*
+  surface: `WINDBG_MCP_TOOLS_<NAME>` beside that client's token, or a `tools` field in its
+  credential-file entry, is how one client of a service gets these tools and another does not.
+
+- **Every Secure Kernel opener is refused until the operator fixes a policy at startup**
+  (`FOLLOWUPS.md` item 118, now in `DONE.md`). `WINDBG_MCP_SK_LIVE_POLICY` names a JSON file the
+  server reads once, when its session registry is created, and nothing in a request or a
+  client-chosen profile can widen it — because `open_sk_live_control`'s two transports were split
+  on whitespace and handed to `Command::new`, and `open_sk_capture`'s `kit` was joined into a path
+  and loaded, under a tool annotated non-destructive, so any admitted client could name the
+  program the worker ran. Without the variable, `open_sk_capture`'s provider loading and both live
+  openers are refused, each saying which variable to set. The file admits `kit_roots`, beneath
+  which a capture's SDK provider must canonicalise, and live authority as one complete set or
+  none: `disposable_vm_ids`; `transport_commands` as exact tokenised templates whose executable is
+  absolute and canonical and whose `{partition_id}`, `{vp}` and `{cr3}` are expanded only after
+  the worker has discovered them; `profile_roots` the profile must sit beneath; and
+  `max_pause_ms`, at least 60,000. That last is the absolute bound on every retained stop,
+  ordinary or KD. Its timer starts when the worker reports a retained stop rather than when the
+  session opens, a step keeps the one window rather than restarting it, a continue ends it, a
+  client's calls do not extend it, and when its service portion ends the session is released
+  through the same fail-closed teardown and recovery path as `end_session` — each stop reserving
+  the smaller of 30 seconds or half the bound for that cleanup, at the start of which the KD
+  service stops accepting work. Two defaults moved with it: `sk_live_arm`'s `mode` and
+  `open_sk_kd`'s `arm_mode` default to `natural`, which leaves RIP alone and waits for the guest
+  to reach the guarded instruction, where 0.22.0's default was `redirect`; and every control-path
+  mutation is recorded at `info` on the `windbg_mcp::secure_kernel_mutation` target, where before
+  it left no record unless a transcript was on. The file's shape and the operator contract are in
+  `docs/secure-kernel/live-control-provider.md` and `docs/secure-kernel/kd-facade.md`.
 
 - **`modules { "refresh": true }` is bounded by the call's clock** (`FOLLOWUPS.md` item 54, in
   `DONE.md`). The resynchronisation is `IDebugSymbols::Reload("")`, a direct engine call nothing
@@ -6686,7 +6777,8 @@ Initial release, packaged as a single-plugin Claude Code marketplace.
 - Crash-dump `!analyze` support via automatic WinDbg extension DLL loading.
 - Windows CI (format, clippy, build, test) and walkthrough docs with sample dumps.
 
-[Unreleased]: https://github.com/glslang/windbg-mcp/compare/v0.22.0...HEAD
+[Unreleased]: https://github.com/glslang/windbg-mcp/compare/v0.23.0...HEAD
+[0.23.0]: https://github.com/glslang/windbg-mcp/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/glslang/windbg-mcp/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/glslang/windbg-mcp/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/glslang/windbg-mcp/compare/v0.19.0...v0.20.0
