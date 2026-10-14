@@ -1821,8 +1821,10 @@ about. This is the other half — an attach that lands:
   `FOLLOWUPS.md` item 101: under `PageAlignLargeAllocs`, which both pool heaps carry on the two
   kernels this was measured against (26100.33438 and 29671), the allocator never hands out a VS user block in
   a page's last sixteen bytes, so a small VS chunk whose header sits at offset `0xfe0` has its
-  `_POOL_HEADER` at the next page start. A kernel without the flag fails the first assertion, and
-  that is a finding to record here rather than exempt. The walk put it at `0xff0` instead until dbgscope read the flag — 1,275
+  `_POOL_HEADER` at the next page start. The flag is read per heap through the engine
+  (`vs_page_align_flag`, a `dx` on `nt!ExPoolState`), because the walk applies its rule only
+  where it is set: on a heap without it the `0xff0` half does not apply and the `!pool` half
+  still does. The walk put it at `0xff0` instead until dbgscope read the flag — 1,275
   chunks on one boot, each with two stale tree pointers decoded as the header. That defect is
   visible in the walk's own answer, as a class of header offsets the allocator cannot produce,
   which is why this one samples `pool_find_tag` where the two above refuse to: it asserts that no

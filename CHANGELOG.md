@@ -39,11 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([dbgscope#199](https://github.com/glslang/dbgscope/pull/199)), and **every
   `layout.fingerprint` moves** with the field it resolves — `bbc9a6daae9ff7a2` →
   `38566b14fd9f4b50` on that kernel. The live-kernel tier's `compare_vs_page_end_placement` puts
-  both halves to the engine: no small VS chunk with its header in a page's last sixteen bytes,
-  and `!pool` reading a header at every page-aligned one the walk reports, with the walk's tag
-  and sixteen bytes more than its usable size. Run both ways against `ctf-vm`: 255 chunks at
-  `0xff0` on the old pin, none of 231 on the new, with four page-start headers agreeing with
-  `!pool`. Needs dbgscope#199.
+  both halves to the engine: no small VS chunk of a heap carrying the flag — read per heap with
+  `dx`, so a target without it is not failed for decoding correctly — with its header in a page's
+  last sixteen bytes, and `!pool` reading a header at every page-aligned one the walk reports,
+  with the walk's tag and sixteen bytes more than its usable size. Run both ways against `ctf-vm`: 255 chunks at
+  `0xff0` on the old pin, none of 744 across the three heaps the census reaches on the new, with
+  four page-start headers agreeing with `!pool`. Needs dbgscope#199.
 
 - **A command the engine refuses answers with what the engine printed.** `FOLLOWUPS.md` item 126.
   A failed `execute`, `irp_stack`, `go`, step, `run_to_address` or `continue_async` used to answer
