@@ -307,9 +307,11 @@ tools are refused on this session so they cannot report `vmwp` state as guest st
 Use this route only for an exact, disposable VBS VM under an independent heartbeat, crash-record and
 unchanged-text audit. Before the server starts, set `WINDBG_MCP_SK_LIVE_POLICY` to an operator-owned
 file that admits the VM GUID, exact provider command templates and profile root. The worker resolves
-the current `vmwp` PID and discovers the per-boot dispatcher VND and partition id; the register
-provider reports CR3 and the memory provider reports the Secure Kernel base. Request fields for
-those values are optional mismatch assertions. `open_sk_live_control` applies policy, validates the
+the current `vmwp` PID, the register provider reports CR3 and the memory provider reports the Secure
+Kernel base, so `vmwp_pid` and `expected_cr3` are optional mismatch assertions. The per-boot
+dispatcher VND and partition id are discovered only when the profile carries a `discovery` section,
+which makes `dispatcher_vnd` and `partition_id` assertions as well; a profile without one takes both
+as required inputs. `open_sk_live_control` applies policy, validates the
 input and profile and reserves the VM. It starts no provider and does not pause, attach to or inspect
 the VM. The first `sk_live_arm` performs discovery and validates the provider identities, live
 VM/`vmwp` binding, CR3, build and guarded instruction before it changes registers or breakpoints.
@@ -318,7 +320,9 @@ The sequence is:
 
 1. `open_sk_live_control` with `profile`, `control_transport`, `live_transport`, `vm_id` and
    optional `vp`. Supply `vmwp_pid`, `dispatcher_vnd`, `partition_id` or `expected_cr3` only when an
-   independent measurement should be enforced as a mismatch assertion.
+   independent measurement should be enforced as a mismatch assertion — except that a profile with
+   no `discovery` section requires `dispatcher_vnd` and `partition_id`, because nothing else
+   supplies them.
 2. `sk_live_arm` with the exact instruction address and 1–15 guarded bytes. Natural mode leaves RIP
    untouched and may arm up to four distinct debug-register slots; redirect mode accepts one and
    deliberately moves RIP.

@@ -110,8 +110,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   controller teardown; `interrupt` is refused, since no running-state break-in route has passed
   item 117. Connect and idle bounds default to 30 and 300 seconds, a peer disconnect while stopped
   opens a bounded reconnect window, and expiry of any bound — the absolute pause bound below
-  included — runs the same fail-closed teardown. `vmwp_pid`, `dispatcher_vnd`, `partition_id` and
-  `expected_cr3` are optional mismatch assertions rather than inputs. Measured 2026-10-07 on the
+  included — runs the same fail-closed teardown. `vmwp_pid` and `expected_cr3` are optional mismatch
+  assertions rather than inputs, and so are `dispatcher_vnd` and `partition_id` when the profile
+  carries a `discovery` section; without one the worker discovers neither and both stay required.
+  Measured 2026-10-07 on the
   disposable K3 VM with kd 10.0.26100.6584: `lm m securekernel`, `t`, `r`, `q`, MCP release, three
   same-PID health samples through 60 seconds, clean VTL1 debug registers and unchanged Secure
   Kernel text; and at a natural timer stop with a prepared symbol cache,
