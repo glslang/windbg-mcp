@@ -264,6 +264,22 @@ pub enum EngineError {
     /// address, a command error, a target that never stopped. Actionable: the model can adjust
     /// its arguments and retry.
     Debugger(String),
+    /// [`Self::Debugger`], carrying what the debugger printed during the command that failed.
+    ///
+    /// `message` is this server's account — the `HRESULT`, and anything this side appended — and
+    /// `engine_output` the engine's: its echo of the command, whatever earlier segments printed,
+    /// and the line saying why, which is the only thing that tells one `0x80040205` from another
+    /// (`FOLLOWUPS.md` item 126). Rendered as the engine's text followed by the message, the order
+    /// they happened in, so anything showing an error as text shows both; the result's typed half
+    /// keeps them apart.
+    ///
+    /// Its own variant rather than a field on [`Self::Debugger`], so the places that build one
+    /// from a sentence of this server's stay as they are: only a failure that crossed the pipe
+    /// carrying [`crate::proto::Failed::engine_output`] becomes this.
+    DebuggerWithOutput {
+        message: String,
+        engine_output: String,
+    },
     /// The call outlived its budget. Reported to the model exactly like [`Self::Debugger`], but
     /// kept separate because it means something the caller must know: the job was abandoned by
     /// the *waiter*, not by the worker, so it may still be running and may still succeed.
@@ -315,6 +331,10 @@ pub enum EngineError {
 impl fmt::Display for EngineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::DebuggerWithOutput {
+                message,
+                engine_output,
+            } => write!(f, "{}\n{message}", engine_output.trim_end()),
             Self::Debugger(m)
             | Self::Timeout(m)
             | Self::Stale(m)
@@ -324,6 +344,35 @@ impl fmt::Display for EngineError {
             | Self::InvalidArgument(m)
             | Self::TargetRunning(m)
             | Self::RecoveryRequired(m) => f.write_str(m),
+        }
+    }
+}
+
+impl EngineError {
+    /// This server's account of the failure, without what the debugger printed.
+    ///
+    /// The whole of [`fmt::Display`] for every variant but [`Self::DebuggerWithOutput`], whose
+    /// rendering puts the engine's text above this.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::DebuggerWithOutput { message, .. }
+            | Self::Debugger(message)
+            | Self::Timeout(message)
+            | Self::Stale(message)
+            | Self::Lost(message)
+            | Self::Interrupted(message)
+            | Self::NotRun(message)
+            | Self::InvalidArgument(message)
+            | Self::TargetRunning(message)
+            | Self::RecoveryRequired(message) => message,
+        }
+    }
+
+    /// What the debugger printed during the command that failed, where the failure carries it.
+    pub fn engine_output(&self) -> Option<&str> {
+        match self {
+            Self::DebuggerWithOutput { engine_output, .. } => Some(engine_output),
+            _ => None,
         }
     }
 }
@@ -351,7 +400,16 @@ fn engine_error(failed: crate::proto::Failed) -> EngineError {
         Some(ErrorCategory::NotRun) => EngineError::NotRun(failed.message),
         Some(ErrorCategory::InvalidArgument) => EngineError::InvalidArgument(failed.message),
         Some(ErrorCategory::StaleSession) => EngineError::Stale(failed.message),
-        _ => EngineError::Debugger(failed.message),
+        // The one category whose failure is the debugger's own, and so the one that keeps what it
+        // printed: the arms above are this server's statements about the call, and a worker
+        // attaches engine output to none of them (`Failed::printed` names no category).
+        _ => match failed.engine_output {
+            Some(engine_output) => EngineError::DebuggerWithOutput {
+                message: failed.message,
+                engine_output,
+            },
+            None => EngineError::Debugger(failed.message),
+        },
     }
 }
 
@@ -5231,6 +5289,39 @@ fn record_secure_kernel_kd_phase(session: &Session, phase: SecureKernelKdPhase) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failure from the worker keeps what the engine printed when it is the debugger's own, and
+    /// only then (`FOLLOWUPS.md` item 126). Every other category is this server's statement about
+    /// the call, so output arriving beside one is not something to show as the engine's reason.
+    #[test]
+    fn engine_error_keeps_what_the_engine_printed_on_a_debugger_failure_alone() {
+        let printed = "zzzz\nCouldn't resolve error at 'zzz'\n";
+        let refused = crate::proto::Failed::printed("Debug command failed", Some(printed));
+        match engine_error(refused) {
+            EngineError::DebuggerWithOutput {
+                message,
+                engine_output,
+            } => {
+                assert_eq!(message, "Debug command failed");
+                assert_eq!(engine_output, printed);
+            }
+            other => panic!("the engine's text was dropped: {other:?}"),
+        }
+
+        let mut interrupted = crate::proto::Failed::categorised(
+            crate::structured::ErrorCategory::Interrupted,
+            "stopped on request",
+        );
+        interrupted.engine_output = Some(printed.into());
+        assert!(matches!(
+            engine_error(interrupted),
+            EngineError::Interrupted(message) if message == "stopped on request"
+        ));
+
+        // Blank output is no output.
+        let blank = crate::proto::Failed::printed("Debug command failed", Some("\n\n"));
+        assert!(matches!(engine_error(blank), EngineError::Debugger(_)));
+    }
 
     // ---- which ops a kind of session accepts ---------------------------------------
 

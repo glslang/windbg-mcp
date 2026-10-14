@@ -48,8 +48,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use dbgscope::dbgeng::{
-    BreakpointAt, BreakpointSpec, CommandRun, DebugEngine, DebuggeeType, FunctionExtent,
-    Instruction, InterruptHandle, Interruption, RunToOutcome, WaitOutcome,
+    BreakpointAt, BreakpointSpec, CommandRun, DbgEngError, DebugEngine, DebuggeeType,
+    FunctionExtent, Instruction, InterruptHandle, Interruption, RunToOutcome, WaitOutcome,
 };
 use dbgscope::heap::{self as heap_query, HeapAllocation, HeapBackend, HeapState, HeapWalk};
 use dbgscope::pool::query::{self, PoolPageFilter, PoolWalk};
@@ -3174,17 +3174,15 @@ fn execute(
         // because arming a watchdog rounded a command up to a multiple of 200ms; it parks on a
         // condvar now and costs nothing until the bound is reached, so they all take
         // [`EngineOp::BoundedCommand`] instead (DECISIONS.md, 2026-08-02, revised 2026-08-31).
-        EngineOp::UnboundedCommand { command } => raw_command(e, &command, 0)
-            .map(|run| Output::text(told(run)))
-            .map_err(failed),
+        EngineOp::UnboundedCommand { command } => {
+            raw_command(e, &command, 0).map(|run| Output::text(told(run)))
+        }
         EngineOp::BoundedCommand {
             command,
             patience_ms,
         } => {
             let budget = watchdog_budget_ms(Duration::from_millis(u64::from(patience_ms)), spent());
-            raw_command(e, &command, budget)
-                .map(|run| Output::text(told(run)))
-                .map_err(failed)
+            raw_command(e, &command, budget).map(|run| Output::text(told(run)))
         }
         EngineOp::CommandAndWait {
             command,
@@ -3269,9 +3267,7 @@ fn execute(
                 None => dispatch_irp_expression(e.instruction_set())?.to_string(),
             };
             let budget = watchdog_budget_ms(Duration::from_millis(u64::from(patience_ms)), spent());
-            raw_command(e, &format!("!irp {irp} 1"), budget)
-                .map(|run| Output::text(told(run)))
-                .map_err(failed)
+            raw_command(e, &format!("!irp {irp} 1"), budget).map(|run| Output::text(told(run)))
         }
         EngineOp::IoctlTrace {
             dispatch,
@@ -3833,6 +3829,16 @@ fn failed<E: ToString>(e: E) -> Failed {
     Failed::from(e.to_string())
 }
 
+/// [`failed`] for a command the engine ran, keeping what it printed before it failed.
+///
+/// For every path a caller's own command text takes, where the line saying why is the only thing
+/// that tells one `0x80040205` from another (`FOLLOWUPS.md` item 126). The engine's own fixed
+/// queries keep going through [`failed`]: a `vertarget` this server issued failing is this
+/// server's problem to report, and its echo is noise to the caller who did not write it.
+fn engine_failed(e: DbgEngError) -> Failed {
+    Failed::printed(e.to_string(), e.output())
+}
+
 /// A command's text, with the deadline's explanation appended when there is one.
 ///
 /// The note lives here rather than in dbgscope because it is prose for whoever reads the tool's
@@ -3957,11 +3963,32 @@ fn appended(mut text: String, note: Option<String>) -> String {
 /// with the pump's output discarded); the command itself is where `.detach`, `q` and `qd` end it,
 /// leaving nothing for a pump to find. One note covers both, because from the caller's side there
 /// is one fact: this session has no target left.
-fn raw_command(e: &DebugEngine, command: &str, budget_ms: u32) -> Result<CommandRun, String> {
+fn raw_command(e: &DebugEngine, command: &str, budget_ms: u32) -> Result<CommandRun, Failed> {
     let started = Instant::now();
-    let result = e.execute_command_bounded(command, budget_ms).map_err(es);
+    let ran = e.execute_command_bounded(command, budget_ms);
     query::invalidate_allocator_snapshots();
+    // Taken before the failure becomes text, because text is all the rest of this has room for:
+    // the settle below appends its own sentences to the message, and what the engine printed has
+    // to stay apart from them (`FOLLOWUPS.md` item 126). Only the command's own failure has any —
+    // a settle that fails after a command that succeeded folds that command's output into its
+    // message, as it always has.
+    let printed = ran
+        .as_ref()
+        .err()
+        .and_then(DbgEngError::output)
+        .map(str::to_string);
+    settled(e, command, budget_ms, started, ran.map_err(es))
+        .map_err(|why| Failed::printed(why, printed.as_deref()))
+}
 
+/// [`raw_command`] after the command has run: the settle, and what it makes of the result.
+fn settled(
+    e: &DebugEngine,
+    command: &str,
+    budget_ms: u32,
+    started: Instant,
+    result: Result<CommandRun, String>,
+) -> Result<CommandRun, String> {
     // Capped at the ordinary execution wait, and again at what is left of the caller's clock.
     //
     // [`EXEC_WAIT_MS`] because a raw `g` that reaches no stop should cost what `go` costs and not
@@ -4164,7 +4191,9 @@ fn elapsed_ms(started: Instant) -> u32 {
 /// it does carry is the only copy of what the run printed — which is why it must not travel as an
 /// `Err`, whose one channel is a message.
 fn resumed(e: &DebugEngine, command: &str, timeout_ms: u32) -> Result<Output, Failed> {
-    let run = e.execute_and_wait(command, timeout_ms).map_err(failed)?;
+    let run = e
+        .execute_and_wait(command, timeout_ms)
+        .map_err(engine_failed)?;
     query::invalidate_allocator_snapshots();
     let (text, report) = stop_report(e, command, run);
     Ok(Output::typed(text, report))
@@ -4237,7 +4266,7 @@ fn pump_a_resume(
     command: &str,
     timeout_ms: u32,
 ) -> Result<Output, Failed> {
-    let echo = e.execute_command(command).map_err(failed)?;
+    let echo = e.execute_command(command).map_err(engine_failed)?;
     // As in `raw_command`, and for its reason: the command may have written allocator memory
     // before this process gets to say anything about what it did.
     query::invalidate_allocator_snapshots();
@@ -7068,18 +7097,18 @@ impl BatchEngine<'_> {
 }
 
 impl Debuggee for BatchEngine<'_> {
-    fn command(&mut self, command: &str, budget_ms: u32) -> Result<Ran, String> {
+    fn command(&mut self, command: &str, budget_ms: u32) -> Result<Ran, Failed> {
         // Bounded, always. A batch is the one place a runaway command would also strand a
         // rollback, so the step self-aborts rather than eating the reserve.
         raw_command(self.e, command, budget_ms).map(|run| self.ran(run))
     }
 
-    fn resume(&mut self, command: &str, timeout_ms: u32) -> Result<Ran, String> {
+    fn resume(&mut self, command: &str, timeout_ms: u32) -> Result<Ran, Failed> {
         self.e
             .execute_and_wait(command, timeout_ms)
             .inspect(|_| query::invalidate_allocator_snapshots())
             .map(|run| self.ran_moving(run))
-            .map_err(es)
+            .map_err(engine_failed)
     }
 
     fn running(&mut self) -> Option<bool> {
@@ -7094,10 +7123,10 @@ impl Debuggee for BatchEngine<'_> {
         held_now(self.e, &self.started_on)
     }
 
-    fn run_to(&mut self, address: &str, timeout_ms: u32) -> Result<Ran, String> {
+    fn run_to(&mut self, address: &str, timeout_ms: u32) -> Result<Ran, Failed> {
         // The typed half is dropped here, deliberately: a batch's product is its own report,
         // which renders every step into one narrative, and a step does not answer separately.
-        let output = run_to_address(self.e, address, timeout_ms).map_err(|error| error.message)?;
+        let output = run_to_address(self.e, address, timeout_ms)?;
         Ok(Ran {
             output: output.text,
             interrupted: self.broken(),
@@ -7105,7 +7134,7 @@ impl Debuggee for BatchEngine<'_> {
         })
     }
 
-    fn read_memory(&mut self, address: &str, size: u32, budget_ms: u32) -> Result<Ran, String> {
+    fn read_memory(&mut self, address: &str, size: u32, budget_ms: u32) -> Result<Ran, Failed> {
         // Bounded, always, and for the reason a command step is: this is the other operation a
         // step can start that spends its time inside the engine rather than between calls — a
         // megabyte over a KD wire — and the reserve the rollback lives on is what it would spend.
@@ -7120,7 +7149,7 @@ impl Debuggee for BatchEngine<'_> {
         })
     }
 
-    fn pool(&mut self, query: &PoolOp, budget_ms: u32) -> Result<Ran, String> {
+    fn pool(&mut self, query: &PoolOp, budget_ms: u32) -> Result<Ran, Failed> {
         // The step's own budget, handed to the walker. Bounded, always, for the same reason a
         // command step is: this is the one step that can spend minutes without a runaway anywhere
         // — a full pool walk is every committed page over the KD wire — and the reserve the
@@ -7129,8 +7158,7 @@ impl Debuggee for BatchEngine<'_> {
             self.e,
             query.clone(),
             Duration::from_millis(u64::from(budget_ms)),
-        )
-        .map_err(|error| error.message)?;
+        )?;
         Ok(Ran {
             output: output.text,
             interrupted: self.broken(),
@@ -8836,7 +8864,7 @@ fn run_to_address(e: &DebugEngine, address: &str, wait: u32) -> Result<Output, F
         .and_then(|hex| u64::from_str_radix(hex, 16).ok())
         .or_else(|| resolve(e, address))
         .ok_or_else(|| format!("could not resolve address `{address}`"))?;
-    let res = e.run_to_address(target, wait).map_err(failed)?;
+    let res = e.run_to_address(target, wait).map_err(engine_failed)?;
     query::invalidate_allocator_snapshots();
     let mut msg = match res.outcome {
         RunToOutcome::Hit => format!("VERDICT: HIT — execution reached {}\n", fmt_addr(target)),

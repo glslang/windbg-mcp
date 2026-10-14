@@ -87,7 +87,6 @@ reopen it). An unmarked line is simply open.
 - [Item 121](#121-windbg-mcp-tracing-pool-allocations-on-an-x86-kernel) — [windbg-mcp] Tracing pool allocations on an x86 kernel — **half landed** (the x86 reader, measured in user mode, 2026-10-13; a trace on a live x86 kernel is what is left)
 - [Item 122](#122-windbg-mcp-a-live-secure-kernel-session-has-no-image-to-resolve-names-or-instructions-against) — [windbg-mcp] A live Secure Kernel session has no image to resolve names or instructions against
 - [Item 125](#125-windbg-mcp--dbgscope-an-interrupted-replay-is-left-where-ttd-puts-it-not-where-it-had-got-to) — [windbg-mcp + dbgscope] An interrupted replay is left where TTD puts it, not where it had got to
-- [Item 126](#126-dbgscope--windbg-mcp-a-command-that-fails-is-reported-by-its-hresult-alone) — [dbgscope + windbg-mcp] A command that fails is reported by its HRESULT alone
 - [Item 127](#127-windbg-mcp-the-code-scans-decode-by-the-stops-effective-machine-not-the-images) — [windbg-mcp] The code scans decode by the stop's effective machine, not the image's
 - [Item 128](#128-windbg-mcp-the-ttd-tier-records-whichever-hostname-the-shells-path-resolves) — [windbg-mcp] The TTD tier records whichever hostname the shell's PATH resolves
 - [Item 129](#129-windbg-mcp-the-live-secure-kernel-tier-takes-a-boots-coordinates-from-a-private-prep-the-kd-gate-discovers-for-itself) — [windbg-mcp] The live Secure Kernel tier takes a boot's coordinates from a private prep the KD gate discovers for itself
@@ -2126,42 +2125,6 @@ here `worker::resumed`, `worker::pump_a_resume` and `worker::run_to_address`; `S
 in `tests/mcp_smoke.rs`, whose printed line is the measurement to turn into an assertion once there
 is a behaviour to assert.
 
-## 126. [dbgscope + windbg-mcp] A command that fails is reported by its HRESULT alone
-
-**Repo:** `dbgscope`, then `windbg-mcp`. **Origin:** closing item 105 (2026-10-13), where it is
-why item 102 could record `||1s` failing and not say why.
-
-**What happens.** When DbgEng's `Execute` returns a failure, dbgscope hands back
-`DbgEngError::CommandFailed` with the HRESULT alone and drops the output it had been collecting for
-that call: `execute_fixed_command` and `execute_command_bounded` each return through
-`result.map_err(DbgEngError::CommandFailed)?` before the buffer is read (`src/dbgeng.rs` at the
-pinned `d208798`). The HRESULT does not say much. Through the service build `0.22.0+gbfd1f388` on
-dbgeng 10.0.29617.1000, `execute { "command": "zzzz" }` and `execute { "command": "||1s" }` both
-answer `Debug command failed: An unexpected exception was raised (0x80040205)`, and `cdb` on
-10.0.26100.1742 prints why the second one failed — `^ Illegal debuggee error in '||1s'`, the
-system it names not having been loaded yet. Everything else the command printed before failing goes
-with it, which is the half `walk_memory` was built to work around for one shape of command.
-
-**What it cost.** Item 102 recorded `||1s` failing with `0x80040205` and could not say why, so item
-105 had to list "which command actually switches" as something this server had never observed. The
-engine had said why, and the answer never left the worker. `docs/limitations.md`, `docs/walk-memory.md` and `docs/ttd-walkthrough.md`
-each explain a `0x80040205` by hand.
-
-**What is not measured.** Whether the engine's error line reaches *this* call's output callbacks at
-all. `Execute` is called with `DEBUG_OUTCTL_THIS_CLIENT`, and `cdb` printing the line shows the
-engine emits it, not that it lands in the buffer this path drops. That is the first thing to check:
-a dbgscope example that prints the buffer on the error path, against `||1s` on a session with a
-system added and not yet loaded, and against a mistyped command.
-
-**What would close it.** A failed command carries what was printed beside the HRESULT — a typed
-field on the error rather than text folded into its message, so a structured client can tell the
-engine's reason from this server's — and `execute` and a `debug_batch` command step show it. The
-asymmetry to keep: DbgEng prints most failures and returns *success* (`debug_batch`'s `command`
-step documents that), so this is only about the calls that do return an error.
-
-**Where it picks up.** dbgscope's `src/dbgeng.rs`, every `map_err(DbgEngError::CommandFailed)?` that
-follows an `Execute` with a capture buffer live; then this server's `engine::engine_error` and the
-places `CommandFailed`'s text reaches a caller.
 ## 127. [windbg-mcp] The code scans decode by the stop's effective machine, not the image's
 
 **Repo:** `windbg-mcp`. **Origin:** item 121's measurement, 2026-10-13.
@@ -2462,7 +2425,8 @@ the memory being *protected* (124). Items 123 and 124 are now in [`DONE.md`](./D
 Item 125 came from closing item 47 (2026-10-13): asking whether a replay can be broken in at its
 bound found that it can, and that TTD then leaves it somewhere it never reached.
 Item 126 came from closing item 105 the same day: the `||1s` failure item 102 could not explain
-had a reason all along, which `cdb` prints and this server does not pass on.
+had a reason all along, which `cdb` prints and this server did not pass on — now in
+[`DONE.md`](./DONE.md).
 Items 128 and 129 came from the release test run of 2026-10-13, which ran every tier including the
 four live ones: the TTD tier failing its own control when launched from Git Bash, which had
 recorded the MSYS `hostname.exe` (128), and the two Secure Kernel tiers being reachable only

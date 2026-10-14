@@ -497,14 +497,16 @@
 - **`crash_triage` tries `!analyze -v` and then `!ext.analyze -v`**, and reports which one worked
   under `analysis.command`. A **manual** `execute` has to pick, and on the bundled engine the
   answer is the module-qualified `!ext.analyze -v` — the unqualified form does not resolve there
-  even after `.load ext` (see [*Bundling the WinDbg engine*](./install.md#bundling-the-windbg-engine)). On a **partial minidump**, reads of
-  pages that weren't captured raise `An unexpected exception was raised (0x80040205)` rather than a
-  clean "memory read error"; query the specific field you need (e.g.
+  even after `.load ext` (see [*Bundling the WinDbg engine*](./install.md#bundling-the-windbg-engine)). On a **partial minidump**, a
+  dereference of a page that wasn't captured — `? poi(<addr>)`, a `.for` loop's `poi` — fails
+  with `An unexpected exception was raised (0x80040205)` and the engine's `Memory access error`
+  line beside it, while `dq`, `dps`, `db` and `dt` of the same page print `????????` or
+  `Memory read error` and succeed. Either way, query the specific field you need (e.g.
   `dt nt!_DRIVER_OBJECT <addr> DriverName`) instead of dumping whole structures. See the
-  [crash-dump walkthrough](crash-dump-walkthrough.md).
-- **That failure is all-or-nothing inside a `.for` loop**, which is what `walk_memory` is for: one
-  unmapped dereference takes the whole script down with no rows at all, and the node it happened on
-  is usually the interesting one. Walk a list, an array or a chain with `walk_memory` and each hole
+  [crash-dump walkthrough](crash-dump-walkthrough.md#5-pitfall-partial-minidumps-and-0x80040205).
+- **That failure ends a `.for` loop where it happens**, which is what `walk_memory` is for: one
+  unmapped dereference takes the whole script down, so no node after it is read — the rows before
+  it come back with the error — and the node it happened on is usually the interesting one. Walk a list, an array or a chain with `walk_memory` and each hole
   is a marked value instead.
 - Single-stepping is only valid once the target is stopped with a real thread context (after a
   `go`/step or a breakpoint hit). Stepping straight after a bare `goto_position` to the very start of

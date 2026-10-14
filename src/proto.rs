@@ -1470,12 +1470,27 @@ pub enum WorkerMessage {
 /// asked it to stop, and a query that was **never run** because too little of the caller's budget
 /// was left to run it in. Both used to arrive looking like a target that had misbehaved, which is
 /// the opposite of what each one means.
-#[derive(Debug, Serialize, Deserialize)]
+///
+/// `PartialEq` and `Clone` because a `debug_batch` step's failure is one of these too
+/// ([`crate::batch::Debuggee`]), and the batch compares and scripts them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Failed {
     pub message: String,
     /// `None` means the ordinary case: the debugger ran it and it failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category: Option<crate::structured::ErrorCategory>,
+    /// What the debugger printed during the command that failed, kept out of `message` so a
+    /// caller can tell the engine's account from this server's (`FOLLOWUPS.md` item 126).
+    ///
+    /// The `HRESULT` in `message` says little on its own — `0x80040205` is the engine's answer to
+    /// a mistyped command, to an argument naming nothing and to `||1s` on a system not yet loaded
+    /// alike — and this is where the line saying which one arrives, beside whatever earlier
+    /// segments of the command printed. Only a failure of the debugger's own carries it: every
+    /// other category is this server's statement, and `engine::engine_error` keeps it for the
+    /// `debugger` one alone. `None` when the failure had no capture or the engine printed nothing
+    /// in it but blank lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_output: Option<String>,
 }
 
 impl Failed {
@@ -1487,6 +1502,21 @@ impl Failed {
         Self {
             message: message.into(),
             category: Some(category),
+            engine_output: None,
+        }
+    }
+
+    /// A debugger failure, carrying what the engine printed during the command that failed.
+    ///
+    /// Blank output is no output: a capture holding nothing but line breaks says nothing a caller
+    /// could read, and an empty field would read as though it did.
+    pub fn printed(message: impl Into<String>, engine_output: Option<&str>) -> Self {
+        Self {
+            message: message.into(),
+            category: None,
+            engine_output: engine_output
+                .filter(|printed| !printed.trim().is_empty())
+                .map(str::to_string),
         }
     }
 
@@ -1562,6 +1592,7 @@ impl From<String> for Failed {
         Self {
             message,
             category: None,
+            engine_output: None,
         }
     }
 }

@@ -149,6 +149,15 @@ nothing changed — unlike `timeout`, where it may still be running), `stale_ses
 `capacity`. Both branches carry a `status` discriminator (`"ok"` / `"error"`), which is what lets one
 schema describe a result whichever way it went.
 
+A `debugger` failure of a command the caller's own text reached — `execute`, `irp_stack`, and the
+tools that run the target — also carries `engine_output`: what the engine printed before it failed,
+starting with its echo of the command and ending with the line saying why. It is kept apart from
+`message`, which is this server's account, because the code in that says little on its own:
+`0x80040205` answers a mistyped command, an argument naming nothing, `g` on a dump and `||1s` on a
+system not yet loaded alike, and only the engine's line says which. The result's text shows both,
+the engine's first. A `debug_batch` step that fails shows the same text as that step's output.
+`FOLLOWUPS.md` item 126 has the measurements.
+
 ## Binary Ninja bridge contracts
 
 `current_location` and `read_memory` use the existing `status: "ok"` / `status: "error"`

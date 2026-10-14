@@ -223,10 +223,21 @@ impl<T> Outcome<T> {
         message: impl Into<String>,
         session_id: Option<String>,
     ) -> Self {
+        Self::failed_printing(category, message, None, session_id)
+    }
+
+    /// [`Self::failed_in`] for a failure that carries what the debugger printed.
+    pub fn failed_printing(
+        category: ErrorCategory,
+        message: impl Into<String>,
+        engine_output: Option<&str>,
+        session_id: Option<String>,
+    ) -> Self {
         Self::Error(Failure {
             error: FailureDetail {
                 category,
                 message: message.into(),
+                engine_output: engine_output.map(str::to_string),
                 session_id,
             },
         })
@@ -247,8 +258,17 @@ pub struct Failure {
 pub struct FailureDetail {
     /// What kind of failure this is. Stable across rewordings of `message`.
     pub category: ErrorCategory,
-    /// The full human-readable failure, identical to the text content of the same result.
+    /// This server's account of the failure. The text content of the same result is this, with
+    /// `engine_output` above it when there is one.
     pub message: String,
+    /// What the debugger printed during the command that failed: its echo, whatever earlier
+    /// segments of the command printed, and the line saying why. Kept apart from `message`
+    /// because the code in that says little on its own — `0x80040205` answers a mistyped command,
+    /// an argument naming nothing and `||1s` on a system not yet loaded alike. Present only on a
+    /// `debugger` failure of a command the caller's own text reached, and only when the engine
+    /// printed something.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine_output: Option<String>,
     /// The session the failure is about, where the failure has one — including the openers
     /// that fail *after* creating a target, where this handle is the only way to reach it.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -325,7 +345,7 @@ impl ErrorCategory {
     /// here instead of an `internal` that quietly swallows it.
     pub fn of(error: &EngineError) -> Self {
         match error {
-            EngineError::Debugger(_) => Self::Debugger,
+            EngineError::Debugger(_) | EngineError::DebuggerWithOutput { .. } => Self::Debugger,
             EngineError::Timeout(_) => Self::Timeout,
             EngineError::Stale(_) => Self::StaleSession,
             EngineError::Lost(_) => Self::WorkerLost,
@@ -5477,6 +5497,14 @@ mod tests {
                 EngineError::InvalidArgument("no".into()),
                 ErrorCategory::InvalidArgument,
                 "invalid_argument",
+            ),
+            (
+                EngineError::DebuggerWithOutput {
+                    message: "no".into(),
+                    engine_output: "zzzz\nCouldn't resolve error at 'zzz'\n".into(),
+                },
+                ErrorCategory::Debugger,
+                "debugger",
             ),
         ];
         for (error, expected, wire) in cases {

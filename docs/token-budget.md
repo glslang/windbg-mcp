@@ -92,14 +92,15 @@ The two halves moved independently, which is the whole argument for measuring th
 fell by 55% and the model-visible column did not move at all except for what the tools themselves
 have accumulated since.
 
-Worst single tool, **today** rather than at the baseline above: `debug_batch` at 10,308
-model-visible bytes (2026-10-05), because its `inputSchema` pulls the whole `StepAction`/`Check`
+Worst single tool, **today** rather than at the baseline above: `debug_batch` at 10,296
+model-visible bytes (2026-10-14), because its `inputSchema` pulls the whole `StepAction`/`Check`
 vocabulary out of `src/batch.rs`. It is dated because it is the one figure in this section that has
 been kept current rather than frozen — it was updated 9,746 → 10,021 on 2026-08-30, which the
 finding below refers to as "the figure above", and 10,842 → 10,308 on 2026-10-05, when item 52 took
 four "the `X` tool" pointers out of that vocabulary and then the `steps` description's catalogue of
-the ops, which each variant documents anyway — and a reader reconstructing the 51-tool surface
-should take the table, not this line.
+the ops, which each variant documents anyway, and 10,308 → 10,296 on 2026-10-14, when item 126
+corrected the `command` step's example of a failure the engine reports as a success — and a reader
+reconstructing the 51-tool surface should take the table, not this line.
 
 The payload is measured as the **serialized result**, not as the sum of its tools, and the 118-byte
 gap between those two is the reason. Result-level fields live in it, and on `2026-07-28` those are
@@ -341,25 +342,25 @@ None of these is a bug. They are recorded because they were invisible, and
    and, since item 41, for the sentences the tools it keeps used to spend on pointing at them.
    Where the bytes sit, and what each profile costs:
 
-   Both tables are measurements of **2026-10-12** and move with any edit to a description. The
+   Both tables are measurements of **2026-10-14** and move with any edit to a description. The
    `securekernel` row is an extra group: the absent spec omits it, while `all` includes it.
 
    | group | tools | bytes | share |
    |---|---:|---:|---:|
-   | `allocator` | 12 | 19,840 | 16.1% |
+   | `allocator` | 12 | 19,807 | 16.1% |
    | `ioctl` | 11 | 16,088 | 13.1% |
    | `securekernel` | 12 | 19,665 | 16.0% |
    | `exec` | 10 | 15,087 | 12.2% |
    | `session` | 10 | 14,208 | 11.5% |
    | `inspect` | 10 | 13,485 | 10.9% |
-   | `batch` | 1 | 10,308 | 8.4% |
+   | `batch` | 1 | 10,296 | 8.4% |
    | `crash` | 3 | 7,473 | 6.1% |
    | `ttd` | 9 | 7,090 | 5.8% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 66 | 103,579 |
-   | `all` | 78 | 123,244 |
+   | *(absent)* | 66 | 103,534 |
+   | `all` | 78 | 123,199 |
    | `session,inspect,exec,crash` | 33 | 49,332 |
    | `session,inspect,crash` | 23 | 34,092 |
    | `crash` | 13 | 20,515 |

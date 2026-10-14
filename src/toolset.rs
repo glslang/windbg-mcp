@@ -1,7 +1,7 @@
 //! Which of this server's seventy-eight tools a run advertises.
 //!
 //! The tool surface is paid **once per conversation, before anything is debugged**, and it is
-//! 123,244 bytes — roughly 30k tokens (measured 2026-10-12; every figure here moves with any edit
+//! 123,199 bytes — roughly 30k tokens (measured 2026-10-14; every figure here moves with any edit
 //! to a description, so re-derive rather than cite). Seven tenths of that is prose, and the prose is what tells
 //! a model how to drive the tools, so there is no strip here the way there was in
 //! [`crate::schema`]: `FOLLOWUPS.md` item 24 measured it and the only honest lever left is the one
@@ -17,16 +17,16 @@
 //!
 //! A group is *an activity*, not a subsystem: the tools you reach for while doing one kind of
 //! debugging. A caller reading a crash dump has no use for the nine TTD tools or the twelve
-//! allocator ones, and pays 26,930 bytes for them at the start of every conversation.
+//! allocator ones, and pays 26,897 bytes for them at the start of every conversation.
 //!
 //! ```text
 //!   group        tools   bytes   what it is for
-//!   allocator       12   19,840  pool and heap walks, a driver's pool allocation trace, and
+//!   allocator       12   19,807  pool and heap walks, a driver's pool allocation trace, and
 //!                                  `walk_memory`
 //!   inspect         10   13,485  registers, stacks, memory, modules, symbols, location, raw commands
 //!   session         10   14,208  opening a target, ending it, and watching this server
 //!   exec            10   15,087  breakpoints and execution control
-//!   batch            1   10,308  `debug_batch`
+//!   batch            1   10,296  `debug_batch`
 //!   crash            3    7,473  a bug check, a user-mode fault, and an error code
 //!   ttd              9    7,090  recording, indexing and querying a Time Travel trace
 //!   ioctl           11   16,088  driver objects, IRP stacks, reachability, hazards, IOCTL maps,
@@ -35,8 +35,8 @@
 //!   securekernel    12   19,665  captured and live VTL1 inspection and execution control
 //! ```
 //!
-//! Those bytes are a measurement of **2026-10-12** and move with any edit to a description — the
-//! whole surface they are shares of is 78 tools and 123,244 B, which is what the rows above sum to.
+//! Those bytes are a measurement of **2026-10-14** and move with any edit to a description — the
+//! whole surface they are shares of is 78 tools and 123,199 B, which is what the rows above sum to.
 //! Re-derive rather than quoting them.
 //!
 //! **Those are shares of the whole surface, and they do not sum to a narrowed one.** `crash` reads

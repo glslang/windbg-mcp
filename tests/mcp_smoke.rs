@@ -2334,8 +2334,8 @@ const MODEL_VISIBLE_CEILING: usize = 126_000;
 /// outcome carries. The new ceiling leaves 8,489 B (2.4%).
 const WIRE_CEILING: usize = 355_000;
 
-/// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,308
-/// bytes (2026-10-05), because its `inputSchema` pulls the whole `StepAction`/`Check` vocabulary
+/// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,296
+/// bytes (2026-10-14), because its `inputSchema` pulls the whole `StepAction`/`Check` vocabulary
 /// from `src/batch.rs` — and, since item 102, both that schema's `always` field and the tool's own
 /// description owe a sentence about the one path that drops the rollback. A tool costing more than this is not necessarily wrong, but it should be a
 /// decision somebody made rather than a schema that grew.
@@ -11405,8 +11405,9 @@ const UNMAPPED: &str = "0x1000";
 ///
 /// The contrast is the point, so it is asserted rather than described. The same dereference
 /// through `execute` — which is how this was done before — fails outright, and a `.for` loop
-/// around it takes the whole script down with it, leaving no rows and no iteration number. That
-/// failure is what cost a MessageManager session an afternoon of hand-bisecting a 512-entry table.
+/// around it takes the whole script down with it, so no node after the hole is read. That failure
+/// is what cost a MessageManager session an afternoon of hand-bisecting a 512-entry table, back
+/// when it also carried none of the rows before the hole (`FOLLOWUPS.md` item 126 since).
 ///
 /// Everything here is read-only against the checked-in dump, and the one address it assumes
 /// anything about is [`UNMAPPED`], which is unmapped on every Windows target there is.
@@ -11447,7 +11448,7 @@ fn a_walk_marks_what_it_cannot_read_and_keeps_going() {
     let (nt, hal) = (base("nt"), base("hal"));
 
     // The old way, first, so the improvement is measured rather than claimed: one unreadable
-    // dereference is a failed call with nothing in it.
+    // dereference is a failed call.
     let old = server.call_tool(
         "execute",
         json!({ "session_id": session_id, "command": format!("? poi({UNMAPPED})") }),
@@ -11560,6 +11561,93 @@ fn a_walk_marks_what_it_cannot_read_and_keeps_going() {
     server.tool_data(
         "end_session",
         json!({ "session_id": session_id }),
+        TARGET_STEP,
+    );
+}
+
+/// A command the engine refuses answers with what the engine printed (`FOLLOWUPS.md` item 126):
+/// the rows a `.for` loop printed before the read that failed, and the line saying why.
+///
+/// Both used to go with the capture, so a loop over a table with one unreadable entry in it
+/// answered `0x80040205` and nothing else — the half of [`a_walk_marks_what_it_cannot_read_and_keeps_going`]'s
+/// premise that this fixes, the other half (the walk stopping at the hole) being the engine's.
+/// And `0x80040205` is also the answer to an argument naming nothing and to `g` on a dump, so
+/// the code alone could not say which had happened; the engine's line can, and is asserted on all
+/// three roads a caller's text takes to it: `execute`, a `debug_batch` step, and `go`.
+///
+/// The loop and its failing read are measured against `cdb` on this dump (dbgeng 10.0.26100.1742,
+/// ARM64): `row 0`, `row 1`, `row 2`, then `Memory access error at ') '`. What is asserted is the
+/// rows and the engine's own words, not their exact spacing.
+#[test]
+fn a_refused_command_answers_with_what_the_engine_printed() {
+    let Some(dump) = target_tier() else {
+        return;
+    };
+    let mut server = Server::started();
+    let session = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
+
+    let looped = format!(
+        ".for (r $t0 = 0; @$t0 < 3; r $t0 = @$t0 + 1) {{ .printf \"row %d\\n\", @$t0; \
+         .if (@$t0 == 2) {{ ? poi({UNMAPPED}) }} }}"
+    );
+    let refused = server.call_tool(
+        "execute",
+        json!({ "session_id": &session, "command": looped }),
+        TARGET_STEP,
+    );
+    let text = text_of(&refused["result"]);
+    assert!(
+        is_tool_error(&refused),
+        "the loop's failing read did not fail: {text}"
+    );
+    for expected in ["row 0", "row 2", "Memory access error", "0x80040205"] {
+        assert!(
+            text.contains(expected),
+            "`{expected}` is missing from the text: {text}"
+        );
+    }
+    let error = &refused["result"]["structuredContent"]["error"];
+    assert_eq!(error["category"], "debugger", "{error}");
+    let printed = error["engine_output"].as_str().unwrap_or_default();
+    assert!(
+        printed.contains("row 2") && printed.contains("Memory access error"),
+        "the typed half lost what the engine printed: {error}"
+    );
+    let message = error["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("0x80040205") && !message.contains("row 2"),
+        "`message` is this server's account and `engine_output` the engine's: {error}"
+    );
+
+    let batch = server.call_tool(
+        "debug_batch",
+        json!({
+            "session_id": &session,
+            "steps": [{ "op": "command", "command": "? nowhere!Nope" }],
+        }),
+        TARGET_STEP,
+    );
+    let text = text_of(&batch["result"]);
+    assert_eq!(
+        batch["result"]["structuredContent"]["steps"][0]["result"], "failed",
+        "{text}"
+    );
+    assert!(
+        text.contains("| Couldn't resolve error at 'nowhere!Nope'"),
+        "the refused step does not show the engine's reason: {text}"
+    );
+
+    let go = server.call_tool("go", json!({ "session_id": &session }), TARGET_STEP);
+    let text = text_of(&go["result"]);
+    assert!(is_tool_error(&go), "`go` on a dump did not fail: {text}");
+    assert!(
+        text.contains("No runnable debuggees"),
+        "`go` on a dump does not say why it failed: {text}"
+    );
+
+    server.tool_data(
+        "end_session",
+        json!({ "session_id": &session }),
         TARGET_STEP,
     );
 }

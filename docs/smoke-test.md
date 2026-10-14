@@ -876,6 +876,14 @@ processes, so they need real ones:
   row between two module bases whose `MZ` it really read. Then array mode over the `nt` DOS header
   at its own field widths, and a chain from that unmapped address, which must stop with
   `unreadable_link` **naming the node** and carry the engine's reason for reading nothing at all.
+- *A refused command answers with what the engine printed.* `FOLLOWUPS.md` item 126, on the three
+  roads a caller's own text takes to the engine. A `.for` loop through `execute` whose third pass
+  reads the same unmapped address has to fail **and** carry `row 0` to `row 2` and the engine's
+  `Memory access error` — in the text, and in the typed half as `error.engine_output`, with
+  `error.message` left as this server's account alone. A `debug_batch` step of `? nowhere!Nope`
+  has to fail with `Couldn't resolve error at 'nowhere!Nope'` as its output, and `go` on the dump
+  has to say `No runnable debuggees`. All three answered `0x80040205` and nothing else before,
+  which is the code for each of them, so the engine's line is the only thing that tells them apart.
 - *A pool walk takes this server's deadline, not the walker's default.* Asserted against the
   worker's log (`RUST_LOG=windbg_mcp=debug`) rather than against the answer, because on a dump the
   number has no visible consequence — the pool is local memory, so every budget from 15s to 120s

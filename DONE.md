@@ -101,6 +101,11 @@ confirming it: in every case measured `.opendump` made none on its own and the `
 the shape `.create` has — and on a live kernel nothing did. And the failure it cited as unexplained
 had been explained by the engine all along, in a line `cdb` prints and this server does not pass on
 — item 126.
+**Item 126** (2026-10-14) is here because the question it put first had a cheap answer it could not
+reach on its own: the engine's reason was in the call's capture all along, and the capture was
+thrown away with the error. Measuring that turned up two shipped claims about which failures come
+back as errors that were backwards — the `debug_batch` step's example, and the partial-minidump
+reads — so the entry records the split as it was measured.
 
 ## What is in here
 
@@ -189,6 +194,7 @@ had been explained by the engine all along, in a line `cdb` prints and this serv
 - [Item 47](#47-windbg-mcp--dbgscope-the-bounded-wait-is-unmeasured-on-a-ttd-replay-target--done-2026-10-13) — [windbg-mcp + dbgscope] The bounded wait is unmeasured on a TTD replay target — done (2026-10-13)
 - [Item 105](#105-windbg-mcp-opendump-is-documented-as-replacing-the-target-and-the-one-measurement-of-it-says-it-adds-one--done-2026-10-13) — [windbg-mcp] `.opendump` is documented as replacing the target, and the one measurement of it says it adds one — done (2026-10-13)
 - [Item 58](#58-dbgscope--windbg-mcp-geteffectiveprocessortype-is-the-question-and-is-not-bound--done-2026-10-14) — [dbgscope + windbg-mcp] `GetEffectiveProcessorType` is the question, and is not bound — done (2026-10-14)
+- [Item 126](#126-dbgscope--windbg-mcp-a-command-that-fails-is-reported-by-its-hresult-alone--done-2026-10-14-dbgscope198) — [dbgscope + windbg-mcp] A command that fails is reported by its HRESULT alone — done (2026-10-14, dbgscope#198)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -11209,3 +11215,146 @@ was observed once and not characterised; the dump half of the measurement is x64
 not exercised, because a `launch` always takes the 64-bit image — which is the case this was
 about. And a first-chance stop was not measured: the engine's default for a C++ exception is to
 stop on the second, and that is the stop a caller gets.
+
+## 126. [dbgscope + windbg-mcp] A command that fails is reported by its HRESULT alone — **done** (2026-10-14, dbgscope#198)
+
+**Repo:** `dbgscope`, then `windbg-mcp`. **Origin:** closing item 105 (2026-10-13), where it is
+why item 102 could record `||1s` failing and not say why.
+
+**What happens.** When DbgEng's `Execute` returns a failure, dbgscope hands back
+`DbgEngError::CommandFailed` with the HRESULT alone and drops the output it had been collecting for
+that call: `execute_fixed_command` and `execute_command_bounded` each return through
+`result.map_err(DbgEngError::CommandFailed)?` before the buffer is read (`src/dbgeng.rs` at the
+pinned `d208798`). The HRESULT does not say much. Through the service build `0.22.0+gbfd1f388` on
+dbgeng 10.0.29617.1000, `execute { "command": "zzzz" }` and `execute { "command": "||1s" }` both
+answer `Debug command failed: An unexpected exception was raised (0x80040205)`, and `cdb` on
+10.0.26100.1742 prints why the second one failed — `^ Illegal debuggee error in '||1s'`, the
+system it names not having been loaded yet. Everything else the command printed before failing goes
+with it, which is the half `walk_memory` was built to work around for one shape of command.
+
+**What it cost.** Item 102 recorded `||1s` failing with `0x80040205` and could not say why, so item
+105 had to list "which command actually switches" as something this server had never observed. The
+engine had said why, and the answer never left the worker. `docs/limitations.md`, `docs/walk-memory.md` and `docs/ttd-walkthrough.md`
+each explain a `0x80040205` by hand.
+
+**What is not measured.** Whether the engine's error line reaches *this* call's output callbacks at
+all. `Execute` is called with `DEBUG_OUTCTL_THIS_CLIENT`, and `cdb` printing the line shows the
+engine emits it, not that it lands in the buffer this path drops. That is the first thing to check:
+a dbgscope example that prints the buffer on the error path, against `||1s` on a session with a
+system added and not yet loaded, and against a mistyped command.
+
+**What would close it.** A failed command carries what was printed beside the HRESULT — a typed
+field on the error rather than text folded into its message, so a structured client can tell the
+engine's reason from this server's — and `execute` and a `debug_batch` command step show it. The
+asymmetry to keep: DbgEng prints most failures and returns *success* (`debug_batch`'s `command`
+step documents that), so this is only about the calls that do return an error.
+
+**Where it picks up.** dbgscope's `src/dbgeng.rs`, every `map_err(DbgEngError::CommandFailed)?` that
+follows an `Execute` with a capture buffer live; then this server's `engine::engine_error` and the
+places `CommandFailed`'s text reaches a caller.
+
+### What closed it (2026-10-14)
+
+**The first question had a cheap answer: the line was in the capture all along.** A dbgscope example
+that keeps the buffer on the error path (`examples/failed_command_output.rs`) ran against a user-mode
+dump on dbgeng 10.0.29617.1000 and on 10.0.26100.1742, ARM64, and the two answered byte for byte
+alike. Every failure below is `0x80040205`; the capture is what tells them apart.
+
+| command | captured |
+|---|---|
+| `zzzz` | `Couldn't resolve error at 'zzz'` |
+| `? ntdll!Nope`, `u ntdll!Nope`, `dd ntdll!Nope` | `Couldn't resolve error at 'ntdll!Nope'` |
+| `.echo before the failure; zzzz` | `before the failure`, then the line above |
+| `g` on the dump | `^ No runnable debuggees error in 'g'` |
+| `\|\|1s` after `.opendump` of a second dump | `^ Illegal debuggee error in '\|\|1s'` |
+
+Each capture starts with the command's echo, as a successful one does. So the engine's reason was
+reaching this call's own output callbacks, and dbgscope was discarding it with the buffer.
+
+**The asymmetry this entry asked to keep is narrower than it said.** "DbgEng prints most failures and
+returns success" was not measured, and its example — `debug_batch`'s `command` step, which said a
+`Couldn't resolve error at 'nt!Nope'` was a step that *succeeded* — was backwards: an argument the
+expression evaluator cannot resolve fails `Execute` on both builds. What does print and succeed is a
+command that looked something up and found nothing: `dt ntdll!_NOPE` (`Symbol ntdll!_NOPE not
+found.`), `!nosuchextension` (`No export nosuchextension found`), `x ntdll!Nope` and `lm m nope`
+(no match). Reads split the same way. On the crash-dump walkthrough's own kernel dump, at addresses
+it holds nothing for, `dq`, `dps` and `db` print `????????` and `dt` prints `Memory read error
+<address>`, and all of them succeed; `? poi(<address>)` fails, with `Memory access error at ')'`.
+
+**What landed.**
+
+- **dbgscope#198.** `DbgEngError::CommandFailedWithOutput { source, output }`, read through
+  `DbgEngError::output()`. `execute_command`, `execute_command_bounded`, `execute_and_wait`,
+  `settle` and `run_to_address` answer with it where they answered `CommandFailed`, when `Execute`
+  refuses the text or the wait after it fails. The message is unchanged. `CommandFailed` stays for
+  the failures that have no capture, so branches open against it keep compiling.
+- **The wire.** `proto::Failed::engine_output`. The supervisor's `engine_error` keeps it for a
+  `debugger` failure alone, as `EngineError::DebuggerWithOutput`.
+- **The result.** The typed half gains `error.engine_output` beside `error.message`, which stays
+  this server's account. The text shows the engine's output first, then the message, the order
+  they happened in.
+- **The paths.** `raw_command` keeps the failing command's capture apart from what the settle
+  appends to the message. That covers `execute`, `irp_stack`, and `debug_batch`'s `command` and
+  `eval` steps. `go`, the steps, `run_to_address` and `continue_async` take
+  `worker::engine_failed`, as does a batch `resume` step.
+- **The batch.** A failed batch step shows the engine's text as that step's output. An assertion
+  whose expression fails, and the probe of where the session stopped, quote it in their reasons.
+
+**Tests.**
+
+- **`a_refused_command_answers_with_what_the_engine_printed`** is the dump tier, end to end. A
+  `.for` loop through `execute` whose third pass reads an unmapped address fails and carries
+  `row 0` to `row 2` and `Memory access error`, in the text and in `engine_output`, with `message`
+  left without them. A batch step of `? nowhere!Nope` fails with the engine's reason as its output.
+  `go` on the dump says `No runnable debuggees`.
+- **dbgscope's `test_a_refused_command_keeps_what_the_engine_printed`** drives the three paths a
+  caller's text takes against a launched process. It passes on the inbox 10.0.26100.1 and fails at
+  each path with that path's change backed out.
+- **Unit tests** cover the batch's rendering, the assertion's reason, the supervisor's mapping,
+  and the result's two halves.
+
+**The cost.** Every output schema gains the optional field: +43 B on each of the 63 tools that
+declare one. That is +2,709 B of `outputSchema`, which no model reads, and the whole `tools/list`
+payload is 350,462 B against its 355,000 B ceiling. The model-visible surface went down, 123,244 → 123,199 B,
+because two descriptions got shorter while being corrected.
+
+**What else this corrected.**
+
+- **Two sentences a model reads.**
+  - The batch step's example now names `dt` of a missing type.
+  - `walk_memory`'s description said a `.for` loop's failure carried "no partial output". It now
+    says no node after the hole is read.
+- **The docs that said a failed loop returns nothing.** `docs/walk-memory.md`,
+  `docs/limitations.md`, the crash-dump walkthrough, the shipped skill's `SKILL.md` and
+  `live-and-kernel.md`, and one doc comment in `tests/mcp_smoke.rs`. A loop still stops at the
+  first hole, so `walk_memory` is still the tool; what changed is that the rows before the hole
+  now come back.
+- **The partial-minidump passages.** The walkthrough's §5, `docs/limitations.md` and the skill's
+  `crash-dump.md` said `dq`, `dps` and `dt` of an uncaptured page raise `0x80040205`. They now
+  say which reads fail and which print and succeed.
+- **The line item 105 left.** `docs/sessions.md` said `||1s` "reaches a caller of this server as
+  `0x80040205` alone". That was true of the build the table was read on, and it now says so.
+
+**What was deliberately left.**
+
+- **The engine's own fixed queries.** `vertarget`, `.sympath` and the like still map through
+  `failed`. Their failure is this server's to report, and their echo is noise to a caller who never
+  wrote them.
+- **The batch's typed report gains no field.** It holds no step's output, failed or not, so the
+  engine's text goes where every step's does, and `detail` stays this server's account.
+- **The settle's own failure.** When the settle after a command fails, and when a failed command
+  left the target running and the pump captured something, that text still folds into `message`
+  as before. `engine_output` is the failing command's own capture and nothing else.
+- **`docs/messagemanager-walkthrough.md` still says the loop "fails opaquely with no partial
+  result".** It records that session.
+- **The TTD walkthrough's `0x80040205` after a bare `goto_position`.** It is still the code, and
+  the reason now arrives beside it.
+
+**What this did not establish.**
+
+- **The wait-failure half has no test.** That covers `settle`, and the pump in `execute_and_wait`
+  and `run_to_address`. It needs a wait that fails with the target still present and no break
+  raised, which a test cannot arrange.
+- **The reach of the measurements.** Two engine builds on one ARM64 host, plus the inbox build
+  under dbgscope's test. Dumps and one launched process. A live kernel, a TTD trace and an x64
+  host were not asked.

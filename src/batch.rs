@@ -47,7 +47,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::driver::fmt_addr;
-use crate::proto::PoolOp;
+use crate::proto::{Failed, PoolOp};
 use crate::server::{
     EXEC_WAIT_MS, Quotes, changes_debug_target, parse_eval, reject_command_breakers,
 };
@@ -171,9 +171,9 @@ const FAILED_OUTPUT_CHARS: usize = 8_000;
 pub enum StepAction {
     /// Run a raw debugger command to completion and keep its output.
     ///
-    /// Note what this does **not** assert: DbgEng prints most failures and returns success, so a
-    /// command that says "Couldn't resolve error at 'nt!Nope'" is a step that *succeeded* with
-    /// that text. Assert on it with a `contains` check if it matters.
+    /// Note what this does **not** assert: DbgEng prints some failures and returns success, so a
+    /// `dt` that says "Symbol nt!_NOPE not found." is a step that *succeeded* with that text.
+    /// Assert on it with a `contains` check if it matters.
     Command { command: String },
     /// Run a command that moves the target (`g`, `p`, `t`, `g @$ra`, a TTD reverse) and wait for
     /// the next stop.
@@ -875,11 +875,11 @@ pub enum Sealed {
 /// script by the tests — see the module docs for why that seam is where it is.
 pub trait Debuggee {
     /// Run a command to completion, self-aborting after `budget_ms`.
-    fn command(&mut self, command: &str, budget_ms: u32) -> Result<Ran, String>;
+    fn command(&mut self, command: &str, budget_ms: u32) -> Result<Ran, Failed>;
     /// Run a command that moves the target, waiting up to `timeout_ms` for the next stop.
-    fn resume(&mut self, command: &str, timeout_ms: u32) -> Result<Ran, String>;
+    fn resume(&mut self, command: &str, timeout_ms: u32) -> Result<Ran, Failed>;
     /// Run to `address` and report a verdict.
-    fn run_to(&mut self, address: &str, timeout_ms: u32) -> Result<Ran, String>;
+    fn run_to(&mut self, address: &str, timeout_ms: u32) -> Result<Ran, Failed>;
     /// Hex-dump `size` bytes at `address`, self-aborting after `budget_ms`.
     ///
     /// `budget_ms` bounds *a read*, not a command, and it is passed for the reason
@@ -890,7 +890,7 @@ pub trait Debuggee {
     /// this was the one operation a step could start that could outrun
     /// [`OVERRUN_ALLOWANCE`]. A read stopped by its budget reports the bytes it reached
     /// and says so, exactly as a walk reports its coverage.
-    fn read_memory(&mut self, address: &str, size: u32, budget_ms: u32) -> Result<Ran, String>;
+    fn read_memory(&mut self, address: &str, size: u32, budget_ms: u32) -> Result<Ran, Failed>;
     /// Answer a pool question — the one capability here that is not a debugger command at all,
     /// but a walk over the allocator's own descriptors.
     ///
@@ -900,7 +900,7 @@ pub trait Debuggee {
     /// it the bound the worker advertises to a teardown, which is what stops a worker being
     /// terminated mid-transaction. A walk stopped by the budget reports how much of the pool it
     /// reached, so a short step degrades to a partial answer that says so rather than to a failure.
-    fn pool(&mut self, query: &PoolOp, budget_ms: u32) -> Result<Ran, String>;
+    fn pool(&mut self, query: &PoolOp, budget_ms: u32) -> Result<Ran, Failed>;
     /// Whether the session still holds a target at all. `None` when the engine could not be
     /// asked, which is not the same as "no" and must not be read as one.
     ///
@@ -1029,7 +1029,7 @@ pub trait Debuggee {
 /// Needed because the only other guard is `worker::engine_thread`'s, which wraps a whole op — an
 /// unwind from a step would pass straight through the rollback. Not hypothetical: several dbgscope
 /// methods use `.expect`, and a step calls into them.
-fn guarded<T>(call: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+fn guarded<T>(call: impl FnOnce() -> Result<T, Failed>) -> Result<T, Failed> {
     catch_unwind(AssertUnwindSafe(call)).unwrap_or_else(|payload| {
         // The message, when the payload carries one. A bare "panicked" would tell a caller that
         // their transaction stopped without telling them what stopped it, and this is a report
@@ -1039,10 +1039,25 @@ fn guarded<T>(call: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
             .map(|s| (*s).to_string())
             .or_else(|| payload.downcast_ref::<String>().cloned());
         match why {
-            Some(why) => Err(format!("the debugger operation panicked: {why}")),
-            None => Err("the debugger operation panicked".to_string()),
+            Some(why) => Err(Failed::from(format!(
+                "the debugger operation panicked: {why}"
+            ))),
+            None => Err(Failed::from("the debugger operation panicked")),
         }
     })
+}
+
+/// A failed call as one clause of a sentence: this server's account, then the engine's.
+///
+/// For the places a failure is quoted inside a reason rather than shown as a step — an assertion
+/// whose expression would not evaluate, the probe of where the session stopped — so the line
+/// saying why reaches the report there too. Phrased as `printed no value` already is beside it,
+/// and with the engine's text trimmed, since it arrives as its own line or lines.
+fn answered(why: &Failed) -> String {
+    match &why.engine_output {
+        Some(printed) => format!("{}; the debugger answered: {}", why.message, printed.trim()),
+        None => why.message.clone(),
+    }
 }
 
 /// [`Debuggee::replaced`] with a panic turned into [`Held::Uncertain`].
@@ -1058,7 +1073,7 @@ fn guarded<T>(call: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
 /// an identity probe that crashed has told us nothing about what the engine holds, which is
 /// exactly what that variant is for.
 fn held(d: &mut impl Debuggee) -> Held {
-    guarded(|| Ok(d.replaced())).unwrap_or_else(Held::Uncertain)
+    guarded(|| Ok(d.replaced())).unwrap_or_else(|why| Held::Uncertain(why.message))
 }
 
 // ---- results --------------------------------------------------------------
@@ -1804,14 +1819,23 @@ fn run_step(
             !already_gone && ran.target_gone,
         ),
         Err(why) => {
+            let result = StepResult::Failed(why.message);
+            // What the engine printed before it failed is this step's output, shown where every
+            // other step's is: the `HRESULT` in the detail line says little, and the line saying
+            // which failure it was is in here (`FOLLOWUPS.md` item 126). Clipped at the failed
+            // step's share for the reason the success path below is.
+            let output = clip(
+                why.engine_output.as_deref().unwrap_or(""),
+                report_cap(&result),
+            );
             return (
                 StepOutcome {
                     position,
                     label: step.label(),
                     rendered,
                     changes,
-                    result: StepResult::Failed(why),
-                    output: String::new(),
+                    result,
+                    output,
                     cut_short: false,
                     // **A step can fail and still have ended the target**, and nothing it returns can
                     // say so: `raw_command`'s own contract is that a command failing part-way may
@@ -1982,7 +2006,7 @@ fn eval_value(
             ran.output
         })
     })
-    .map_err(|why| CheckFailed::Unmet(format!("`? ({expr})` failed: {why}")))?;
+    .map_err(|why| CheckFailed::Unmet(format!("`? ({expr})` failed: {}", answered(&why))))?;
     parse_eval(&text).ok_or_else(|| {
         CheckFailed::Unmet(format!(
             "`? ({expr})` printed no value; the debugger answered: {}",
@@ -2128,11 +2152,12 @@ fn probe_state(
         },
         Err(why) if ran_on => SessionAfter::Running {
             why: format!(
-                "a step resumed the target and did not report a stop, and `? @$ip` failed: {why}"
+                "a step resumed the target and did not report a stop, and `? @$ip` failed: {}",
+                answered(&why)
             ),
         },
         Err(why) => SessionAfter::Uncertain {
-            why: format!("`? @$ip` failed: {why}"),
+            why: format!("`? @$ip` failed: {}", answered(&why)),
         },
     }
 }
@@ -2415,7 +2440,7 @@ mod tests {
 
     /// One scripted answer: what the fake returns, and how long the call "takes".
     struct Answer {
-        result: Result<String, String>,
+        result: Result<String, Failed>,
         costs: Duration,
     }
 
@@ -2535,7 +2560,21 @@ mod tests {
             self.answers.push((
                 matching.to_string(),
                 Answer {
-                    result: result.map(str::to_string).map_err(str::to_string),
+                    result: result.map(str::to_string).map_err(Failed::from),
+                    costs: Duration::ZERO,
+                },
+            ));
+            self
+        }
+
+        /// Fails any call whose text contains `matching`, the way a real engine fails a command it
+        /// refuses: `why` is this server's account and `printed` what the engine wrote before it
+        /// gave up — its echo, any earlier segment's output, and the line saying why.
+        fn fails_printing(mut self, matching: &str, why: &str, printed: &str) -> Self {
+            self.answers.push((
+                matching.to_string(),
+                Answer {
+                    result: Err(Failed::printed(why, Some(printed))),
                     costs: Duration::ZERO,
                 },
             ));
@@ -2629,14 +2668,14 @@ mod tests {
             self.answers.push((
                 matching.to_string(),
                 Answer {
-                    result: result.map(str::to_string).map_err(str::to_string),
+                    result: result.map(str::to_string).map_err(Failed::from),
                     costs,
                 },
             ));
             self
         }
 
-        fn answer(&mut self, call: &str) -> Result<String, String> {
+        fn answer(&mut self, call: &str) -> Result<String, Failed> {
             self.calls.push(call.to_string());
             if self.panic_on.iter().any(|m| call.contains(m.as_str())) {
                 panic!("{PANIC}");
@@ -2661,7 +2700,7 @@ mod tests {
 
         /// [`Self::answer`], as the call a *step* makes — carrying whether the break reached this
         /// call, which is how a real engine reports it.
-        fn answer_run(&mut self, call: &str) -> Result<Ran, String> {
+        fn answer_run(&mut self, call: &str) -> Result<Ran, Failed> {
             // Before the `?` below, so a call scripted to *fail* can still have ended the target.
             if self
                 .ends_target_on
@@ -2707,22 +2746,22 @@ mod tests {
     }
 
     impl Debuggee for Script {
-        fn command(&mut self, command: &str, _budget_ms: u32) -> Result<Ran, String> {
+        fn command(&mut self, command: &str, _budget_ms: u32) -> Result<Ran, Failed> {
             self.answer_run(command)
         }
-        fn resume(&mut self, command: &str, _timeout_ms: u32) -> Result<Ran, String> {
+        fn resume(&mut self, command: &str, _timeout_ms: u32) -> Result<Ran, Failed> {
             self.answer_run(command)
         }
-        fn run_to(&mut self, address: &str, _timeout_ms: u32) -> Result<Ran, String> {
+        fn run_to(&mut self, address: &str, _timeout_ms: u32) -> Result<Ran, Failed> {
             self.answer_run(&format!("run to {address}"))
         }
-        fn read_memory(&mut self, address: &str, size: u32, budget_ms: u32) -> Result<Ran, String> {
+        fn read_memory(&mut self, address: &str, size: u32, budget_ms: u32) -> Result<Ran, Failed> {
             // The budget is in the call text for the reason `pool`'s is: a read is bounded now
             // (dbgscope#95), and a double that swallowed what it was armed with could not tell a
             // step given the deadline from one given nothing.
             self.answer_run(&format!("read {size} at {address} within {budget_ms}ms"))
         }
-        fn pool(&mut self, query: &PoolOp, budget_ms: u32) -> Result<Ran, String> {
+        fn pool(&mut self, query: &PoolOp, budget_ms: u32) -> Result<Ran, Failed> {
             // The budget is part of the call text, not swallowed: a pool step's whole hazard is
             // taking longer than the batch can afford, so a test that could not see what the walk
             // was armed with could not tell the fix from the bug.
@@ -4495,6 +4534,71 @@ mod tests {
 
         let report = run(&mut d, &batch, BUDGET);
         assert_eq!(report.outcome, BatchOutcome::Failed { at: 1 });
+    }
+
+    /// A step the engine refuses shows what the engine printed, beside the code it refused with.
+    ///
+    /// `0x80040205` is the same answer for a mistyped command, an argument naming nothing and
+    /// `||1s` on a system not yet loaded, so the detail line alone cannot say which happened —
+    /// the engine's own line can, and it used to be dropped with the rest of the capture
+    /// (`FOLLOWUPS.md` item 126). It lands in the step's output, where every other step's text
+    /// is, and the detail keeps this server's account. The earlier segment's output survives too.
+    #[test]
+    fn a_refused_command_step_shows_what_the_engine_printed() {
+        let refused = "Debug command failed: An unexpected exception was raised (0x80040205)";
+        let mut d = stopped().fails_printing(
+            ".echo before; zzzz",
+            refused,
+            ".echo before; zzzz\nbefore\nCouldn't resolve error at 'zzz'\n",
+        );
+        let batch = op(vec![cmd(".echo before; zzzz")], vec![]);
+
+        let report = run(&mut d, &batch, BUDGET);
+        assert_eq!(report.outcome, BatchOutcome::Failed { at: 1 });
+        assert_eq!(
+            report.steps[0].result,
+            StepResult::Failed(refused.to_string()),
+            "the detail is this server's account, without the engine's text folded in"
+        );
+        let text = render(&report);
+        assert!(text.contains(&format!("! {refused}")), "{text}");
+        assert!(text.contains("| before"), "{text}");
+        assert!(
+            text.contains("| Couldn't resolve error at 'zzz'"),
+            "the engine's reason is not in the report: {text}"
+        );
+    }
+
+    /// An assertion whose expression the engine refuses says why, in the reason the step fails
+    /// with — the same line [`a_refused_command_step_shows_what_the_engine_printed`] keeps, quoted
+    /// where an assertion's verdict is written rather than shown as output.
+    #[test]
+    fn an_assertion_the_engine_refuses_quotes_the_engine() {
+        let mut d = stopped().on("r rcx", Ok("rcx=0")).fails_printing(
+            "? (nowhere!Nope)",
+            "Debug command failed: An unexpected exception was raised (0x80040205)",
+            "? (nowhere!Nope)\nCouldn't resolve error at 'nowhere!Nope'\n",
+        );
+        let batch = op(
+            vec![BatchStep {
+                expect: vec![Check::Eval {
+                    expr: "nowhere!Nope".to_string(),
+                    equals: "0x42".to_string(),
+                }],
+                ..cmd("r rcx")
+            }],
+            vec![],
+        );
+
+        let report = run(&mut d, &batch, BUDGET);
+        assert_eq!(report.outcome, BatchOutcome::Failed { at: 1 });
+        assert!(
+            matches!(&report.steps[0].result, StepResult::Unmet(why)
+                if why.contains("(0x80040205); the debugger answered:")
+                    && why.contains("Couldn't resolve error at 'nowhere!Nope'")),
+            "{:?}",
+            report.steps[0].result
+        );
     }
 
     // ---- assertions --------------------------------------------------------
