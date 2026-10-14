@@ -1485,11 +1485,12 @@ pub struct Failed {
     /// The `HRESULT` in `message` says little on its own — `0x80040205` is the engine's answer to
     /// a mistyped command, to an argument naming nothing and to `||1s` on a system not yet loaded
     /// alike — and this is where the line saying which one arrives, beside whatever earlier
-    /// segments of the command printed. It starts on a failure of the debugger's own
-    /// ([`Self::printed`] names no category), and `worker::cut_short` keeps it when a break turns
-    /// that failure into an interruption; `engine::engine_error` keeps it for those two categories
-    /// and drops it from every other, which are this server's statements. `None` when the failure
-    /// had no capture or the engine printed nothing in it but blank lines.
+    /// segments of the command printed and, where the command left the target running, what the
+    /// pump to a stop printed after it (`worker::settled`). It starts on a failure of the
+    /// debugger's own ([`Self::printed`] names no category), and `worker::cut_short` keeps it when
+    /// a break turns that failure into an interruption; `engine::engine_error` keeps it for those
+    /// two categories and drops it from every other, which are this server's statements. `None`
+    /// when the failure had no capture or the engine printed nothing in it but blank lines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine_output: Option<String>,
 }

@@ -11293,10 +11293,16 @@ it holds nothing for, `dq`, `dps` and `db` print `????????` and `dt` prints `Mem
 - **The result.** The typed half gains `error.engine_output` beside `error.message`, which stays
   this server's account. The text shows the engine's output first, then the message, the order
   they happened in.
-- **The paths.** `raw_command` keeps the failing command's capture apart from what the settle
-  appends to the message. That covers `execute`, `irp_stack`, and `debug_batch`'s `command` and
-  `eval` steps. `go`, the steps, `run_to_address` and `continue_async` take
-  `worker::engine_failed`, as does a batch `resume` step.
+- **The paths.** `raw_command` carries the failure as a `Failed` through the settle, so what the
+  engine printed stays apart from the sentences the settle adds to the message. That covers
+  `execute`, `irp_stack`, and `debug_batch`'s `command` and `eval` steps. `go`, the steps,
+  `run_to_address` and `continue_async` take `worker::engine_failed`, as does a batch `resume`
+  step.
+- **The settle's capture.** When a command leaves the target running, what the pump to a stop
+  printed is the engine's too. On a failure it joins the command's capture in `engine_output`:
+  after a failed command whose settle worked, and from the settle's own error when the pump
+  failed, which dbgscope#198 hands back and the first version of this dropped. On a success it
+  follows the command's output, as before. `continue_async`'s pump takes the same path.
 - **The batch.** A step the debugger refused shows the engine's text as that step's output, and the
   typed report carries it as the step's own `engine_output` beside `detail`. The step is marked
   `refused` where the refusal happens, because a step whose assertions could not be checked is
@@ -11351,9 +11357,6 @@ because two descriptions got shorter while being corrected.
 - **The engine's own fixed queries.** `vertarget`, `.sympath` and the like still map through
   `failed`. Their failure is this server's to report, and their echo is noise to a caller who never
   wrote them.
-- **The settle's own failure.** When the settle after a command fails, and when a failed command
-  left the target running and the pump captured something, that text still folds into `message`
-  as before. `engine_output` is the failing command's own capture and nothing else.
 - **`docs/messagemanager-walkthrough.md` still says the loop "fails opaquely with no partial
   result".** It records that session.
 - **The TTD walkthrough's `0x80040205` after a bare `goto_position`.** It is still the code, and
@@ -11361,9 +11364,10 @@ because two descriptions got shorter while being corrected.
 
 **What this did not establish.**
 
-- **The wait-failure half has no test.** That covers `settle`, and the pump in `execute_and_wait`
-  and `run_to_address`. It needs a wait that fails with the target still present and no break
-  raised, which a test cannot arrange.
+- **The wait-failure half has no end-to-end test.** That covers `settle`, and the pump in
+  `execute_and_wait` and `run_to_address`. It needs a wait that fails with the target still
+  present and no break raised, which a test cannot arrange. What a failed settle's capture becomes
+  is unit-tested, from the error dbgscope returns onwards; that dbgscope returns it is not.
 - **The reach of the measurements.** Two engine builds on one ARM64 host, plus the inbox build
   under dbgscope's test. Dumps and one launched process. A live kernel, a TTD trace and an x64
   host were not asked.
