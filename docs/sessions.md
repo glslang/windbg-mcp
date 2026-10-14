@@ -124,9 +124,12 @@ limits are recorded there rather than here.
 disposable VBS VM. The caller supplies a primary `vp` and may add distinct `additional_vps`; every
 provider shares the exact VM GUID, discovered partition ID and VTL1 CR3. The caller also supplies
 an exact-build adapter profile, a register-control provider command and a live memory transport
-command, each of which the server's startup policy must admit; the `vmwp` PID, dispatcher address,
-partition ID and CR3 are discovered by the worker, and a caller that supplies one supplies a
-mismatch assertion rather than an input. The repository supplies neither privileged provider.
+command, each of which the server's startup policy must admit. The `vmwp` PID is resolved by the
+server from the VM id and CR3 is reported by the register provider, so `vmwp_pid` and
+`expected_cr3` are mismatch assertions rather than inputs; the dispatcher address and partition ID
+are discovered by the worker only when the profile carries a `discovery` section, which makes
+`dispatcher_vnd` and `partition_id` assertions too — a profile without one still takes both as
+required inputs. The repository supplies neither privileged provider.
 The worker validates the request, profile and register provider's declared identity and
 capabilities before it accepts the session; opening itself does not change guest execution. The
 first `sk_live_arm` pauses the VM,
