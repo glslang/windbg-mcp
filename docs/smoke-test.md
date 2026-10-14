@@ -1519,15 +1519,19 @@ run there, which had pinned `wow64` and failed — and on that side the engine a
 x86 and the OS is not asked. The test reads frame 0's module, says which side it got, refuses a
 third answer, and asserts that side's shape.
 
-**A dump of that stop, written by the engine with `.dump /ma`, is decoded right only on the 32-bit
-side.** The dump is taken from the host's side — on the 32-bit side the test runs `.effmach .`
-first, and on reopening it checks the engine does not already decode for x86, so a 32-bit dump
-fails naming the cause rather than passing as a control. Reopened, its header says the writer's
-machine and its process is gone, so neither older source can say 32 and the throw reads as `other`
-with nothing recovered — which is the control, and what the build before this change answered on
-this dump. After `.effmach x86` the same triage reads `cpp_throw` with the same HRESULT, from the
-effective machine alone and with the OS not asked. The dump is made and deleted by the test,
-because what it pins is the writer's width against the process's rather than a file.
+**A dump of that stop, written by the x64 engine with `.dump /ma`, is decoded right only on the
+32-bit side.** Reopened, its header says x64 — the test reads that off `.effmach` before trusting
+the control — and its process is gone, so neither older source can say 32 and the throw reads as
+`other` with nothing recovered — which is the control, and what the build before this change
+answered on this dump. After `.effmach x86` the same triage reads `cpp_throw` with the same
+HRESULT, from the effective machine alone and with the OS not asked. The dump is made and deleted
+by the test, because what it pins is the writer's width against the process's rather than a file.
+**This half runs where the stop was reported from the 64-bit side, and stands down otherwise with
+a `SKIPPED` line.** On CI's ARM64 runner the one attempt to arrange a 64-bit writer's dump from the
+32-bit side — `.effmach .` before `.dump /ma`, 2026-10-14 — was accepted live and then reopened as
+a file on which `.effmach` printed nothing at all, which is not a 64-bit writer's dump either and
+not a reading this item needed to chase; what that engine writes there is its own question. The
+x64 tier pins the half.
 
 **The decisions are read off the server's stderr**, under `RUST_LOG=windbg_mcp=debug`: which
 source answered is a worker log line, nothing in the result carries the width, and `server_log`'s
