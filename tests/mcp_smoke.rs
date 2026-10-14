@@ -7081,7 +7081,9 @@ fn a_wow64_throw_is_decoded_at_its_own_width_on_either_side_of_the_engine() {
     // x64 in its header, and that is the file this change decodes differently. It is removed below
     // once the assertions on it have passed, and deliberately **not** on a failing path: a run that
     // fails on this dump leaves 12 MB beside the fixture, and that file is the thing to open to see
-    // what the engine saw.
+    // what the engine saw. `/o` is for the run after that one: the fixture directory is per process
+    // id and Windows recycles those, so a later run can land on a retained dump's exact path, and
+    // `.dump` refuses to replace a file without it (Codex, round three of #497).
     //
     // On the 32-bit side the half stands down rather than passing by not running. The dump the
     // engine writes there is an x86 process's as it sees it, and the one attempt to make it the
@@ -7095,7 +7097,7 @@ fn a_wow64_throw_is_decoded_at_its_own_width_on_either_side_of_the_engine() {
             "execute",
             json!({
                 "session_id": &session,
-                "command": format!(".dump /ma \"{}\"", dump.display()),
+                "command": format!(".dump /ma /o \"{}\"", dump.display()),
             }),
             TARGET_STEP,
         );
