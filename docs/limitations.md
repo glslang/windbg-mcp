@@ -445,7 +445,7 @@
   and having it print its own record and walk its own graph. Every one of those differences makes a
   mismatched reader come back *empty* rather than fail, so the width is asked per target rather
   than assumed; `docs/samples/cppthrow-fastfail-x86.dmp` is the fixture that keeps it honest.
-- **Asking takes two questions, and one of them cannot be asked about a dump.** The engine's
+- **Asking takes three questions, and only one of them can be asked about a dump.** The engine's
   `GetActualProcessorType` answers for the **physical processor**, so a WoW64 process on an x64 box
   comes back `0x8664` — measured, by launching `C:\Windows\SysWOW64\cmd.exe` under a 64-bit
   worker. It is nonetheless the right answer for a dump, whose header records the machine it was
@@ -455,11 +455,16 @@
   exited before the file was written, and some unrelated live process may have inherited the number
   since — which is not a query that fails but one that succeeds about the wrong process, so it would
   be a confident wrong width on a target whose own file already says the right one. A kernel's
-  belong to the debugged machine and were never this host's at all. What neither source tracks is
-  the engine's *effective*
-  machine (`GetEffectiveProcessorType`), which follows a WoW64 target across the transition and is
-  not in the pinned `dbgscope`; `FOLLOWUPS.md` item 58 carries it, with the measurement of where
-  the approximation and the authoritative answer differ.
+  belong to the debugged machine and were never this host's at all. The third question is asked
+  first: the engine's *effective* machine (`GetEffectiveProcessorType`), which follows a WoW64
+  target across the transition, and **a 32-bit answer from it is decisive**. It is the one source
+  that can say 32 about a dump of a WoW64 process that a 64-bit writer took, once the engine is on
+  its 32-bit side (`.effmach x86`); until it was asked (`FOLLOWUPS.md` item 58) such a dump's
+  throws read as `other` with nothing recovered. A 64-bit answer from it decides nothing, and the
+  reason is a measurement rather than caution: an uncaught 32-bit throw stops the engine on its
+  **second chance in 64-bit code** — `wow64!Wow64pNotifyDebugger`, 2026-10-14 — where the
+  effective machine reads x64 and the record is the three-parameter 32-bit throw's. The process's
+  own width, from the OS, is what reads it right there.
 - **`exception_triage`'s stack comes from the stored crash context where the target has one.** That
   is what `.ecxr` adopts, walked without `.ecxr`'s effect on the session, so the caller's selected
   thread and frame are left alone — which is what lets the tool be read-only where `crash_triage`

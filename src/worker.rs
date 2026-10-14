@@ -5094,14 +5094,23 @@ fn crash_triage(
 
 /// The debuggee's pointer width, which the C++ EH decode is laid out by.
 ///
-/// **Two questions, because neither source answers alone.**
+/// **Three questions, because no source answers alone — and the first is the question itself.**
 ///
-/// `GetActualProcessorType` is the engine's, and it is right for a dump: measured on the two
-/// checked-in user-mode fixtures, `0x14c` for the 32-bit one and `0x8664` for the 64-bit. For a
-/// **live WoW64 process it is wrong and cannot be otherwise** — it reports the machine of the
-/// physical processor, so a 32-bit process on an x64 box answers `0x8664`. Measured, by launching
-/// `C:\Windows\SysWOW64\cmd.exe`: `0x8664`, in a 64-bit worker, for a target whose every C++ throw
-/// raises three parameters and lays its `EXCEPTION_RECORD` out in 80 bytes.
+/// `GetEffectiveProcessorType` is the machine the engine is *decoding for* at this stop, and it
+/// follows a WoW64 target across the transition. Measured, by launching
+/// `C:\Windows\SysWOW64\cmd.exe` under a 64-bit worker (2026-10-14): `x64 (AMD64)` at the 64-bit
+/// loader's initial break, `x86 compatible (x86)` at the 32-bit loader's one `go` later — and both
+/// stops are exception events this triage runs on, `0x80000003` and then the WOW64 breakpoint
+/// `0x4000001f`. It is asked first, and **a 32-bit answer from it is decisive**; a 64-bit one
+/// decides nothing, for the reason [`decide_bitness`] gives. Binding it was `FOLLOWUPS.md`
+/// item 58, filed on 2026-09-05 while the call was not in the pinned `dbgscope`; the pin picked it
+/// up five days later, on 2026-09-10, and nothing here noticed until 2026-10-14.
+///
+/// `GetActualProcessorType` is the engine's answer for the **physical processor**, and it is right
+/// for a dump: measured on the two checked-in user-mode fixtures, `0x14c` for the 32-bit one and
+/// `0x8664` for the 64-bit. For a **live WoW64 process it is wrong and cannot be otherwise**: a
+/// 32-bit process on an x64 box answers `0x8664` — measured on that same launch, for a target whose
+/// every C++ throw raises three parameters and lays its `EXCEPTION_RECORD` out in 80 bytes.
 ///
 /// It is not a case the routing prevents, either. A `launch` has no dump to parse and no process to
 /// ask about until one exists, so the supervisor cannot preselect the 32-bit worker for one:
@@ -5113,15 +5122,20 @@ fn crash_triage(
 /// an unrelated live one may have inherited the number. [`may_ask_the_os`] is that precondition,
 /// and is written as an allowlist for a reason it gives there.
 ///
-/// **What this still does not track is `.effmach`.** The engine's *effective* machine follows the
-/// target through the WoW64 transition — measured on that same launch: `x64 (AMD64)` at the initial
-/// break, `x86 compatible (x86)` once it is running in 32-bit code — and it is the authoritative
-/// answer to "how wide is the record I am about to read".
-/// `IDebugControl::GetEffectiveProcessorType` is not in the pinned `dbgscope`, so binding it is the
-/// two-repo flow — `FOLLOWUPS.md` item 58. The approximation is safe in the direction that matters:
-/// a WoW64 process's C++ throws happen in its 32-bit code, and the window where the engine is still
-/// 64-bit is the initial breakpoint, which carries no throw to decode.
+/// **Where the first question changes the answer** is a target the OS cannot be asked about, whose
+/// file says x64, once the engine has been put on its 32-bit side: a dump of a WoW64 process that a
+/// 64-bit writer took, after `.effmach x86` or `!wow64exts.sw`. The other two sources both say 64
+/// there, and the record the throw left on its stack is 80 bytes.
 fn target_bitness(e: &DebugEngine) -> fault::Bitness {
+    let effective_says = match e.effective_processor_type() {
+        Ok(machine) => Arch::of_machine(machine as u16),
+        Err(why) => {
+            tracing::debug!(
+                "worker: could not ask the engine which machine it decodes for ({why})"
+            );
+            None
+        }
+    };
     let engine_says = match e.processor_type() {
         Ok(machine) => Arch::of_machine(machine as u16),
         Err(why) => {
@@ -5130,7 +5144,7 @@ fn target_bitness(e: &DebugEngine) -> fault::Bitness {
         }
     };
 
-    let os_says = if !may_ask_the_os(TARGET_ORIGIN.get().copied(), engine_says) {
+    let os_says = if !may_ask_the_os(TARGET_ORIGIN.get().copied(), effective_says, engine_says) {
         None
     } else {
         match e
@@ -5146,29 +5160,45 @@ fn target_bitness(e: &DebugEngine) -> fault::Bitness {
         }
     };
 
-    let bitness = decide_bitness(engine_says, os_says, native_bitness());
+    let bitness = decide_bitness(effective_says, engine_says, os_says, native_bitness());
     tracing::debug!(
-        "worker: the engine says {engine_says:?} and the OS says {os_says:?}, so the fault is \
-         decoded as {bitness:?}"
+        "worker: the fault is decoded as {bitness:?}: the engine decodes for {effective_says:?}, \
+         the processor is {engine_says:?} and the OS says {os_says:?}"
     );
     bitness
 }
 
 /// Which width to lay a fault out at, given what each source said and what this worker's own is.
 ///
-/// **A 32-bit answer from either source wins**, because neither can produce one spuriously: the
-/// engine reports the physical processor, which is never narrower than the target, and the OS is
-/// asked about the process rather than the machine. They disagree in one direction only — a WoW64
-/// process, where the engine says x64 and the OS says x86 — and that direction has one right
-/// answer.
+/// **A 32-bit answer from any source wins**, because none can produce one spuriously: the engine
+/// decodes for a 32-bit machine only where the target is stopped in 32-bit code or a caller put it
+/// there, the physical processor is never narrower than the target, and the OS is asked about the
+/// process rather than the machine. The sources disagree in one direction only — a WoW64 process,
+/// where the processor is x64 and the process is x86 — and that direction has one right answer.
 ///
-/// `native` is the fallback for a machine neither source named, and it is the width the supervisor
+/// **The effective machine is believed in that direction alone**, and the reason is a stop rather
+/// than caution. An uncaught 32-bit throw stops the engine on its **second chance in 64-bit
+/// code** — `wow64!Wow64pNotifyDebugger`, measured 2026-10-14 on `docs/samples/cppthrow.cpp`
+/// built 32-bit under the x64 engine — where the effective machine reads x64 and the record is the
+/// 32-bit throw's: three parameters, an 80-byte record on the 32-bit stack. That is the ordinary
+/// stop for the fault class this decode exists for, and the process's own width, from the OS, is
+/// what reads it right; a 64-bit answer from the effective machine made decisive would have read
+/// it at 152 bytes and found no throw. The same holds with nothing at stake at the 64-bit loader's
+/// initial break, where it also says x64 about the WoW64 process and the width reaches nothing — a
+/// breakpoint's kind is decided by its code, and no scan runs for one. And it is a setting as well
+/// as a reading: `.effmach` moves it, where neither other source can be set.
+///
+/// `native` is the fallback for a machine no source named, and it is the width the supervisor
 /// picked this worker for.
 fn decide_bitness(
+    effective_says: Option<Arch>,
     engine_says: Option<Arch>,
     os_says: Option<Arch>,
     native: fault::Bitness,
 ) -> fault::Bitness {
+    if names_a_32_bit_machine(effective_says) {
+        return fault::Bitness::Bits32;
+    }
     match (engine_says, os_says) {
         (Some(Arch::X86 | Arch::Arm), _) | (_, Some(Arch::X86 | Arch::Arm)) => {
             fault::Bitness::Bits32
@@ -5180,6 +5210,11 @@ fn decide_bitness(
     }
 }
 
+/// Whether an answer names a 32-bit machine — the one direction a single source decides in.
+fn names_a_32_bit_machine(arch: Option<Arch>) -> bool {
+    matches!(arch, Some(Arch::X86 | Arch::Arm))
+}
+
 /// This worker's own pointer width.
 fn native_bitness() -> fault::Bitness {
     if cfg!(target_pointer_width = "32") {
@@ -5189,8 +5224,8 @@ fn native_bitness() -> fault::Bitness {
     }
 }
 
-/// Whether the OS may be asked about this target's process — the second of [`target_bitness`]'s
-/// two questions, and the one with a precondition.
+/// Whether the OS may be asked about this target's process — the last of [`target_bitness`]'s
+/// three questions, and the one with a precondition.
 ///
 /// **A recorded process id is only this machine's to query when the target is on this machine.**
 /// `IsWow64Process2` takes a number and answers about whatever holds it *now*, so asking it about
@@ -5211,11 +5246,16 @@ fn native_bitness() -> fault::Bitness {
 /// this runs — and is written anyway, because "some other rule further up happens to stop it" is
 /// the property that quietly stops holding.
 ///
-/// An engine that already answered x86 is not asked either. Nothing is left to correct, and the
-/// answer costs a process open.
-fn may_ask_the_os(origin: Option<TargetOrigin>, engine_says: Option<Arch>) -> bool {
+/// An engine that already answered 32-bit — as the machine it decodes for, or as the processor —
+/// is not asked either. Nothing is left to correct, and the answer costs a process open.
+fn may_ask_the_os(
+    origin: Option<TargetOrigin>,
+    effective_says: Option<Arch>,
+    engine_says: Option<Arch>,
+) -> bool {
     matches!(origin, Some(TargetOrigin::LocalProcess))
-        && !matches!(engine_says, Some(Arch::X86 | Arch::Arm))
+        && !names_a_32_bit_machine(effective_says)
+        && !names_a_32_bit_machine(engine_says)
 }
 
 /// What may honestly be said about where a throw record came from.
@@ -15453,47 +15493,83 @@ mod tests {
     /// the opening the supervisor cannot route around, because there is no image to parse and no
     /// process to ask about until after the worker exists.
     ///
-    /// The three inputs are separated from the two engine calls that produce them so this can be
-    /// asserted at all — neither call has an answer without a debuggee.
+    /// The inputs are separated from the three calls that produce them so this can be asserted at
+    /// all — none of the calls has an answer without a debuggee. Each case below gives the
+    /// effective machine the value the engine was measured reporting at that stop.
     #[test]
     fn test_a_wow64_process_is_decoded_at_the_processs_width_not_the_processors() {
         use fault::Bitness::{Bits32, Bits64};
 
-        // The case this exists for: the engine describes the box, the OS describes the process.
+        // The case this exists for, at the 64-bit loader's initial break: the engine decodes for
+        // x64 and describes an x64 box, and the OS describes the process.
         assert_eq!(
-            decide_bitness(Some(Arch::X64), Some(Arch::X86), Bits64),
+            decide_bitness(Some(Arch::X64), Some(Arch::X64), Some(Arch::X86), Bits64),
             Bits32,
             "a WoW64 process was decoded at the physical processor's width"
         );
         assert_eq!(
-            decide_bitness(Some(Arch::Arm64), Some(Arch::Arm), Bits64),
+            decide_bitness(
+                Some(Arch::Arm64),
+                Some(Arch::Arm64),
+                Some(Arch::Arm),
+                Bits64
+            ),
             Bits32
         );
 
-        // A 64-bit process on the same box, where the two agree and nothing is corrected.
+        // A 64-bit process on the same box, where all three agree and nothing is corrected.
         assert_eq!(
-            decide_bitness(Some(Arch::X64), Some(Arch::X64), Bits64),
+            decide_bitness(Some(Arch::X64), Some(Arch::X64), Some(Arch::X64), Bits64),
             Bits64
         );
 
         // A dump, and any other target the OS cannot be asked about: the engine is the only source
-        // and it is right, since a dump records the machine it was written for.
-        assert_eq!(decide_bitness(Some(Arch::X64), None, Bits64), Bits64);
-        assert_eq!(decide_bitness(Some(Arch::X86), None, Bits64), Bits32);
-
-        // Neither source named a machine this build knows: the worker's own width, which is the
-        // width the supervisor picked it for.
-        assert_eq!(decide_bitness(None, None, Bits32), Bits32);
-        assert_eq!(decide_bitness(None, None, Bits64), Bits64);
+        // and it is right, since a dump records the machine it was written for, and the engine
+        // decodes for that machine until told otherwise.
         assert_eq!(
-            decide_bitness(Some(Arch::Other(0x1234)), None, Bits32),
+            decide_bitness(Some(Arch::X64), Some(Arch::X64), None, Bits64),
+            Bits64
+        );
+        assert_eq!(
+            decide_bitness(Some(Arch::X86), Some(Arch::X86), None, Bits64),
             Bits32
         );
 
-        // And the OS alone answers when the engine declines, which is the same fact from the one
-        // source that still has it.
-        assert_eq!(decide_bitness(None, Some(Arch::X86), Bits64), Bits32);
-        assert_eq!(decide_bitness(None, Some(Arch::X64), Bits32), Bits64);
+        // **The effective machine, asked first, in the one direction it decides**: the engine is
+        // on the 32-bit side of a target whose file says x64 and whose process the OS cannot be
+        // asked about -- a 64-bit writer's dump of a WoW64 process, after `.effmach x86`. The two
+        // older sources both say 64 here, and before this source existed so did the answer.
+        assert_eq!(
+            decide_bitness(Some(Arch::X86), Some(Arch::X64), None, Bits64),
+            Bits32,
+            "the engine decoding for x86 was overruled by the processor it runs on"
+        );
+        assert_eq!(
+            decide_bitness(Some(Arch::Arm), Some(Arch::Arm64), None, Bits64),
+            Bits32
+        );
+        // And in the other direction it decides nothing. At the 64-bit loader's break it says x64
+        // about a WoW64 process (the first case above), and a caller's `.effmach amd64` on a stop
+        // in 32-bit code does not widen the record the throw left: the process's own width stands.
+        assert_eq!(
+            decide_bitness(Some(Arch::X64), Some(Arch::X64), Some(Arch::X86), Bits64),
+            Bits32,
+            "a 64-bit effective machine overruled the process's own width"
+        );
+
+        // No source named a machine this build knows: the worker's own width, which is the width
+        // the supervisor picked it for.
+        assert_eq!(decide_bitness(None, None, None, Bits32), Bits32);
+        assert_eq!(decide_bitness(None, None, None, Bits64), Bits64);
+        assert_eq!(
+            decide_bitness(None, Some(Arch::Other(0x1234)), None, Bits32),
+            Bits32
+        );
+
+        // And the OS alone answers when the engine declines both questions, which is the same
+        // fact from the one source that still has it.
+        assert_eq!(decide_bitness(None, None, Some(Arch::X86), Bits64), Bits32);
+        assert_eq!(decide_bitness(None, None, Some(Arch::X64), Bits32), Bits64);
     }
 
     /// **The correction above is only sound for a process that is on this machine.**
@@ -15511,33 +15587,57 @@ mod tests {
     fn test_only_a_process_on_this_machine_is_asked_about() {
         // Asked about: the two openers that leave a process running here. The launch is the case
         // the correction exists for, since the supervisor cannot preselect the 32-bit worker for a
-        // process that does not exist yet.
+        // process that does not exist yet -- and at its first break the engine decodes for x64 on
+        // an x64 box, which is exactly where the OS has something to add.
         assert!(may_ask_the_os(
             Some(TargetOrigin::LocalProcess),
+            Some(Arch::X64),
             Some(Arch::X64)
         ));
-        assert!(may_ask_the_os(Some(TargetOrigin::LocalProcess), None));
+        assert!(may_ask_the_os(Some(TargetOrigin::LocalProcess), None, None));
 
         // Not asked about: everything whose process ids were issued somewhere else.
         assert!(
-            !may_ask_the_os(Some(TargetOrigin::Recorded), Some(Arch::X64)),
+            !may_ask_the_os(
+                Some(TargetOrigin::Recorded),
+                Some(Arch::X64),
+                Some(Arch::X64)
+            ),
             "a recorded process id was handed to this machine's OS"
         );
-        assert!(!may_ask_the_os(Some(TargetOrigin::Kernel), Some(Arch::X64)));
+        assert!(!may_ask_the_os(
+            Some(TargetOrigin::Kernel),
+            Some(Arch::X64),
+            Some(Arch::X64)
+        ));
         assert!(
-            !may_ask_the_os(None, Some(Arch::X64)),
+            !may_ask_the_os(None, Some(Arch::X64), Some(Arch::X64)),
             "a target this build records no origin for was asked about anyway"
         );
 
-        // Nothing to correct: the engine already named a 32-bit machine, and asking costs a
-        // process open for an answer that cannot change the outcome.
+        // Nothing to correct: the engine already named a 32-bit machine as the processor, and
+        // asking costs a process open for an answer that cannot change the outcome.
         assert!(!may_ask_the_os(
             Some(TargetOrigin::LocalProcess),
+            None,
             Some(Arch::X86)
         ));
         assert!(!may_ask_the_os(
             Some(TargetOrigin::LocalProcess),
+            None,
             Some(Arch::Arm)
+        ));
+        // Nor when it decodes for one: the 32-bit loader's break of a WoW64 launch, where the
+        // processor still says x64 and the OS would only repeat what the engine has said.
+        assert!(!may_ask_the_os(
+            Some(TargetOrigin::LocalProcess),
+            Some(Arch::X86),
+            Some(Arch::X64)
+        ));
+        assert!(!may_ask_the_os(
+            Some(TargetOrigin::LocalProcess),
+            Some(Arch::Arm),
+            Some(Arch::Arm64)
         ));
     }
 

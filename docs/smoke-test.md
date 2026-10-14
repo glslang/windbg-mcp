@@ -1496,6 +1496,42 @@ taken after the stop in 32-bit code, and the register names assert the switch. T
 toolchain: `vswhere` names the installation and `vcvars32.bat` sets it up, so a host with no VC
 tools stands down with a `SKIPPED` line rather than failing.
 
+## A WoW64 throw's width, on either side of the engine
+
+**`a_wow64_throw_is_decoded_at_its_own_width_on_either_side_of_the_engine`** rides the debugger
+tier on `docs/samples/cppthrow.cpp` built 32-bit — the checked-in fault fixtures' own program, run
+as a WoW64 process — and is what closed `FOLLOWUPS.md` item 58: `worker::target_bitness` asks the
+engine's effective machine (`GetEffectiveProcessorType`) first, and believes a 32-bit answer from
+it alone. It pins the two readings taken on 2026-10-14 that decided the shape of that rule, and the
+one answer it changed.
+
+**An uncaught 32-bit throw stops the engine in 64-bit code.** The second-chance stop a `go` hands
+back is in `wow64!Wow64pNotifyDebugger` (asserted by frame 0's module), where the effective machine
+is the host's and the record is the 32-bit throw's: three parameters, with `0x80670015` recovered
+as a reported throw. The item had recorded the initial break as the only stop where the effective
+machine and the process disagree, and that break as carrying no throw to decode; this stop carries
+one, and the process's own width — from the OS — is what reads it right. So a 64-bit answer from
+the effective machine decides nothing, and the test asserts that the decision was `Bits32` with the
+OS answering and the engine *not* decoding for a 32-bit machine. Which host machine it did decode
+for is deliberately not pinned: CI's ARM64 runner runs the same fixture under emulation, and the
+answer there is ARM64.
+
+**A dump of that stop, written by the engine with `.dump /ma`, is decoded right only on the 32-bit
+side.** Reopened, its header says the writer's machine and its process is gone, so neither older
+source can say 32 and the throw reads as `other` with nothing recovered — which is the control, and
+what the build before this change answered on this dump. After `.effmach x86` the same triage reads
+`cpp_throw` with the same HRESULT, from the effective machine alone and with the OS not asked. The
+dump is made and deleted by the test, because what it pins is the writer's width against the
+process's rather than a file.
+
+**The decisions are read off the server's stderr**, under `RUST_LOG=windbg_mcp=debug`: which
+source answered is a worker log line, nothing in the result carries the width, and `server_log`'s
+ring is bounded and busy at that level. There are four, not three, because the first `go` lands on
+the 32-bit loader's initial break and the test triages there too: that one reads `Bits32` with the
+engine already decoding for x86 and the OS **not asked** — `may_ask_the_os`'s skip, seen from
+outside — and the last three are the readings above. The gate is the C++ toolchain, found the way
+the test above finds it; a host with no VC tools stands down with a `SKIPPED` line.
+
 ## The bounded-command tier
 
 A third tier in the same file, `#[ignore]`d rather than env-gated because it deliberately runs

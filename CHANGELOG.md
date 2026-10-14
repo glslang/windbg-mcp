@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`exception_triage` asks the engine's effective machine first when deciding how wide a fault's
+  record is**, and believes a 32-bit answer from it alone (`FOLLOWUPS.md` item 58). What changes
+  is a dump of a WoW64 process that a 64-bit writer took: its header says x64 and its process is
+  gone, so neither the physical processor nor the OS could say 32, and a 32-bit throw read as
+  `other` with nothing recovered; after `.effmach x86` it now reads as the throw it is. A 64-bit
+  answer decides nothing, because an uncaught 32-bit throw stops the engine on its second chance in
+  64-bit code (`wow64!Wow64pNotifyDebugger`, measured 2026-10-14) with the effective machine
+  reading x64 and the record still the 32-bit throw's — the process's own width is what reads it
+  right there, as it did before. The call reached the pinned `dbgscope` on 2026-09-10; no
+  dependency moves here.
+
 ## [0.23.0] - 2026-10-14
 
 ### Added

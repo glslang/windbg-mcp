@@ -63,7 +63,6 @@ reopen it). An unmarked line is simply open.
 - [Item 50](#50-windbg-mcp-the-released-binary-is-unsigned--only-the-certificate-is-left) — [windbg-mcp] The released binary is unsigned — only the certificate is left — **half landed**
 - [Item 53](#53-windbg-mcp-a-break-raised-after-a-runs-stop-is-built-labels-the-result-cut-short) — [windbg-mcp] A break raised *after* a run's stop is built labels the result cut short
 - [Item 56](#56-windbg-mcp-resolves--expr-is-a-callers-command-on-nobodys-clock) — [windbg-mcp] `resolve`'s `? <expr>` is a caller's command on nobody's clock
-- [Item 58](#58-dbgscope--windbg-mcp-geteffectiveprocessortype-is-the-question-and-is-not-bound) — [dbgscope + windbg-mcp] `GetEffectiveProcessorType` is the question, and is not bound
 - [Item 59](#59-dbgscope--windbg-mcp-nothing-can-ask-which-thread-the-engine-has-selected) — [dbgscope + windbg-mcp] Nothing can ask which thread the engine has selected
 - [Item 61](#61-windbg-mcp-attribute-the-cve-2026-83498-fix-independently-of-similarity-scores) — [windbg-mcp] Attribute the CVE-2026-83498 fix independently of similarity scores
 - [Item 62](#62-windbg-mcp--binja-windbg-mcp-capture-a-live-securekernel-handoff) — [windbg-mcp + binja-windbg-mcp] Capture a live securekernel handoff
@@ -806,36 +805,6 @@ its op is its own; this one is not, for the reason below.
   server can block that too — see `EngineOp::Backtrace`. This item is worth doing because a
   *command* is bounded cheaply and there is no reason to leave one that is not; it is not worth
   doing as a claim that the symbol-server hazard is gone.
-
-## 58. [dbgscope + windbg-mcp] `GetEffectiveProcessorType` is the question, and is not bound
-
-`worker::target_bitness` decides how wide to lay a fault's `EXCEPTION_RECORD` out, and asks two
-sources that each answer a slightly different question. `GetActualProcessorType` answers for the
-**physical processor** — measured, by launching `C:\Windows\SysWOW64\cmd.exe`: `0x8664`, under a
-64-bit worker, for a process whose every C++ throw raises three parameters and whose record is 80
-bytes. `IsWow64Process2`, through `target::process_arch`, answers for the **process**. Between them
-a WoW64 target comes out right, which is what
-[#286](https://github.com/glslang/windbg-mcp/pull/286) shipped after Codex found the case.
-
-Neither is the question actually being asked. `IDebugControl::GetEffectiveProcessorType` is: the
-machine the engine is *currently decoding for*, which follows a WoW64 target across the transition
-— measured on that same launch, `x64 (AMD64)` at the initial break and `x86 compatible (x86)` once
-the process is running in its own code.
-
-- **Why deferred:** it is not in the pinned `dbgscope`, so closing this is the two-repo flow — a
-  typed method on `DebugEngine`, a `rev` pin moved, and both committed together — for a correction
-  the pair of calls already makes on every target this bench can build.
-- **What would close it:** `DebugEngine::effective_processor_type` in dbgscope, and
-  `worker::decide_bitness` taking it as a third source, ahead of both: a 32-bit answer from it is
-  decisive, and the two existing sources become what answers before the target has been resumed.
-- **What the approximation costs meanwhile:** the two disagree only at the initial breakpoint of a
-  WoW64 launch, where the engine is still 64-bit and the process has not entered its own code. That
-  break carries no C++ throw to decode, so nothing reads a record at the wrong width there. It is
-  an approximation with a known gap rather than one that happens to hold.
-
-**Where it picks up.** `worker::target_bitness` and `worker::decide_bitness` in `src/worker.rs`,
-the module docs in `src/target.rs` — which already name this call as the authoritative one, and say
-why the *routing* cannot use it — and dbgscope's `src/dbgeng.rs` beside `processor_type`.
 
 ## 59. [dbgscope + windbg-mcp] Nothing can ask which thread the engine has selected
 
