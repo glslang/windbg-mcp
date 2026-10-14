@@ -16975,10 +16975,43 @@ fn vs_heap_index(pool: &str) -> Option<usize> {
     }
 }
 
+/// Whether this kernel's PDB carries `_HEAP_VS_CONTEXT.Config` at all, read with `dt`. A PDB
+/// without the field cannot carry the flag the field holds, and the walk then reads every heap
+/// as unflagged and says so in a diagnostic (dbgscope's `vs_skips_page_end`) — which is what
+/// this tier has to read too, rather than the failure `dx` gives for a field it cannot resolve.
+/// Raised by Codex on #499 as the case [`vs_page_align_flag`] did not cover. No PDB without the
+/// field has been met, so the line looked for is the one both lab kernels print,
+/// `+0x004 Config : _RTL_HP_VS_CONFIG`, and a `dt` that prints no field at all is a failure.
+fn vs_config_field_present(server: &mut Server, session: &str) -> bool {
+    let call = server.call_tool(
+        "execute",
+        json!({ "command": "dt nt!_HEAP_VS_CONTEXT", "session_id": session }),
+        POOL_CALL_BUDGET,
+    );
+    assert!(
+        !is_tool_error(&call),
+        "`dt nt!_HEAP_VS_CONTEXT` failed: {call}"
+    );
+    let answer = text_of(&call["result"]);
+    let fields: Vec<&str> = answer
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| line.starts_with("+0x"))
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .collect();
+    assert!(
+        !fields.is_empty(),
+        "`dt nt!_HEAP_VS_CONTEXT` printed no field, so neither the walk nor this can read a VS \
+         context on this target:\n{answer}"
+    );
+    fields.contains(&"Config")
+}
+
 /// Bit 0 of one pool heap's `_HEAP_VS_CONTEXT.Config` — `PageAlignLargeAllocs`, `Pos 0, 1 Bit`
 /// on both kernels this has run against (`dt -r2 nt!_RTL_HP_VS_CONFIG`, 26100.33438 and 29671) —
 /// read through the engine the way the two oracles above read their facts, so that a
 /// disagreement with the walk is between two readings rather than two uses of one layout.
+/// Asked only once [`vs_config_field_present`] has said the field exists.
 ///
 /// `None` is a heap the target does not have: `Heaps[0]`, the executable nonpaged pool, is null
 /// on `ctf-vm` and `dx` fails to read through it, which is also a heap no chunk is from. Any
@@ -17035,7 +17068,9 @@ fn vs_page_align_flag(
 /// two kernels this has run against (`ctf-vm` 26100.33438 and the 29671 lab guest, 2026-10-14);
 /// the gate was raised by Codex on #499. Every census tag is scanned so that the first half
 /// covers each heap a sampled chunk is from, which a scan that stopped at its fourth page-start
-/// header did not — it read one heap.
+/// header did not — it read one heap. The flags are read *after* the scan, because a raw command
+/// drops the walk's cached snapshot and a `dx` issued inside it cost the next `pool_find_tag` a
+/// fresh walk per heap met (Codex, round 2 on #499).
 ///
 /// Sampled from the walk, which the two oracles beside this one refuse to do, because this
 /// defect is one the walk's own answer shows: a class of header offsets the allocator cannot
@@ -17047,13 +17082,13 @@ fn vs_page_align_flag(
 /// (`ExAllocateHeapPool` sends anything larger to `ExpAllocateBigPool`).
 fn compare_vs_page_end_placement(server: &mut Server, session: &str, tags: &[String]) {
     let mut small_vs = 0usize;
-    let mut at_page_end: Vec<String> = Vec::new();
+    // Small VS chunks whose header the walk put in a page's last sixteen bytes, each with the
+    // heap it is from: judged once the flags are read, below the scan.
+    let mut at_page_end_rows: Vec<(u64, u64, String, u64, String)> = Vec::new();
     let mut page_start: Vec<(u64, String, u64)> = Vec::new();
+    // Every heap a sampled chunk is from, as `(node, pool)`.
+    let mut heaps: std::collections::BTreeSet<(u64, String)> = Default::default();
     let mut fingerprint = None;
-    // `PageAlignLargeAllocs` per heap a sampled chunk is from, read once each.
-    let mut flags: std::collections::BTreeMap<(u64, String), Option<bool>> = Default::default();
-    // Chunks at `0xff0` on a heap without the flag, where that is where a header can be.
-    let mut unflagged_at_page_end = 0usize;
     for candidate in tags {
         let found = server.tool_data(
             "pool_find_tag",
@@ -17081,21 +17116,9 @@ fn compare_vs_page_end_placement(server: &mut Server, session: &str, tags: &[Str
             let tag = chunk["tag"].as_str().unwrap_or_default().to_owned();
             let numa_node = chunk["numa_node"].as_u64().unwrap_or_default();
             let pool = chunk["pool"].as_str().unwrap_or_default().to_owned();
-            let flagged = *flags.entry((numa_node, pool.clone())).or_insert_with(|| {
-                vs_heap_index(&pool)
-                    .and_then(|heap| vs_page_align_flag(server, session, numa_node, heap))
-            });
+            heaps.insert((numa_node, pool.clone()));
             match header & 0xfff {
-                0xff0 => match flagged {
-                    Some(true) => at_page_end.push(format!(
-                        "{header:#x} ({size} bytes, `{tag}`, node {numa_node} {pool})"
-                    )),
-                    Some(false) => unflagged_at_page_end += 1,
-                    None => panic!(
-                        "the walk reports a chunk at {header:#x} from pool node {numa_node} \
-                         `{pool}`, a heap the engine could not read the VS config of"
-                    ),
-                },
+                0xff0 => at_page_end_rows.push((header, size, tag, numa_node, pool)),
                 0 if page_start.len() < POOL_ORACLE_PAGE_START_SAMPLES => {
                     page_start.push((header, tag, size));
                 }
@@ -17104,17 +17127,54 @@ fn compare_vs_page_end_placement(server: &mut Server, session: &str, tags: &[Str
         }
         // Every census tag, deliberately: a scan that stopped at its fourth page-start header
         // read one heap — the first with small VS chunks, the prototype-paged one on `ctf-vm` —
-        // and the page-end half is a claim about each heap a sampled chunk is from. Each call
-        // after the first reads the cached snapshot.
+        // and the page-end half is a claim about each heap a sampled chunk is from. And no raw
+        // command inside it: `raw_command` drops the cached snapshot unconditionally, so the
+        // flag reads come after and every call here after the first reads the one walk.
     }
     println!("layout {fingerprint:?}; {} tag(s) scanned", tags.len());
-    println!("PageAlignLargeAllocs by (node, pool): {flags:?}");
     assert!(
         small_vs >= POOL_ORACLE_MINIMUM,
         "only {small_vs} small VS chunk(s) among the census's {} tags — fewer than the \
          {POOL_ORACLE_MINIMUM} this needs to mean anything",
         tags.len()
     );
+    // `PageAlignLargeAllocs` per heap, read once each — or taken as unset for every heap where
+    // the PDB has no field to read it from, which is the walk's reading of that case too.
+    let field_present = vs_config_field_present(server, session);
+    if !field_present {
+        println!(
+            "the PDB has no `_HEAP_VS_CONTEXT.Config`: the walk reads every heap as unflagged, \
+             and so does this"
+        );
+    }
+    let flags: std::collections::BTreeMap<(u64, String), Option<bool>> = heaps
+        .iter()
+        .map(|(numa_node, pool)| {
+            let flag = if field_present {
+                vs_heap_index(pool)
+                    .and_then(|heap| vs_page_align_flag(server, session, *numa_node, heap))
+            } else {
+                Some(false)
+            };
+            ((*numa_node, pool.clone()), flag)
+        })
+        .collect();
+    println!("PageAlignLargeAllocs by (node, pool): {flags:?}");
+    let mut at_page_end: Vec<String> = Vec::new();
+    // Chunks at `0xff0` on a heap without the flag, where that is where a header can be.
+    let mut unflagged_at_page_end = 0usize;
+    for (header, size, tag, numa_node, pool) in &at_page_end_rows {
+        match flags.get(&(*numa_node, pool.clone())).copied().flatten() {
+            Some(true) => at_page_end.push(format!(
+                "{header:#x} ({size} bytes, `{tag}`, node {numa_node} {pool})"
+            )),
+            Some(false) => unflagged_at_page_end += 1,
+            None => panic!(
+                "the walk reports a chunk at {header:#x} from pool node {numa_node} `{pool}`, a \
+                 heap the engine could not read the VS config of"
+            ),
+        }
+    }
     assert!(
         at_page_end.is_empty(),
         "{} small VS chunk(s) have their header in the last sixteen bytes of a page, on a heap \

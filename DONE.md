@@ -11456,7 +11456,8 @@ allocator cannot produce. Run both ways against `ctf-vm` the day it was written:
 it fails with 255 small VS chunks at `0xff0`, every one under the zero tag (347 s, the guest
 released cleanly); on the new pin it passes, four page-start headers agreeing with `!pool` and
 744 small VS chunks across the three heaps the census reaches — nonpaged NX, paged and
-prototype paged, each reading the flag set — checked with none at `0xff0` (270 s).
+prototype paged, each reading the flag set — checked with none at `0xff0` (220 s once the
+flag reads were moved after the scan; 270 s with them inside it, each costing a fresh walk).
 
 **What this did not establish.**
 
