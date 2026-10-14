@@ -6962,12 +6962,16 @@ fn a_32_bit_user_mode_fault_is_triaged_at_its_own_pointer_width() {
 /// `worker::target_bitness` asks, and recorded the gap it was closing as the initial break alone.
 /// Measured here (2026-10-14), the gap is wider than that and the fix is narrower:
 ///
-/// - **An uncaught 32-bit throw stops the engine in 64-bit code.** The second-chance stop a `go`
-///   hands back is in `wow64!Wow64pNotifyDebugger`, where the effective machine is the host's,
-///   and the record is the 32-bit throw's — three parameters, with an 80-byte record on the
+/// - **Under the x64 engine, an uncaught 32-bit throw stops it in 64-bit code.** The second-chance
+///   stop a `go` hands back is in `wow64!Wow64pNotifyDebugger`, where the effective machine is
+///   x64, and the record is the 32-bit throw's — three parameters, with an 80-byte record on the
 ///   32-bit stack. The width is the process's, from the OS; a 64-bit answer from the effective
 ///   machine decides nothing, and this stop is why it must not. The item believed the two sources
 ///   disagree only at the initial break, "which carries no throw to decode". This one does.
+///   **Which side the stop is reported from is the host's**: CI's ARM64 runner, emulating x86,
+///   reports the same stop from the 32-bit `KERNELBASE!RaiseException` with an all-32-bit stack
+///   (measured 2026-10-14, on this test's first run there), where the engine already decodes for
+///   x86 and the OS is not asked. The test reads which side it got and asserts that side's shape.
 /// - **A dump of that stop, taken by the engine, says the host's machine in its header**, and its
 ///   process is gone, so neither older source can say 32: the throw reads as `other` and nothing
 ///   is recovered — the same answer the build before this gave, which is what the control below
@@ -7029,13 +7033,32 @@ fn a_wow64_throw_is_decoded_at_its_own_width_on_either_side_of_the_engine() {
         "`go` never reached the fixture's throw: {live}"
     );
     assert_eq!(live["exception"]["first_chance"], false, "{live}");
-    // The stop is on the 64-bit side -- the WoW64 layer's debugger notification -- and the record
-    // is the 32-bit throw's. The width to read it at is therefore not the stop's.
-    assert_eq!(
-        live["frames"][0]["module"], "wow64",
-        "the second-chance stop of a WoW64 throw was measured in `wow64!Wow64pNotifyDebugger`; if \
-         it has moved into 32-bit code, the reasoning on `worker::decide_bitness` needs re-reading: \
-         {live}"
+    // Which side of WoW64 the stop is reported from is the host's. Measured 2026-10-14: the x64
+    // engine reports it from `wow64!Wow64pNotifyDebugger`, in 64-bit code, where the effective
+    // machine is x64 and the width to read the record at is therefore not the stop's; CI's ARM64
+    // runner, emulating x86, reports it from the 32-bit `KERNELBASE!RaiseException`, where the
+    // engine already decodes for x86. Either way the record is the 32-bit throw's.
+    let stop_module = live["frames"][0]["module"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let on_the_64_bit_side = match stop_module.as_str() {
+        "wow64" => true,
+        "KERNELBASE" => false,
+        other => panic!(
+            "the second-chance stop of a WoW64 throw was measured in `wow64` (x64) and in \
+             `KERNELBASE` (ARM64, under emulation); a stop in `{other}` is a reading this test has \
+             not seen, and the reasoning on `worker::decide_bitness` wants re-reading against it: \
+             {live}"
+        ),
+    };
+    eprintln!(
+        "the second-chance stop is in `{stop_module}`, on the {} side of WoW64",
+        if on_the_64_bit_side {
+            "64-bit"
+        } else {
+            "32-bit"
+        }
     );
     assert_eq!(
         live["exception"]["parameters"].as_array().map(Vec::len),
@@ -7049,8 +7072,25 @@ fn a_wow64_throw_is_decoded_at_its_own_width_on_either_side_of_the_engine() {
     assert_eq!(live["thrown"]["hresult"]["value"], "0x80670015", "{live}");
     assert_eq!(live["thrown"]["provenance"], "reported", "{live}");
 
-    // A dump of this stop, written by the engine: the header carries the writer's machine.
-    let dump = x86_fixture_dir().join("wow64-cppthrow-x64writer.dmp");
+    // A dump of this stop, written by the engine: the header carries the writer's machine. It is
+    // removed below once the assertions on it have passed, and deliberately **not** on a failing
+    // path: a run that fails on this dump leaves 12 MB beside the fixture, and that file is the
+    // thing to open to see what the engine saw.
+    let dump = x86_cppthrow_dir().join("wow64-cppthrow-x64writer.dmp");
+    // Taken from the host's side whichever side the stop was reported from, so that the file says
+    // the host's machine: `.effmach .` is the target's actual processor type. Whether the dump
+    // follows the effective machine is checked on the reopened file below rather than assumed.
+    if !on_the_64_bit_side {
+        let native = server.tool_text(
+            "execute",
+            json!({ "session_id": &session, "command": ".effmach ." }),
+            TARGET_STEP,
+        );
+        assert!(
+            native.contains("Effective machine") && !native.contains("x86"),
+            "`.effmach .` should put the engine on the host's machine: {native}"
+        );
+    }
     let written = server.tool_text(
         "execute",
         json!({
@@ -7073,6 +7113,19 @@ fn a_wow64_throw_is_decoded_at_its_own_width_on_either_side_of_the_engine() {
         "open_dump",
         json!({ "path": dump.to_string_lossy() }),
         TARGET_STEP,
+    );
+    // The control below rests on the file saying the writer's machine, so read that off the engine
+    // first: a 32-bit dump would fail here, naming the cause, and not inside the control as a
+    // decode that "worked".
+    let reopened_as = server.tool_text(
+        "execute",
+        json!({ "session_id": &dumped, "command": ".effmach" }),
+        TARGET_STEP,
+    );
+    assert!(
+        reopened_as.contains("Effective machine") && !reopened_as.contains("x86"),
+        "the engine wrote a 32-bit dump, so this is not a 64-bit writer's dump and the control \
+         below would be decoding a file that already says 32: {reopened_as}"
     );
     // **The control.** The file says 64-bit, the process is gone, and the engine decodes for the
     // file's machine: a three-parameter throw read with the four-parameter table is not a throw
@@ -7153,14 +7206,27 @@ fn a_wow64_throw_is_decoded_at_its_own_width_on_either_side_of_the_engine() {
     let [live_decision, unswitched_decision, switched_decision] = &decisions[expected - 3..] else {
         unreachable!("three elements were sliced");
     };
-    // Live, on the 64-bit side: the OS answered for the process, and the engine did not decode for
-    // a 32-bit machine (which machine it did decode for is the host's, and is not pinned).
+    // Live: the width is the process's whichever side the stop was reported from. On the 64-bit
+    // side the OS answered for the process and the engine did not decode for a 32-bit machine
+    // (which host machine it did decode for is not pinned); on the 32-bit side the engine already
+    // decoded for x86, and the OS was not asked.
     assert!(
-        live_decision.contains("decoded as Bits32")
-            && live_decision.contains("the OS says Some(X86)")
-            && !live_decision.contains("decodes for Some(X86)"),
+        live_decision.contains("decoded as Bits32"),
         "live: {live_decision}"
     );
+    if on_the_64_bit_side {
+        assert!(
+            live_decision.contains("the OS says Some(X86)")
+                && !live_decision.contains("decodes for Some(X86)"),
+            "live, on the 64-bit side: {live_decision}"
+        );
+    } else {
+        assert!(
+            live_decision.contains("the engine decodes for Some(X86)")
+                && live_decision.contains("the OS says None"),
+            "live, on the 32-bit side: {live_decision}"
+        );
+    }
     // The dump as opened: nobody could say 32.
     assert!(
         unswitched_decision.contains("decoded as Bits64")
@@ -7175,8 +7241,8 @@ fn a_wow64_throw_is_decoded_at_its_own_width_on_either_side_of_the_engine() {
         "dump, switched: {switched_decision}"
     );
     ran(
-        "a WoW64 throw decoded at its own width from the 64-bit side live, and from a 64-bit \
-         writer's dump once the engine was on the 32-bit side",
+        "a WoW64 throw decoded at its own width live, and from a 64-bit writer's dump once the \
+         engine was on the 32-bit side",
     );
 }
 
@@ -20627,12 +20693,20 @@ fn x86_stdcall_fixture() -> Option<&'static std::path::Path> {
 ///
 /// `/EHsc` is the one flag the C fixture above does without and this one cannot: without it the
 /// compiler has no C++ exception model and `throw` is refused.
+///
+/// **Built in a directory of its own, not beside the C fixture.** Two `cl /Zi` runs sharing a
+/// directory share the compiler's `vc140.pdb`, and the tests that build them run concurrently
+/// under libtest's default scheduling — measured 2026-10-14, on the first run of the pair after
+/// this fixture was added: the C fixture failed with `fatal error C1041: cannot open program
+/// database … if multiple CL.EXE write to the same .PDB file, please use /FS` (raised by Codex on
+/// [#497](https://github.com/glslang/windbg-mcp/pull/497), and reproduced before it was fixed). A
+/// subdirectory shares nothing, where `/Fd` or `/FS` would share everything but the one file.
 fn x86_cppthrow_fixture() -> Option<&'static std::path::Path> {
     static FIXTURE: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     FIXTURE
         .get_or_init(|| {
             let vcvars = vcvars32()?;
-            let dir = x86_fixture_dir();
+            let dir = x86_cppthrow_dir();
             let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("docs")
                 .join("samples")
@@ -20664,6 +20738,14 @@ fn x86_cppthrow_fixture() -> Option<&'static std::path::Path> {
             Some(exe)
         })
         .as_deref()
+}
+
+/// Where [`x86_cppthrow_fixture`] builds, and where its test writes the dump it makes: a
+/// subdirectory of the 32-bit fixture directory, for the reason that function's doc gives.
+fn x86_cppthrow_dir() -> std::path::PathBuf {
+    let dir = x86_fixture_dir().join("cppthrow");
+    std::fs::create_dir_all(&dir).expect("create the C++ fixture directory");
+    dir
 }
 
 /// The bytes `read_memory` answered, from its hex string.

@@ -5177,13 +5177,16 @@ fn target_bitness(e: &DebugEngine) -> fault::Bitness {
 /// where the processor is x64 and the process is x86 — and that direction has one right answer.
 ///
 /// **The effective machine is believed in that direction alone**, and the reason is a stop rather
-/// than caution. An uncaught 32-bit throw stops the engine on its **second chance in 64-bit
-/// code** — `wow64!Wow64pNotifyDebugger`, measured 2026-10-14 on `docs/samples/cppthrow.cpp`
-/// built 32-bit under the x64 engine — where the effective machine reads x64 and the record is the
-/// 32-bit throw's: three parameters, an 80-byte record on the 32-bit stack. That is the ordinary
-/// stop for the fault class this decode exists for, and the process's own width, from the OS, is
-/// what reads it right; a 64-bit answer from the effective machine made decisive would have read
-/// it at 152 bytes and found no throw. The same holds with nothing at stake at the 64-bit loader's
+/// than caution. Under the x64 engine, an uncaught 32-bit throw stops it on its **second chance in
+/// 64-bit code** — `wow64!Wow64pNotifyDebugger`, measured 2026-10-14 on `docs/samples/cppthrow.cpp`
+/// built 32-bit — where the effective machine reads x64 and the record is the 32-bit throw's:
+/// three parameters, an 80-byte record on the 32-bit stack. That is the ordinary stop for the
+/// fault class this decode exists for, and the process's own width, from the OS, is what reads it
+/// right; a 64-bit answer from the effective machine made decisive would have read it at 152 bytes
+/// and found no throw. (Which side the stop is reported from is the host's: ARM64, emulating x86,
+/// reports it from the 32-bit `KERNELBASE!RaiseException` with the effective machine already x86,
+/// measured the same day on CI — so the direction matters on x64 and costs nothing on ARM64.)
+/// The same holds with nothing at stake at the 64-bit loader's
 /// initial break, where it also says x64 about the WoW64 process and the width reaches nothing — a
 /// breakpoint's kind is decided by its code, and no scan runs for one. And it is a setting as well
 /// as a reading: `.effmach` moves it, where neither other source can be set.
