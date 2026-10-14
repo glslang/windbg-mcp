@@ -11190,8 +11190,12 @@ is the host's**: CI's ARM64 runner, emulating x86, reports it from the 32-bit
 `KERNELBASE!RaiseException` with an all-32-bit stack (`_CxxThrowException`, `inner`, `middle`,
 `main`, then `KERNEL32!$push_thunk$cdecl$u$u` and `ntdllWoW`), where the engine already decodes
 for x86 — so the sentence above about 64-bit code is an x64 fact, the test's first version pinned
-`wow64` and failed there, and the test now reads which side it got and asserts that side's shape,
-putting the engine back on the host's machine before it takes the dump. And **two `cl /Zi` runs in
+`wow64` and failed there, and the test now reads which side it got and asserts that side's shape.
+Its second version tried to run the dump half there too, by `.effmach .` before `.dump /ma` so the
+file would say the host's machine: the command was accepted live, and the reopened file answered
+`.effmach` with nothing at all — not a 64-bit writer's dump, and not a reading this item needed to
+chase — so the dump half now runs on the 64-bit side only and stands down with a `SKIPPED` line on
+the 32-bit one. And **two `cl /Zi` runs in
 one directory contend for the compiler's `vc140.pdb`**: Codex raised it, and the first local run
 of the two fixture-building tests together reproduced it (`C1041`) before both CI tiers did — the
 existing C fixture's build failed, not the new one's. The C++ fixture builds in a subdirectory of
@@ -11199,7 +11203,9 @@ its own.
 
 **What this did not establish.** Two hosts — the x64 bench on one engine build, CI's x64 and
 ARM64 runners — and the dump the engine itself writes, not one from Task Manager or `procdump`,
-whose headers were not read; a TTD trace of a WoW64 process was not asked. The 32-bit worker was
+whose headers were not read; a TTD trace of a WoW64 process was not asked. What the ARM64 engine
+writes when asked for a dump of an x86 process from the host's side, and what reopening it holds,
+was observed once and not characterised; the dump half of the measurement is x64-only. The 32-bit worker was
 not exercised, because a `launch` always takes the 64-bit image — which is the case this was
 about. And a first-chance stop was not measured: the engine's default for a C++ exception is to
 stop on the second, and that is the stop a caller gets.

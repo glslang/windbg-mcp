@@ -6972,11 +6972,16 @@ fn a_32_bit_user_mode_fault_is_triaged_at_its_own_pointer_width() {
 ///   reports the same stop from the 32-bit `KERNELBASE!RaiseException` with an all-32-bit stack
 ///   (measured 2026-10-14, on this test's first run there), where the engine already decodes for
 ///   x86 and the OS is not asked. The test reads which side it got and asserts that side's shape.
-/// - **A dump of that stop, taken by the engine, says the host's machine in its header**, and its
-///   process is gone, so neither older source can say 32: the throw reads as `other` and nothing
-///   is recovered — the same answer the build before this gave, which is what the control below
-///   is. `.effmach x86` puts the engine on the 32-bit side, and the effective machine is then the
-///   one source that can say so — and does, which is the half of this the change moved.
+/// - **A dump of that stop, taken by the x64 engine, says x64 in its header**, and its process is
+///   gone, so neither older source can say 32: the throw reads as `other` and nothing is
+///   recovered — the same answer the build before this gave, which is what the control below is.
+///   `.effmach x86` puts the engine on the 32-bit side, and the effective machine is then the one
+///   source that can say so — and does, which is the half of this the change moved. **This half
+///   runs on the 64-bit side only.** On the 32-bit side the dump the engine writes is not a 64-bit
+///   writer's: the one attempt to make it one (`.effmach .` before `.dump /ma`, CI's ARM64
+///   runner, 2026-10-14) was accepted live and reopened as a file on which `.effmach` printed
+///   nothing at all. What that engine writes there is its own question; the half stands down with
+///   a `SKIPPED` line, and the x64 tier pins it.
 ///
 /// Which source answered is a worker log line and nothing in the result, so the server runs at
 /// debug level and the decisions are read back off its stderr in order. The 32-bit loader's
@@ -7072,97 +7077,103 @@ fn a_wow64_throw_is_decoded_at_its_own_width_on_either_side_of_the_engine() {
     assert_eq!(live["thrown"]["hresult"]["value"], "0x80670015", "{live}");
     assert_eq!(live["thrown"]["provenance"], "reported", "{live}");
 
-    // A dump of this stop, written by the engine: the header carries the writer's machine. It is
-    // removed below once the assertions on it have passed, and deliberately **not** on a failing
-    // path: a run that fails on this dump leaves 12 MB beside the fixture, and that file is the
-    // thing to open to see what the engine saw.
-    let dump = x86_cppthrow_dir().join("wow64-cppthrow-x64writer.dmp");
-    // Taken from the host's side whichever side the stop was reported from, so that the file says
-    // the host's machine: `.effmach .` is the target's actual processor type. Whether the dump
-    // follows the effective machine is checked on the reopened file below rather than assumed.
-    if !on_the_64_bit_side {
-        let native = server.tool_text(
+    // The dump half, on the 64-bit side only. A dump of this stop written by the x64 engine says
+    // x64 in its header, and that is the file this change decodes differently. It is removed below
+    // once the assertions on it have passed, and deliberately **not** on a failing path: a run that
+    // fails on this dump leaves 12 MB beside the fixture, and that file is the thing to open to see
+    // what the engine saw.
+    //
+    // On the 32-bit side the half stands down rather than passing by not running. The dump the
+    // engine writes there is an x86 process's as it sees it, and the one attempt to make it the
+    // host's -- `.effmach .` before `.dump /ma`, on CI's ARM64 runner, 2026-10-14 -- was accepted
+    // live and then reopened as a file on which `.effmach` printed nothing at all: not a 64-bit
+    // writer's dump either, and what that engine writes there is its own question.
+    let live_triages = triages.get();
+    if on_the_64_bit_side {
+        let dump = x86_cppthrow_dir().join("wow64-cppthrow-x64writer.dmp");
+        let written = server.tool_text(
             "execute",
-            json!({ "session_id": &session, "command": ".effmach ." }),
+            json!({
+                "session_id": &session,
+                "command": format!(".dump /ma \"{}\"", dump.display()),
+            }),
             TARGET_STEP,
         );
         assert!(
-            native.contains("Effective machine") && !native.contains("x86"),
-            "`.effmach .` should put the engine on the host's machine: {native}"
+            written.contains("Dump successfully written") && dump.is_file(),
+            "the engine did not write the dump: {written}"
+        );
+        server.tool_text(
+            "end_session",
+            json!({ "session_id": &session }),
+            TARGET_STEP,
+        );
+
+        let dumped = server.open_session(
+            "open_dump",
+            json!({ "path": dump.to_string_lossy() }),
+            TARGET_STEP,
+        );
+        // The control below rests on the file saying the writer's machine, so read that off the
+        // engine first: a dump that is not a 64-bit writer's fails here, naming the cause, and not
+        // inside the control as a decode that "worked".
+        let reopened_as = server.tool_text(
+            "execute",
+            json!({ "session_id": &dumped, "command": ".effmach" }),
+            TARGET_STEP,
+        );
+        assert!(
+            reopened_as.contains("Effective machine") && !reopened_as.contains("x86"),
+            "the engine did not write a 64-bit writer's dump, so the control below would be \
+             decoding a file that already says 32, or says nothing: {reopened_as:?}"
+        );
+        // **The control.** The file says 64-bit, the process is gone, and the engine decodes for
+        // the file's machine: a three-parameter throw read with the four-parameter table is not a
+        // throw this understands -- and this is what the build before this change answered on
+        // this dump, switched or not.
+        let unswitched = triage(&mut server, &dumped);
+        assert_eq!(
+            unswitched["exception"]["code"], "0xe06d7363",
+            "{unswitched}"
+        );
+        assert_eq!(
+            unswitched["kind"], "other",
+            "a 64-bit writer's dump of a WoW64 throw was decoded at 32 bits with the engine still \
+             on the 64-bit side -- which source said so? {unswitched}"
+        );
+        assert!(unswitched["thrown"].is_null(), "{unswitched}");
+
+        // **The claim.** On the 32-bit side the effective machine is the one source that can say
+        // 32, and the same record is the throw it always was.
+        let switched_to = server.tool_text(
+            "execute",
+            json!({ "session_id": &dumped, "command": ".effmach x86" }),
+            TARGET_STEP,
+        );
+        assert!(switched_to.contains("x86"), "{switched_to}");
+        let switched = triage(&mut server, &dumped);
+        assert_eq!(
+            switched["kind"], "cpp_throw",
+            "the engine decoding for x86 was not believed over the dump's header: {switched}"
+        );
+        assert_eq!(
+            switched["thrown"]["hresult"]["value"], "0x80670015",
+            "{switched}"
+        );
+        assert_eq!(switched["thrown"]["provenance"], "reported", "{switched}");
+        server.tool_text("end_session", json!({ "session_id": &dumped }), TARGET_STEP);
+        let _ = std::fs::remove_file(&dump);
+    } else {
+        server.tool_text(
+            "end_session",
+            json!({ "session_id": &session }),
+            TARGET_STEP,
+        );
+        skip(
+            "the stop was reported from the 32-bit side, so the 64-bit writer's dump half stands \
+             down on this host; the x64 tier pins it",
         );
     }
-    let written = server.tool_text(
-        "execute",
-        json!({
-            "session_id": &session,
-            "command": format!(".dump /ma \"{}\"", dump.display()),
-        }),
-        TARGET_STEP,
-    );
-    assert!(
-        written.contains("Dump successfully written") && dump.is_file(),
-        "the engine did not write the dump: {written}"
-    );
-    server.tool_text(
-        "end_session",
-        json!({ "session_id": &session }),
-        TARGET_STEP,
-    );
-
-    let dumped = server.open_session(
-        "open_dump",
-        json!({ "path": dump.to_string_lossy() }),
-        TARGET_STEP,
-    );
-    // The control below rests on the file saying the writer's machine, so read that off the engine
-    // first: a 32-bit dump would fail here, naming the cause, and not inside the control as a
-    // decode that "worked".
-    let reopened_as = server.tool_text(
-        "execute",
-        json!({ "session_id": &dumped, "command": ".effmach" }),
-        TARGET_STEP,
-    );
-    assert!(
-        reopened_as.contains("Effective machine") && !reopened_as.contains("x86"),
-        "the engine wrote a 32-bit dump, so this is not a 64-bit writer's dump and the control \
-         below would be decoding a file that already says 32: {reopened_as}"
-    );
-    // **The control.** The file says 64-bit, the process is gone, and the engine decodes for the
-    // file's machine: a three-parameter throw read with the four-parameter table is not a throw
-    // this understands -- and this is what the build before this change answered on this dump,
-    // switched or not.
-    let unswitched = triage(&mut server, &dumped);
-    assert_eq!(
-        unswitched["exception"]["code"], "0xe06d7363",
-        "{unswitched}"
-    );
-    assert_eq!(
-        unswitched["kind"], "other",
-        "a 64-bit writer's dump of a WoW64 throw was decoded at 32 bits with the engine still on \
-         the 64-bit side -- which source said so? {unswitched}"
-    );
-    assert!(unswitched["thrown"].is_null(), "{unswitched}");
-
-    // **The claim.** On the 32-bit side the effective machine is the one source that can say 32,
-    // and the same record is the throw it always was.
-    let switched_to = server.tool_text(
-        "execute",
-        json!({ "session_id": &dumped, "command": ".effmach x86" }),
-        TARGET_STEP,
-    );
-    assert!(switched_to.contains("x86"), "{switched_to}");
-    let switched = triage(&mut server, &dumped);
-    assert_eq!(
-        switched["kind"], "cpp_throw",
-        "the engine decoding for x86 was not believed over the dump's header: {switched}"
-    );
-    assert_eq!(
-        switched["thrown"]["hresult"]["value"], "0x80670015",
-        "{switched}"
-    );
-    assert_eq!(switched["thrown"]["provenance"], "reported", "{switched}");
-    server.tool_text("end_session", json!({ "session_id": &dumped }), TARGET_STEP);
-    let _ = std::fs::remove_file(&dump);
 
     // The decisions, in order, as the worker logged them: which source answered each time. Read off
     // stderr rather than `server_log`, whose ring is bounded and at debug level is busy, and waited
@@ -7189,13 +7200,13 @@ fn a_wow64_throw_is_decoded_at_its_own_width_on_either_side_of_the_engine() {
         decisions.join("\n")
     );
     assert!(
-        expected >= 3,
+        live_triages >= 1 && expected >= live_triages,
         "the loop above triaged the throw at least once"
     );
-    // Any decision before the last three is the 32-bit loader's initial break, where the engine
+    // Any decision before the live one is the 32-bit loader's initial break, where the engine
     // already decodes for x86 and the OS -- which could only repeat it -- is not asked. (Measured:
     // the first `go` lands there, so this is ordinarily one line.)
-    for earlier in &decisions[..expected - 3] {
+    for earlier in &decisions[..live_triages - 1] {
         assert!(
             earlier.contains("decoded as Bits32")
                 && earlier.contains("the engine decodes for Some(X86)")
@@ -7203,9 +7214,7 @@ fn a_wow64_throw_is_decoded_at_its_own_width_on_either_side_of_the_engine() {
             "at the 32-bit loader's break: {earlier}"
         );
     }
-    let [live_decision, unswitched_decision, switched_decision] = &decisions[expected - 3..] else {
-        unreachable!("three elements were sliced");
-    };
+    let live_decision = &decisions[live_triages - 1];
     // Live: the width is the process's whichever side the stop was reported from. On the 64-bit
     // side the OS answered for the process and the engine did not decode for a 32-bit machine
     // (which host machine it did decode for is not pinned); on the 32-bit side the engine already
@@ -7220,30 +7229,46 @@ fn a_wow64_throw_is_decoded_at_its_own_width_on_either_side_of_the_engine() {
                 && !live_decision.contains("decodes for Some(X86)"),
             "live, on the 64-bit side: {live_decision}"
         );
+        // The dump half triaged twice more: as opened, and switched.
+        assert_eq!(
+            expected,
+            live_triages + 2,
+            "the dump half triages twice:\n{}",
+            decisions.join("\n")
+        );
+        let unswitched_decision = &decisions[live_triages];
+        let switched_decision = &decisions[live_triages + 1];
+        // The dump as opened: nobody could say 32.
+        assert!(
+            unswitched_decision.contains("decoded as Bits64")
+                && unswitched_decision.contains("the OS says None"),
+            "dump, unswitched: {unswitched_decision}"
+        );
+        // The dump switched: the effective machine alone said 32, and the OS was not asked.
+        assert!(
+            switched_decision.contains("decoded as Bits32")
+                && switched_decision.contains("the engine decodes for Some(X86)")
+                && switched_decision.contains("the OS says None"),
+            "dump, switched: {switched_decision}"
+        );
+        ran(
+            "a WoW64 throw decoded at its own width live, and from a 64-bit writer's dump once \
+             the engine was on the 32-bit side",
+        );
     } else {
         assert!(
             live_decision.contains("the engine decodes for Some(X86)")
                 && live_decision.contains("the OS says None"),
             "live, on the 32-bit side: {live_decision}"
         );
+        assert_eq!(
+            expected,
+            live_triages,
+            "the dump half stood down, so nothing was triaged after the live stop:\n{}",
+            decisions.join("\n")
+        );
+        ran("a WoW64 throw decoded at its own width live, reported from the 32-bit side");
     }
-    // The dump as opened: nobody could say 32.
-    assert!(
-        unswitched_decision.contains("decoded as Bits64")
-            && unswitched_decision.contains("the OS says None"),
-        "dump, unswitched: {unswitched_decision}"
-    );
-    // The dump switched: the effective machine alone said 32, and the OS was not asked.
-    assert!(
-        switched_decision.contains("decoded as Bits32")
-            && switched_decision.contains("the engine decodes for Some(X86)")
-            && switched_decision.contains("the OS says None"),
-        "dump, switched: {switched_decision}"
-    );
-    ran(
-        "a WoW64 throw decoded at its own width live, and from a 64-bit writer's dump once the \
-         engine was on the 32-bit side",
-    );
 }
 
 /// **A stale throw record must not become this fault's cause**, which is a claim no synthetic
