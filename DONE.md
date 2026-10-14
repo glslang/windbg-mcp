@@ -188,6 +188,7 @@ had been explained by the engine all along, in a line `cdb` prints and this serv
 - [Item 54](#54-dbgscope--windbg-mcp-modules--refresh-true--has-no-wall-clock-bound--done-2026-10-13-dbgscope197) — [dbgscope + windbg-mcp] `modules { "refresh": true }` has no wall-clock bound — done (2026-10-13, dbgscope#197)
 - [Item 47](#47-windbg-mcp--dbgscope-the-bounded-wait-is-unmeasured-on-a-ttd-replay-target--done-2026-10-13) — [windbg-mcp + dbgscope] The bounded wait is unmeasured on a TTD replay target — done (2026-10-13)
 - [Item 105](#105-windbg-mcp-opendump-is-documented-as-replacing-the-target-and-the-one-measurement-of-it-says-it-adds-one--done-2026-10-13) — [windbg-mcp] `.opendump` is documented as replacing the target, and the one measurement of it says it adds one — done (2026-10-13)
+- [Item 58](#58-dbgscope--windbg-mcp-geteffectiveprocessortype-is-the-question-and-is-not-bound--done-2026-10-14) — [dbgscope + windbg-mcp] `GetEffectiveProcessorType` is the question, and is not bound — done (2026-10-14)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -11108,3 +11109,84 @@ record what was believed when they were written.
 
 **What this did not establish.** Two engine builds on one ARM64 host, serial KD rather than KDNET,
 and one target of each kind. An attached process and a TTD trace were not asked.
+
+## 58. [dbgscope + windbg-mcp] `GetEffectiveProcessorType` is the question, and is not bound — **done** (2026-10-14)
+
+`worker::target_bitness` decides how wide to lay a fault's `EXCEPTION_RECORD` out, and asks two
+sources that each answer a slightly different question. `GetActualProcessorType` answers for the
+**physical processor** — measured, by launching `C:\Windows\SysWOW64\cmd.exe`: `0x8664`, under a
+64-bit worker, for a process whose every C++ throw raises three parameters and whose record is 80
+bytes. `IsWow64Process2`, through `target::process_arch`, answers for the **process**. Between them
+a WoW64 target comes out right, which is what
+[#286](https://github.com/glslang/windbg-mcp/pull/286) shipped after Codex found the case.
+
+Neither is the question actually being asked. `IDebugControl::GetEffectiveProcessorType` is: the
+machine the engine is *currently decoding for*, which follows a WoW64 target across the transition
+— measured on that same launch, `x64 (AMD64)` at the initial break and `x86 compatible (x86)` once
+the process is running in its own code.
+
+- **Why deferred:** it is not in the pinned `dbgscope`, so closing this is the two-repo flow — a
+  typed method on `DebugEngine`, a `rev` pin moved, and both committed together — for a correction
+  the pair of calls already makes on every target this bench can build.
+- **What would close it:** `DebugEngine::effective_processor_type` in dbgscope, and
+  `worker::decide_bitness` taking it as a third source, ahead of both: a 32-bit answer from it is
+  decisive, and the two existing sources become what answers before the target has been resumed.
+- **What the approximation costs meanwhile:** the two disagree only at the initial breakpoint of a
+  WoW64 launch, where the engine is still 64-bit and the process has not entered its own code. That
+  break carries no C++ throw to decode, so nothing reads a record at the wrong width there. It is
+  an approximation with a known gap rather than one that happens to hold.
+
+**Where it picks up.** `worker::target_bitness` and `worker::decide_bitness` in `src/worker.rs`,
+the module docs in `src/target.rs` — which already name this call as the authoritative one, and say
+why the *routing* cannot use it — and dbgscope's `src/dbgeng.rs` beside `processor_type`.
+
+### What closed it (2026-10-14)
+
+**The two-repo flow this was deferred for had already happened, and nothing here noticed.**
+`DebugEngine::effective_processor_type` went into dbgscope on 2026-09-10 (`945965e`, to discriminate
+a disassembly rendering by the processor that rendered it), and this repo's pin picked it up the
+same day (`e8c8561`, the typed-disassembly merge) — five days after the item was filed, and
+thirty-four more before anyone read the pinned source rather than the entry. `worker.rs`'s doc
+comment said "not in the pinned `dbgscope`" the whole time; `grep` of the checkout under
+`git show <rev>:src/dbgeng.rs` is what settled it. The first draft of this paragraph said the pin
+picked it up on 2026-09-25, having read the pin history through a `head -12` that stopped there;
+walking every pin move since the dbgscope commit found eight earlier ones that carried it, and the
+one before them (`c8c380f`, 2026-09-05) that did not. So what landed is one repo's change and no
+pin move: `worker::target_bitness` asks the effective machine first, `worker::decide_bitness` takes
+it as a third source, and `may_ask_the_os` skips the process open when either engine answer has
+already said 32.
+
+**It is a third source in one direction, not the authoritative one this entry called it — and the
+reason is a measurement the entry's own cost paragraph got wrong.** "The two disagree only at the
+initial breakpoint of a WoW64 launch … that break carries no C++ throw to decode." Measured
+2026-10-14 by launching `docs/samples/cppthrow.cpp` built 32-bit under the x64 engine (dbgeng
+10.0.29617.1000, through the registered server at `0.22.0+g008bfa65`): the stop a `go` hands back
+on its uncaught throw is the **second chance**, delivered from `wow64!Wow64pNotifyDebugger` —
+64-bit code, `.effmach` reading `x64 (AMD64)` — with the record the 32-bit throw's: three
+parameters, magic `0x19930520`, the object and `ThrowInfo` at 32-bit addresses. The pair of older
+sources decodes it right (`cpp_throw`, `0x80670015` recovered and corroborated) because the OS says
+x86. Had the effective machine been authoritative as proposed, that stop — the ordinary one for
+the fault class this tool exists for — would have been read at 64 bits and found no throw at all.
+So a 32-bit answer from it is decisive and a 64-bit one decides nothing; `decide_bitness` carries
+the reasoning, and the initial breaks keep their measured readings (`x64 (AMD64)` at the 64-bit
+loader's, `x86 compatible (x86)` at the 32-bit loader's; both are exception events, `0x80000003`
+and the WOW64 breakpoint `0x4000001f`, and the width reaches nothing at either).
+
+**Where it changes the answer, measured on the same run.** `.dump /ma` from that stop writes a
+mini user dump whose header says x64; reopened, its process is gone, so neither older source can
+say 32, and the triage read `kind: other` with no `thrown`. After `.effmach x86` the effective
+machine is the one source that can say 32, and the same record reads `cpp_throw` with the same
+HRESULT. The build before this change still said `other` there, measured on that same server as
+the control. `a_wow64_throw_is_decoded_at_its_own_width_on_either_side_of_the_engine` in
+`tests/mcp_smoke.rs` pins all three readings on the debugger tier, making its own dump from the
+fixture it compiles, and reads which source answered off the worker's debug log, since nothing in
+the result carries the width — which also shows a fourth: at the 32-bit loader's initial break the
+engine already decodes for x86 and the OS is not asked at all, the process open `may_ask_the_os`
+now saves. `docs/smoke-test.md` has the section.
+
+**What this did not establish.** One x64 host and one engine build; the dump the engine itself
+writes, not one from Task Manager or `procdump`, whose headers were not read; and a TTD trace of a
+WoW64 process was not asked. The 32-bit worker was not exercised, because a `launch` always takes
+the 64-bit image — which is the case this was about. And a first-chance stop was not measured:
+the engine's default for a C++ exception is to stop on the second, and that is the stop a caller
+gets.

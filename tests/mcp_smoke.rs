@@ -6955,6 +6955,231 @@ fn a_32_bit_user_mode_fault_is_triaged_at_its_own_pointer_width() {
     server.call_tool("end_session", json!({ "session_id": session }), STEP);
 }
 
+/// **A 32-bit throw is decoded at its own width whichever side of WoW64 the engine stops on — and
+/// a 64-bit writer's dump of it is decoded right once the engine is put on the 32-bit side.**
+///
+/// `FOLLOWUPS.md` item 58 bound `GetEffectiveProcessorType` as the first of the three questions
+/// `worker::target_bitness` asks, and recorded the gap it was closing as the initial break alone.
+/// Measured here (2026-10-14), the gap is wider than that and the fix is narrower:
+///
+/// - **An uncaught 32-bit throw stops the engine in 64-bit code.** The second-chance stop a `go`
+///   hands back is in `wow64!Wow64pNotifyDebugger`, where the effective machine is the host's,
+///   and the record is the 32-bit throw's — three parameters, with an 80-byte record on the
+///   32-bit stack. The width is the process's, from the OS; a 64-bit answer from the effective
+///   machine decides nothing, and this stop is why it must not. The item believed the two sources
+///   disagree only at the initial break, "which carries no throw to decode". This one does.
+/// - **A dump of that stop, taken by the engine, says the host's machine in its header**, and its
+///   process is gone, so neither older source can say 32: the throw reads as `other` and nothing
+///   is recovered — the same answer the build before this gave, which is what the control below
+///   is. `.effmach x86` puts the engine on the 32-bit side, and the effective machine is then the
+///   one source that can say so — and does, which is the half of this the change moved.
+///
+/// Which source answered is a worker log line and nothing in the result, so the server runs at
+/// debug level and the decisions are read back off its stderr in order. The 32-bit loader's
+/// initial break, which the first `go` lands on, contributes one more: the engine already decodes
+/// for x86 there and the OS is not asked, which is `may_ask_the_os`'s skip seen from outside.
+///
+/// The fixture is `docs/samples/cppthrow.cpp` built 32-bit, so the HRESULT it throws is the one
+/// the checked-in 32-bit dump recovers; the dump is made here rather than checked in, because what
+/// it pins is the writer's width against the process's and not the file.
+#[test]
+fn a_wow64_throw_is_decoded_at_its_own_width_on_either_side_of_the_engine() {
+    if !launch_tier() {
+        return;
+    }
+    let Some(fixture) = x86_cppthrow_fixture() else {
+        skip("this host has no 32-bit C++ compiler, so this tier cannot make itself a target");
+        return;
+    };
+    let mut server = Server::started_with(&[("RUST_LOG", "windbg_mcp=debug")]);
+    let session = server.open_session(
+        "launch",
+        json!({ "command_line": fixture.to_string_lossy() }),
+        TARGET_STEP,
+    );
+    // Counted, because every triage logs one decision and the last three are the ones pinned below.
+    let triages = std::cell::Cell::new(0usize);
+    let triage = |server: &mut Server, session: &str| -> Value {
+        let data = server.tool_data(
+            "exception_triage",
+            json!({ "session_id": session }),
+            TARGET_STEP,
+        );
+        assert_eq!(data["status"], "ok", "{data}");
+        triages.set(triages.get() + 1);
+        data
+    };
+
+    // Past the 32-bit loader's initial break (the launch stopped at the 64-bit loader's) to the
+    // throw, whose default handling stops the engine on the second chance.
+    let mut live = Value::Null;
+    for _ in 0..3 {
+        let stop = server.tool_data("go", json!({ "session_id": &session }), TARGET_STEP);
+        assert_ne!(
+            stop["target_gone"], true,
+            "the fixture ended before the engine stopped on its throw: {stop}"
+        );
+        live = triage(&mut server, &session);
+        if live["exception"]["code"] == "0xe06d7363" {
+            break;
+        }
+    }
+    assert_eq!(
+        live["exception"]["code"], "0xe06d7363",
+        "`go` never reached the fixture's throw: {live}"
+    );
+    assert_eq!(live["exception"]["first_chance"], false, "{live}");
+    // The stop is on the 64-bit side -- the WoW64 layer's debugger notification -- and the record
+    // is the 32-bit throw's. The width to read it at is therefore not the stop's.
+    assert_eq!(
+        live["frames"][0]["module"], "wow64",
+        "the second-chance stop of a WoW64 throw was measured in `wow64!Wow64pNotifyDebugger`; if \
+         it has moved into 32-bit code, the reasoning on `worker::decide_bitness` needs re-reading: \
+         {live}"
+    );
+    assert_eq!(
+        live["exception"]["parameters"].as_array().map(Vec::len),
+        Some(3),
+        "a 32-bit throw raises three parameters: {live}"
+    );
+    assert_eq!(
+        live["kind"], "cpp_throw",
+        "a 32-bit throw stopped on from 64-bit code was decoded at the stop's width: {live}"
+    );
+    assert_eq!(live["thrown"]["hresult"]["value"], "0x80670015", "{live}");
+    assert_eq!(live["thrown"]["provenance"], "reported", "{live}");
+
+    // A dump of this stop, written by the engine: the header carries the writer's machine.
+    let dump = x86_fixture_dir().join("wow64-cppthrow-x64writer.dmp");
+    let written = server.tool_text(
+        "execute",
+        json!({
+            "session_id": &session,
+            "command": format!(".dump /ma \"{}\"", dump.display()),
+        }),
+        TARGET_STEP,
+    );
+    assert!(
+        written.contains("Dump successfully written") && dump.is_file(),
+        "the engine did not write the dump: {written}"
+    );
+    server.tool_text(
+        "end_session",
+        json!({ "session_id": &session }),
+        TARGET_STEP,
+    );
+
+    let dumped = server.open_session(
+        "open_dump",
+        json!({ "path": dump.to_string_lossy() }),
+        TARGET_STEP,
+    );
+    // **The control.** The file says 64-bit, the process is gone, and the engine decodes for the
+    // file's machine: a three-parameter throw read with the four-parameter table is not a throw
+    // this understands -- and this is what the build before this change answered on this dump,
+    // switched or not.
+    let unswitched = triage(&mut server, &dumped);
+    assert_eq!(
+        unswitched["exception"]["code"], "0xe06d7363",
+        "{unswitched}"
+    );
+    assert_eq!(
+        unswitched["kind"], "other",
+        "a 64-bit writer's dump of a WoW64 throw was decoded at 32 bits with the engine still on \
+         the 64-bit side -- which source said so? {unswitched}"
+    );
+    assert!(unswitched["thrown"].is_null(), "{unswitched}");
+
+    // **The claim.** On the 32-bit side the effective machine is the one source that can say 32,
+    // and the same record is the throw it always was.
+    let switched_to = server.tool_text(
+        "execute",
+        json!({ "session_id": &dumped, "command": ".effmach x86" }),
+        TARGET_STEP,
+    );
+    assert!(switched_to.contains("x86"), "{switched_to}");
+    let switched = triage(&mut server, &dumped);
+    assert_eq!(
+        switched["kind"], "cpp_throw",
+        "the engine decoding for x86 was not believed over the dump's header: {switched}"
+    );
+    assert_eq!(
+        switched["thrown"]["hresult"]["value"], "0x80670015",
+        "{switched}"
+    );
+    assert_eq!(switched["thrown"]["provenance"], "reported", "{switched}");
+    server.tool_text("end_session", json!({ "session_id": &dumped }), TARGET_STEP);
+    let _ = std::fs::remove_file(&dump);
+
+    // The decisions, in order, as the worker logged them: which source answered each time. Read off
+    // stderr rather than `server_log`, whose ring is bounded and at debug level is busy, and waited
+    // for by count, because the two 32-bit-side decisions below are word for word the same line.
+    let needle = "the fault is decoded as";
+    let expected = triages.get();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let decisions = loop {
+        let log = server.stderr();
+        let found: Vec<String> = log
+            .lines()
+            .filter(|line| line.contains(needle))
+            .map(str::to_string)
+            .collect();
+        if found.len() >= expected || Instant::now() >= deadline {
+            break found;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    assert_eq!(
+        decisions.len(),
+        expected,
+        "{expected} triages, {expected} decisions:\n{}",
+        decisions.join("\n")
+    );
+    assert!(
+        expected >= 3,
+        "the loop above triaged the throw at least once"
+    );
+    // Any decision before the last three is the 32-bit loader's initial break, where the engine
+    // already decodes for x86 and the OS -- which could only repeat it -- is not asked. (Measured:
+    // the first `go` lands there, so this is ordinarily one line.)
+    for earlier in &decisions[..expected - 3] {
+        assert!(
+            earlier.contains("decoded as Bits32")
+                && earlier.contains("the engine decodes for Some(X86)")
+                && earlier.contains("the OS says None"),
+            "at the 32-bit loader's break: {earlier}"
+        );
+    }
+    let [live_decision, unswitched_decision, switched_decision] = &decisions[expected - 3..] else {
+        unreachable!("three elements were sliced");
+    };
+    // Live, on the 64-bit side: the OS answered for the process, and the engine did not decode for
+    // a 32-bit machine (which machine it did decode for is the host's, and is not pinned).
+    assert!(
+        live_decision.contains("decoded as Bits32")
+            && live_decision.contains("the OS says Some(X86)")
+            && !live_decision.contains("decodes for Some(X86)"),
+        "live: {live_decision}"
+    );
+    // The dump as opened: nobody could say 32.
+    assert!(
+        unswitched_decision.contains("decoded as Bits64")
+            && unswitched_decision.contains("the OS says None"),
+        "dump, unswitched: {unswitched_decision}"
+    );
+    // The dump switched: the effective machine alone said 32, and the OS was not asked.
+    assert!(
+        switched_decision.contains("decoded as Bits32")
+            && switched_decision.contains("the engine decodes for Some(X86)")
+            && switched_decision.contains("the OS says None"),
+        "dump, switched: {switched_decision}"
+    );
+    ran(
+        "a WoW64 throw decoded at its own width from the 64-bit side live, and from a 64-bit \
+         writer's dump once the engine was on the 32-bit side",
+    );
+}
+
 /// **A stale throw record must not become this fault's cause**, which is a claim no synthetic
 /// test could make credible on its own.
 ///
@@ -20388,6 +20613,51 @@ fn x86_stdcall_fixture() -> Option<&'static std::path::Path> {
             assert!(
                 built.status.success() && exe.is_file(),
                 "the 32-bit C fixture did not compile:\n{}\n{}",
+                String::from_utf8_lossy(&built.stdout),
+                String::from_utf8_lossy(&built.stderr)
+            );
+            Some(exe)
+        })
+        .as_deref()
+}
+
+/// `docs/samples/cppthrow.cpp` built 32-bit — the checked-in fault fixtures' own program, as a
+/// WoW64 process that throws — for
+/// [`a_wow64_throw_is_decoded_at_its_own_width_on_either_side_of_the_engine`].
+///
+/// `/EHsc` is the one flag the C fixture above does without and this one cannot: without it the
+/// compiler has no C++ exception model and `throw` is refused.
+fn x86_cppthrow_fixture() -> Option<&'static std::path::Path> {
+    static FIXTURE: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    FIXTURE
+        .get_or_init(|| {
+            let vcvars = vcvars32()?;
+            let dir = x86_fixture_dir();
+            let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("docs")
+                .join("samples")
+                .join("cppthrow.cpp");
+            std::fs::copy(&source, dir.join("cppthrow.cpp")).expect("copy the fixture source");
+            let script = dir.join("build-cppthrow32.cmd");
+            std::fs::write(
+                &script,
+                format!(
+                    "@echo off\r\ncall \"{}\" >nul\r\ncd /d \"{}\"\r\n\
+                     cl /nologo /EHsc /Zi /Od /MT /W3 /Fe:cppthrow32.exe cppthrow.cpp\r\n",
+                    vcvars.display(),
+                    dir.display()
+                ),
+            )
+            .expect("write the build script");
+            let built = Command::new("cmd")
+                .arg("/c")
+                .arg(&script)
+                .output()
+                .expect("run the C++ compiler");
+            let exe = dir.join("cppthrow32.exe");
+            assert!(
+                built.status.success() && exe.is_file(),
+                "the 32-bit C++ fixture did not compile:\n{}\n{}",
                 String::from_utf8_lossy(&built.stdout),
                 String::from_utf8_lossy(&built.stderr)
             );
