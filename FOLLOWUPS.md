@@ -78,7 +78,6 @@ reopen it). An unmarked line is simply open.
 - [Item 94](#94-windbg-mcp-disabling-a-breakpoint-has-no-typed-tool) — [windbg-mcp] Disabling a breakpoint has no typed tool
 - [Item 97](#97-dbgscope-an-lfh-block-awaiting-a-delayed-free-is-reported-allocated) — [dbgscope] An LFH block awaiting a delayed free is reported allocated
 - [Item 100](#100-dbgscope-the-vs-chunk-chain-comes-apart-on-29671--the-targets-paging-not-the-build) — [dbgscope] The VS chunk chain comes apart on 29671 — the target's paging, not the build — **declined** (2026-09-24)
-- [Item 101](#101-dbgscope-the-vs-chunk-chain-drifts-0x10-and-not-from-where-it-starts) — [dbgscope] The VS chunk chain drifts 0x10, and not from where it starts
 - [Item 104](#104-windbg-mcp-a-fingerprint-field-that-was-refused-is-indistinguishable-from-one-that-does-not-apply) — [windbg-mcp] A fingerprint field that was *refused* is indistinguishable from one that does not apply
 - [Item 108](#108-windbg-mcp-a-kmdf-drivers-real-callbacks--step-1-landed-the-frameworks-per-device-config-is-what-is-left) — [windbg-mcp] A KMDF driver's real callbacks — step 1 landed, the framework's per-device config is what is left — **half landed**
 - [Item 113](#113-windbg-mcp-the-device-descriptor-sweeps-own-figures-do-not-add-up) — [windbg-mcp] The `\Device` descriptor sweep's own figures do not add up
@@ -1421,7 +1420,8 @@ routine, and it is not the mechanism.
 - **Why it stays here rather than moving to `DONE.md`:** nothing was built. The reopening condition
   is the content above.
 - **What would reopen it:** a target that loses the chain where the named page is **not** a pagefile
-  PTE. That would be a placement defect and belongs with item 101.
+  PTE. That would be a placement defect; item 101 was the one found, now in
+  [`DONE.md`](./DONE.md), and a new one would be filed beside it.
 - **The confound that remains, and it does not matter here:** one guest per build, and `lab-nt` is
   also a hypervisor root partition (`Partition Pages: 4096`), so "29671" and "this guest under this
   load" are not separated. The mechanism found is build-independent — any target trimming paged pool
@@ -1483,45 +1483,6 @@ uptime went 3h34m → 19h40m (254 → 459, 204 → 332, 7.7 MB → 15.6 MB), so 
 it does not do is produce them, which is what the 26100 control settled.
 
 </details>
-
-## 101. [dbgscope] The VS chunk chain drifts 0x10, and not from where it starts
-
-**Repo:** `dbgscope`, surfaced by `windbg-mcp`'s `pool_*` tools.
-
-Left over from item 99, and now the only thing left in it. On a live 26100.33438 kernel
-(2026-09-24) the walk places a VS chunk's `_POOL_HEADER` **0x10 before** where one really is, for
-every chunk in certain subsegments. Read from the bytes rather than from `!pool`'s heuristic: at
-`0xffff8b836d46f000` sits a genuine `_POOL_HEADER` — `BlockSize` `0x21`, `PoolType` `0x02`, tag
-`MmLd`, matching `!pool`'s `size: 210` exactly — while the walk read the eight bytes 0x10 earlier,
-which are a pointer, and reported the tag `0x838bffff`: the top half of a kernel address.
-
-It is **not a lost chain**: the walk's chunk starts 0x10 early *and* is 0x10 long, so each chunk
-ends where the real one does and the next is found. The size it reports is over by the same 0x10 —
-528 against `!pool`'s 0x210 less its header.
-
-Item 99's fix removed the part of this that was about tags: a chunk too large for
-`_POOL_HEADER.BlockSize` is now named from `nt!PoolBigPageTable` by containment, so its placement
-does not matter. What is left is the chunks *under* that limit, which do carry a header and whose
-header the walk mislocates — 1,047 of them under `0x838bffff` alone, 2.0 MB, on the run that
-measured this.
-
-- **Why deferred:** the obvious cause is ruled out and no other is established. It would be a
-  guess, and item 99's remedy was built specifically so that it did not have to wait for this.
-- **What would close it:** find which chunk introduces the 0x10. **The chunk area's start is not
-  it** — `sizeof(_HEAP_VS_SUBSEGMENT)` is `0x28`, the first chunk header is at `+0x30` where
-  `discover_segment_context` computes it, and a real `MiSe` `_POOL_HEADER` sits at `+0x40`. So the
-  chain begins correctly and drifts later, which points at a chunk whose `UnsafeSize` covers
-  something the walk does not expect — a big-pool chunk is the obvious candidate, since those are
-  the ones with no header and the drift shows up after them. Read
-  `nt!RtlpHpVsChunkSplit`/`RtlpHpVsSubsegmentInitialize` for what a header-less chunk's
-  `UnsafeSize` counts.
-- **Where it picks up:** `walk_vs`'s chain arithmetic in dbgscope's `src/pool/snapshot.rs`, and
-  `decode_vs_chunk` in `src/pool/decode.rs`. **This is not item 100**, which that entry's
-  measurement settled on 2026-09-24: item 100's extents begin on a boundary the walk cannot *read*
-  — the page holding the previous header is paged out — whereas this one mislocates a header in
-  memory that reads fine. The drift here is a uniform 0x10; there, the gap between the chain's
-  expectation and the next readable boundary runs to 0x820 and more, and varies per site. A target
-  that loses the chain where the named page is **not** a pagefile PTE would belong here.
 
 ## 104. [windbg-mcp] A fingerprint field that was *refused* is indistinguishable from one that does not apply
 
@@ -2375,8 +2336,9 @@ on **29671**, found while confirming those fixes were not fitted to 26100, which
 the same chain drifting 0x10 on 26100, which is all that is left of item 99 now that it too is in
 [`DONE.md`](./DONE.md). They were filed as possibly one question and are **not** (2026-09-24):
 item 100 is the target's paged pool being trimmed out from under a KD link, with nothing in the
-walker to fix, and is measured and declined; item 101 is a real placement defect in readable
-memory.
+walker to fix, and is measured and declined; item 101 was a real placement defect in readable
+memory — not a drift of the chain but the allocator moving a user block off a page end under a
+flag the walk had never read — closed 2026-10-14 and in [`DONE.md`](./DONE.md).
 And item 110 from the 2026-10-01 VTL1 controlled-stop probe (item 103's control axis): stopping and
 resuming real `securekernel.exe` image code on a partition we own does not reach an *initialized*
 Secure Kernel, and the route that would needs the experiment to own a Windows/VBS boot — filed as a

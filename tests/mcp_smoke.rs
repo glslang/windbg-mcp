@@ -16959,6 +16959,166 @@ fn compare_pool_decoding_against_the_engine(server: &mut Server, session: &str, 
     big_pages.assert_agreement();
 }
 
+/// How many page-start VS headers to put to `!pool`, each one raw command.
+const POOL_ORACLE_PAGE_START_SAMPLES: usize = 4;
+
+/// Where the walk puts the header of a VS chunk whose user block the allocator moved off a page
+/// end, against where `!pool` reads it (`FOLLOWUPS.md` item 101).
+///
+/// Under `_HEAP_VS_CONTEXT.Config.Flags.PageAlignLargeAllocs`, `nt!RtlpHpVsContextAllocate`
+/// never hands out a user block in the last sixteen bytes of a page: a chunk whose header sits
+/// at page offset `0xfe0` has its `_POOL_HEADER` at the next page start. Both pool heaps carry
+/// the flag on the two kernels this was measured against (`ctf-vm`, 26100.33438, and the 29671
+/// lab guest, 2026-10-14), and a kernel without it would fail the first assertion below — which
+/// is the finding to bring back here, not a reason for an exemption. Two things follow for a walk of such a target, and this
+/// checks both. **No small VS chunk has its header at offset `0xff0`** — that is where
+/// the walk put every moved one until dbgscope read the flag, 1,275 of them on one boot of
+/// `ctf-vm`, each decoding two stale tree pointers as a header — so one there is item 101's
+/// defect and nothing else. And **a small VS chunk with a page-aligned header is a moved one**,
+/// so `!pool` on that address must print a header there, with the walk's tag and sixteen bytes
+/// more than the walk's usable size.
+///
+/// Sampled from the walk, which the two oracles beside this one refuse to do, because this
+/// defect is one the walk's own answer shows: a class of header offsets the allocator cannot
+/// produce. The engine is then asked about each page-start header the walk reports, so the
+/// placement is put to its reading and not only to the rule. Big-pool chunks are left out of
+/// both halves — their `header_address` is the allocation's own page-aligned start, from the
+/// big-page table rather than from any header, and `!pool` prints them as
+/// `large page allocation` lines — and a request past `0xfe0` bytes is what makes one
+/// (`ExAllocateHeapPool` sends anything larger to `ExpAllocateBigPool`).
+fn compare_vs_page_end_placement(server: &mut Server, session: &str, tags: &[String]) {
+    let mut small_vs = 0usize;
+    let mut at_page_end: Vec<String> = Vec::new();
+    let mut page_start: Vec<(u64, String, u64)> = Vec::new();
+    let mut fingerprint = None;
+    for candidate in tags {
+        let found = server.tool_data(
+            "pool_find_tag",
+            json!({ "tag": candidate, "session_id": session, "limit": 256 }),
+            POOL_CALL_BUDGET,
+        );
+        fingerprint.get_or_insert_with(|| found["layout"]["fingerprint"].clone());
+        for chunk in found["chunks"].as_array().into_iter().flatten() {
+            if chunk["backend"] != "vs" {
+                continue;
+            }
+            let Some(size) = chunk["size"].as_u64() else {
+                continue;
+            };
+            if size > 0xfe0 {
+                continue;
+            }
+            let Some(header) = chunk["header_address"]
+                .as_str()
+                .and_then(|address| u64::from_str_radix(address.trim_start_matches("0x"), 16).ok())
+            else {
+                continue;
+            };
+            small_vs += 1;
+            let tag = chunk["tag"].as_str().unwrap_or_default().to_owned();
+            match header & 0xfff {
+                0xff0 => at_page_end.push(format!("{header:#x} ({size} bytes, `{tag}`)")),
+                0 if page_start.len() < POOL_ORACLE_PAGE_START_SAMPLES => {
+                    page_start.push((header, tag, size));
+                }
+                _ => {}
+            }
+        }
+        if page_start.len() >= POOL_ORACLE_PAGE_START_SAMPLES && small_vs >= POOL_ORACLE_MINIMUM {
+            break;
+        }
+    }
+    println!("layout {fingerprint:?}");
+    assert!(
+        small_vs >= POOL_ORACLE_MINIMUM,
+        "only {small_vs} small VS chunk(s) among the census's {} tags — fewer than the \
+         {POOL_ORACLE_MINIMUM} this needs to mean anything",
+        tags.len()
+    );
+    assert!(
+        at_page_end.is_empty(),
+        "{} small VS chunk(s) have their header in the last sixteen bytes of a page, where the \
+         allocator never puts one: {at_page_end:#?}. That is `FOLLOWUPS.md` item 101 exactly — \
+         the user block was moved to the next page start and the walk read the stale unit before \
+         it as the header.",
+        at_page_end.len()
+    );
+    assert!(
+        !page_start.is_empty(),
+        "none of {small_vs} small VS chunks has a page-aligned header. Under \
+         `PageAlignLargeAllocs` every chunk whose header sits at offset 0xfe0 has one there, so \
+         either the sample missed them all or the walk is placing them elsewhere again."
+    );
+    let mut wrong = Vec::new();
+    for (header, tag, size) in &page_start {
+        let command = format!("!pool {header:#x}");
+        let call = server.call_tool(
+            "execute",
+            json!({ "command": command, "session_id": session }),
+            POOL_CALL_BUDGET,
+        );
+        if is_tool_error(&call) {
+            wrong.push(format!("{header:#x}: `!pool` failed"));
+            continue;
+        }
+        let answer = text_of(&call["result"]);
+        // The line `!pool` marks as holding the address asked about:
+        // `*<header> size: <hex> previous size: <hex> (Allocated) *<tag>`.
+        let Some(line) = answer
+            .lines()
+            .map(str::trim_start)
+            .find(|line| line.starts_with('*'))
+        else {
+            wrong.push(format!(
+                "{header:#x}: `!pool` marked no block as holding it:\n{answer}"
+            ));
+            continue;
+        };
+        let engine_header = line
+            .trim_start_matches('*')
+            .split_whitespace()
+            .next()
+            .and_then(|address| u64::from_str_radix(&address.replace('`', ""), 16).ok());
+        let engine_size = line
+            .split("size:")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|size| u64::from_str_radix(size, 16).ok());
+        let engine_tag = line.rsplit('*').next().map(str::trim).unwrap_or_default();
+        if engine_header != Some(*header) {
+            wrong.push(format!(
+                "{header:#x}: the walk reads a header there and `!pool` reads one at \
+                 {engine_header:#x?}\n  {line}"
+            ));
+            continue;
+        }
+        // `!pool`'s size counts the header; the walk's does not.
+        if engine_size.map(|engine| engine.saturating_sub(0x10)) != Some(*size) {
+            wrong.push(format!(
+                "{header:#x}: `!pool` says size {engine_size:#x?} with the header, the walk \
+                 {size:#x} usable\n  {line}"
+            ));
+        }
+        // Compared only where the walk rendered four printable bytes; `display_tag` keeps a
+        // trailing space that `!pool` does not.
+        if !tag.contains('.') && engine_tag != tag.trim() {
+            wrong.push(format!(
+                "{header:#x}: `!pool` says `{engine_tag}`, the walk `{tag}`\n  {line}"
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} page-start VS header(s) the walk reports are not what `!pool` reads there: {wrong:#?}",
+        wrong.len()
+    );
+    println!(
+        "{} page-start VS header(s) agreed with `!pool`; {small_vs} small VS chunk(s) checked, \
+         none ending a page",
+        page_start.len()
+    );
+}
+
 /// The engine's reading of the allocations that carry **no** `_POOL_HEADER`, put back to the walk.
 ///
 /// `ExAllocatePoolWithTag` sends anything that will not fit inside a page to `ExpAllocateBigPool`,
@@ -17631,6 +17791,7 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
             .collect();
         if !census_tags.is_empty() {
             compare_pool_decoding_against_the_engine(&mut server, &session, &census_tags);
+            compare_vs_page_end_placement(&mut server, &session, &census_tags);
         }
     }));
 

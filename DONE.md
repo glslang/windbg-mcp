@@ -195,6 +195,7 @@ reads — so the entry records the split as it was measured.
 - [Item 105](#105-windbg-mcp-opendump-is-documented-as-replacing-the-target-and-the-one-measurement-of-it-says-it-adds-one--done-2026-10-13) — [windbg-mcp] `.opendump` is documented as replacing the target, and the one measurement of it says it adds one — done (2026-10-13)
 - [Item 58](#58-dbgscope--windbg-mcp-geteffectiveprocessortype-is-the-question-and-is-not-bound--done-2026-10-14) — [dbgscope + windbg-mcp] `GetEffectiveProcessorType` is the question, and is not bound — done (2026-10-14)
 - [Item 126](#126-dbgscope--windbg-mcp-a-command-that-fails-is-reported-by-its-hresult-alone--done-2026-10-14-dbgscope198) — [dbgscope + windbg-mcp] A command that fails is reported by its HRESULT alone — done (2026-10-14, dbgscope#198)
+- [Item 101](#101-dbgscope-the-vs-chunk-chain-drifts-0x10-and-not-from-where-it-starts--done-2026-10-14-dbgscope199) — [dbgscope] The VS chunk chain drifts 0x10, and not from where it starts — done (2026-10-14, dbgscope#199)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -11371,3 +11372,145 @@ because two descriptions got shorter while being corrected.
 - **The reach of the measurements.** Two engine builds on one ARM64 host, plus the inbox build
   under dbgscope's test. Dumps and one launched process. A live kernel, a TTD trace and an x64
   host were not asked.
+
+## 101. [dbgscope] The VS chunk chain drifts 0x10, and not from where it starts — **done** (2026-10-14, dbgscope#199)
+
+**Repo:** `dbgscope`, surfaced by `windbg-mcp`'s `pool_*` tools. Closed on
+[dbgscope#199](https://github.com/glslang/dbgscope/pull/199), 2026-10-14; the pin moves to its
+merge.
+
+**The chain never drifted.** Every VS chunk header the walk found was the right chunk at the right
+address with the right size, and the next was found where the sizes put it — the entry said as
+much and then went looking for the chunk that "introduces the 0x10". None does. What moves is
+where the **user block** sits *inside* the chunk, by one unit, for one class of chunk, under a
+flag the walk had never read.
+
+**The rule, read out of `nt` (x64 26100.33438, `ctf-vm`, 2026-10-14).** Under
+`_HEAP_VS_CONTEXT.Config.Flags.PageAlignLargeAllocs`, `nt!RtlpHpVsContextAllocate+0xf6..+0x12a`
+computes the user block as `chunk + 0x10`, then tests whether `chunk + 0x20` is page-aligned and,
+when it is, hands out `chunk + 0x20` with the usable size one unit shorter:
+
+```text
+lea     rdi,[rsi+10h]
+…
+test    byte ptr [rbp+4],1        ; VsContext.Config.Flags.PageAlignLargeAllocs
+je      done
+lea     rax,[rsi+20h]
+test    rax,0FFFh                 ; would the user block be the page's last sixteen bytes?
+jne     done
+lea     rdi,[rsi+20h]             ; then it is the next page start
+add     ebx,0FFFFFFF0h
+```
+
+`RtlpHpVsContextAllocateFinalize+0x3d` does the same for a multi-allocation, and
+`RtlpHpVsContextFree+0xf2` is the mirror — a page-aligned user block's chunk is `block - 0x20`.
+The kernel needs the rule because `ExFreeHeapPool+0xd6` tells a chunk from a page allocation by
+`P & 0xfff`: a `_POOL_HEADER` in a page's last sixteen bytes would hand its caller a page-aligned
+pointer. Both pool heaps on that kernel carry the flag
+(`(*(nt!_EX_POOL_HEAP_MANAGER_STATE*)&nt!ExPoolState).PoolNode[0].Heaps[1]->VsContext.Config`
+and `Heaps[2]`, each `PageAlignLargeAllocs : 0x1`).
+
+**What that looked like through the tool surface, and how it was found — the reusable half.**
+`pool_census` listed a "tag" that is the top half of a paged-pool address: `0x84e7ffff`, 1,275
+paged allocations, 1,953,120 bytes. `pool_find_tag` on it gave every one of them at once, and
+**every `header_address` ended in `ff0`** — the whole diagnosis before a byte was read. Then the
+bytes: `dq 0xffffe78459203fe0` reads `c1914c0d038da756 ffffe78400000056` (the chunk header),
+`ffffe78459207e18 ffffe78459213bc8` (what the walk decoded as a `_POOL_HEADER`: two tree pointers
+left from when the chunk was free, whose top half is the "tag") and `54446d4d03060000` at
+`0xffffe78459204000` — `MmDT`, `BlockSize` 6 — where `!pool` prints
+`*ffffe78459204000 size: 60 previous size: 0 (Allocated) *MmDT`. `pool_chunk` on the real data
+answered a chunk at `0xffffe78459204000` with its header at `…3ff0`, 96 bytes, tag `....`; the
+right answer is a header at `…4000`, 80 bytes, `MmDT`. The chunk is `0x80` bytes: header, the
+skipped unit, the pool header and `0x50` of data.
+
+**What the entry got wrong, each of which cost a direction.** *"For every chunk in certain
+subsegments"*: it is every chunk whose header sits at page offset `0xfe0`, in every subsegment —
+they cluster at page boundaries, which read as clustering by subsegment. *"The walk's chunk
+starts 0x10 early and is 0x10 long"*: the chunk was right; the *span* reported for it (header and
+data) was early and long. *"Find which chunk introduces the 0x10 … a big-pool chunk is the obvious
+candidate … read `RtlpHpVsChunkSplit`/`RtlpHpVsSubsegmentInitialize`"*: the splitter was never
+involved, and a search for a chunk whose `UnsafeSize` covers something unexpected could not have
+ended, since every `UnsafeSize` was right. The 2026-09-24 reading had `0x838bffff` on nonpaged
+pool; this run found none there and 1,275 on paged — the top half of whichever pool's addresses
+the stale pointers hold, so the "tag" is per heap and per boot and its absence under one value
+says nothing.
+
+**What landed (dbgscope#199).** `_HEAP_VS_CONTEXT.Config` is an optional field; discovery reads
+bit 0 once per heap into `PoolRegion::vs_skips_page_end`, and `walk_vs` moves the user block by
+one unit where the flag is set and `chunk + 0x20` is page-aligned — the chain untouched. A PDB
+without the field reads unset with a diagnostic; a target without the flag is walked as before,
+which is what the control test holds. `adjust_page_end_header`, which moved a candidate *back*
+to the previous page's end and could never fire on a sixteen-byte-aligned one, is gone, with its
+sentence about where a straddling header is stored. And `tree_nodes` polls the budget before its
+first read: the one extra read per heap moved the sampled deadlines in dbgscope's overshoot test
+onto a five-read stretch between polls it had never landed on. **Every `layout.fingerprint`
+moves**, since one more field is resolved — `bbc9a6daae9ff7a2` → `38566b14fd9f4b50` on
+`ctf-vm`, and the two pinned in dbgscope's back-compat test were re-recorded with the reason.
+Here, the live-kernel tier's `compare_vs_page_end_placement` puts both halves to the engine: no
+small VS chunk may have its header at offset `0xff0`, and `!pool` must read a header at every
+page-aligned one the walk reports, with the walk's tag and sixteen bytes more than its usable
+size. Sampled from the walk, deliberately and against the grain of the two oracles beside it,
+because this defect is one the walk's own answer shows — as a class of header offsets the
+allocator cannot produce. Run both ways against `ctf-vm` the day it was written: on the old pin
+it fails with 255 small VS chunks at `0xff0`, every one under the zero tag (347 s, the guest
+released cleanly); on the new pin it passes, four page-start headers agreeing with `!pool` and
+231 small VS chunks checked with none at `0xff0` (242 s).
+
+**What this did not establish.**
+
+- **A target without the flag.** None measured; the walk's reading of one is the control test's
+  fixture, not a kernel.
+- **29671 (`lab-nt`) was measured the same day, and carries the same rule with a different
+  signature.** Both pool heaps' `Config` read `0x3` — `PageAlignLargeAllocs` is `Pos 0` on that
+  PDB too, and `Config` is at `+4` — and the walk's zero-tagged chunks are the class: the first
+  300 rows of `pool_find_tag 0x00000000` are all small VS chunks of paged pool with their header
+  at offset `0xff0`, one per page from `0xffffa9c3e7202ff0` on. The pointer-half tag matches
+  nothing there (`0xc3a9ffff`, 0): on that guest the skipped unit reads as zeroes rather than as
+  stale tree pointers, so the misplaced headers sat inside the `....` bulk that item 99's
+  big-pool fix had already halved, under a tag nothing would query. What a run of the fixed walk
+  there would show is not measured. ARM64 and x86 are not measured at all.
+- **Where the allocator finds the room.** `RtlpHpVsContextAllocate+0x1a..+0x3c` adds a unit to
+  the request when the flag is set (`and eax,1` / `inc eax` / `add eax,r10d`), which is what a
+  moved block consumes — and the `MmLd` chunk at `0xffffd783ba453270` is `0x1b0` bytes for a
+  `0x1a0` block, with no such unit. Not explained, and not needed: the walk sizes every chunk
+  from its own header.
+
+<details>
+<summary>The entry as filed (2026-09-24)</summary>
+
+Left over from item 99, and now the only thing left in it. On a live 26100.33438 kernel
+(2026-09-24) the walk places a VS chunk's `_POOL_HEADER` **0x10 before** where one really is, for
+every chunk in certain subsegments. Read from the bytes rather than from `!pool`'s heuristic: at
+`0xffff8b836d46f000` sits a genuine `_POOL_HEADER` — `BlockSize` `0x21`, `PoolType` `0x02`, tag
+`MmLd`, matching `!pool`'s `size: 210` exactly — while the walk read the eight bytes 0x10 earlier,
+which are a pointer, and reported the tag `0x838bffff`: the top half of a kernel address.
+
+It is **not a lost chain**: the walk's chunk starts 0x10 early *and* is 0x10 long, so each chunk
+ends where the real one does and the next is found. The size it reports is over by the same 0x10 —
+528 against `!pool`'s 0x210 less its header.
+
+Item 99's fix removed the part of this that was about tags: a chunk too large for
+`_POOL_HEADER.BlockSize` is now named from `nt!PoolBigPageTable` by containment, so its placement
+does not matter. What is left is the chunks *under* that limit, which do carry a header and whose
+header the walk mislocates — 1,047 of them under `0x838bffff` alone, 2.0 MB, on the run that
+measured this.
+
+- **Why deferred:** the obvious cause is ruled out and no other is established. It would be a
+  guess, and item 99's remedy was built specifically so that it did not have to wait for this.
+- **What would close it:** find which chunk introduces the 0x10. **The chunk area's start is not
+  it** — `sizeof(_HEAP_VS_SUBSEGMENT)` is `0x28`, the first chunk header is at `+0x30` where
+  `discover_segment_context` computes it, and a real `MiSe` `_POOL_HEADER` sits at `+0x40`. So the
+  chain begins correctly and drifts later, which points at a chunk whose `UnsafeSize` covers
+  something the walk does not expect — a big-pool chunk is the obvious candidate, since those are
+  the ones with no header and the drift shows up after them. Read
+  `nt!RtlpHpVsChunkSplit`/`RtlpHpVsSubsegmentInitialize` for what a header-less chunk's
+  `UnsafeSize` counts.
+- **Where it picks up:** `walk_vs`'s chain arithmetic in dbgscope's `src/pool/snapshot.rs`, and
+  `decode_vs_chunk` in `src/pool/decode.rs`. **This is not item 100**, which that entry's
+  measurement settled on 2026-09-24: item 100's extents begin on a boundary the walk cannot *read*
+  — the page holding the previous header is paged out — whereas this one mislocates a header in
+  memory that reads fine. The drift here is a uniform 0x10; there, the gap between the chain's
+  expectation and the next readable boundary runs to 0x820 and more, and varies per site. A target
+  that loses the chain where the named page is **not** a pagefile PTE would belong here.
+
+</details>
