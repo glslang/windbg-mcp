@@ -2256,8 +2256,10 @@ tree on 2026-10-15, and the derived form below avoids all four.
 - **What would close it:** two pieces, the first useful without the second.
   1. **Record the inbound contexts on `tool_request`, kept apart by where each came from**: the one
      in `params._meta` (SEP-414) and, on the listener, the one in the `traceparent` header, each
-     with its trace id, parent span id and any `tracestate`, each checked against the W3C format
-     and left out rather than recorded when it does not parse. They are two fields and not one
+     kept as its whole `traceparent` value with any `tracestate` beside it — not as the ids parsed
+     out of it, which would drop the trace flags and with them whether the client sampled the
+     trace — and left out rather than recorded when it does not parse as the W3C format. They are
+     two fields and not one
      because they are not the same thing: the OpenTelemetry MCP conventions (status
      *Development*, read 2026-10-15) treat the MCP and transport contexts as independent — one HTTP
      request can carry several MCP messages, and one message can take several requests — and say
