@@ -89,6 +89,7 @@ reopen it). An unmarked line is simply open.
 - [Item 127](#127-windbg-mcp-the-code-scans-decode-by-the-stops-effective-machine-not-the-images) — [windbg-mcp] The code scans decode by the stop's effective machine, not the image's
 - [Item 128](#128-windbg-mcp-the-ttd-tier-records-whichever-hostname-the-shells-path-resolves) — [windbg-mcp] The TTD tier records whichever hostname the shell's PATH resolves
 - [Item 129](#129-windbg-mcp-the-live-secure-kernel-tier-takes-a-boots-coordinates-from-a-private-prep-the-kd-gate-discovers-for-itself) — [windbg-mcp] The live Secure Kernel tier takes a boot's coordinates from a private prep the KD gate discovers for itself
+- [Item 130](#130-windbg-mcp-a-transcript-cannot-be-joined-to-the-clients-opentelemetry-trace) — [windbg-mcp] A transcript cannot be joined to the client's OpenTelemetry trace
 
 ## 2. [dbgscope] Typed write primitives
 
@@ -2222,6 +2223,73 @@ workaround above is a measurement of the gap, not a fix of it.
   VTL0 block the live test runs only when configured; and, outside the repository, the three preps
   and `run_k4_stop_step.py`'s `discover_dispatcher`/`discover_partition` under `target/private`.
 
+## 130. [windbg-mcp] A transcript cannot be joined to the client's OpenTelemetry trace
+
+**What happens.** Claude Code exports OpenTelemetry traces with a span per tool call — a beta, off
+unless `CLAUDE_CODE_ENABLE_TELEMETRY=1` and `CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1` are both set —
+and its monitoring page says *"Outbound HTTP MCP requests carry `traceparent`"* (read 2026-10-15).
+So under `--listen` a `tools/call` can arrive carrying the W3C context of the client's span for
+that call, and this server drops it: nothing reads the header, `Event::ToolRequest` has no field
+for it, and a transcript record can be matched to the client's trace only by lining up wall
+clocks. MCP has a convention for the same context in the request body — SEP-414, Final:
+`params._meta.traceparent`, `tracestate` and `baggage`, deliberately unprefixed — and nothing here
+reads that either. The two halves do not overlap. The client's span times the call from outside
+and knows the prompt and model turn behind it; only this server knows which session the call was
+routed to, the worker round trip, and the stops, mutations, batch rollbacks, timeouts and worker
+deaths the transcript records.
+
+**What is not proposed: a live OTLP exporter in the server.** Four reasons, each read against the
+tree on 2026-10-15, and the derived form below avoids all four.
+
+- **There is nothing span-shaped to export.** `src/` and `tests/` contain no `span!`, no
+  `#[instrument]` and no `.instrument(`, so a `tracing-opentelemetry` layer in `init_logging`
+  (`src/main.rs`) would ship log events with no trace structure; real spans mean instrumenting the
+  supervisor by hand.
+- **It would lose the transcript's crash property.** A batching exporter flushes at shutdown,
+  while `Recorder::write` is one `write_all` per record so that an abrupt exit leaves whole records
+  behind — and a worker death or a lost supervisor are the exits worth reading afterwards.
+- **A collector endpoint is egress of debugger output**, which `docs/transcripts.md` says to treat
+  like a crash dump. `kdconn::scrub` masks secrets, not memory, so an exporter would need a content
+  policy of its own.
+- **The OTel crates and an OTLP transport would join both builds**, the i686 worker's included.
+
+- **What would close it:** two pieces, the first useful without the second.
+  1. **Record the inbound context on `tool_request`**: one optional field holding the trace id, the
+     parent span id and any `tracestate`, read from `params._meta` (SEP-414) and, on the listener,
+     from the `traceparent` header — checked against the W3C format and left out rather than
+     recorded when it does not parse. No new dependency and nothing sent anywhere; a transcript
+     record and the client's span then share a trace id that `jq` can join on.
+  2. **`windbg-mcp --render-otlp <transcript.jsonl>`**, a role beside `--render-cast` and derived
+     the same way (`src/cast.rs`, *Derived, not written twice*): a session is a span from
+     `session_open` to `session_end`, each tool call a child timed from `mono_ms`, the derived
+     records (`stop`, `mutation`, `batch`, `call_timeout`, `worker_lost`) are span events, and a
+     call with a recorded context is parented under it. The output is an OTLP/JSON file. Metadata
+     only by default — tool, session kind, elapsed, verdict, category — with `args`, `text` and
+     `data` behind an explicit flag, since the file exists to be sent somewhere.
+
+  It closes on one Claude Code session driven over `--listen` with its traces on, whose rendered
+  file shows this server's spans under the client's span for the same call.
+- **Why deferred:** the payoff is narrow, and nothing has asked for it — this was filed from
+  reading Claude Code's OpenTelemetry docs, not from an investigation that needed the join. Claude
+  Code sends the header only with the traces beta on, and by default only when
+  `ANTHROPIC_BASE_URL` is unset or points at the Anthropic API (`CLAUDE_CODE_PROPAGATE_TRACEPARENT=1`
+  overrides that). Its docs cover HTTP MCP requests only: they do not mention `_meta`, and of stdio
+  servers they say only that `OTEL_*` variables are not passed to them — so a stdio registration
+  gains nothing from Claude Code as documented, and piece 1 there waits on a client that implements
+  SEP-414. Without the join, piece 2 is a timeline for what `--render-cast` and a `jq` over the
+  JSONL already show.
+- **Where it picks up:** **measure the premise first** — one `tools/call` from Claude Code with
+  its traces on, through the listener, with the request's headers and `_meta` logged. The docs say
+  the header is sent; nothing in this repository has seen one arrive. Then `call_tool` in
+  `src/server.rs`, at its `self.rec.tool_request(tcc.name(), args.as_ref())`:
+  `tcc.request_context` carries `meta`, and on the listener the HTTP request's `Parts`, which rmcp
+  3.5.1 inserts into the request's `extensions` on both its stateless and session paths
+  (`streamable_http_server/tower.rs`). Reading it there and not in `listen::gate` is for the reason
+  `.claude/rules/listener-clients.md` gives about rmcp's spawned session task. The field goes on
+  `Recorder::tool_request` and `Event::ToolRequest` in `src/record.rs`; the renderer beside
+  `src/cast.rs`, selected in `src/main.rs` the way `cast::RENDER_FLAG` is; and both into
+  `docs/transcripts.md`.
+
 ## Where these items came from
 
 Each cluster above, and what filing it measured. Items named here as *"now in `DONE.md`"* have
@@ -2396,5 +2464,8 @@ through private preps whose boot-specific values, policy shape and thread-hijack
 cost a workaround that day (129). The same run found the capture tier red since the 9 October
 hardening narrowed its server's surface, fixed on
 [#494](https://github.com/glslang/windbg-mcp/pull/494).
+Item 130 came from asking, on 2026-10-15, whether this server should export OpenTelemetry now that
+Claude Code does: the answer was a field and a renderer rather than an exporter, and the item
+records why, together with what Claude Code's documentation does and does not promise to send.
 `DECISIONS.md`'s 2026-08-02 entries are the bounded-command coverage review that produced
 item 13, now in [`DONE.md`](./DONE.md).
