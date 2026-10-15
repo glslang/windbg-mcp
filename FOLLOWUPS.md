@@ -2254,21 +2254,33 @@ tree on 2026-10-15, and the derived form below avoids all four.
 - **The OTel crates and an OTLP transport would join both builds**, the i686 worker's included.
 
 - **What would close it:** two pieces, the first useful without the second.
-  1. **Record the inbound context on `tool_request`**: one optional field holding the trace id, the
-     parent span id and any `tracestate`, read from `params._meta` (SEP-414) and, on the listener,
-     from the `traceparent` header — checked against the W3C format and left out rather than
-     recorded when it does not parse. No new dependency and nothing sent anywhere; a transcript
-     record and the client's span then share a trace id that `jq` can join on.
+  1. **Record the inbound contexts on `tool_request`, kept apart by where each came from**: the one
+     in `params._meta` (SEP-414) and, on the listener, the one in the `traceparent` header, each
+     with its trace id, parent span id and any `tracestate`, each checked against the W3C format
+     and left out rather than recorded when it does not parse. They are two fields and not one
+     because they are not the same thing: the OpenTelemetry MCP conventions (status
+     *Development*, read 2026-10-15) treat the MCP and transport contexts as independent — one HTTP
+     request can carry several MCP messages, and one message can take several requests — and say
+     a server *"SHOULD, by default, use context extracted from MCP `params._meta` as a parent for
+     MCP server span and SHOULD link current ambient context"*. No new dependency and nothing sent
+     anywhere; a transcript record then carries the client's trace id, which `jq` can join on.
   2. **`windbg-mcp --render-otlp <transcript.jsonl>`**, a role beside `--render-cast` and derived
-     the same way (`src/cast.rs`, *Derived, not written twice*): a session is a span from
-     `session_open` to `session_end`, each tool call a child timed from `mono_ms`, the derived
-     records (`stop`, `mutation`, `batch`, `call_timeout`, `worker_lost`) are span events, and a
-     call with a recorded context is parented under it. The output is an OTLP/JSON file. Metadata
+     the same way (`src/cast.rs`, *Derived, not written twice*). A session is a span from
+     `session_open` to `session_end`. Each tool call is a span timed from `mono_ms`, with **one**
+     parent: the `_meta` context where the call carried one, which puts it in the client's trace,
+     and its session's span where it did not. A session outlives a prompt, so its calls can belong
+     to several client traces, and no single span can parent them all. Every call therefore names
+     its session as an attribute; a call parented in the client's trace also links to its
+     session's span; and any call that recorded a header context links to that one, as the
+     conventions' link to the transport. The derived records (`stop`, `mutation`, `batch`,
+     `call_timeout`, `worker_lost`) are span events. The output is an OTLP/JSON file. Metadata
      only by default — tool, session kind, elapsed, verdict, category — with `args`, `text` and
      `data` behind an explicit flag, since the file exists to be sent somewhere.
 
   It closes on one Claude Code session driven over `--listen` with its traces on, whose rendered
-  file shows this server's spans under the client's span for the same call.
+  file reaches the client's span for the same call. **As Claude Code documents itself that is a
+  link and not a parent**: it sends the header and says nothing of `_meta`, so by the conventions
+  its context is the transport's, and a call carrying only that one stays under its session.
 - **Why deferred:** the payoff is narrow, and nothing has asked for it — this was filed from
   reading Claude Code's OpenTelemetry docs, not from an investigation that needed the join. Claude
   Code sends the header only with the traces beta on, and by default only when
@@ -2285,7 +2297,7 @@ tree on 2026-10-15, and the derived form below avoids all four.
   `tcc.request_context` carries `meta`, and on the listener the HTTP request's `Parts`, which rmcp
   3.5.1 inserts into the request's `extensions` on both its stateless and session paths
   (`streamable_http_server/tower.rs`). Reading it there and not in `listen::gate` is for the reason
-  `.claude/rules/listener-clients.md` gives about rmcp's spawned session task. The field goes on
+  `.claude/rules/listener-clients.md` gives about rmcp's spawned session task. The fields go on
   `Recorder::tool_request` and `Event::ToolRequest` in `src/record.rs`; the renderer beside
   `src/cast.rs`, selected in `src/main.rs` the way `cast::RENDER_FLAG` is; and both into
   `docs/transcripts.md`.
@@ -2465,7 +2477,8 @@ cost a workaround that day (129). The same run found the capture tier red since 
 hardening narrowed its server's surface, fixed on
 [#494](https://github.com/glslang/windbg-mcp/pull/494).
 Item 130 came from asking, on 2026-10-15, whether this server should export OpenTelemetry now that
-Claude Code does: the answer was a field and a renderer rather than an exporter, and the item
-records why, together with what Claude Code's documentation does and does not promise to send.
+Claude Code does: the answer was the inbound context recorded and a renderer rather than an
+exporter, and the item records why, together with what Claude Code's documentation does and does
+not promise to send.
 `DECISIONS.md`'s 2026-08-02 entries are the bounded-command coverage review that produced
 item 13, now in [`DONE.md`](./DONE.md).
