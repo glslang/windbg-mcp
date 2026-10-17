@@ -221,6 +221,11 @@ where the run broke rather than a score per step. Four things bite.
   against its own pins with no server. Run it after editing a fact.
 - **A fact is searched for from its own step onward.** `0x9F_3_ACPI_IMAGE_pci.sys` at step 1
   contains `acpi`, step 7's answer.
+- **A fact is credited by its value, not by the claim around it.** On the first `v2` run, qwen
+  called Arg3 the IRP at step 2 and listed Arg4's address beside it as "the related device object".
+  The step was credited, and the break was reported at step 3. Its two `late` facts were the same
+  thing: `nvlddmkm` named as the largest image, and ACPI quoted inside that failure bucket. So read
+  the answers before believing the `broke at` column or a `late`.
 - **The conversation id, not the task, is the unit.** Two attempts deduplicated by task splice into
   a transcript no model had. The runner mints the id and writes it into its kill notes, which is
   why `claude_code_drive.py`, with no transcript to carry, is refused for a scenario plan.

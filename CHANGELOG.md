@@ -24,9 +24,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     turn as many.
 
   `tools/eval_scenario.json` is the first scenario: the walkthrough's `0x9F`, from the bug check to
-  the driver holding the IRP, in seven steps. `--verify-key tools/eval_scenario.json` re-reads its
-  facts, and held on all seven on 2026-10-17. `tools/eval_plan_scenario.json` is the plan for the
-  first run, which has not been made.
+  the driver holding the IRP, then two steps that each need the whole module table, nine in all.
+  `--verify-key tools/eval_scenario.json` re-reads its facts, and held on all nine on 2026-10-17.
+
+  **What it measured** (`tools/eval_plan_scenario.json`: qwen and gemma at 262,144 and 32,768, one
+  draw each). A growing transcript ended no investigation at any length. qwen held all nine facts at
+  a served 32,768 with its prompt at 79,352 tokens, 2.4 times the window, and the longest prompt was
+  122,107 tokens. The two models that broke broke by misreading, not on length. gemma, at both
+  windows, took a 32-row `modules` page for the whole table, past a line saying how to get the rest.
+  qwen at 262,144 took the wrong bug-check parameter for the IRP at step 2. The grader reports that
+  break a step late, because the answer printed the right address in another role.
+  `docs/local-model-eval.md` has the table and what each figure does and does not support.
 
 ### Changed
 

@@ -1,6 +1,6 @@
 {
-  "suite": "scenario-power-hang-v1",
-  "note": "One continuing investigation rather than six separate questions (`FOLLOWUPS.md` item 39): a `0x9F DRIVER_POWER_STATE_FAILURE` walked from the bug check to the driver holding the IRP, the walk `docs/crash-dump-walkthrough.md` sections 2 and 4 do by hand. Every step after the first depends on the one before it - the IRP comes from the bug check's fourth parameter, the operation and the device from that IRP's current stack location, the driver from that device - so a wrong turn at step 2 leaves steps 3 to 7 with nothing to read, and per-task grading would score that as six failures. `--scenario` grades it as a run instead: the facts below in order, the step at which each was first stated (searched from the step that asks for it onward, never before - an earlier answer can carry a fact by accident, and `0x9F_3_ACPI_IMAGE_pci.sys` is a failure bucket containing `acpi`), and the first fact never stated, which is where the run stopped being recoverable. Run it with `WINDBG_MCP_SCENARIO` set, which the runner does for any suite carrying `facts`. Two traps are deliberate. `!analyze` blames `pci` on a host with `triage\\triage.ini` beside the engine (bucket `0x9F_3_ACPI_IMAGE_pci.sys`, read 2026-10-17) - the bus driver, not the one holding the IRP - so a model that takes its word at step 5 goes wrong, and step 6 then asks where the wrong driver is loaded. And the IRP has two power stack locations, `IRP_MN_WAIT_WAKE` on the PDO and `IRP_MN_SET_POWER` at the current one, so reading the wrong location answers step 3 with the wrong minor function. Every fact was read through this server's own read-only tools on 2026-10-17 and each carries a `verify` binding, so `--verify-key` re-takes this key as it does the suite's. `possible_on` is a prediction and too pessimistic in one direction (`.claude/skills/eval-bench/SKILL.md`): steps 3 to 7 are marked `full` because `irp_stack` and `device_object` are in the `ioctl` group, but a `lean` client is served `read_memory` and could in principle walk `_IRP` and `_DEVICE_OBJECT` by hand.",
+  "suite": "scenario-power-hang-v2",
+  "note": "One continuing investigation rather than six separate questions (`FOLLOWUPS.md` item 39): a `0x9F DRIVER_POWER_STATE_FAILURE` walked from the bug check to the driver holding the IRP, the walk `docs/crash-dump-walkthrough.md` sections 2 and 4 do by hand. Every step after the first depends on the one before it - the IRP comes from the bug check's fourth parameter, the operation and the device from that IRP's current stack location, the driver from that device - so a wrong turn at step 2 leaves steps 3 to 8 with nothing to read, and per-task grading would score that as six failures. `--scenario` grades it as a run instead: the facts below in order, the step at which each was first stated (searched from the step that asks for it onward, never before - an earlier answer can carry a fact by accident, and `0x9F_3_ACPI_IMAGE_pci.sys` is a failure bucket containing `acpi`), and the first fact never stated, which is where the run stopped being recoverable. Run it with `WINDBG_MCP_SCENARIO` set, which the runner does for any suite carrying `facts`. Steps 8 and 9 are what make it an investigation the *transcript* can fill: each needs the whole module table, which `modules` answers 32 rows at a time by default, so a model that gets there has asked for all 227 rows and the driver has handed it the whole result - text and structured content together - on top of everything before it. `v1` was the first seven steps, whose results are all small: run once on 2026-10-17, every cell held every fact with the transcript never more than 31,130 tokens, which measured the surface rather than the investigation. Two traps are deliberate. `!analyze` blames `pci` on a host with `triage\\triage.ini` beside the engine (bucket `0x9F_3_ACPI_IMAGE_pci.sys`, read 2026-10-17) - the bus driver, not the one holding the IRP - so a model that takes its word at step 5 goes wrong, and step 6 then asks where the wrong driver is loaded. And the IRP has two power stack locations, `IRP_MN_WAIT_WAKE` on the PDO and `IRP_MN_SET_POWER` at the current one, so reading the wrong location answers step 3 with the wrong minor function. Every fact was read through this server's own read-only tools on 2026-10-17 and each carries a `verify` binding, so `--verify-key` re-takes this key as it does the suite's. `possible_on` is a prediction and too pessimistic in one direction (`.claude/skills/eval-bench/SKILL.md`): steps 3 to 8 are marked `full` because `irp_stack` and `device_object` are in the `ioctl` group and step 8 starts from the driver they find, but a `lean` client is served `read_memory` and could in principle walk `_IRP` and `_DEVICE_OBJECT` by hand.",
   "tasks": [
     {
       "id": "s1_bug_check",
@@ -43,6 +43,18 @@
       "possible_on": ["full"],
       "prompt": "In the device stack that device object belongs to, which driver's device object sits directly below it?",
       "useful_tools": ["device_object"]
+    },
+    {
+      "id": "s8_next_above",
+      "possible_on": ["full"],
+      "prompt": "Go back to the driver that owns the device holding the IRP. Which module is loaded at the next address above it - the image that starts right after that driver's ends?",
+      "useful_tools": ["modules"]
+    },
+    {
+      "id": "s9_second_largest",
+      "possible_on": ["full", "lean"],
+      "prompt": "Of every module loaded in this dump, which one has the second largest image?",
+      "useful_tools": ["modules"]
     }
   ],
   "facts": [
@@ -181,6 +193,56 @@
           "needs": "kernel_symbols",
           "pin": [
             {"read": "@text", "has": "AttachedTo (Lower) ffffe284fe535df0 \\Driver\\ACPI"}
+          ],
+          "grounds": [0]
+        }
+      ]
+    },
+    {
+      "id": "next_above",
+      "step": "s8_next_above",
+      "note": "The table `modules` answers is sorted by start address (all 227 rows, checked 2026-10-17), so the pins at indices 151 and 152 are the relation itself: `nvlddmkm` ends at 0xfffff80338eab000 and the next image to start is `fastfat`, at 0xfffff80338eb0000.",
+      "expect": [["fastfat"]],
+      "verify": [
+        {
+          "tool": "open_dump",
+          "args": {"path": "C:\\workspace\\windbg-mcp\\docs\\samples\\052126-34312-01.dmp"},
+          "session": "open"
+        },
+        {
+          "tool": "modules",
+          "args": {"session_id": "$session", "limit": 2000},
+          "pin": [
+            {"read": "matched", "is": 227},
+            {"read": "modules.151.name", "is": "nvlddmkm"},
+            {"read": "modules.151.end", "is": "0xfffff80338eab000"},
+            {"read": "modules.152.name", "is": "fastfat"},
+            {"read": "modules.152.start", "is": "0xfffff80338eb0000"}
+          ],
+          "grounds": [0]
+        }
+      ]
+    },
+    {
+      "id": "second_largest",
+      "step": "s9_second_largest",
+      "note": "Ranked from all 227 rows on 2026-10-17: `nvlddmkm` 112,766,976 B, `igdkmd64` 44,216,320, `nt` 21,299,200, no tie at second. The pins hold the three sizes; that no other row falls between the first two is the ranking, which a pin cannot state and the 2026-10-17 read did.",
+      "expect": [["igdkmd64"]],
+      "verify": [
+        {
+          "tool": "open_dump",
+          "args": {"path": "C:\\workspace\\windbg-mcp\\docs\\samples\\052126-34312-01.dmp"},
+          "session": "open"
+        },
+        {
+          "tool": "modules",
+          "args": {"session_id": "$session", "limit": 2000},
+          "pin": [
+            {"read": "matched", "is": 227},
+            {"read": "modules.name=nvlddmkm.size", "is": 112766976},
+            {"read": "modules.name=igdkmd64.name", "is": "igdkmd64"},
+            {"read": "modules.name=igdkmd64.size", "is": 44216320},
+            {"read": "modules.name=nt.size", "is": 21299200}
           ],
           "grounds": [0]
         }

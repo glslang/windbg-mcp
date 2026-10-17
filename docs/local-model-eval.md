@@ -1376,7 +1376,7 @@ stopped being recoverable (`FOLLOWUPS.md` item 39).
 **The key is an ordered list of facts, each asked by one step.**
 [`tools/eval_scenario.json`](../tools/eval_scenario.json) walks the `0x9F` from
 [`crash-dump-walkthrough.md`](crash-dump-walkthrough.md) §2 and §4, from the bug check to the
-driver holding the IRP, in seven steps:
+driver holding the IRP, in nine steps:
 
 1. The bug check.
 2. The blocked IRP, which is its fourth parameter.
@@ -1385,8 +1385,11 @@ driver holding the IRP, in seven steps:
 5. The driver that owns that device.
 6. Where that driver is loaded.
 7. The driver whose device sits beneath it.
+8. The module loaded at the next address above the owning driver.
+9. The module with the second-largest image.
 
-Each step reads something only the previous one found. Two traps are deliberate:
+Steps 2 to 8 each read something only an earlier step found. Steps 8 and 9 each need the whole
+module table, which is what puts a large result in the transcript. Two traps are deliberate:
 
 - **`!analyze` names the wrong layer.** On a host with `triage\triage.ini` beside the engine it
   blames `pci`, the bus driver, so a model that takes its word at step 5 goes wrong, and step 6
@@ -1394,7 +1397,9 @@ Each step reads something only the previous one found. Two traps are deliberate:
 - **The IRP has two power stack locations.** Reading the one that is not current answers step 3
   with `IRP_MN_WAIT_WAKE` instead of `IRP_MN_SET_POWER`.
 
-Steps 3 to 7 are possible on `full` only: `irp_stack` and `device_object` are in the `ioctl` group.
+Steps 3 to 8 are possible on `full` only: `irp_stack` and `device_object` are in the `ioctl` group,
+and step 8 starts from the driver they find. Step 9 is possible on `lean` too, since `modules` is in
+`inspect`.
 
 **A run is graded by when each fact was first stated, not by whether each step was right.**
 `--scenario` reports four things per fact: the step that stated it, the turn index counted across
@@ -1431,7 +1436,7 @@ tools/eval_scenario.json` checks each one with the run's knowledge at that point
 send what the prompts so far named *or* what an earlier fact established: step 5's binding asks
 `device_object` about the address step 4 found, which no prompt names. Measured 2026-10-17 against
 `windbg-mcp 0.22.0+gbfd1f388`: all seven facts held, each grounded by value with the symbol gate
-open. A copy with step 5's fact changed to `pci` failed twice. The fact itself failed, and so did
+open, and all nine once steps 8 and 9 were added. A copy with step 5's fact changed to `pci` failed twice. The fact itself failed, and so did
 step 6's, because that binding sends `nvlddmkm`, which the run would no longer have established.
 That second failure is the chain property this mode is built on, showing up in the key's own check.
 
@@ -1443,17 +1448,82 @@ underscored spelling of the name, from a model or from the server, therefore arr
 `driver_power_statefailure`, and the natural alternative would have marked every correct answer
 wrong. The key spells it the way the grader reads it, and says why beside it.
 
-**No run is recorded yet.** [`tools/eval_plan_scenario.json`](../tools/eval_plan_scenario.json) is
-the plan for the first: two models on `full`, at 262,144 and at 32,768. The runner refuses two
-kinds of group for a scenario. A `claude-code` group is refused because that driver starts a
-conversation per task. A `subset` is refused because it would drop links from the chain.
+[`tools/eval_plan_scenario.json`](../tools/eval_plan_scenario.json) is the plan: two models on
+`full`, at 262,144 and at 32,768. The runner refuses two kinds of group for a scenario. A
+`claude-code` group is refused because that driver starts a conversation per task. A `subset` is
+refused because it would drop links from the chain.
+
+### The first runs (2026-10-17)
+
+Two runs, both against `windbg-mcp 0.22.0+gbfd1f388` on the ARM64 bench, through the bench
+listener's `full` client. That client is served 66 tools, 106,049 B of minified JSON. The models
+ran on ollama 0.40.6 with reasoning off: `qwen3.8:27b-mlx` (`5642e97495e1`) and `gemma4:31b-mlx`
+(`a22a363052da`). Each cell is one draw.
+
+**The first run was seven steps, and it measured the surface.** Every result in steps 1 to 7 is
+small, so the transcript grew by only 3.8k to 5.4k tokens over the whole investigation, against a
+surface of 22.7k (gemma) to 26.6k (qwen) tokens. All four cells held all seven facts, and none of
+the model-visible traps caught anyone. Every model followed the IRP past `!analyze`'s `pci`. The
+peak was 31,130 tokens. So the case this section was written for, a transcript filling the window,
+had still not been run.
+
+**So steps 8 and 9 each need the whole module table**, which `modules` answers 32 rows at a time
+by default. A model that asks for all of it gets about 65,000 to 80,000 characters back. That is
+text and structured content together, as the driver hands it on, and it lands on top of everything
+before it. The second run:
+
+| cell | window served | held | stated | broke at | cause | peak prompt | turns | wall |
+|---|---|---|---|---|---|---|---|---|
+| qwen | 32,768 | 9/9 | 9 | - | - | 79,352 | 17 | 637 s |
+| gemma | 32,768 | 7/9 | 8 | `next_above` (8) | `answer` | 69,369 | 17 | 650 s |
+| gemma | 262,144 | 7/9 | 8 | `next_above` (8) | `answer` | 70,841 | 18 | 667 s |
+| qwen | 262,144 | 2/9 | 5 | `stuck_operation` (3) | `gave up` | 122,107 | 36 | 1,281 s |
+
+**The transcript ended nothing.** No conversation in either run broke with `error`, at any length.
+qwen at a served 32,768 held all nine facts with its last prompt at 79,352 tokens, 2.4 times the
+window. Its step-8 answer is the evidence that this was not a truncation to the window. It needed
+the step's own question and the driver named at step 5, and both sat about 49,000 tokens before the
+end of that prompt. The 2026-08-23 grid found the same of an 8,192 window and a large surface.
+This is the same thing for a growing transcript, on a newer runtime.
+
+**Every break was about reading, not about length.**
+
+- **gemma broke the same way at both windows.** At step 8 it called `modules` without a limit and
+  read the 32-row page as the whole table: "there are no images that start immediately after this
+  address". The page's own last line says *"Showing the first 32 loaded and 32 unloaded row(s) —
+  `limit: 277` returns all of them"*. At step 9 it asked for all 227 rows and answered right.
+- **qwen at 262,144 went wrong at step 2, and the grade says step 3.** It named Arg3, the triage
+  block, as the IRP, and listed Arg4's value beside it as "the related device object". Containment
+  found the right address in that answer and credited the step. Every later step then followed the
+  wrong IRP, and the run ended at `pci`, the driver `!analyze` blames. Its two `late` facts are the
+  same limit, and neither is a recovery. `nvlddmkm` reappears at step 9 as the largest image, and
+  ACPI arrives at step 8 inside the failure bucket `0x9F_3_ACPI_IMAGE_pci.sys`, quoted as the reason
+  for blaming `pci`. That is the accidental carry the from-the-asking-step rule exists for, landing
+  after the step that asked rather than before it.
+
+**`present()` grades a value, not a claim**, and a scenario makes that bite harder than a single
+question does: the step after a wrong turn reads the wrong value, so the grade lands one step late.
+Read the answers before the `broke at` column, and before believing a `late`. The `v1` answers read
+clean: right, and not hedged.
+
+**One draw per cell, so none of this is a rate.** qwen at 262,144 held all seven facts in the first
+run and broke at step 2 in the second, on identical prompts for those steps. That makes its break a
+draw, not a property of the window, and "qwen does worse at 262,144" is the reading this table
+invites and does not support. What it does support is narrower: on this runtime, a growing
+transcript did not end an investigation at any length these four cells reached. The same goes for
+qwen holding all nine facts with a prompt 2.4 times the window it was served. One small thing
+beside that: qwen's step-9 answer at 32,768 named the right module but gave its size as
+44,241,061 bytes, read back from the table step 8 had fetched rather than asked for again. The
+table says 44,216,320.
 
 ## What this does not cover
 
-The same list `local-model.md` carries, minus what this closed. Still open: a long investigation
-where the transcript outgrows the surface (`--scenario` grades one, and no run of it is recorded
-yet), anything behind the read-only allow-list, a box smaller than this one, and any model but
-these.
+The same list `local-model.md` carries, minus what this closed. A long investigation whose
+transcript outgrows the surface has been run now, once per cell, on one scenario and two models,
+with reasoning off. Still open: anything behind the read-only allow-list (`FOLLOWUPS.md` item 131),
+a box smaller than this one, and any model but these. And every wall-clock figure on this page is
+one ARM64 Mac serving MLX builds: the correctness columns should travel, and the timings should not
+be quoted anywhere else.
 
 And one that this page adds: the Claude row is **Claude Code**, not the Claude API. Its token
 columns include a harness this server does not control — its own system prompt, its own
