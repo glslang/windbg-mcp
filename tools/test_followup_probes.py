@@ -55,21 +55,27 @@ LOCATION = {
 
 
 class Client:
+    # What each tool declares. On the remote side that is also all it accepts: windbg-mcp has refused
+    # an argument its schema does not declare since item 107, so a fake that took one would pass a
+    # probe the server turns away - which is how `timeout_ms` on `execute` survived here. The
+    # companion is another server whose schema this repository does not own, so its entries are only
+    # what the probe requires (`similarity_diff` is paged, and the probe sends `offset`/`limit`).
+    FIELDS = {
+        "session_status": ["session_id"],
+        "current_location": ["session_id"],
+        "modules": ["session_id", "filter", "limit"],
+        "registers": ["session_id"],
+        "read_memory": ["session_id", "coordinate", "size"],
+        "execute": ["session_id", "command"],
+        "list_binaries": [],
+        "similarity_diff": ["comparison_id", "result_id"],
+        "navigate": ["binary_id", "coordinate", "expected_generation"],
+    }
+
     def __init__(self, side):
         self.side, self.calls, self.overrides = side, [], {}
 
     async def list_tools(self):
-        fields = {
-            "session_status": ["session_id"],
-            "current_location": ["session_id"],
-            "modules": ["session_id", "filter", "limit"],
-            "registers": ["session_id"],
-            "read_memory": ["session_id", "coordinate", "size"],
-            "execute": ["session_id", "command", "timeout_ms"],
-            "list_binaries": [],
-            "similarity_diff": ["comparison_id", "result_id"],
-            "navigate": ["binary_id", "coordinate", "expected_generation"],
-        }
         return SimpleNamespace(
             tools=[
                 SimpleNamespace(
@@ -77,7 +83,7 @@ class Client:
                     input_schema={"properties": dict.fromkeys(v, {})},
                     output_schema={"type": "object"},
                 )
-                for k, v in fields.items()
+                for k, v in self.FIELDS.items()
             ],
             next_cursor=None,
         )
@@ -95,12 +101,10 @@ class Client:
             "similarity_diff",
             "navigate",
         )
+        if self.side == "remote":
+            assert set(args) <= set(self.FIELDS[name]), f"{name} does not take {sorted(args)}"
         if name == "execute":
-            assert args == {
-                "session_id": "session",
-                "command": "bl",
-                "timeout_ms": 5000,
-            }
+            assert args == {"session_id": "session", "command": "bl"}
         self.calls.append((name, copy.deepcopy(args)))
         count = sum(n == name for n, _ in self.calls)
         if name == "session_status":

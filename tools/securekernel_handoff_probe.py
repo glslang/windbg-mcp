@@ -19,6 +19,13 @@ class Refused(RuntimeError):
     """A failed acceptance condition, with a credential-free reason."""
 
 
+# **The one `execute` this probe may send, defined once.** The gate, the schema check and both
+# breakpoint reads each spelled it out, and item 107 took the invented `timeout_ms` out of one copy
+# of four: the gate then refused the probe's own cleanup read, and the schema check refused the
+# real server, whose `execute` declares no such field and has refused unknown ones since.
+BL = {"command": "bl"}
+
+
 def require(condition, message):
     if not condition:
         raise Refused(message)
@@ -151,12 +158,7 @@ class Calls:
         require(name in allowed[self.side], "probe attempted a forbidden tool")
         if name == "execute":
             require(
-                arguments
-                == {
-                    "session_id": arguments.get("session_id"),
-                    "command": "bl",
-                    "timeout_ms": 5000,
-                },
+                arguments == {"session_id": arguments.get("session_id"), **BL},
                 "only the fixed bl command is permitted",
             )
         response = await self.client.call_tool(name, arguments)
@@ -231,7 +233,7 @@ async def capture(
                 "modules": ["session_id", "filter", "limit"],
                 "registers": ["session_id"],
                 "read_memory": ["session_id", "coordinate", "size"],
-                "execute": ["session_id", "command", "timeout_ms"],
+                "execute": ["session_id", *BL],
             }
         )
         await c.discover(
@@ -251,7 +253,7 @@ async def capture(
             basename(before["coordinate"].get("image_name", "")) == "securekernel.exe",
             "stopped instruction does not establish Secure Kernel context",
         )
-        bl_args = {**args, "command": "bl", "timeout_ms": 5000}
+        bl_args = {**args, **BL}
         breakpoints = breakpoint_snapshot(
             await r.call("execute", bl_args, label="breakpoints_before")
         )
@@ -404,8 +406,7 @@ async def capture(
                 (
                     "breakpoints_after",
                     "execute",
-                    # `execute` takes no `timeout_ms` — the server bounds the command itself.
-                    {"session_id": session_id, "command": "bl"},
+                    {"session_id": session_id, **BL},
                 ),
             ):
                 try:
