@@ -709,7 +709,17 @@ fn expand_target_command(
              must discover CR3 and report it in its hello"
         );
     }
-    if let Some((vmwp_pid, partition_handle)) = memory_handle {
+    let uses_memory_handle = words
+        .iter()
+        .skip(1)
+        .any(|argument| argument.contains("{vmwp_pid}") || argument.contains("{partition_handle}"));
+    if uses_memory_handle {
+        let Some((vmwp_pid, partition_handle)) = memory_handle else {
+            bail!(
+                "only the live-memory command may use {{vmwp_pid}} or {{partition_handle}}, and \
+                 the profile must support worker discovery"
+            );
+        };
         if partition_handle == 0 {
             bail!("worker discovery did not produce a partition handle for the memory provider");
         }
@@ -718,15 +728,6 @@ fn expand_target_command(
                 .replace("{vmwp_pid}", &vmwp_pid.to_string())
                 .replace("{partition_handle}", &format!("0x{partition_handle:x}"));
         }
-    } else if words
-        .iter()
-        .skip(1)
-        .any(|argument| argument.contains("{vmwp_pid}") || argument.contains("{partition_handle}"))
-    {
-        bail!(
-            "only the live-memory command may use {{vmwp_pid}} or {{partition_handle}}, and the \
-             profile must support worker discovery"
-        );
     }
     Ok(crate::skpolicy::render_transport(&words))
 }
@@ -4814,6 +4815,29 @@ mod tests {
         );
         let error = expand_target_command(command, &target, true, None).unwrap_err();
         assert!(error.to_string().contains("only the live-memory command"));
+    }
+
+    #[test]
+    fn discovery_free_memory_command_does_not_require_a_partition_handle() {
+        let target = target();
+        let command = "memory --partition {partition_id} --cr3 {cr3}";
+        assert_eq!(
+            expand_target_command(command, &target, true, Some((4242, 0))).unwrap(),
+            "memory --partition 0x85 --cr3 0x1201000"
+        );
+
+        let error = expand_target_command(
+            "memory --handle {partition_handle}",
+            &target,
+            true,
+            Some((4242, 0)),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("did not produce a partition handle")
+        );
     }
 
     #[test]
