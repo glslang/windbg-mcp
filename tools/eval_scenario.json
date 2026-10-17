@@ -1,0 +1,193 @@
+{
+  "suite": "scenario-power-hang-v1",
+  "note": "One continuing investigation rather than six separate questions (`FOLLOWUPS.md` item 39): a `0x9F DRIVER_POWER_STATE_FAILURE` walked from the bug check to the driver holding the IRP, the walk `docs/crash-dump-walkthrough.md` sections 2 and 4 do by hand. Every step after the first depends on the one before it - the IRP comes from the bug check's fourth parameter, the operation and the device from that IRP's current stack location, the driver from that device - so a wrong turn at step 2 leaves steps 3 to 7 with nothing to read, and per-task grading would score that as six failures. `--scenario` grades it as a run instead: the facts below in order, the step at which each was first stated (searched from the step that asks for it onward, never before - an earlier answer can carry a fact by accident, and `0x9F_3_ACPI_IMAGE_pci.sys` is a failure bucket containing `acpi`), and the first fact never stated, which is where the run stopped being recoverable. Run it with `WINDBG_MCP_SCENARIO` set, which the runner does for any suite carrying `facts`. Two traps are deliberate. `!analyze` blames `pci` on a host with `triage\\triage.ini` beside the engine (bucket `0x9F_3_ACPI_IMAGE_pci.sys`, read 2026-10-17) - the bus driver, not the one holding the IRP - so a model that takes its word at step 5 goes wrong, and step 6 then asks where the wrong driver is loaded. And the IRP has two power stack locations, `IRP_MN_WAIT_WAKE` on the PDO and `IRP_MN_SET_POWER` at the current one, so reading the wrong location answers step 3 with the wrong minor function. Every fact was read through this server's own read-only tools on 2026-10-17 and each carries a `verify` binding, so `--verify-key` re-takes this key as it does the suite's. `possible_on` is a prediction and too pessimistic in one direction (`.claude/skills/eval-bench/SKILL.md`): steps 3 to 7 are marked `full` because `irp_stack` and `device_object` are in the `ioctl` group, but a `lean` client is served `read_memory` and could in principle walk `_IRP` and `_DEVICE_OBJECT` by hand.",
+  "tasks": [
+    {
+      "id": "s1_bug_check",
+      "possible_on": ["full", "lean", "min"],
+      "prompt": "There is a Windows kernel crash dump on the debug host at C:\\workspace\\windbg-mcp\\docs\\samples\\052126-34312-01.dmp. Open it and tell me which bug check the machine stopped on: the code and its name.",
+      "useful_tools": ["open_dump", "crash_triage", "session_status"]
+    },
+    {
+      "id": "s2_blocked_irp",
+      "possible_on": ["full", "lean", "min"],
+      "prompt": "That bug check is about an I/O request packet that was held for too long. What is the address of that IRP?",
+      "useful_tools": ["crash_triage"]
+    },
+    {
+      "id": "s3_stuck_operation",
+      "possible_on": ["full"],
+      "prompt": "Look at that IRP. Which operation is it stuck in - the major and minor function of its current stack location?",
+      "useful_tools": ["irp_stack"]
+    },
+    {
+      "id": "s4_holding_device",
+      "possible_on": ["full"],
+      "prompt": "Which device object is that current stack location addressed to? Give its address.",
+      "useful_tools": ["irp_stack", "device_object"]
+    },
+    {
+      "id": "s5_owner",
+      "possible_on": ["full"],
+      "prompt": "Which driver owns that device object?",
+      "useful_tools": ["device_object", "driver_object"]
+    },
+    {
+      "id": "s6_loaded_at",
+      "possible_on": ["full"],
+      "prompt": "Where is that driver loaded? Give its base address.",
+      "useful_tools": ["modules"]
+    },
+    {
+      "id": "s7_beneath",
+      "possible_on": ["full"],
+      "prompt": "In the device stack that device object belongs to, which driver's device object sits directly below it?",
+      "useful_tools": ["device_object"]
+    }
+  ],
+  "facts": [
+    {
+      "id": "bug_check",
+      "step": "s1_bug_check",
+      "note": "`driver_power_statefailure` is not a typo. An alternative is matched against the answer after `normalise()`, which strips `_`, `'` and a backtick between two hex digits so that an address WinDbg splits in two reads as one - and `E_F` in `STATE_FAILURE` is two hex digits. So every spelling of the name a model or the server writes with underscores arrives here as `driver_power_statefailure`, and the natural `driver_power_state_failure` would have marked every correct answer wrong. Found by `test_the_shipped_scenario_agrees_with_its_own_bindings` before any run.",
+      "expect": [["0x9f", "9f"], ["driver_power_statefailure", "driver power state failure"]],
+      "verify": [
+        {
+          "tool": "open_dump",
+          "args": {"path": "C:\\workspace\\windbg-mcp\\docs\\samples\\052126-34312-01.dmp"},
+          "session": "open",
+          "pin": [
+            {"read": "summary.bug_check.code", "is": "0x9f"},
+            {"read": "summary.bug_check.name", "is": "DRIVER_POWER_STATE_FAILURE"}
+          ],
+          "grounds": [0, 1]
+        }
+      ]
+    },
+    {
+      "id": "blocked_irp",
+      "step": "s2_blocked_irp",
+      "expect": [["0xffffe2850787bc20", "ffffe2850787bc20"]],
+      "verify": [
+        {
+          "tool": "open_dump",
+          "args": {"path": "C:\\workspace\\windbg-mcp\\docs\\samples\\052126-34312-01.dmp"},
+          "session": "open",
+          "pin": [
+            {"read": "summary.bug_check.parameters.0", "is": "0x0000000000000003"},
+            {"read": "summary.bug_check.parameters.3", "is": "0xffffe2850787bc20"}
+          ],
+          "grounds": [0]
+        }
+      ]
+    },
+    {
+      "id": "stuck_operation",
+      "step": "s3_stuck_operation",
+      "expect": [["set_power", "set power"]],
+      "verify": [
+        {
+          "tool": "open_dump",
+          "args": {"path": "C:\\workspace\\windbg-mcp\\docs\\samples\\052126-34312-01.dmp"},
+          "session": "open"
+        },
+        {
+          "tool": "irp_stack",
+          "args": {"session_id": "$session", "irp": "0xffffe2850787bc20"},
+          "needs": "kernel_symbols",
+          "pin": [
+            {"read": "@text", "has": ">[IRP_MJ_POWER(16), IRP_MN_SET_POWER(2)]"}
+          ],
+          "grounds": [0]
+        }
+      ]
+    },
+    {
+      "id": "holding_device",
+      "step": "s4_holding_device",
+      "expect": [["ffffe28503b85030"]],
+      "verify": [
+        {
+          "tool": "open_dump",
+          "args": {"path": "C:\\workspace\\windbg-mcp\\docs\\samples\\052126-34312-01.dmp"},
+          "session": "open"
+        },
+        {
+          "tool": "irp_stack",
+          "args": {"session_id": "$session", "irp": "0xffffe2850787bc20"},
+          "needs": "kernel_symbols",
+          "pin": [
+            {"read": "@text", "has": "ffffe28503b85030"}
+          ],
+          "grounds": [0]
+        }
+      ]
+    },
+    {
+      "id": "owner",
+      "step": "s5_owner",
+      "expect": [["nvlddmkm"]],
+      "verify": [
+        {
+          "tool": "open_dump",
+          "args": {"path": "C:\\workspace\\windbg-mcp\\docs\\samples\\052126-34312-01.dmp"},
+          "session": "open"
+        },
+        {
+          "tool": "device_object",
+          "args": {"session_id": "$session", "device": "ffffe28503b85030"},
+          "needs": "kernel_symbols",
+          "pin": [
+            {"read": "@text", "has": "\\Driver\\nvlddmkm DriverObject"}
+          ],
+          "grounds": [0]
+        }
+      ]
+    },
+    {
+      "id": "owner_base",
+      "step": "s6_loaded_at",
+      "expect": [["0xfffff80332320000", "fffff80332320000"]],
+      "verify": [
+        {
+          "tool": "open_dump",
+          "args": {"path": "C:\\workspace\\windbg-mcp\\docs\\samples\\052126-34312-01.dmp"},
+          "session": "open"
+        },
+        {
+          "tool": "modules",
+          "args": {"session_id": "$session", "filter": "nvlddmkm"},
+          "pin": [
+            {"read": "matched", "is": 1},
+            {"read": "modules.name=nvlddmkm.start", "is": "0xfffff80332320000"}
+          ],
+          "grounds": [0]
+        }
+      ]
+    },
+    {
+      "id": "lower_driver",
+      "step": "s7_beneath",
+      "expect": [["acpi"]],
+      "verify": [
+        {
+          "tool": "open_dump",
+          "args": {"path": "C:\\workspace\\windbg-mcp\\docs\\samples\\052126-34312-01.dmp"},
+          "session": "open"
+        },
+        {
+          "tool": "device_object",
+          "args": {"session_id": "$session", "device": "ffffe28503b85030"},
+          "needs": "kernel_symbols",
+          "pin": [
+            {"read": "@text", "has": "AttachedTo (Lower) ffffe284fe535df0 \\Driver\\ACPI"}
+          ],
+          "grounds": [0]
+        }
+      ]
+    }
+  ],
+  "answer_key": {
+    "052126-34312-01.dmp": "x64, 0x9f DRIVER_POWER_STATE_FAILURE subtype 3; blocked IRP 0xffffe2850787bc20 stuck at IRP_MJ_POWER/IRP_MN_SET_POWER on device 0xffffe28503b85030, owned by \\Driver\\nvlddmkm (loaded at 0xfffff80332320000), attached above \\Driver\\ACPI's 0xffffe284fe535df0, which is above \\Driver\\pci's PDO 0xffffe284ffe59060"
+  }
+}

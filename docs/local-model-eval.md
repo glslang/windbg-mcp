@@ -1362,11 +1362,98 @@ and each fix was the same check bolted to another caller. The check lives in `re
 is the one function every reader passes through; resume is deliberately outside it, since resume
 tells the arms apart by key and appending is how such a log would be repaired.
 
+## One investigation rather than six questions: `--scenario`
+
+Every conversation the six runs above held was short: one question, a call or two, an answer. So
+"the window did not bite" is true **a question at a time**. What the grid never measured is the
+transcript filling the window rather than the surface: the tenth turn of a triage, with three
+large results already in it. `WINDBG_MCP_SCENARIO` has driven that case since the driver was
+written, keeping one transcript and one set of sessions across a task list. Nothing could grade it,
+because the unit was wrong. A wrong turn at step 2 leaves steps 3 to 7 nothing to read, so per-task
+scoring reports six failures for one mistake. What is worth measuring is the step at which the run
+stopped being recoverable (`FOLLOWUPS.md` item 39).
+
+**The key is an ordered list of facts, each asked by one step.**
+[`tools/eval_scenario.json`](../tools/eval_scenario.json) walks the `0x9F` from
+[`crash-dump-walkthrough.md`](crash-dump-walkthrough.md) §2 and §4, from the bug check to the
+driver holding the IRP, in seven steps:
+
+1. The bug check.
+2. The blocked IRP, which is its fourth parameter.
+3. The operation the IRP is stuck in, read from its current stack location.
+4. The device that stack location is addressed to.
+5. The driver that owns that device.
+6. Where that driver is loaded.
+7. The driver whose device sits beneath it.
+
+Each step reads something only the previous one found. Two traps are deliberate:
+
+- **`!analyze` names the wrong layer.** On a host with `triage\triage.ini` beside the engine it
+  blames `pci`, the bus driver, so a model that takes its word at step 5 goes wrong, and step 6
+  then asks where the wrong driver is loaded.
+- **The IRP has two power stack locations.** Reading the one that is not current answers step 3
+  with `IRP_MN_WAIT_WAKE` instead of `IRP_MN_SET_POWER`.
+
+Steps 3 to 7 are possible on `full` only: `irp_stack` and `device_object` are in the `ioctl` group.
+
+**A run is graded by when each fact was first stated, not by whether each step was right.**
+`--scenario` reports four things per fact: the step that stated it, the turn index counted across
+the whole conversation, and that turn's prompt-token count. That count is the length of the
+transcript the model was holding when it said it, and every driver already records it per turn, so
+the growth curve was in the log all along. The first fact never stated is the break, and it carries
+a cause that says which side of the bench it is on:
+
+| cause | meaning |
+|---|---|
+| `not reached` | the cell was killed, or the driver died, before the step ran |
+| `error` | the chat failed; a window too small for the transcript lands here |
+| `surface` | this client is not served the tool the step needs |
+| `gave up` | the step ran out of turns |
+| `answer` | the model answered without the fact, which is the only cause about the model |
+
+Three rules, each closing a way of reading this wrong:
+
+- **A fact is searched for from the step that asks for it onward, never before.** An earlier answer
+  can carry one by accident. Step 1's failure bucket here is `0x9F_3_ACPI_IMAGE_pci.sys`, which
+  contains `acpi`, the answer to step 7. A fact stated later than asked is reported as `late`,
+  which is a recovery.
+- **The conversation is the unit, not the task.** Each record carries the id of the conversation it
+  belongs to, and the runner writes the same id into any note it leaves when it kills one. A cell's
+  **last** conversation is graded. Deduplicating by task, as the per-task readers do, would splice
+  two attempts into a transcript no model had: an attempt killed at step 5 followed by one killed
+  at step 3.
+- **Every per-task reader refuses a scenario log**, from the one gate in `records()` they all pass
+  through. The steps carry no `expect`, and `all()` over no groups marks every answered step
+  correct.
+
+**The key is re-taken like the suite's.** Each fact carries a `verify` binding, and `--verify-key
+tools/eval_scenario.json` checks each one with the run's knowledge at that point. A binding may
+send what the prompts so far named *or* what an earlier fact established: step 5's binding asks
+`device_object` about the address step 4 found, which no prompt names. Measured 2026-10-17 against
+`windbg-mcp 0.22.0+gbfd1f388`: all seven facts held, each grounded by value with the symbol gate
+open. A copy with step 5's fact changed to `pci` failed twice. The fact itself failed, and so did
+step 6's, because that binding sends `nvlddmkm`, which the run would no longer have established.
+That second failure is the chain property this mode is built on, showing up in the key's own check.
+
+**The offline half caught a key defect before any run.**
+`test_the_shipped_scenario_agrees_with_its_own_bindings` grounds each fact against its own pins
+without a server. It refused the bug check's name. `normalise()` strips a `_` between two hex digits
+so that a split address reads as one, and `E_F` in `STATE_FAILURE` is two hex digits. Every
+underscored spelling of the name, from a model or from the server, therefore arrives as
+`driver_power_statefailure`, and the natural alternative would have marked every correct answer
+wrong. The key spells it the way the grader reads it, and says why beside it.
+
+**No run is recorded yet.** [`tools/eval_plan_scenario.json`](../tools/eval_plan_scenario.json) is
+the plan for the first: two models on `full`, at 262,144 and at 32,768. The runner refuses two
+kinds of group for a scenario. A `claude-code` group is refused because that driver starts a
+conversation per task. A `subset` is refused because it would drop links from the chain.
+
 ## What this does not cover
 
 The same list `local-model.md` carries, minus what this closed. Still open: a long investigation
-where the transcript outgrows the surface (scenario mode exists and no cell here uses it), anything
-behind the read-only allow-list, a box smaller than this one, and any model but these.
+where the transcript outgrows the surface (`--scenario` grades one, and no run of it is recorded
+yet), anything behind the read-only allow-list, a box smaller than this one, and any model but
+these.
 
 And one that this page adds: the Claude row is **Claude Code**, not the Claude API. Its token
 columns include a harness this server does not control — its own system prompt, its own

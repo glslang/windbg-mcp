@@ -267,7 +267,10 @@ prompts before it.
 `WINDBG_MCP_SCENARIO=1` says the list is one continuing investigation instead — **one transcript and
 one set of sessions across every task**, so "disassemble the address you just found" means something.
 It is also how you would measure the case the run below does not cover: the prompt-token count
-printed for each task is the transcript growing, and scenario mode is what makes it grow.
+printed for each task is the transcript growing, and scenario mode is what makes it grow. A suite
+carrying `facts` is run this way by `local_model_eval.py` and graded with `--scenario`, which reports
+the step where the run stopped being recoverable rather than a score per task — see
+[One investigation rather than six questions](./local-model-eval.md#one-investigation-rather-than-six-questions---scenario).
 
 **A different arrangement, not a prerequisite:** `ollama launch claude --model <tag>` (ollama 0.32.12
 or newer) makes the local model *the agent* — it drives the harness itself, with these tools as its

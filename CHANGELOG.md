@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The local-model eval can grade an investigation, not only a list of questions**
+  (`FOLLOWUPS.md` item 39). Every conversation the grid ran was one question long, so it had never
+  measured a transcript filling the window. A suite carrying `facts` is now run as one conversation
+  per cell, and `tools/local_model_eval.py --scenario <log>` grades it by when each fact was first
+  stated: the step, the turn index across the conversation, and that turn's prompt tokens. The first
+  fact never stated is the break, with a cause that says whether the model, the surface, the window
+  or a kill is responsible. Three rules keep the reading honest:
+  - A fact is searched for from the step that asks for it onward, because an earlier answer can
+    carry it by accident.
+  - Attempts are kept apart by a conversation id the runner mints and also writes into its kill
+    notes.
+  - Every per-task reader refuses a scenario log, since scoring each step alone reports one wrong
+    turn as many.
+
+  `tools/eval_scenario.json` is the first scenario: the walkthrough's `0x9F`, from the bug check to
+  the driver holding the IRP, in seven steps. `--verify-key tools/eval_scenario.json` re-reads its
+  facts, and held on all seven on 2026-10-17. `tools/eval_plan_scenario.json` is the plan for the
+  first run, which has not been made.
+
 ### Changed
 
 - **A live Secure Kernel memory transport can use the VID handle the worker already discovers.**
