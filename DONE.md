@@ -196,6 +196,7 @@ reads — so the entry records the split as it was measured.
 - [Item 58](#58-dbgscope--windbg-mcp-geteffectiveprocessortype-is-the-question-and-is-not-bound--done-2026-10-14) — [dbgscope + windbg-mcp] `GetEffectiveProcessorType` is the question, and is not bound — done (2026-10-14)
 - [Item 126](#126-dbgscope--windbg-mcp-a-command-that-fails-is-reported-by-its-hresult-alone--done-2026-10-14-dbgscope198) — [dbgscope + windbg-mcp] A command that fails is reported by its HRESULT alone — done (2026-10-14, dbgscope#198)
 - [Item 101](#101-dbgscope-the-vs-chunk-chain-drifts-0x10-and-not-from-where-it-starts--done-2026-10-14-dbgscope199) — [dbgscope] The VS chunk chain drifts 0x10, and not from where it starts — done (2026-10-14, dbgscope#199)
+- [Item 39](#39-windbg-mcp-the-eval-measures-single-questions-not-an-investigation--done-2026-10-17) — [windbg-mcp] The eval measures single questions, not an investigation — done (2026-10-17)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -11522,3 +11523,75 @@ measured this.
   that loses the chain where the named page is **not** a pagefile PTE would belong here.
 
 </details>
+
+## 39. [windbg-mcp] The eval measures single questions, not an investigation — **done** (2026-10-17)
+
+**What it was filed for.** [`docs/local-model-eval.md`](./docs/local-model-eval.md)'s strongest
+finding was a negative one. At a **served** 8,192-token window, a 17,300-token surface was evaluated
+in full and answered correctly, so the window was not the constraint the plan expected. Every
+conversation the grid ran was short, though: one question, a call or two, an answer. The case left
+untested was the *transcript* filling the window rather than the surface, "the tenth turn of a
+kernel triage, three large results deep". `WINDBG_MCP_SCENARIO` could already drive that, with one
+transcript and one set of sessions across a task list. Nothing could grade it, because a wrong turn
+at one step leaves every later step unanswerable, and per-task scoring reports one mistake as many.
+
+**What landed** (`a72b3878`, then the two table steps and the runs):
+
+- **A suite carrying `facts` is a scenario.** `local_model_eval.py` runs it as one conversation per
+  cell. The runner mints a conversation id, passes it to the driver, and writes it into any note it
+  leaves when it kills one.
+- **`--scenario` grades each cell's last conversation.** For each fact it reports the step that
+  stated it (searched from the step that asks onward), the turn index across the conversation, and
+  that turn's prompt tokens. The first fact never stated is the break, with a cause: `not reached`,
+  `error`, `surface`, `gave up` or `answer`.
+- **Every per-task reader refuses a scenario log**, from the one gate in `records()`. The runner
+  refuses a `claude-code` group, which has no transcript to carry, and a `subset`, which drops links
+  from the chain.
+- **`tools/eval_scenario.json` (`scenario-power-hang-v2`) walks the walkthrough's `0x9F` in nine
+  steps**, from the bug check to `nvlddmkm` holding the IRP. Steps 8 and 9 each need the whole
+  module table. Every fact carries a `verify` binding, and `--verify-key` held each binding to the
+  prompts so far plus the earlier facts. All nine held against `0.22.0+gbfd1f388`.
+
+**What the runs showed.** Two runs, eight conversations, `qwen3.8:27b-mlx` and `gemma4:31b-mlx` at
+262,144 and 32,768, one draw each.
+
+- **No conversation broke with `error`**, at any length. The longest prompt was 122,107 tokens.
+- **qwen at a served 32,768 held all nine facts** with its last prompt at 79,352 tokens, 2.4 times
+  the window. Its step-8 answer needed the step's question and the driver named at step 5, both
+  about 49,000 tokens before the end of that prompt, so this was not a truncation to the window.
+- **Both breaks were reading.** gemma, at both windows, took the default 32-row `modules` page for
+  the whole table, past a last line naming `limit: 277`. qwen at 262,144 took Arg3 for the IRP at
+  step 2. That cell held all seven facts in the first run, on identical prompts for those steps, so
+  its break is a draw and not the window.
+
+**What building it disproved, or would have got wrong:**
+
+- **The premise, on this runtime.** The item expected a transcript filling the window to be the
+  interesting failure. On ollama 0.40.6 with MLX builds, a served window is not a cap on the
+  transcript any more than on the surface, and what ended the two runs that broke was reading.
+  That is a statement about this runtime, measured once per cell. A runtime that enforces
+  `num_ctx` would answer differently, and `served_context` is still recorded so a run can say
+  which it had.
+- **A scenario of small results measures the surface.** The first key had seven steps with no large
+  result in them. All four cells held every fact, with the transcript growing by 3.8k to 5.4k tokens
+  on a surface of 22.7k to 26.6k. "Three large results deep" needs a step that cannot be answered
+  without one, which is what steps 8 and 9 are.
+- **The grade lands a step late when an answer carries the right value in the wrong role.** qwen's
+  step-2 answer called Arg3 the IRP and listed Arg4's address beside it as "the related device
+  object". `present()` found the address and credited the step. Its two `late` facts were the same:
+  `nvlddmkm` named at step 9 as the largest image, and ACPI quoted at step 8 inside the failure
+  bucket `0x9F_3_ACPI_IMAGE_pci.sys`. Matching a value cannot tell a claim from a mention, so the
+  document says to read the answers before the `broke at` column.
+- **The natural spelling of the bug check's name could never have matched.** `normalise()` strips a
+  `_` between two hex digits, so `STATE_FAILURE` reads as `statefailure` in every answer and in
+  every server reading. `test_the_shipped_scenario_agrees_with_its_own_bindings` caught it offline
+  before any run, by grounding each fact against its own pins. A scan of the main suite found one
+  alternative dead the same way, `arm64_pc`'s backticked address, harmless because the bare one sits
+  beside it.
+- **The half-landed draft said only the run could say "at what length"** a transcript ends an
+  investigation. The run did not find a length: none up to 122,107 tokens ended one.
+
+**What it left open.** It left two things open, and neither is in this entry's scope. Measuring the
+mutating tools the harness refuses is work, and is item 131. That every timing is one ARM64 Mac
+serving MLX builds is a caveat, and it went into `docs/local-model-eval.md`'s *What this does not
+cover*.

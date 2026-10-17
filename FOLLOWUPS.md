@@ -59,7 +59,6 @@ reopen it). An unmarked line is simply open.
 - [Item 27](#27-windbg-mcp--dbgscope-a-deferred-module-reports-no-pdb-identity--declined-2026-08-20) — [windbg-mcp + dbgscope] A deferred module reports no PDB identity — **declined** (2026-08-20)
 - [Item 33](#33-windbg-mcp-the-lease-grace-assumes-the-server-is-the-slow-party) — [windbg-mcp] The lease grace assumes the server is the slow party
 - [Item 35](#35-windbg-mcp--dbgscope-the-engines-subregister-flag-misses-the-views-that-matter--declined-2026-08-22) — [windbg-mcp + dbgscope] The engine's subregister flag misses the views that matter — **declined** (2026-08-22)
-- [Item 39](#39-windbg-mcp-the-eval-measures-single-questions-not-an-investigation) — [windbg-mcp] The eval measures single questions, not an investigation — **half landed** (the scenario key and `--scenario`, the key verified live, 2026-10-17; a recorded run is what is left)
 - [Item 50](#50-windbg-mcp-the-released-binary-is-unsigned--only-the-certificate-is-left) — [windbg-mcp] The released binary is unsigned — only the certificate is left — **half landed**
 - [Item 53](#53-windbg-mcp-a-break-raised-after-a-runs-stop-is-built-labels-the-result-cut-short) — [windbg-mcp] A break raised *after* a run's stop is built labels the result cut short
 - [Item 56](#56-windbg-mcp-resolves--expr-is-a-callers-command-on-nobodys-clock) — [windbg-mcp] `resolve`'s `? <expr>` is a caller's command on nobody's clock
@@ -90,6 +89,7 @@ reopen it). An unmarked line is simply open.
 - [Item 128](#128-windbg-mcp-the-ttd-tier-records-whichever-hostname-the-shells-path-resolves) — [windbg-mcp] The TTD tier records whichever hostname the shell's PATH resolves
 - [Item 129](#129-windbg-mcp-the-live-secure-kernel-tier-takes-a-boots-coordinates-from-a-private-prep-the-kd-gate-discovers-for-itself) — [windbg-mcp] The live Secure Kernel tier takes a boot's coordinates from a private prep the KD gate discovers for itself
 - [Item 130](#130-windbg-mcp-a-transcript-cannot-be-joined-to-the-clients-opentelemetry-trace) — [windbg-mcp] A transcript cannot be joined to the client's OpenTelemetry trace
+- [Item 131](#131-windbg-mcp-the-eval-never-runs-a-mutating-tool) — [windbg-mcp] The eval never runs a mutating tool
 
 ## 2. [dbgscope] Typed write primitives
 
@@ -565,67 +565,6 @@ asserted against whatever architecture the host is
   left open rather than made here.
 - **What it is worth if reopened:** ~1.8 KB of a ~6.3 KB answer, on ARM64 only. Real, and smaller
   than the 6.3 KB item 24 already took off the same tool.
-
-## 39. [windbg-mcp] The eval measures single questions, not an investigation
-
-[`docs/local-model-eval.md`](./docs/local-model-eval.md) runs six tasks across three tool surfaces,
-three context windows and five models, and its strongest finding is a negative one: at a **served**
-8,192-token window a 17,300-token surface was evaluated in full and answered correctly, so the
-window is not the binding constraint the plan expected. That finding is true of the conversations
-the grid runs, and **every one of them is short** - one question, one or two tool calls, an answer.
-
-What is untested is the case where the *transcript* fills the window rather than the surface. The
-surface is paid once per conversation and the runtime caches the prefix (`docs/local-model.md`
-measured 86.5s cold against under 5s warm); a growing investigation is paid in full, every turn,
-and a `modules` page or a `read_memory` answer lands in it whole. So the honest scope of "the
-window did not bite" is *a question at a time*, and the interesting failure - the tenth turn of a
-kernel triage, three large results deep - has not been run.
-
-**Half landed, 2026-10-17: the key and the grader are built, and the key is verified live; no
-scenario has been run.** What is left is the run, and this entry is narrowed to it.
-
-**What landed.** The driver had the mechanism already (`WINDBG_MCP_SCENARIO=1`: one transcript and
-one set of sessions across a task list) and nothing could grade it. A wrong turn at step 3 leaves
-the later steps unanswerable, so per-task scoring reports one mistake as many. So:
-
-- **A suite carrying `facts` is a scenario**, and `local_model_eval.py` runs it as one conversation
-  per cell. The runner mints the conversation id, passes it to the driver, and writes it into any
-  note it leaves when it kills one.
-- **`--scenario` grades each cell's last conversation.** For each fact it reports the step that
-  stated it (searched from the step asking onward), the turn index across the conversation, and that
-  turn's prompt tokens. The first fact never stated is the break, with a cause: `not reached`,
-  `error`, `surface`, `gave up` or `answer`.
-- **Every per-task reader refuses a scenario log** from the one gate in `records()`.
-- **`tools/eval_scenario.json` is the first key**: seven steps walking the `0x9F` from the bug check
-  to `nvlddmkm` holding the IRP, with `!analyze`'s `pci` as a deliberate trap at step 5. Each fact
-  carries a `verify` binding. `--verify-key tools/eval_scenario.json` held on all seven against
-  `windbg-mcp 0.22.0+gbfd1f388`, and a copy with step 5's fact changed to `pci` failed that fact and
-  step 6's.
-
-`docs/local-model-eval.md`, *One investigation rather than six questions*, has the rules and why
-each exists.
-
-**What is left: the run.** `tools/eval_plan_scenario.json` is the plan: `qwen3.8:27b-mlx` and
-`gemma4:31b-mlx` on `full`, at 262,144 and at 32,768. It needs the bench listener on the VM serving
-a `full` client of the run's own (`tools/bench_listener.ps1`), which this pass did not set up; the
-pass was done from the Mac. The question the item was filed for is answered only by that run:
-whether a growing transcript, rather than the surface, is what ends an investigation, and at what
-length. Read each cell's break against the window it was **served**, not the one it asked for.
-`usable()` already uncounts a conversation where the two differ.
-
-Two smaller things the same run left open:
-
-- **Nothing measures the mutating tools.** The harness executes a read-only allow-list, so
-  `debug_batch`, `launch` and `execute` are offered and never run. gemma calling `debug_batch` four
-  times on a surface that does not serve it - and being refused four times - is a hint that this is
-  where a wrong pick would be expensive rather than merely wasted: a batch that *does* run patches
-  the target. Measuring it wants a throwaway target and a rollback assertion, which is the
-  live-kernel tier's shape rather than this one's.
-- **One bench, one architecture, for the timings.** Every wall-clock number in that document is an
-  ARM64 Mac serving MLX builds. The correctness columns should travel; the timings should not be
-  quoted anywhere else.
-
----
 
 ## 50. [windbg-mcp] The released binary is unsigned — only the certificate is left
 
@@ -2323,6 +2262,34 @@ tree on 2026-10-15, and the derived form below avoids all four.
   `src/cast.rs`, selected in `src/main.rs` the way `cast::RENDER_FLAG` is; and both into
   `docs/transcripts.md`.
 
+## 131. [windbg-mcp] The eval never runs a mutating tool
+
+**Repo:** `windbg-mcp`. **Origin:** split out of item 39 when it closed on 2026-10-17, where it was
+one of two things the grid's first run had left open. The other, that every timing in
+`docs/local-model-eval.md` is one ARM64 Mac serving MLX builds, is a caveat rather than work, and
+went into that document's *What this does not cover*.
+
+The harness runs only what each tool's `readOnlyHint` allows (`adopt_fence` in
+`tools/local_model_drive.py`), so `debug_batch`, `launch` and `execute` are offered and never run. A
+model that picks one is recorded `refused_by_harness`. That is not a rare pick:
+
+- **The 2026-08-23 grid:** gemma called `debug_batch` four times on a surface that does not serve
+  it.
+- **Both scenario runs of 2026-10-17:** both models reached for `execute` (`!devobj`, `dt nt!_IRP`,
+  `dps`) and were refused.
+
+A wrong pick there is expensive rather than wasted, since a batch that does run patches the target.
+
+- **Why deferred:** running one needs a target it is safe to change and a way to show it was put
+  back, and nothing the bench opens today is either. The samples are dumps.
+- **What would close it:** a throwaway live target, either a launched process or a
+  snapshot-restorable VM, with a rollback assertion after each run. `debug_batch`'s `always` block
+  is the server's half of that assertion. That is the live-kernel tier's shape rather than this
+  one's, so it likely wants a cell type of its own rather than a hole in the read-only fence.
+- **Where it picks up:** `permitted()` and `ALLOW_ANYWAY`/`DENY_ANYWAY` in
+  `tools/local_model_drive.py`, and `grade_record`'s `refused_by_harness` verdict, which is what a
+  run of this kind would stop producing.
+
 ## Where these items came from
 
 Each cluster above, and what filing it measured. Items named here as *"now in `DONE.md`"* have
@@ -2344,7 +2311,7 @@ thrown away — item 15 from the private worker channel (#65 / #72,
 `windows-11-arm` in September 2026 — now in [`DONE.md`](./DONE.md), the migration having landed on
 2026-09-23 — items 33 and 39 from driving the server with a **local model** —
 the lease grace measured against the wrong slow party (2026-08-22), and then running the surface,
-the window and the model as a **grid** rather than as a sighting (2026-08-23) — item 35 from
+the window and the model as a **grid** rather than as a sighting (2026-08-23; item 39 now in [`DONE.md`](./DONE.md)) — item 35 from
 measuring what a `registers` answer is actually made of (2026-08-22), item 47 from fixing
 [#226](https://github.com/glslang/windbg-mcp/issues/226), where making every target take the bounded
 wait left one target type nobody on this bench can measure (2026-08-25 — now in
@@ -2501,5 +2468,7 @@ Item 130 came from asking, on 2026-10-15, whether this server should export Open
 Claude Code does: the answer was the inbound context recorded and a renderer rather than an
 exporter, and the item records why, together with what Claude Code's documentation does and does
 not promise to send.
+Item 131 came from closing item 39 on 2026-10-17: of the two things its first run had left open,
+measuring the mutating tools is work and needed an entry of its own.
 `DECISIONS.md`'s 2026-08-02 entries are the bounded-command coverage review that produced
 item 13, now in [`DONE.md`](./DONE.md).

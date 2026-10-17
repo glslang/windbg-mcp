@@ -1,10 +1,10 @@
 {
-  "run": "scenario-power-hang-v1, first read",
+  "run": "scenario-power-hang-v2, first read",
   "note": "The first plan to run one investigation rather than six questions (`FOLLOWUPS.md` item 39). The suite carries `facts`, so the runner drives each cell as one conversation and grades it with `--scenario` - the step each fact was first stated at, the transcript length there, and the first fact never stated. `full` only, because steps 3 to 7 need the `ioctl` group; a narrower surface breaks at step 3 for the surface's reason, which the grade reports as `surface` and is worth one cell at most. The windows are the axis: at 262144 the surface and the transcript both fit, so a break is the model's; at 32768 the full surface takes a large share of the window before the first result lands - its size is in every record's `surface.bytes`, so read it there rather than from an older grid - and a step whose chat fails is graded `error` with the transcript length it was asked at. One draw per cell, so this reads where runs break and not how often.",
   "tasks": "tools/eval_scenario.json",
   "url": "http://127.0.0.1:8766/",
-  "out": "eval-out/scenario.jsonl",
-  "logs": "eval-out/logs-scenario",
+  "out": "eval-out/scenario-v2.jsonl",
+  "logs": "eval-out/logs-scenario-v2",
   "max_steps": 6,
   "keep_alive": "10m",
   "surfaces": [
