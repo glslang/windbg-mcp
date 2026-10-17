@@ -25,7 +25,10 @@ supplies — a child process speaking a line protocol on its stdio — and
 `windbg-mcp --sk-live --transport "<command>" --image <path>` runs gate S1's whole decode through
 it. This repository ships **no transport**: reading another partition's VTL1 live needs a kernel
 component it will not distribute, which is the same arrangement as the live-kernel tier's KDNET
-wiring. It is not a fifth tool on purpose — gate S5x measured a page of `securekernel.exe`'s
+wiring. For a live-control session, an allowlisted memory command may name `{vmwp_pid}` and
+`{partition_handle}`; the worker expands both from its guarded discovery so an operator source can
+duplicate the VID object without making either value client authority. It is not a fifth tool on
+purpose — gate S5x measured a page of `securekernel.exe`'s
 `.data` changing inside twenty seconds, so a live source cannot keep the promise a capture
 session's decode-on-open makes.
 

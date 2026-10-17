@@ -12,7 +12,7 @@
 //! # Why a subprocess, and why this repository ships no transport
 //!
 //! Reading another partition's VTL1 live needs something this repository will not contain. Every
-//! route measured on the bench — `hvlib.dll` with its own kernel driver, a hypercall through a
+//! route measured on the bench — an operator-owned kernel driver or a hypercall through a
 //! test-signed driver of our own — is a component the operator installs, test-signs and accepts the
 //! posture of. That is item 103's standing decision: **the repository distributes no driver and the
 //! operator supplies the transport.** It is the same shape as the live-kernel tier, which needs
@@ -20,9 +20,10 @@
 //!
 //! So the seam is a **child process speaking a line protocol on its stdio**. What ships here is the
 //! client half, which contains no privileged code, links nothing, and can be read in one sitting.
-//! The operator's half can be anything that can read their guest: on this bench it is a Python
-//! script driving `hvlib`, and a second mode of the same script driving `HvCallReadGpa` through the
-//! probe driver — which is the one that *refuses*.
+//! The operator's half can be anything that can read their guest. The first bench transport drove
+//! `hvlib`; the current one duplicates the worker-discovered VID partition handle out of `vmwp`
+//! and drives the operator's memory driver directly. A separate `HvCallReadGpa` mode remains the
+//! negative control — it is the route that *refuses*.
 //!
 //! A DLL with an agreed export would have been the other option and is worse here: it would put
 //! unsafe FFI and a vendor ABI in this crate, and a provider that `__fastfail`s — which gate S0
@@ -36,7 +37,7 @@
 //!
 //! **The transport opens by printing [`READY_LINE`], and everything before that is ignored.** That
 //! is not politeness about banners: a provider an operator installs prints during its own setup, and
-//! on this bench `hvlib.py` prints a partition menu with an ordinary `print()` — so the client's
+//! the original bench `hvlib.py` printed a partition menu with an ordinary `print()` — so the client's
 //! first read would otherwise take `[ 0 ] Lab Guest Hyper-V` as a `SHAPE` reply. The alternative was
 //! for the transport to redirect its own stdout around the provider, and that was **tried and
 //! abandoned**: duplicating the descriptor and pointing `fd 1` elsewhere crashed the Python host
@@ -769,9 +770,9 @@ impl LiveSource {
 impl Drop for LiveSource {
     fn drop(&mut self) {
         // Closing stdin is the transport's cue to exit, which lets an operator's script tear its own
-        // provider down in order — on this bench that means `SdkCloseAllPartitions` and a driver
-        // handle. So the kill is a fallback rather than the method, because a provider killed
-        // mid-read can leave that handle open.
+        // provider down in order — including any duplicated partition and driver handles. So the
+        // kill is a fallback rather than the method, because a provider killed mid-read can leave
+        // those handles open.
         self.transport.borrow_mut().take();
         reap(&mut self.child, TEARDOWN_GRACE);
     }
@@ -1327,7 +1328,7 @@ mod tests {
 
     #[test]
     fn a_providers_own_banner_is_skipped_up_to_the_sentinel_and_handed_back() {
-        // The exact failure this exists for: hvlib's partition menu read as a SHAPE reply.
+        // The exact historical failure this exists for: hvlib's partition menu became a SHAPE reply.
         let mut transport = exchange(
             "[ 0 ] Lab Guest Hyper-V . (PartitionId =  5 )\nActive partitions count:  2\n\
              windbg-mcp-gpa/1\nSHAPE cr3=0x1201000 max_read=16\n",

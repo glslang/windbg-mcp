@@ -354,20 +354,20 @@
     {
       "annotations": 121,
       "description": 266,
-      "inputSchema": 2283,
-      "modelVisible": 2600,
+      "inputSchema": 2360,
+      "modelVisible": 2677,
       "name": "open_sk_kd",
       "outputSchema": 4702,
-      "wire": 7454
+      "wire": 7531
     },
     {
       "annotations": 132,
       "description": 369,
-      "inputSchema": 2472,
-      "modelVisible": 2902,
+      "inputSchema": 2564,
+      "modelVisible": 2994,
       "name": "open_sk_live_control",
       "outputSchema": 4702,
-      "wire": 7767
+      "wire": 7859
     },
     {
       "annotations": 114,
@@ -706,13 +706,13 @@
   "totals": {
     "annotations": 8555,
     "description": 46760,
-    "inputSchema": 72308,
+    "inputSchema": 72477,
     "instructions": 2022,
-    "modelVisible": 123199,
+    "modelVisible": 123368,
     "outputSchema": 216484,
-    "payload": 350505,
+    "payload": 350674,
     "tools": 78,
-    "wire": 350416,
+    "wire": 350585,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10296
   }

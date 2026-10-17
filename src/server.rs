@@ -1157,7 +1157,8 @@ pub struct SkLiveOpenArgs {
     /// otherwise the provider must discover CR3 and report it in its hello.
     pub control_transport: String,
     /// Command line for the live VTL1 physical-memory source child. `{vp}`, `{partition_id}` and
-    /// `{cr3}` are replaced only after the provider identity has been validated.
+    /// `{cr3}` are replaced only after the provider identity has been validated. `{vmwp_pid}` and
+    /// `{partition_handle}` come only from this worker's guarded vmwp discovery.
     pub live_transport: String,
     /// Optional assertion for the current host `vmwp.exe` process id. The server resolves the PID
     /// from `vm_id`; a supplied value must match.
@@ -1197,7 +1198,8 @@ pub struct SkKdOpenArgs {
     /// Register provider command. The worker expands `{vp}` and `{partition_id}` after discovery.
     pub control_transport: String,
     /// Live VTL1 memory provider command. The worker expands `{vp}`, `{partition_id}` and `{cr3}`
-    /// from the validated provider identity.
+    /// from the validated provider identity, and `{vmwp_pid}` plus `{partition_handle}` from its
+    /// guarded vmwp discovery.
     pub live_transport: String,
     /// Canonical GUID of the exact disposable VM.
     pub vm_id: String,

@@ -86,7 +86,7 @@ the server starts. The JSON file fixes all authority that a client may select:
   "disposable_vm_ids": ["51749a1f-f939-44f5-b251-1251ef5b64a3"],
   "transport_commands": [
     "\"C:\\Python313\\python.exe\" \"D:\\windbg-mcp-private\\control.py\" --vm-id 51749a1f-f939-44f5-b251-1251ef5b64a3 --partition-id {partition_id} --vp {vp}",
-    "\"C:\\Python313\\python.exe\" \"D:\\windbg-mcp-private\\memory.py\" --vm-id 51749a1f-f939-44f5-b251-1251ef5b64a3 --partition-id {partition_id} --vp {vp} --cr3 {cr3}"
+    "\"C:\\Python313\\python.exe\" \"D:\\windbg-mcp-private\\memory.py\" --vm-id 51749a1f-f939-44f5-b251-1251ef5b64a3 --partition-id {partition_id} --vp {vp} --cr3 {cr3} --vmwp-pid {vmwp_pid} --partition-handle {partition_handle}"
   ],
   "profile_roots": ["D:\\windbg-mcp-private\\profiles"],
   "kit_roots": ["C:\\Program Files (x86)\\Windows Kits\\10"],
@@ -117,7 +117,10 @@ Missing, unreadable or malformed version metadata refuses the open; the profile 
 for guest evidence. The resource-directory read is bounded to 64 KiB and shares the held stop's
 service deadline. `{partition_id}` and `{vp}` are expanded only
 after the worker discovers them; `{cr3}` is expanded for the memory provider after the register
-provider reports and validates it. `vmwp_pid`, `dispatcher_vnd`, `partition_id` and `expected_cr3`
+provider reports and validates it. A memory command may additionally use `{vmwp_pid}` and
+`{partition_handle}`; those are expanded only from the same guarded vmwp discovery, allowing an
+operator transport to duplicate the VID file object into its own process without exposing either
+value as client authority. `vmwp_pid`, `dispatcher_vnd`, `partition_id` and `expected_cr3`
 remain optional mismatch assertions. The server resolves the current `vmwp` PID itself, generates
 the pipe name from the system RNG, reserves both the VM and PID, and returns a session id plus the
 exact connection string:
