@@ -16,7 +16,11 @@ Reservations are supervisor-local; orphan workers require operator recovery befo
 server/controller attaches. Non-kernel forced cleanup is unchanged. See `docs/sessions.md`.
 A late successful reply to an already-submitted `EndSession` is confirmed release, not unresolved
 ownership: the reader records it and cleans up even if the original caller is gone. A returned
-pre-commit attach failure claimed no target and must not retain an orphan either.
+pre-commit attach failure claimed no target and must not retain an orphan either — on **both**
+sides: the worker releases itself (`KernelSafety::finished_attach`), and `settle_open` ends a
+session the caller's deadline preserved when that refusal lands after it (issue #462). A failure
+after `Committed` stays unresolved. `call_as` closes its receiver before declaring a deadline, so a
+reply that crosses it is either taken or reaches `settle_open` — never dropped with the receiver.
 An orphan's metadata wait observes either completion even if EOF beat the engine's result;
 late attach success alone never permits exit.
 
