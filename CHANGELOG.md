@@ -23,6 +23,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The Secure Kernel handoff probe could not run against this server since item 107**, and its
+  own tests had been failing since the same commit. Item 107 made every tool refuse an argument
+  its schema does not declare, and took the invented `timeout_ms` out of the probe's closing `bl`
+  read. The probe spelled that argument set out three more times, though. Its call gate admitted
+  `execute` only *with* `timeout_ms`, so it refused its own closing read. Its schema check required
+  the server's `execute` to declare `timeout_ms`, so it refused the real server before any call.
+  And its opening `bl` still sent it. Item 107's sweep matched an argument object written next to
+  its tool's name, so it found the one literal and could not see the other three. The arguments are
+  now one definition the four places share. In `tools/test_followup_probes.py` the fake server's
+  remote half now refuses an argument it does not declare, as the real one does. Without that, the
+  fake accepted the stale argument for a fortnight. Checked against the live server's `tools/list`
+  (`0.22.0+gbfd1f388`): every argument the probe needs and sends is declared. The fake's guard is
+  mutation-verified: an undeclared argument on `registers` fails five tests with it and none
+  without it.
+
 - **A VS pool chunk whose user block the allocator moved off a page end is placed where `!pool`
   places it.** `FOLLOWUPS.md` item 101. Under `_HEAP_VS_CONTEXT.Config.Flags.PageAlignLargeAllocs`
   — set on both pool heaps of the two kernels measured, 26100.33438 and 29671 —
