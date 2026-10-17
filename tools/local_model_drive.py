@@ -28,7 +28,10 @@ Configuration:
                         model sees them; `0`, the default, passes them whole
     WINDBG_MCP_SCENARIO treat the task list as one continuing investigation: one
                         transcript and one set of sessions across every task, rather
-                        than a conversation and a target apiece
+                        than a conversation and a target apiece. `local_model_eval.py
+                        --scenario` grades the result
+    EVAL_CONVERSATION   the id a scenario's records carry, so a re-run's are kept apart
+                        from the last one's (default: one minted per process)
     WINDBG_MCP_KEEPALIVE  seconds of silence after which this run pings the listener to
                         keep its lease alive (default 120; `0` disables) — see below
     NUM_CTX             context window to serve this run at, in tokens; empty means
@@ -68,6 +71,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 MCP_URL = os.environ.get("WINDBG_MCP_URL", "http://127.0.0.1:8765/")
 OLLAMA = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/chat")
@@ -273,6 +277,13 @@ def bearer():
 
 AUTH = bearer()
 SCENARIO = bool(os.environ.get("WINDBG_MCP_SCENARIO"))
+# **Which conversation a scenario record belongs to** (`FOLLOWUPS.md` item 39). A scenario's tasks
+# are the steps of one transcript, so the grader's unit is the conversation and not the task - and
+# a re-run of a cell starts a new one from step 1 that the log must keep apart from the last.
+# `local_model_eval.py` names it, so the note it writes if it has to kill this process carries the
+# same id; a run driven by hand mints its own. `None` outside a scenario, where each task is its own.
+CONVERSATION = ((os.environ.get("EVAL_CONVERSATION") or uuid.uuid4().hex[:12]) if SCENARIO
+                else None)
 SESSION = None
 
 # **What this run was asked against, kept rather than discarded.** A record used to identify the
@@ -949,6 +960,7 @@ def main():
             # here are an A/B, and two that do not say which arm they are cannot be read
             # against each other at all.
             "think": THINK,
+            "conversation": CONVERSATION,
             # The two identity fields that are constant for a cell: which build was asked, and
             # which task list it was asked from. The third - which weights answered - is read per
             # task, since it is a property of the instance the runtime happened to have loaded.

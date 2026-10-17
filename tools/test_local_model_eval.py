@@ -9,7 +9,10 @@ second sentence true of a field added tomorrow: one fails if a driver does not a
 fails if the grader defaults it.
 """
 
+import json
 import os
+import shutil
+import tempfile
 import unittest
 
 # **Before the drivers are imported.** `local_model_drive` resolves the run's bearer token at
@@ -138,6 +141,209 @@ class LogsWrittenBeforeTheBlock(unittest.TestCase):
         block = evaluator.legacy_identity({"backend": "claude-code"})
         self.assertNotIn("weights", block)
         self.assertNotIn("harness", block)
+
+
+def scenario_suite():
+    """Three steps, three facts: small enough to read every assertion against by eye."""
+    return {
+        "suite": "test-scenario",
+        "tasks": [
+            {"id": "s1", "prompt": "Open the dump. What bug check?", "possible_on": ["full", "min"]},
+            {"id": "s2", "prompt": "Which IRP is it about?", "possible_on": ["full", "min"]},
+            {"id": "s3", "prompt": "Which driver holds it?", "possible_on": ["full"]},
+        ],
+        "facts": [
+            {"id": "code", "step": "s1", "expect": [["0x9f"]]},
+            {"id": "irp", "step": "s2", "expect": [["ffffe2850787bc20"]]},
+            {"id": "owner", "step": "s3", "expect": [["nvlddmkm"]]},
+        ],
+    }
+
+
+def step_record(suite, step, answer, tokens, conversation="c1", client="full", **extra):
+    """One step's record as the driver writes it - a turn per prompt-token figure."""
+    prompt = next(t["prompt"] for t in suite["tasks"] if t["id"] == step)
+    return {"task": step, "prompt": prompt, "backend": "ollama", "model": "m", "num_ctx": None,
+            "draw": 1, "conversation": conversation, "answer": answer, "calls": [],
+            "turns": [{"prompt_tokens": t} for t in tokens],
+            "surface": {"client": client, "names": []}, **extra}
+
+
+class Scenario(unittest.TestCase):
+    """`--scenario`: the key, the conversation as the unit, and where a run broke (item 39)."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.suite_file = os.path.join(self.dir, "scenario.json")
+        with open(self.suite_file, "w", encoding="utf-8") as f:
+            json.dump(scenario_suite(), f)
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def log(self, *lines):
+        path = os.path.join(self.dir, "run.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            f.writelines(json.dumps(line) + "\n" for line in lines)
+        return path
+
+    def grade(self, *lines):
+        rows, _ = evaluator.grade_scenario(self.log(*lines), self.suite_file)
+        self.assertEqual(len(rows), 1)
+        return rows[0]
+
+    def test_a_late_fact_is_a_recovery_and_the_first_missing_one_is_the_break(self):
+        suite = scenario_suite()
+        row = self.grade(
+            step_record(suite, "s1", "Bug check 0x9F.", [1000, 1400]),
+            step_record(suite, "s2", "I could not tell.", [1900]),
+            step_record(suite, "s3", "IRP ffffe285`0787bc20; I cannot name the driver.",
+                        [2500, 3100, 3600]))
+        self.assertEqual([f["stated_at"] for f in row["facts"]], [1, 3, None])
+        self.assertEqual(row["late"], ["irp"])
+        # Turns are counted across the conversation, and a fact's turn is the one that answered.
+        self.assertEqual([f["turn"] for f in row["facts"]], [2, 6, None])
+        self.assertEqual(row["facts"][1]["prompt_tokens"], 3600)
+        self.assertEqual((row["held"], row["stated"], row["of"]), (2, 2, 3))
+        self.assertEqual(row["broke"]["fact"], "owner")
+        self.assertEqual(row["broke"]["cause"], "answer")
+        self.assertEqual(row["broke"]["prompt_tokens"], 3600)
+        self.assertEqual(row["peak_prompt_tokens"], 3600)
+
+    def test_a_fact_in_an_earlier_answer_does_not_count_before_it_is_asked(self):
+        """The failure bucket `0x9F_3_ACPI_IMAGE_pci.sys` carries `acpi` at step 1 of the real one."""
+        suite = scenario_suite()
+        row = self.grade(
+            step_record(suite, "s1", "0x9f, and !analyze guesses nvlddmkm", [100]),
+            step_record(suite, "s2", "ffffe2850787bc20", [200]),
+            step_record(suite, "s3", "pci", [300]))
+        self.assertIsNone(row["facts"][2]["stated_at"])
+        self.assertEqual(row["broke"]["fact"], "owner")
+
+    def test_a_break_on_a_step_the_surface_cannot_answer_is_the_surfaces(self):
+        suite = scenario_suite()
+        row = self.grade(
+            step_record(suite, "s1", "0x9f", [100], client="min"),
+            step_record(suite, "s2", "ffffe2850787bc20", [200], client="min"),
+            step_record(suite, "s3", "pci", [300], client="min"))
+        self.assertEqual(row["broke"]["cause"], "surface")
+
+    def test_a_chat_that_failed_is_an_error_whatever_the_surface(self):
+        """A window too small for the transcript is this, and it is the reading the mode is for."""
+        suite = scenario_suite()
+        # On `min`, whose `s3` is not possible - so the cause has to come from the chat failing.
+        row = self.grade(
+            step_record(suite, "s1", "0x9f", [7900], client="min"),
+            step_record(suite, "s2", "ffffe2850787bc20", [8100], client="min"),
+            step_record(suite, "s3", None, [], client="min", error="context window exceeded"))
+        self.assertEqual(row["broke"]["cause"], "error")
+        self.assertEqual(row["broke"]["error"], "context window exceeded")
+        self.assertIsNone(row["broke"]["prompt_tokens"])
+
+    def test_a_conversation_that_stopped_early_says_where(self):
+        suite = scenario_suite()
+        row = self.grade(step_record(suite, "s1", "0x9f", [100]))
+        self.assertEqual(row["cut_short"], 2)
+        self.assertEqual((row["broke"]["fact"], row["broke"]["cause"]), ("irp", "not reached"))
+
+    def test_the_last_conversation_is_graded_and_its_kill_note_is_its_own(self):
+        """The id is what keeps two attempts apart: deduplicating by task would splice them."""
+        suite = scenario_suite()
+        row = self.grade(
+            step_record(suite, "s1", "0x9f", [100], conversation="a"),
+            step_record(suite, "s2", "ffffe2850787bc20", [200], conversation="a"),
+            {"task": None, "backend": "ollama", "model": "m", "num_ctx": None, "draw": 1,
+             "surface": {"client": "full"}, "conversation": "a", "error": "budget"},
+            step_record(suite, "s1", "0x9f", [100], conversation="b"),
+            {"task": None, "backend": "ollama", "model": "m", "num_ctx": None, "draw": 1,
+             "surface": {"client": "full"}, "conversation": "b", "error": "killed again"})
+        self.assertEqual((row["conversation"], row["attempts"]), ("b", 2))
+        self.assertEqual(row["broke"]["fact"], "irp")
+        self.assertEqual(row["broke"]["cause"], "not reached")
+        self.assertEqual(row["note"], "killed again")
+
+    def test_a_conversation_killed_before_its_first_record_is_still_the_last(self):
+        suite = scenario_suite()
+        row = self.grade(
+            step_record(suite, "s1", "0x9f", [100], conversation="a"),
+            step_record(suite, "s2", "ffffe2850787bc20", [200], conversation="a"),
+            {"task": None, "backend": "ollama", "model": "m", "num_ctx": None, "draw": 1,
+             "surface": {"client": "full"}, "conversation": "b", "error": "budget"})
+        self.assertEqual((row["conversation"], row["held"]), ("b", 0))
+        self.assertEqual(row["broke"]["cause"], "not reached")
+
+    def test_a_reworded_step_uncounts_the_whole_conversation(self):
+        suite = scenario_suite()
+        reworded = step_record(suite, "s2", "ffffe2850787bc20", [200])
+        reworded["prompt"] = "an older wording"
+        row = self.grade(step_record(suite, "s1", "0x9f", [100]), reworded)
+        self.assertEqual(row["uncounted"], ["s2"])
+
+    def test_a_log_holding_a_run_that_was_not_a_scenario_is_refused(self):
+        suite = scenario_suite()
+        loose = step_record(suite, "s1", "0x9f", [100])
+        del loose["conversation"]
+        with self.assertRaises(SystemExit):
+            self.grade(step_record(suite, "s1", "0x9f", [100]), loose)
+
+    def test_every_per_task_reader_refuses_a_scenario_log(self):
+        """One gate in `records()`, which `--grade`, `--matrix`, `--compare` and `--series` share."""
+        path = self.log(step_record(scenario_suite(), "s1", "0x9f", [100]))
+        with self.assertRaises(SystemExit) as refused:
+            evaluator.records(path)
+        self.assertIn("--scenario", str(refused.exception))
+
+
+class ScenarioKey(unittest.TestCase):
+    def refused(self, suite):
+        with self.assertRaises(SystemExit) as refused:
+            evaluator.scenario_key(suite)
+        return str(refused.exception)
+
+    def test_facts_out_of_step_order_are_refused(self):
+        suite = scenario_suite()
+        suite["facts"].reverse()
+        self.assertIn("before the fact listed ahead of it", self.refused(suite))
+
+    def test_a_fact_no_step_asks_for_is_refused(self):
+        suite = scenario_suite()
+        suite["facts"][0]["step"] = "s9"
+        self.assertIn("which the suite has not got", self.refused(suite))
+
+    def test_an_empty_group_is_refused_since_it_passes_every_answer(self):
+        suite = scenario_suite()
+        suite["facts"][1]["expect"] = [["ffffe2850787bc20"], []]
+        self.assertIn("empty one", self.refused(suite))
+
+    def test_a_fact_a_prompt_hands_over_is_refused(self):
+        suite = scenario_suite()
+        suite["tasks"][2]["prompt"] = "Does nvlddmkm hold it?"
+        self.assertIn("repeating the question", self.refused(suite))
+
+    def test_the_shipped_scenario_agrees_with_its_own_bindings(self):
+        """Offline half of `--verify-key`: every unit's binding sends only what the run knows by
+        then, and every `expect` alternative renders from - or is a spelling of - what its own pins
+        say the server answers. The live half is the same check against what the server *does*."""
+        suite = evaluator.load(os.path.join(os.path.dirname(__file__), "eval_scenario.json"))
+        for unit in evaluator.scenario_units(suite):
+            with self.subTest(fact=unit["id"]):
+                self.assertEqual(evaluator.prompt_renders_binding(unit), [])
+                pinned = {i: [evaluator.rendered(pin.get("is", pin.get("has")))
+                              for pin in step.get("pin") or []]
+                          for i, step in enumerate(unit["verify"])}
+                held = {i: {pin["read"] for pin in step.get("pin") or []}
+                        for i, step in enumerate(unit["verify"])}
+                how, failures = evaluator.grounding(unit, pinned, held, set(pinned))
+                self.assertEqual(failures, [])
+                self.assertEqual(set(how.values()), {"value"})
+
+    def test_a_scenario_plan_refuses_a_driver_with_no_transcript_and_a_subset(self):
+        suite = scenario_suite()
+        for group in ({"backend": "claude-code", "models": ["opus"]},
+                      {"backend": "ollama", "models": ["m"], "subset": "short"}):
+            with self.subTest(group=group), self.assertRaises(SystemExit):
+                evaluator.scenario_cells_are_drivable({"cells": [group]}, suite)
+        evaluator.scenario_cells_are_drivable({"cells": [{"backend": "ollama"}]}, suite)
 
 
 if __name__ == "__main__":

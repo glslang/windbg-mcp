@@ -264,6 +264,8 @@ def main():
             # onto draw 1 and the grader's `(cell, draw, task)` dedup keeps only the last. A
             # five-draw rate would be recorded, and graded, as one sighting.
             "draw": drive.DRAW,
+            # Null outside a scenario; inside one, the id every step's record shares.
+            "conversation": drive.CONVERSATION,
             "server": dict(drive.SERVER_INFO) or None,
             "suite": dict(drive.SUITE) or None,
             "surface": {"client": os.environ.get("EVAL_SURFACE", ""),

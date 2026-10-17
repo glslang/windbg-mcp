@@ -207,6 +207,28 @@ an engine may reorder without the key having rotted, so a `read` path enters a l
 binding on purpose** — it is the wording published logs were graded against — so the mode refuses
 it by name rather than skipping it.
 
+**A scenario is graded with `--scenario`, and everything else refuses its log** (item 39). A suite
+carrying `facts` (`tools/eval_scenario.json`) is run as one conversation per cell, and the grade is
+where the run broke rather than a score per step. Four things bite.
+
+- **An `expect` alternative is matched against the *normalised* answer**, and `normalise()` strips
+  a `_` between two hex digits. So `DRIVER_POWER_STATE_FAILURE` arrives as
+  `driver_power_statefailure` (`E_F`), and the natural alternative would mark every correct answer
+  wrong. That applies to the main suite's keys too. Scanned 2026-10-17, one alternative there is
+  dead this way: `arm64_pc`'s backticked `` fffff801`3c65bca8 ``. It costs nothing only because the
+  bare `fffff8013c65bca8` sits in the same group.
+  `test_the_shipped_scenario_agrees_with_its_own_bindings` caught it offline, by grounding each fact
+  against its own pins with no server. Run it after editing a fact.
+- **A fact is searched for from its own step onward.** `0x9F_3_ACPI_IMAGE_pci.sys` at step 1
+  contains `acpi`, step 7's answer.
+- **The conversation id, not the task, is the unit.** Two attempts deduplicated by task splice into
+  a transcript no model had. The runner mints the id and writes it into its kill notes, which is
+  why `claude_code_drive.py`, with no transcript to carry, is refused for a scenario plan.
+- **A later fact's binding may send what an earlier fact established**: step 5 asks
+  `device_object` about step 4's address. So `--verify-key` holds each binding to the prompts so
+  far plus the earlier facts' alternatives, and a wrong earlier fact fails the later binding too.
+  That is the chain showing up in the key's own check, not a second bug.
+
 **Re-run against item 41** (2026-08-24): unserved calls 14 -> 6, with `debug_batch` going 10 -> 0
 and every name this server was teaching now gone. What that re-run mostly taught is **how easy it
 is to over-read at n=1, in a file that already says so**. Two claims had to be pulled back after

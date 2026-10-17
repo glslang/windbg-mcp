@@ -12,6 +12,7 @@ what comes back against the answer key in `tools/eval_tasks.json`, so the questi
     WINDBG_MCP_TOKEN=<token> python3 tools/local_model_eval.py --verify-key [tasks.json]
     python3 tools/local_model_eval.py --compare <old.jsonl> <new.jsonl> [tasks.json]
     python3 tools/local_model_eval.py --series <results.jsonl>... [tasks.json] -o <series.json>
+    python3 tools/local_model_eval.py --scenario <results.jsonl> [scenario.json]
 
 **Three axes, and they are not independent.** The tool surface is bytes of prose in every
 turn; the context is what the runtime will hold; the model is what can pick a tool out of
@@ -58,6 +59,14 @@ which runs the same cell n times asking for seed 1..n, and every reader here key
 repeats **accumulate** rather than replace: the grader counts over draws, and `--matrix` prints a
 distribution (`3Y2n`) where a single draw prints a mark. A record from before draws existed is
 draw 1, so an old log grades exactly as it did.
+
+**A scenario is one investigation, and it is graded as a run rather than as a list of questions**
+(`FOLLOWUPS.md` item 39). A suite carrying `facts` - `tools/eval_scenario.json` is the one - is run
+as a single conversation per cell, and `--scenario` reports when each fact was first stated, how
+many turns in, how long the transcript was at that turn, and the first fact never stated, which is
+where the run stopped being recoverable. Every per-task reader refuses such a log, because a wrong
+turn at step 2 leaves every later step nothing to read, and scoring each step on its own reports
+one mistake as six.
 """
 import json
 import os
@@ -68,6 +77,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DRIVER = os.path.join(HERE, "local_model_drive.py")
@@ -283,6 +293,35 @@ def fm_axes_are_absent(plan):
                 f"measured rather than asked for.")
 
 
+def scenario_cells_are_drivable(plan, suite):
+    """Refuse a scenario plan's groups that would run something other than one conversation.
+
+    Two, and both would run to completion and grade as something they are not:
+
+    - **A `claude-code` group.** That driver starts a fresh `claude -p` per task and has no
+      transcript to carry, so the steps would arrive as separate questions - step 2's "that bug
+      check" asked of a model that has seen none - and the run would grade as a model that cannot
+      follow an investigation. The ollama and fm drivers share `local_model_drive.run`, which is
+      what carries the transcript.
+    - **A `subset`.** A scenario's steps are one chain, and a subset drops links from it: the facts
+      the dropped steps ask for become breaks no model could have avoided.
+
+    Also refuses a scenario whose key does not parse, before any cell is spent on it.
+    """
+    scenario_key(suite)
+    for group in plan["cells"]:
+        if group.get("backend") == "claude-code":
+            raise SystemExit(
+                "this plan runs a scenario, and its `claude-code` group cannot: that driver starts "
+                "a conversation per task, so the steps would arrive as separate questions and the "
+                "run would grade as a model that cannot follow an investigation.")
+        if group.get("subset"):
+            raise SystemExit(
+                f"this plan runs a scenario with `subset: {group['subset']}`; a scenario's steps "
+                f"are one chain, and the facts a dropped step asks for would read as breaks no "
+                f"model could have avoided.")
+
+
 def arm_of(record):
     """The reasoning arm a record ran under, for deciding whether its work is done.
 
@@ -378,13 +417,18 @@ def release_sessions(env, why):
 
 
 def run_cell(plan, tokens, backend, model, context, surface, draw, subset, planned, budget_s,
-             log_path, logs_dir, think=False):
+             log_path, logs_dir, think=False, scenario=False):
     """One (backend, model, context, surface, draw) cell: a driver process over the task list.
 
     `planned` is the ids this draw was asked to run, and it exists to travel into the cell-level
     note: a draw that dies leaves nothing else behind, and without the list a task **no** draw ever
     reached is indistinguishable in the log from one the cell was never asked (a group's `subset`).
     The grader cannot recover that, so the runner records it.
+
+    **A scenario cell is one conversation, and its id is minted here rather than by the driver**,
+    because the runner is the only party that outlives a kill: a cell killed before its first record
+    leaves a note and nothing else, and a note naming no conversation would be credited to whichever
+    one the log happened to hold last - an earlier attempt's partial run graded as the latest one.
     """
     label = (f"{backend}:{model} ctx={context or 'default'} surface={surface}"
              + (f" draw={draw}" if draw != 1 else ""))
@@ -395,8 +439,11 @@ def run_cell(plan, tokens, backend, model, context, surface, draw, subset, plann
     # `OLLAMA_THINK` exported, which is the shell a plan is most likely to be run from. An
     # inherited `OLLAMA_THINK` reaches `fm_drive.py`, which refuses an arm this model does not
     # have, and a valid plan dies at `0s, exit 1` blaming a group that asked for nothing.
+    # `WINDBG_MCP_SCENARIO` is the same trap with a worse failure: inherited into an ordinary plan, it
+    # runs six separate questions as one conversation and the per-task grade reads them as such.
     for inherited in ("LOCAL_MODEL", "NUM_CTX", "OLLAMA_THINK", "OLLAMA_KEEP_ALIVE", "EVAL_SEED",
-                      "CLAUDE_MODEL", "ENABLE_TOOL_SEARCH", "EVAL_SUBSET"):
+                      "CLAUDE_MODEL", "ENABLE_TOOL_SEARCH", "EVAL_SUBSET", "WINDBG_MCP_SCENARIO",
+                      "EVAL_CONVERSATION"):
         env.pop(inherited, None)
     env.update({
         "WINDBG_MCP_URL": plan["url"],
@@ -409,6 +456,21 @@ def run_cell(plan, tokens, backend, model, context, surface, draw, subset, plann
     })
     if subset:
         env["EVAL_SUBSET"] = subset
+    conversation = uuid.uuid4().hex[:12] if scenario else None
+    if conversation:
+        env["WINDBG_MCP_SCENARIO"] = "1"
+        env["EVAL_CONVERSATION"] = conversation
+
+    def write_note(error):
+        """The cell-level record a draw that died leaves behind - its only one, if it died early."""
+        note = {"run": plan["run"], "backend": backend, "model": model,
+                "num_ctx": context or None, "surface": {"client": surface}, "draw": draw,
+                "task": None, "planned": planned, "think": think, "error": error}
+        if conversation:
+            note["conversation"] = conversation
+        with open(log_path, "a", encoding="utf-8") as log:
+            log.write(json.dumps(note) + "\n")
+
     if backend == "ollama":
         env["LOCAL_MODEL"] = model
         env["NUM_CTX"] = str(context or 0)
@@ -498,12 +560,7 @@ def run_cell(plan, tokens, backend, model, context, surface, draw, subset, plann
             proc.wait()
             print(f"    budget of {budget_s}s exceeded; cell killed")
             killed = True
-            note = {"run": plan["run"], "backend": backend, "model": model,
-                    "num_ctx": context or None, "surface": {"client": surface}, "draw": draw,
-                    "task": None, "planned": planned, "think": think,
-                    "error": f"cell exceeded its {budget_s}s budget"}
-            with open(log_path, "a", encoding="utf-8") as log:
-                log.write(json.dumps(note) + "\n")
+            write_note(f"cell exceeded its {budget_s}s budget")
     if cwd:
         # `rmtree`, not `rmdir`: Claude Code may leave state of its own in the directory it ran
         # in, and a cell must not fail on the way out because its scratch was not empty.
@@ -517,12 +574,7 @@ def run_cell(plan, tokens, backend, model, context, surface, draw, subset, plann
         # credential, an MCP handshake or a missing model writes some records or none, and
         # without this the summary shows a short row or no row at all - an incomplete grid
         # reading as a finished one. The note gives the cell a row that says what happened.
-        note = {"run": plan["run"], "backend": backend, "model": model,
-                "num_ctx": context or None, "surface": {"client": surface}, "draw": draw,
-                "task": None, "planned": planned, "think": think,
-                "error": f"driver exited {proc.returncode}; see {os.path.basename(stdout_path)}"}
-        with open(log_path, "a", encoding="utf-8") as log:
-            log.write(json.dumps(note) + "\n")
+        write_note(f"driver exited {proc.returncode}; see {os.path.basename(stdout_path)}")
     return proc.returncode
 
 
@@ -847,7 +899,8 @@ def check_pins(step, structured, text):
     is not `"227"` the string (nor `227.0` the float, nor `0` the boolean `False`, which Python's
     own `==` would have accepted), and a field renamed is a `KeyError` rather than a pass. `has` is
     [`present`] over the rendered text, for a tool with no structured half to name a field in; it
-    is weaker on purpose and is used exactly once, which is once more than nothing would be.
+    is weaker on purpose, and used only where there is no field - `decode_ioctl` in the suite, and
+    `irp_stack` and `device_object` in the scenario, which answer in the extension's prose.
 
     A `has` value is normalised as well as the text, which `matches()` does not do to an `expect`
     alternative — the asymmetry is deliberate and narrow. A pin asks "does the server still print
@@ -1099,7 +1152,8 @@ def verify_key(tasks_file):
     import local_model_drive as drive  # noqa: PLC0415 - see the docstring
 
     suite = load(tasks_file)
-    tasks = suite["tasks"]
+    # A scenario's key is its facts rather than its steps, so those are what get re-read.
+    tasks = scenario_units(suite) if is_scenario(suite) else suite["tasks"]
     if not tasks:
         # **An empty suite is not a verified one**, and without this the run printed "every fact 0
         # tasks are graded against still reads off the dumps" and exited zero - making a file an
@@ -1129,6 +1183,27 @@ def verify_key(tasks_file):
               + (" The key itself verified." if outcome == 0 else ""))
         return 1
     return outcome
+
+
+def scenario_units(suite):
+    """A scenario's facts as the units `--verify-key` checks, one per fact, in the task shape.
+
+    **The "prompt" a fact's binding is held to is what the run knows by then**: every step's prompt
+    up to the one asking for it, and every alternative of every fact asked before it. That is the
+    one thing a scenario changes about [`prompt_renders_binding`], and it is the point of one - the
+    binding for the driver that owns a device sends that device's address, which no prompt names
+    because finding it is step 4's job. Holding it to the prompts alone would refuse every binding
+    past the first; holding it to nothing would let a binding send a value the run never had.
+    """
+    steps, facts = scenario_key(suite)
+    at = {step["id"]: index for index, step in enumerate(steps)}
+    units, known = [], []
+    for fact in facts:
+        told = [step.get("prompt") or "" for step in steps[:at[fact["step"]] + 1]]
+        units.append({"id": fact["id"], "prompt": "\n".join(told + known),
+                      "expect": fact.get("expect"), "verify": fact.get("verify")})
+        known.extend(alt for group in fact.get("expect") or [] for alt in group)
+    return units
 
 
 def verify_against(drive, suite, tasks):
@@ -1324,20 +1399,10 @@ def records(log_path):
     # **Refused here, because here is the only place every reader passes through.** Three rounds
     # of review found this one class at three different readers - `--grade`, `--series`, then
     # `--matrix` and the `--compare` built on it - and each fix was the same check bolted to
-    # another caller, which is a count that only goes up. A log holding both reasoning arms for a
-    # cell has no honest reading: the deduplication below keeps whichever arm was appended later,
-    # so every reader would show one arm's numbers under a run identity naming both. One gate ends
-    # the class; `already_done` is deliberately not behind it, since resume tells the arms apart
-    # by key and appending to such a log is how it would be repaired.
-    pooled = sorted(cell for cell, arms in reasoning_arms(log_path).items() if len(arms) > 1)
-    if pooled:
-        raise SystemExit(
-            f"{os.path.basename(log_path)} holds both reasoning arms for {len(pooled)} cell(s) - "
-            f"{cell_label(pooled[0])}"
-            + (f" and {len(pooled) - 1} more" if len(pooled) > 1 else "")
-            + ". Deduplication keeps whichever arm was written later, so every reading of this "
-              "log would report one arm's scores under a run that names both. Grade each arm's "
-              "log on its own and read them with `--compare`.")
+    # another caller, which is a count that only goes up. One gate ends the class; `already_done`
+    # is deliberately not behind it, since resume tells the arms apart by key and appending to such
+    # a log is how it would be repaired.
+    refuse_pooled_arms(log_path)
     latest, seen_at = {}, {}
     for at, line in enumerate(open(log_path, encoding="utf-8")):
         line = line.strip()
@@ -1364,7 +1429,37 @@ def records(log_path):
         if any(other[:-1] == key[:-1] and other[-1] is not None and at > note_at
                for other, at in seen_at.items()):
             del latest[key]
+    # **A scenario run is refused by every per-task reader, from the same gate** (item 39). Its
+    # tasks are the steps of one conversation, so a wrong turn at one step leaves every later step
+    # with nothing to read, and scoring each step on its own reports that one mistake as many. The
+    # steps carry no `expect` either - the key is the scenario's `facts` - and `matches()` runs
+    # `all()` over the groups, so a per-task grade would mark every answered step correct.
+    scenario = sum(1 for record in latest.values() if record.get("conversation"))
+    if scenario:
+        raise SystemExit(
+            f"{os.path.basename(log_path)} holds {scenario} record(s) from a scenario run - one "
+            "conversation across its tasks, where a wrong turn at one step leaves every later step "
+            "unanswerable. Read per task, that is one mistake scored as many; grade it with "
+            "`--scenario`.")
     return list(latest.values())
+
+
+def refuse_pooled_arms(log_path):
+    """Refuse a log holding both reasoning arms for one cell, which has no honest reading.
+
+    The deduplication in [`records`] keeps whichever arm was appended later, so every reader would
+    show one arm's numbers under a run identity naming both - and [`conversations`] would grade
+    whichever arm's conversation began last. Both readers call this; neither restates it.
+    """
+    pooled = sorted(cell for cell, arms in reasoning_arms(log_path).items() if len(arms) > 1)
+    if pooled:
+        raise SystemExit(
+            f"{os.path.basename(log_path)} holds both reasoning arms for {len(pooled)} cell(s) - "
+            f"{cell_label(pooled[0])}"
+            + (f" and {len(pooled) - 1} more" if len(pooled) > 1 else "")
+            + ". Deduplication keeps whichever arm was written later, so every reading of this "
+              "log would report one arm's scores under a run that names both. Grade each arm's "
+              "log on its own and read them with `--compare`.")
 
 
 _ARMS_CACHE = {}
@@ -2263,7 +2358,314 @@ def series(log_paths, tasks_file, out_path):
     return rows
 
 
+# --------------------------------------------------------------------------------------------
+# `--scenario`: one investigation graded as a run, not as a list of questions (item 39).
+#
+# The grid's conversations are all short - one question, a call or two, an answer - so "the
+# window did not bite" is true a question at a time. What it has never measured is the transcript
+# filling the window rather than the surface: the tenth turn of a triage, three large results deep.
+# `WINDBG_MCP_SCENARIO` already drives that - one transcript and one set of sessions across a task
+# list - and nothing could grade it, because the unit is wrong. A wrong turn at step 3 leaves steps
+# 4 to 8 nothing to read, so per-task scoring reports six failures for one mistake, and the thing
+# worth measuring is the step at which the run stopped being recoverable.
+#
+# So the key is an ordered list of **facts**, each asked by one step, and a run is graded by when
+# each was first stated, how many turns in, and how long the transcript was at that turn. The first
+# fact never stated is where it broke. Every turn's prompt-token count is already in the records
+# the drivers write, so the growth curve was in the log all along; what was missing was the key and
+# this reader of it.
+# --------------------------------------------------------------------------------------------
+
+
+def is_scenario(suite):
+    """Whether a suite is one continuing investigation: it carries `facts`, the scenario's key.
+
+    **The key is the marker, not a flag beside it**, so the two cannot disagree. A suite with facts
+    and no flag would have been run as separate conversations and graded per task - which is the
+    misreading this mode exists to replace, reached by forgetting a field.
+    """
+    return bool(suite.get("facts"))
+
+
+def scenario_key(suite):
+    """The scenario's `(steps, facts)`, refused rather than graded when they are not a key.
+
+    Four refusals, each a key that would grade without measuring:
+
+    - **A fact asked by a step the suite has not got**, which no run could ever state.
+    - **Facts out of step order.** The break is the *first* fact never stated, so the list's order
+      is the claim about which step depends on which; one listed ahead of an earlier step's fact
+      would move the break to wherever the list put it.
+    - **An empty `expect`, or an empty group in one**, which `matches()` passes for every answer -
+      the hole `verify_against` closes for the suite, at the same place here.
+    - **A fact the question hands over.** A fact is searched for in the answers from the step that
+      asks for it onward, so an alternative appearing in *any* step's prompt could be an answer
+      repeating the user rather than stating something it found.
+    """
+    steps = suite.get("tasks") or []
+    facts = suite.get("facts") or []
+    at, problems = {}, []
+    for index, step in enumerate(steps):
+        if step.get("id") in at:
+            problems.append(f"step `{step.get('id')}` appears twice")
+        at.setdefault(step.get("id"), index)
+    if not facts:
+        problems.append("it has no `facts`, so there is nothing to grade a run against")
+    seen, latest = set(), -1
+    for fact in facts:
+        name = fact.get("id")
+        if name in seen:
+            problems.append(f"fact `{name}` appears twice")
+        seen.add(name)
+        if fact.get("step") not in at:
+            problems.append(f"fact `{name}` is asked by step `{fact.get('step')}`, which the suite "
+                            f"has not got")
+            continue
+        if at[fact["step"]] < latest:
+            problems.append(f"fact `{name}` is asked at step {at[fact['step']] + 1}, before the "
+                            f"fact listed ahead of it - facts are listed in the order the run is "
+                            f"asked for them, since the first one missing is where it broke")
+        latest = max(latest, at[fact["step"]])
+        groups = fact.get("expect") or []
+        if not groups or not all(groups):
+            problems.append(f"fact `{name}` has no `expect` groups or an empty one, and `all()` "
+                            f"over nothing passes every answer")
+        for alt in (alt for group in groups for alt in group):
+            for step in steps:
+                if present(alt, normalise(step.get("prompt") or "")):
+                    problems.append(f"fact `{name}` accepts `{alt}`, which step `{step['id']}`'s "
+                                    f"own prompt carries - an answer stating it may only be "
+                                    f"repeating the question")
+    if problems:
+        raise SystemExit("not a scenario key: " + "; ".join(problems))
+    return steps, facts
+
+
+def conversations(log_path):
+    """Every conversation in a scenario log, per (cell, draw), in the order each began.
+
+    **Read raw, not through [`records`]**, whose deduplication keeps the last record per
+    (cell, draw, task) - which for a scenario splices attempts together: one killed at step 5 and
+    a later one killed at step 3 leave steps 1-2 from the second and 3-4 from the first, a
+    transcript no model ever had. The unit here is the conversation, named by the id each of its
+    records carries (`local_model_drive.CONVERSATION`); the runner gives the driver that id and
+    writes it into the note it leaves when it kills one, so a note is attributed exactly rather
+    than to whichever conversation happens to precede it.
+
+    Returns `(cells, foreign)`: `{cell: [{"id", "records", "notes"}, ...]}`, and how many lines
+    carry no conversation at all - records and notes from a run that was not one.
+    """
+    cells, foreign = {}, 0
+    with open(log_path, encoding="utf-8") as log:
+        for line in log:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            conversation = record.get("conversation")
+            if not conversation:
+                foreign += 1
+                continue
+            surface = record.get("surface") or {}
+            cell = (record.get("backend"), record.get("model"), record.get("num_ctx"),
+                    surface.get("client"), draw_of(record))
+            entry = cells.setdefault(cell, {}).setdefault(
+                conversation, {"id": conversation, "records": [], "notes": []})
+            entry["notes" if record.get("task") is None else "records"].append(record)
+    return {cell: list(by_id.values()) for cell, by_id in cells.items()}, foreign
+
+
+def grade_conversation(conversation, steps, facts):
+    """One conversation against the key: when each fact was first stated, and where it broke.
+
+    **A fact is searched for from the step that asks for it onward, never before.** An earlier
+    answer can carry one by accident - the scenario's own `!analyze` failure bucket,
+    `0x9F_3_ACPI_IMAGE_pci.sys`, contains `acpi`, which is the last fact's answer - and a fact
+    credited to step 1 on that evidence would hold the run up past a break it actually had. A fact
+    stated at a *later* step than the one asking is a recovery, and is reported as `late`.
+
+    **The turn index is counted across the whole conversation** and names the turn whose answer
+    stated the fact - a step's last turn, since only the answer is recorded - and its
+    `prompt_tokens` is the transcript the model was holding when it said it.
+
+    **The cause of a break says which side of the bench it is on**: `not reached` (the cell was
+    killed or the driver died before the step ran), `error` (the chat failed - a window too small
+    for the transcript is this), `surface` (the step's `possible_on` does not include this client,
+    so the tool it needs was not served), `gave up` (out of turns), or `answer` - the model
+    answered and the fact was not in it, which is the one that is about the model.
+    """
+    by_step = {record.get("task"): record for record in conversation["records"]}
+    first = conversation["records"][0] if conversation["records"] else {}
+    surface = first.get("surface") or {}
+    rows, turn = [], 0
+    for index, step in enumerate(steps, 1):
+        record = by_step.get(step["id"])
+        if record is None:
+            rows.append({"step": step["id"], "index": index, "reached": False})
+            continue
+        turns = record.get("turns") or []
+        start, turn = turn + 1, turn + len(turns)
+        calls = grade_record(record, step, surface.get("names"))
+        rows.append({"step": step["id"], "index": index, "reached": True,
+                     "turns": [start, turn] if turns else None,
+                     "prompt_tokens": [t.get("prompt_tokens") for t in turns],
+                     "answer": record.get("answer"), "error": record.get("error"),
+                     "gave_up": bool(record.get("gave_up")), "calls": calls["calls"],
+                     "call_errors": calls["errored"], "unserved": calls["unserved"],
+                     "wall_s": record.get("wall_s")})
+    stated = []
+    for fact in facts:
+        asked = next(row for row in rows if row["step"] == fact["step"])
+        found = next((row for row in rows[asked["index"] - 1:]
+                      if row["reached"] and matches(by_step[row["step"]], fact)), None)
+        stated.append({
+            "fact": fact["id"], "asked_at": asked["index"],
+            "possible": surface.get("client") in steps[asked["index"] - 1].get("possible_on", []),
+            "stated_at": found["index"] if found else None,
+            "turn": found["turns"][1] if found and found["turns"] else None,
+            "prompt_tokens": found["prompt_tokens"][-1] if found and found["prompt_tokens"] else None,
+        })
+    broke = next((fact for fact in stated if fact["stated_at"] is None), None)
+    if broke:
+        row = rows[broke["asked_at"] - 1]
+        cause = ("not reached" if not row["reached"] else "error" if row["error"]
+                 else "surface" if not broke["possible"] else "gave up" if row["gave_up"]
+                 else "answer")
+        broke = {"fact": broke["fact"], "step": row["step"], "index": row["index"],
+                 "cause": cause, "error": row.get("error"),
+                 # The transcript the model held when it answered the question without the fact -
+                 # the reading this whole mode exists for.
+                 "prompt_tokens": next((t for t in reversed(row.get("prompt_tokens") or []) if t),
+                                       None)}
+    tokens = [t for row in rows for t in row.get("prompt_tokens") or [] if t]
+    reached = [row for row in rows if row["reached"]]
+    return {
+        "conversation": conversation["id"],
+        "held": next((i for i, fact in enumerate(stated) if fact["stated_at"] is None),
+                     len(stated)),
+        "of": len(stated),
+        "stated": sum(1 for fact in stated if fact["stated_at"] is not None),
+        "late": [fact["fact"] for fact in stated
+                 if fact["stated_at"] is not None and fact["stated_at"] > fact["asked_at"]],
+        "broke": broke,
+        # A conversation that stopped before its last step - the runner's note says why.
+        "cut_short": next((row["index"] for row in rows if not row["reached"]), None),
+        "note": conversation["notes"][-1].get("error") if conversation["notes"] else None,
+        "peak_prompt_tokens": max(tokens) if tokens else None,
+        "served_context": first.get("served_context"),
+        "turns": turn,
+        "calls": sum(row["calls"] for row in reached),
+        "unserved": sum(row["unserved"] for row in reached),
+        "wall_s": round(sum(row["wall_s"] or 0 for row in reached)),
+        "steps": rows,
+        "facts": stated,
+    }
+
+
+def grade_scenario(log_path, suite_file):
+    """Grade every (cell, draw) of a scenario log by its **last** conversation.
+
+    The last, as [`records`] keeps the last record: a cell is re-run only when the previous
+    attempt did not finish or no longer measures what the plan asks, so the latest attempt is the
+    measurement and the earlier ones are counted (`attempts`) rather than averaged in. An attempt
+    that ran against a reworded step, or at a window it did not ask for, is `uncounted` whole -
+    one step of a conversation cannot be dropped and the rest kept, since every later step was
+    answered from a transcript that held it.
+
+    Returns `(rows, identity)`.
+    """
+    suite = load(suite_file)
+    if not is_scenario(suite):
+        raise SystemExit(f"{suite_file} carries no `facts`, so it is not a scenario key; a task "
+                         f"list is graded with `--grade`")
+    steps, facts = scenario_key(suite)
+    by_id = {step["id"]: step for step in steps}
+    refuse_pooled_arms(log_path)
+    cells, foreign = conversations(log_path)
+    if foreign:
+        raise SystemExit(
+            f"{os.path.basename(log_path)} holds {foreign} line(s) that belong to no conversation "
+            "- records or notes from a run that was not a scenario. Keep a scenario's runs in a "
+            "log of their own, and grade a task list with `--grade`.")
+    if not cells:
+        raise SystemExit(f"{os.path.basename(log_path)} holds no scenario conversation")
+    rows, kept = [], []
+    for cell in sorted(cells, key=lambda c: (cell_order(c[:4]), c[4])):
+        attempts = cells[cell]
+        last = attempts[-1]
+        kept.extend(last["records"] + last["notes"])
+        row = {"backend": cell[0], "model": cell[1], "num_ctx": cell[2], "surface": cell[3],
+               "draw": cell[4], "attempts": len(attempts)}
+        stale = sorted({record.get("task") for record in last["records"]
+                        if not usable(record, by_id.get(record.get("task")))
+                        or record.get("task") not in by_id})
+        if stale:
+            row.update(conversation=last["id"], uncounted=stale)
+        else:
+            row.update(grade_conversation(last, steps, facts))
+        rows.append(row)
+    return rows, identity(kept)
+
+
+def print_scenario(suite_file, rows):
+    suite = load(suite_file)
+    print(f"\nscenario {suite.get('suite')}: {len(suite['facts'])} facts over "
+          f"{len(suite['tasks'])} steps, graded by each cell's last conversation")
+    print(f"\n{'cell':<44} {'draw':>4} {'held':>5} {'stated':>6}  {'broke at':<26} {'cause':<11} "
+          f"{'tokens':>7} {'peak':>7} {'turns':>5} {'calls':>5}")
+    for row in rows:
+        label = cell_label((row["backend"], row["model"], row["num_ctx"], row["surface"]))
+        if row.get("uncounted"):
+            print(f"{label:<44} {row['draw']:>4}  UNCOUNTED: {', '.join(row['uncounted'])} ran "
+                  f"against a reworded step or a window it did not ask for")
+            continue
+        broke = row["broke"]
+        where = f"{broke['fact']} (step {broke['index']})" if broke else "-"
+        tokens = f"{broke['prompt_tokens']:,}" if broke and broke["prompt_tokens"] else "-"
+        peak = f"{row['peak_prompt_tokens']:,}" if row["peak_prompt_tokens"] else "-"
+        print(f"{label:<44} {row['draw']:>4} {row['held']:>2}/{row['of']:<2} {row['stated']:>6}  "
+              f"{where:<26} {(broke or {}).get('cause', '-'):<11} {tokens:>7} {peak:>7} "
+              f"{row['turns']:>5} {row['calls']:>5}")
+        # Per fact: `Y` stated when asked, `L<n>` stated late at step n, `n` never, `-` its step
+        # never ran. The transcript beside it is the growth curve, a step's last turn at a time.
+        marks = " ".join(
+            f"{fact['fact']}:" + ("Y" if fact["stated_at"] == fact["asked_at"]
+                                  else f"L{fact['stated_at']}" if fact["stated_at"]
+                                  else "-" if not row["steps"][fact["asked_at"] - 1]["reached"]
+                                  else "n")
+            for fact in row["facts"])
+        growth = " ".join(f"{step['prompt_tokens'][-1]:,}" if step.get("prompt_tokens")
+                          and step["prompt_tokens"][-1] else "-" for step in row["steps"])
+        print(f"    facts   {marks}")
+        print(f"    tokens  {growth}"
+              + (f"   (served {row['served_context']:,})" if row["served_context"] else ""))
+        if broke and broke.get("error"):
+            print(f"    error   {broke['error'][:200]}")
+        if row["note"]:
+            print(f"    note    {row['note']}")
+        if row["attempts"] > 1:
+            print(f"    ({row['attempts']} attempts; the last is graded)")
+
+
+def report_scenario(log_path, suite_file):
+    """Grade, print, and write `<log>.scenario.json` with the identity inside it. Returns the path."""
+    rows, ident = grade_scenario(log_path, suite_file)
+    print_identity(ident)
+    print_scenario(suite_file, rows)
+    out = os.path.splitext(log_path)[0] + ".scenario.json"
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump({"identity": ident, "rows": rows}, f, indent=2)
+    return out
+
+
 def main():
+    if sys.argv[1:2] == ["--scenario"]:
+        rest = [a for a in sys.argv[2:] if not a.startswith("--")]
+        if not rest:
+            raise SystemExit("--scenario needs a log, and optionally the scenario it ran")
+        suite_file = rest[1] if len(rest) > 1 else os.path.join(HERE, "eval_scenario.json")
+        print(f"\nwrote {report_scenario(rest[0], suite_file)}")
+        return
     if sys.argv[1:2] == ["--verify-key"]:
         # No log to read: this mode asks the *server*, not a run of it. The tasks file is the
         # only positional, and it defaults to the suite in use rather than to a frozen one -
@@ -2349,6 +2751,9 @@ def main():
     logs_dir = plan.get("logs", os.path.join(os.path.dirname(log_path), "logs"))
     one_arm_per_log(plan, log_path)
     fm_axes_are_absent(plan)
+    scenario = is_scenario(load(plan["tasks"]))
+    if scenario:
+        scenario_cells_are_drivable(plan, load(plan["tasks"]))
     suite = cell_tasks(plan["tasks"], None)
     done = already_done(log_path, suite)
     print(f"plan {plan['run']}: {len(done)} task records already in {log_path}")
@@ -2377,7 +2782,8 @@ def main():
                             continue
                         run_cell(plan, tokens, backend, model, context, surface, draw, subset,
                                  [t["id"] for t in wanted], group.get("budget_s", 1800),
-                                 log_path, logs_dir, think=bool(group.get("think", False)))
+                                 log_path, logs_dir, think=bool(group.get("think", False)),
+                                 scenario=scenario)
                         done = already_done(log_path, suite)
                 if backend == "ollama":
                     # **Evicted between contexts, not only between models** - and this is the
@@ -2399,6 +2805,9 @@ def main():
                               f"{evicted.stderr.strip()[:200]}\n"
                               f"    cells at the next context may be served this one's window")
 
+    if scenario:
+        report_scenario(log_path, plan["tasks"])
+        return
     cells = summarise(log_path, plan["tasks"])
     ident = identity(records(log_path))
     print_identity(ident)

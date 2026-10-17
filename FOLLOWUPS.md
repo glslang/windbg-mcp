@@ -59,7 +59,7 @@ reopen it). An unmarked line is simply open.
 - [Item 27](#27-windbg-mcp--dbgscope-a-deferred-module-reports-no-pdb-identity--declined-2026-08-20) — [windbg-mcp + dbgscope] A deferred module reports no PDB identity — **declined** (2026-08-20)
 - [Item 33](#33-windbg-mcp-the-lease-grace-assumes-the-server-is-the-slow-party) — [windbg-mcp] The lease grace assumes the server is the slow party
 - [Item 35](#35-windbg-mcp--dbgscope-the-engines-subregister-flag-misses-the-views-that-matter--declined-2026-08-22) — [windbg-mcp + dbgscope] The engine's subregister flag misses the views that matter — **declined** (2026-08-22)
-- [Item 39](#39-windbg-mcp-the-eval-measures-single-questions-not-an-investigation) — [windbg-mcp] The eval measures single questions, not an investigation
+- [Item 39](#39-windbg-mcp-the-eval-measures-single-questions-not-an-investigation) — [windbg-mcp] The eval measures single questions, not an investigation — **half landed** (the scenario key and `--scenario`, the key verified live, 2026-10-17; a recorded run is what is left)
 - [Item 50](#50-windbg-mcp-the-released-binary-is-unsigned--only-the-certificate-is-left) — [windbg-mcp] The released binary is unsigned — only the certificate is left — **half landed**
 - [Item 53](#53-windbg-mcp-a-break-raised-after-a-runs-stop-is-built-labels-the-result-cut-short) — [windbg-mcp] A break raised *after* a run's stop is built labels the result cut short
 - [Item 56](#56-windbg-mcp-resolves--expr-is-a-callers-command-on-nobodys-clock) — [windbg-mcp] `resolve`'s `? <expr>` is a caller's command on nobody's clock
@@ -581,18 +581,37 @@ and a `modules` page or a `read_memory` answer lands in it whole. So the honest 
 window did not bite" is *a question at a time*, and the interesting failure - the tenth turn of a
 kernel triage, three large results deep - has not been run.
 
-**Why it was deferred rather than added.** The driver already has the mechanism:
-`WINDBG_MCP_SCENARIO=1` makes a task list one continuing investigation with one transcript and one
-set of sessions. What it does not have is a way to *grade* one. A scenario has no per-task answer
-key - a wrong turn at step 3 makes steps 4 to 8 unanswerable, so per-task scoring reports eight
-failures for one mistake, and the thing worth measuring is the step at which the run stopped being
-recoverable. That is a different unit of measurement and a different key, not a flag on this grid.
+**Half landed, 2026-10-17: the key and the grader are built, and the key is verified live; no
+scenario has been run.** What is left is the run, and this entry is narrowed to it.
 
-**Where it picks up.** A scenario key would want: an ordered list of facts the run must have
-established by the end, the turn index at which each first appears, and the transcript length at
-that point. `local_model_eval.py` grades from records that already carry every turn's prompt token
-count, so the growth curve is in the log this eval already writes - what is missing is the key and
-a `--scenario` mode in the grader that reads it.
+**What landed.** The driver had the mechanism already (`WINDBG_MCP_SCENARIO=1`: one transcript and
+one set of sessions across a task list) and nothing could grade it. A wrong turn at step 3 leaves
+the later steps unanswerable, so per-task scoring reports one mistake as many. So:
+
+- **A suite carrying `facts` is a scenario**, and `local_model_eval.py` runs it as one conversation
+  per cell. The runner mints the conversation id, passes it to the driver, and writes it into any
+  note it leaves when it kills one.
+- **`--scenario` grades each cell's last conversation.** For each fact it reports the step that
+  stated it (searched from the step asking onward), the turn index across the conversation, and that
+  turn's prompt tokens. The first fact never stated is the break, with a cause: `not reached`,
+  `error`, `surface`, `gave up` or `answer`.
+- **Every per-task reader refuses a scenario log** from the one gate in `records()`.
+- **`tools/eval_scenario.json` is the first key**: seven steps walking the `0x9F` from the bug check
+  to `nvlddmkm` holding the IRP, with `!analyze`'s `pci` as a deliberate trap at step 5. Each fact
+  carries a `verify` binding. `--verify-key tools/eval_scenario.json` held on all seven against
+  `windbg-mcp 0.22.0+gbfd1f388`, and a copy with step 5's fact changed to `pci` failed that fact and
+  step 6's.
+
+`docs/local-model-eval.md`, *One investigation rather than six questions*, has the rules and why
+each exists.
+
+**What is left: the run.** `tools/eval_plan_scenario.json` is the plan: `qwen3.8:27b-mlx` and
+`gemma4:31b-mlx` on `full`, at 262,144 and at 32,768. It needs the bench listener on the VM serving
+a `full` client of the run's own (`tools/bench_listener.ps1`), which this pass did not set up; the
+pass was done from the Mac. The question the item was filed for is answered only by that run:
+whether a growing transcript, rather than the surface, is what ends an investigation, and at what
+length. Read each cell's break against the window it was **served**, not the one it asked for.
+`usable()` already uncounts a conversation where the two differ.
 
 Two smaller things the same run left open:
 
