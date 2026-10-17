@@ -2464,6 +2464,15 @@ impl Sessions {
                 return settled(reply);
             }
         }
+        // The deadline and the reply can cross. `reader` may have sent since the last poll, and a
+        // reply left in a receiver about to be dropped is lost — its send succeeded, so `reader`
+        // never settles the open on nobody's behalf, and a refusal that proved nothing was claimed
+        // leaves a preserved kernel session preserved. Closing first makes every later send fail,
+        // which is what routes it to [`settle_open`].
+        rx.close();
+        if let Ok(reply) = rx.try_recv() {
+            return reply;
+        }
         // A timeout is an operational outcome, not broken plumbing: the target may simply still be
         // running. Note the job itself is *not* cancelled — only this wait for it.
         //
@@ -4015,12 +4024,44 @@ fn settle_uncommitted(session: &Session, why: &str) -> bool {
     false
 }
 
+/// Ends a kernel session that was preserved while its attach was outstanding, once the attach has
+/// returned a refusal from before it claimed anything — see [`settle_open`].
+///
+/// `released` first, because it is what every guard on this session reads: it lets the state
+/// leave `KernelUnresolved` and the worker be killed, and it makes a preservation scheduled a
+/// moment late decline rather than re-reserve the endpoint.
+fn release_unclaimed_kernel(session: &Session, refusal: &EngineError) {
+    session.released.store(true, Ordering::SeqCst);
+    session.update_state(|_| {
+        Some(SessionState::Failed(format!(
+            "the attach was refused after the caller's deadline, before it claimed a target: \
+             {refusal}"
+        )))
+    });
+    session.kill();
+}
+
 /// Settles a session from its opener's result when nobody is left to do it — the caller's timeout
 /// fired, so [`Sessions::open`] never saw the reply.
 ///
 /// Returns whether the session was left **live**: its worker still holds a target, so it still
 /// owes its slot and capacity has to be reconciled against it.
 fn settle_open(session: &Session, result: &Result<Output, EngineError>) -> bool {
+    // **A refusal the attach returned before committing claimed nothing, deadline or not**, and
+    // the worker reaches that verdict on its own side (`KernelSafety::finished_attach`). The
+    // deadline was right to preserve the session while the answer was unknown; the answer is now
+    // known, and keeping the controller reserved would send an operator to recover a target that
+    // nothing attached to — what a held KDNET port on a loaded runner did (issue #462). Ahead of
+    // the sticky check below, which is about a target that may exist.
+    if let Err(e) = result
+        && session.kind == SessionKind::Kernel
+        && session.kernel_unresolved()
+        && !session.phase().committed()
+        && !matches!(e, EngineError::RecoveryRequired(_))
+    {
+        release_unclaimed_kernel(session, e);
+        return false;
+    }
     if session.kernel_unresolved() || session.live_control_unresolved() {
         return true;
     }
@@ -7822,6 +7863,10 @@ mod tests {
     }
 
     fn kernel_with_child(id: &str) -> Arc<Session> {
+        kernel_with_child_in(id, SessionState::Attaching)
+    }
+
+    fn kernel_with_child_in(id: &str, state: SessionState) -> Arc<Session> {
         let _spawn = spawn_guard();
         let child = Command::new("ping.exe")
             .args(["-t", "127.0.0.1"])
@@ -7832,8 +7877,7 @@ mod tests {
             .kill_on_drop(true)
             .spawn()
             .unwrap();
-        let mut session =
-            Arc::into_inner(kernel_double(id, SessionState::Attaching, 50194)).unwrap();
+        let mut session = Arc::into_inner(kernel_double(id, state, 50194)).unwrap();
         session.pid = child.id().unwrap();
         session.child = Mutex::new(Some(child));
         Arc::new(session)
@@ -8195,6 +8239,101 @@ mod tests {
             Err(EngineError::RecoveryRequired(_))
         ));
         assert!(queue.try_recv().is_err());
+    }
+
+    /// A refusal the attach returned **before committing** ends a session the caller's deadline
+    /// preserved, and the same refusal after the commit does not (issue #462).
+    ///
+    /// Committed or not is the whole distinction, so both arms run. A held KDNET port refuses at
+    /// `AttachKernel`, before the commit, and a deadline that won that race on a loaded runner
+    /// left the controller reserved against a target nothing had attached to — `kernel_unresolved`
+    /// in `session_status` and the endpoint refused to the next attach, until an operator handoff.
+    #[tokio::test]
+    async fn a_late_refusal_before_commit_releases_what_the_deadline_preserved() {
+        for committed in [false, true] {
+            let kernel = kernel_with_child_in(
+                "late-refusal",
+                if committed {
+                    SessionState::Attaching
+                } else {
+                    SessionState::Opening
+                },
+            );
+            let (jobs, _queue) = mpsc::unbounded_channel();
+            let kernel = Arc::new(Session {
+                tx: jobs,
+                ..Arc::into_inner(kernel).unwrap()
+            });
+            let sessions = registry_of(std::slice::from_ref(&kernel));
+            let deadline = sessions
+                .call_as(
+                    &kernel,
+                    Call::new(EngineOp::AttachKernel {
+                        connection: kdconn::Connection::new("net:port=50194,key=1.2.3.4"),
+                        experimental_break_on_connect: false,
+                    }),
+                    Duration::from_millis(1),
+                    OPENER_JOB,
+                    Wait::Fixed,
+                )
+                .await;
+            assert!(matches!(deadline, Err(EngineError::RecoveryRequired(_))));
+            assert!(kernel.kernel_unresolved());
+
+            let (messages, rx) = mpsc::unbounded_channel();
+            let reading = tokio::spawn(reader(
+                Arc::downgrade(&kernel),
+                rx,
+                kernel.waiters.clone(),
+                sessions.clone(),
+            ));
+            messages
+                .send(WorkerMessage::Done {
+                    id: OPENER_JOB,
+                    result: Err(crate::proto::Failed::from(
+                        "Failed to attach to kernel: Unspecified error (0x80004005)",
+                    )),
+                })
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !kernel.waiters.lock().unwrap().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let retry_admitted = || {
+                sessions
+                    .admit(&kernel_double("retry", SessionState::Opening, 50194))
+                    .is_ok()
+            };
+            if committed {
+                assert!(
+                    kernel.kernel_unresolved(),
+                    "a refusal after the commit is about a target that may exist"
+                );
+                assert!(kernel.child.lock().unwrap().is_some());
+                assert!(!retry_admitted());
+            } else {
+                assert!(
+                    matches!(kernel.state(), SessionState::Failed(_)),
+                    "a refusal before the commit claimed nothing: {:?}",
+                    kernel.state()
+                );
+                assert!(
+                    kernel.child.lock().unwrap().is_none(),
+                    "the worker that claimed nothing is ended rather than retained"
+                );
+                // A preservation scheduled a moment late must not reserve the endpoint again.
+                kernel.preserve_kernel("racing timeout");
+                assert!(!kernel.kernel_unresolved());
+                assert!(retry_admitted(), "the endpoint is free for the next attach");
+            }
+            reading.abort();
+            // The stand-in is our ping child, not a debugger or a live target.
+            kernel.released.store(true, Ordering::SeqCst);
+            kernel.kill();
+        }
     }
 
     #[test]

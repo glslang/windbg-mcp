@@ -29,6 +29,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A kernel attach refused before it claimed anything no longer leaves a controller reserved when
+  the caller's deadline got there first** (issue #462). The deadline answers `target: unknown` and
+  preserves the session, which is right while the outcome is unknown. A KDNET port another process
+  holds is refused at `AttachKernel`, before the commit, as `Unspecified error (0x80004005)`. When
+  that refusal came back after the deadline, the session stayed `kernel_unresolved`, the endpoint
+  stayed reserved against the next attach, and only an operator handoff freed it, though nothing had
+  attached. The worker already counted that refusal as claiming nothing. The supervisor now does
+  too, and the session settles as failed with the refusal as its reason. A failure after the commit
+  is unchanged, since that target may exist. A reply landing just as the deadline expires is no
+  longer lost either: the wait closes its channel before declaring the timeout, so the reply is
+  either taken or reaches the settling path. Measured with a temporary 2.5 s delay before
+  `AttachKernel` and a 1 s budget. Before, the session was still `kernel_unresolved` six seconds
+  later and a second attach was refused as already reserved. After, it left `session_status` when
+  the refusal landed (about 2.7 s), its worker exited, and the next attach was admitted.
+
 - **The Secure Kernel handoff probe could not run against this server since item 107**, and its
   own tests had been failing since the same commit. Item 107 made every tool refuse an argument
   its schema does not declare, and took the invented `timeout_ms` out of the probe's closing `bl`

@@ -261,6 +261,13 @@ additional interrupts; an ACTIVE interrupt is not a safe timeout-recovery mechan
 An already-submitted release is different: a late successful `EndSession` reply confirms release,
 closes the session, and permits worker cleanup and endpoint reuse without a recovery handoff.
 
+So is an attach whose refusal arrives after the caller's deadline from **before** the attach claimed
+anything. A KDNET port another process holds is refused that way, at `AttachKernel`. The `unknown`
+was right when it was given. The refusal then proves nothing was attached, so the session closes as
+failed, its worker exits and the endpoint is free. `session_status` stops listing it, and a handoff
+sent afterwards is told the session never opened, with the refusal as the reason. A failure after
+the attach committed proves nothing about the target, and that session stays unresolved.
+
 Ordinary `end_session` reports `released: false`, `worker_terminated: false`, and
 `recovery_required: true`. No native teardown is queued for an unresolved controller. Idle/capacity
 reclamation, client lease expiry, and server shutdown cannot kill it automatically. On supervisor

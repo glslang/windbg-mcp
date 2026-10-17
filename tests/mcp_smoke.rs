@@ -21609,7 +21609,8 @@ fn a_kdnet_endpoint_another_process_holds_is_refused_rather_than_parked() {
     let held = std::net::UdpSocket::bind("0.0.0.0:0").expect("a udp port to hold");
     let port = held.local_addr().expect("a bound address").port();
     // This checks the engine's refusal, not its speed. A one-second caller deadline can win
-    // before AttachKernel returns, yielding unresolved ownership instead of the refusal.
+    // before AttachKernel returns, yielding unresolved ownership instead of the refusal — until
+    // the refusal lands and closes the session (issue #462), which this test would not wait for.
     let timeout = STEP.as_secs().to_string();
     let mut server = Server::started_with(&[("WINDBG_MCP_CALL_TIMEOUT_SECS", &timeout)]);
     let reply = server.call_tool(
