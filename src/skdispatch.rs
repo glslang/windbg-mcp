@@ -314,6 +314,7 @@ impl Session {
             &pending.control_transport,
             &partial,
             pending.target.expected_cr3.is_some(),
+            None,
         )?;
         let (provider, skipped) = crate::skcontrol::ControlProcess::spawn_selected(
             &control_transport,
@@ -325,7 +326,12 @@ impl Session {
             },
         )?;
         let target = provider.target().clone();
-        let live_transport = expand_target_command(&pending.live_transport, &target, true)?;
+        let live_transport = expand_target_command(
+            &pending.live_transport,
+            &target,
+            true,
+            Some((self.dispatcher.vmwp_pid, found.partition_handle)),
+        )?;
         self.dispatcher
             .bind_identity(found, live_transport, &target)?;
         let mut providers = vec![provider];
@@ -345,6 +351,7 @@ impl Session {
                 &additional.control_transport,
                 &partial,
                 additional.target.expected_cr3.is_some(),
+                None,
             )?;
             let (provider, provider_skipped) = crate::skcontrol::ControlProcess::spawn_selected(
                 &command,
@@ -677,6 +684,7 @@ fn expand_target_command(
     command: &str,
     target: &TargetIdentity,
     cr3_known: bool,
+    memory_handle: Option<(u32, u64)>,
 ) -> Result<String> {
     let mut words = crate::livesrc::split_command(command);
     if words.is_empty() {
@@ -699,6 +707,25 @@ fn expand_target_command(
         bail!(
             "the provider command uses {{cr3}}, but no CR3 assertion was supplied; the provider \
              must discover CR3 and report it in its hello"
+        );
+    }
+    if let Some((vmwp_pid, partition_handle)) = memory_handle {
+        if partition_handle == 0 {
+            bail!("worker discovery did not produce a partition handle for the memory provider");
+        }
+        for argument in words.iter_mut().skip(1) {
+            *argument = argument
+                .replace("{vmwp_pid}", &vmwp_pid.to_string())
+                .replace("{partition_handle}", &format!("0x{partition_handle:x}"));
+        }
+    } else if words
+        .iter()
+        .skip(1)
+        .any(|argument| argument.contains("{vmwp_pid}") || argument.contains("{partition_handle}"))
+    {
+        bail!(
+            "only the live-memory command may use {{vmwp_pid}} or {{partition_handle}}, and the \
+             profile must support worker discovery"
         );
     }
     Ok(crate::skpolicy::render_transport(&words))
@@ -4754,6 +4781,7 @@ mod tests {
                 "provider --partition {partition_id} --vp {vp} --cr3 {cr3}",
                 &target,
                 true,
+                None,
             )
             .unwrap(),
             "provider --partition 0x85 --vp 0 --cr3 0x1201000"
@@ -4767,12 +4795,25 @@ mod tests {
             r#""C:\provider {vp} {cr3}.exe" --partition {partition_id} --vp {vp}"#,
             &target,
             false,
+            None,
         )
         .unwrap();
         let words = crate::livesrc::split_command(&expanded);
 
         assert_eq!(words[0], r"C:\provider {vp} {cr3}.exe");
         assert_eq!(&words[1..], ["--partition", "0x85", "--vp", "0"]);
+    }
+
+    #[test]
+    fn memory_handle_placeholders_expand_only_from_worker_discovery() {
+        let target = target();
+        let command = "memory --pid {vmwp_pid} --handle {partition_handle} --cr3 {cr3}";
+        assert_eq!(
+            expand_target_command(command, &target, true, Some((4242, 0x2e0))).unwrap(),
+            "memory --pid 4242 --handle 0x2e0 --cr3 0x1201000"
+        );
+        let error = expand_target_command(command, &target, true, None).unwrap_err();
+        assert!(error.to_string().contains("only the live-memory command"));
     }
 
     #[test]

@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A live Secure Kernel memory transport can use the VID handle the worker already discovers.**
+  `{vmwp_pid}` and `{partition_handle}` are now expanded in the allowlisted live-memory command,
+  after guarded `vmwp` discovery, so an operator transport can duplicate that file object and read
+  through its own driver without loading `hvlib`. Neither placeholder is accepted by a register
+  provider, and neither value becomes client-selectable authority.
+
 - **`exception_triage` asks the engine's effective machine first when deciding how wide a fault's
   record is**, and believes a 32-bit answer from it alone (`FOLLOWUPS.md` item 58). What changes
   is a dump of a WoW64 process that a 64-bit writer took: its header says x64 and its process is

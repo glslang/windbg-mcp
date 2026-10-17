@@ -199,7 +199,7 @@ proved VM pause to keep provider state stable:
    attach to or inspect the VM, and starts no provider. `allow_transition_cr3` defaults to false and
    is accepted only with natural arming.
 2. The first `sk_live_arm` pauses the VM, verifies its `vmwp` binding and exact build, discovers the
-   dispatcher VND and VID partition id on the worker engine thread, then starts the register
+   dispatcher VND, VID partition handle and partition id on the worker engine thread, then starts the register
    provider and validates its reported CR3. It opens live memory against that identity, validates
    the provider-reported Secure Kernel base and guarded instructions, and checks every profiled
    dispatcher site. Only then does it save every selected VP's writable baseline and install one to
