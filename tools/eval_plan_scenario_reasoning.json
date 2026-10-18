@@ -1,0 +1,27 @@
+{
+  "run": "scenario-power-hang-v2, reasoning",
+  "note": "The reasoning arm of `eval_plan_scenario.json`, on the same nine steps, the same server build and the same weights, so the two logs differ by `think` and by nothing else that was asked for. Each model at the highest level it declares, because reasoning off is not how these models are used any more: `qwen3.8:27b-mlx` declares `low`, `medium` and `xhigh` (`/api/show`'s `thinking.values`, ollama 0.40.6) and `true` would mean `medium`, so it is asked for `xhigh` by name; `gemma4:31b-mlx` declares only `true`. One window, 262,144, which is both models' own: the first arm's 32,768 cells were served a 79,352-token prompt and answered from text 49,000 tokens back, so on this MLX runtime `num_ctx` bounds nothing and a second window would be a second draw of the first, not an axis. Its own log, because `one_arm_per_log` refuses two arms in one.",
+  "tasks": "tools/eval_scenario.json",
+  "url": "http://127.0.0.1:8766/",
+  "out": "eval-out/scenario-v2-reasoning.jsonl",
+  "logs": "eval-out/logs-scenario-v2-reasoning",
+  "max_steps": 6,
+  "keep_alive": "10m",
+  "surfaces": [
+    { "client": "full", "spec": "all" }
+  ],
+  "cells": [
+    { "backend": "ollama",
+      "models": ["qwen3.8:27b-mlx"],
+      "think": "xhigh",
+      "contexts": [262144],
+      "surfaces": ["full"],
+      "budget_s": 10800 },
+    { "backend": "ollama",
+      "models": ["gemma4:31b-mlx"],
+      "think": true,
+      "contexts": [262144],
+      "surfaces": ["full"],
+      "budget_s": 10800 }
+  ]
+}

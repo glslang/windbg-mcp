@@ -209,7 +209,7 @@ it by name rather than skipping it.
 
 **A scenario is graded with `--scenario`, and everything else refuses its log** (item 39). A suite
 carrying `facts` (`tools/eval_scenario.json`) is run as one conversation per cell, and the grade is
-where the run broke rather than a score per step. Four things bite.
+where the run broke rather than a score per step. What bites:
 
 - **An `expect` alternative is matched against the *normalised* answer**, and `normalise()` strips
   a `_` between two hex digits. So `DRIVER_POWER_STATE_FAILURE` arrives as
@@ -233,6 +233,33 @@ where the run broke rather than a score per step. Four things bite.
   `device_object` about step 4's address. So `--verify-key` holds each binding to the prompts so
   far plus the earlier facts' alternatives, and a wrong earlier fact fails the later binding too.
   That is the chain showing up in the key's own check, not a second bug.
+- **An emptied key is still a scenario.** `is_scenario` reads whether `facts` is *present*, so
+  `"facts": []` is refused by `scenario_key` by name. Read as "not a scenario" it ran the steps as a
+  task list, and a step has no `expect`, so every answer passed (Codex on #504).
+- **A fact that is a rank is pinned through an order, not a position.** `modules.-size.1.name` is
+  the second-largest image and `modules.+start.152.name` the image after index 151 by start address,
+  whatever order the server lists in: the segment re-sorts by one numeric field, reading a `0x`
+  string as a number. Pin the values on either side of the rank too, because a tie keeps the
+  server's order and passes a name pin; and pin the last index (`226`), because `matched` counts the
+  rows before `limit` cut them and only an index that exists says the sort saw them all.
+- **The window a scenario fills is the model's own, and the MLX runtime does not serve a smaller
+  one.** Both bench models are 262,144 (`ollama show`). A cell `/api/ps` reported at 32,768
+  evaluated a 79,352-token prompt and answered from text 49,000 tokens back, so on ollama 0.40.6 a
+  window axis is the same condition run twice. Compare a transcript with the model's own window:
+  none of the `v2` runs got within half of it. "2.4 times the window" was written against the
+  served figure, and the user caught it.
+
+**`think` takes a level as well as a switch, and only a level the model declares** (2026-10-18).
+The user's call: reasoning off is no longer a realistic eval, so a run asks for each model's top
+level. `/api/show`'s `thinking.values` lists them, and they differ per model: `qwen3.8:27b-mlx` has
+`low`, `medium` and `xhigh`, with `true` meaning `medium` and **no `high`**, and `gemma4:31b-mlx`
+has only `true`. ollama 0.40.6 accepted `think: "high"` for qwen without an error, so the driver
+refuses an undeclared level (`refuse_an_undeclared_level`) rather than recording a level nobody
+applied. A level is its own arm (`arm_named`): `xhigh` records as `xhigh`, so it cannot share a log
+with `on` (`one_arm_per_log`), and it reaches the driver through `think_env`, which has to
+round-trip with `think_of`. **What a level buys is unmeasured, so do not write that it reasons
+more.** On one counting question, three draws a level, qwen's reasoning text did not order by
+level (`xhigh` gave 1,326 once and 7,268 once; `low` gave 10,078 once).
 
 **Re-run against item 41** (2026-08-24): unserved calls 14 -> 6, with `debug_batch` going 10 -> 0
 and every name this server was teaching now gone. What that re-run mostly taught is **how easy it

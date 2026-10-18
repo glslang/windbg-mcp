@@ -90,6 +90,7 @@ reopen it). An unmarked line is simply open.
 - [Item 129](#129-windbg-mcp-the-live-secure-kernel-tier-takes-a-boots-coordinates-from-a-private-prep-the-kd-gate-discovers-for-itself) — [windbg-mcp] The live Secure Kernel tier takes a boot's coordinates from a private prep the KD gate discovers for itself
 - [Item 130](#130-windbg-mcp-a-transcript-cannot-be-joined-to-the-clients-opentelemetry-trace) — [windbg-mcp] A transcript cannot be joined to the client's OpenTelemetry trace
 - [Item 131](#131-windbg-mcp-the-eval-never-runs-a-mutating-tool) — [windbg-mcp] The eval never runs a mutating tool
+- [Item 132](#132-windbg-mcp-no-scenario-has-outgrown-a-models-own-window) — [windbg-mcp] No scenario has outgrown a model's own window
 
 ## 2. [dbgscope] Typed write primitives
 
@@ -2290,6 +2291,39 @@ A wrong pick there is expensive rather than wasted, since a batch that does run 
   `tools/local_model_drive.py`, and `grade_record`'s `refused_by_harness` verdict, which is what a
   run of this kind would stop producing.
 
+## 132. [windbg-mcp] No scenario has outgrown a model's own window
+
+**Repo:** `windbg-mcp`. **Origin:** review of item 39's close on
+[#504](https://github.com/glslang/windbg-mcp/pull/504), 2026-10-18. The close had reported a
+transcript "2.4 times the window" that ended nothing, measured against the 32,768 `/api/ps` said it
+served. That window is not what bounds a prompt on this runtime.
+
+Item 39 was filed for the transcript filling the window, "the tenth turn of a kernel triage, three
+large results deep", and its scenario never got there:
+
+- **Both bench models' own window is 262,144** (`ollama show`), and the longest prompt in the ten
+  scenario conversations was 122,107, 47% of it. With reasoning on, the peaks were 73,095 and
+  63,926.
+- **A smaller served figure is not enforced.** A cell `/api/ps` reported at 32,768 evaluated a
+  79,352-token prompt and answered step 8 from text about 49,000 tokens before its end (ollama
+  0.40.6, MLX builds). The 2026-08-23 grid found the same of a served 8,192. So on this runtime the
+  window axis is one condition run twice, and the plan's two windows were exactly that.
+
+What a transcript past the window does is therefore unmeasured: whether the runtime refuses the
+request (graded `error`), truncates the front of the transcript and loses the surface or the early
+facts (a break with cause `answer` at the first fact that needed them), or degrades quietly.
+
+- **Why deferred:** it needs either a longer investigation or a smaller window that is actually in
+  force, and neither existed when item 39 closed.
+- **What would close it:** a scenario run whose prompt passes the window the runtime enforces, with
+  `served_context` and the model card both recorded beside the break. Three routes, cheapest first:
+  `muse-glimmer:30b-mlx`, already on the bench, whose card is 131,072, against which the off-arm
+  qwen cell's 122,107 is 93%; more whole-table steps in `tools/eval_scenario.json`; or a runtime
+  shown to enforce `num_ctx`.
+- **Where it picks up:** `tools/eval_plan_scenario_reasoning.json` for the plan shape, and the
+  break causes in `local_model_eval.grade_conversation`, whose `error` and `answer` are the two a
+  window would produce.
+
 ## Where these items came from
 
 Each cluster above, and what filing it measured. Items named here as *"now in `DONE.md`"* have
@@ -2470,5 +2504,7 @@ exporter, and the item records why, together with what Claude Code's documentati
 not promise to send.
 Item 131 came from closing item 39 on 2026-10-17: of the two things its first run had left open,
 measuring the mutating tools is work and needed an entry of its own.
+Item 132 came from the review of that close on 2026-10-18, when the window its runs were measured
+against turned out not to be the model's, and nothing in them had come within half of the model's.
 `DECISIONS.md`'s 2026-08-02 entries are the bounded-command coverage review that produced
 item 13, now in [`DONE.md`](./DONE.md).

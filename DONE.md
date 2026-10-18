@@ -11552,26 +11552,32 @@ at one step leaves every later step unanswerable, and per-task scoring reports o
   module table. Every fact carries a `verify` binding, and `--verify-key` held each binding to the
   prompts so far plus the earlier facts. All nine held against `0.22.0+gbfd1f388`.
 
-**What the runs showed.** Two runs, eight conversations, `qwen3.8:27b-mlx` and `gemma4:31b-mlx` at
-262,144 and 32,768, one draw each.
+**What the runs showed.** Two runs with reasoning off, eight conversations, `qwen3.8:27b-mlx` and
+`gemma4:31b-mlx` at 262,144 and 32,768, then one with reasoning on, one draw each throughout.
 
-- **No conversation broke with `error`**, at any length. The longest prompt was 122,107 tokens.
-- **qwen at a served 32,768 held all nine facts** with its last prompt at 79,352 tokens, 2.4 times
-  the window. Its step-8 answer needed the step's question and the driver named at step 5, both
-  about 49,000 tokens before the end of that prompt, so this was not a truncation to the window.
+- **No conversation broke with `error`**, at any length. The longest prompt was 122,107 tokens,
+  and both models' own window is 262,144.
+- **qwen at a served 32,768 held all nine facts** with its last prompt at 79,352 tokens. Its step-8
+  answer needed the step's question and the driver named at step 5, both about 49,000 tokens before
+  the end of that prompt, so the runtime did not truncate to the 32,768 it reported. The plan's
+  two windows were one condition run twice.
 - **Both breaks were reading.** gemma, at both windows, took the default 32-row `modules` page for
   the whole table, past a last line naming `limit: 277`. qwen at 262,144 took Arg3 for the IRP at
   step 2. That cell held all seven facts in the first run, on identical prompts for those steps, so
   its break is a draw and not the window.
+- **With reasoning on, both held all nine** (2026-10-18, qwen at `xhigh`, gemma on, 262,144 only).
+  Both asked `modules` for the whole table at step 8, and qwen checked Arg4 with `irp_stack` at step
+  2. Neither misreading recurred, which one draw a cell cannot turn into a rate.
 
 **What building it disproved, or would have got wrong:**
 
-- **The premise, on this runtime.** The item expected a transcript filling the window to be the
-  interesting failure. On ollama 0.40.6 with MLX builds, a served window is not a cap on the
-  transcript any more than on the surface, and what ended the two runs that broke was reading.
-  That is a statement about this runtime, measured once per cell. A runtime that enforces
-  `num_ctx` would answer differently, and `served_context` is still recorded so a run can say
-  which it had.
+- **The premise was not tested, and the close first said otherwise.** The item expected a
+  transcript filling the window to be the interesting failure. On ollama 0.40.6 with MLX builds a
+  served window smaller than the model's is not a cap on the transcript, any more than on the
+  surface, and no run came within half of the model's own 262,144. The close reported a transcript
+  "2.4 times the window" against the served figure, and review on #504 pointed out the models' own
+  window. What ended the runs that broke was reading; what a transcript past the real window does
+  is item 132.
 - **A scenario of small results measures the surface.** The first key had seven steps with no large
   result in them. All four cells held every fact, with the transcript growing by 3.8k to 5.4k tokens
   on a surface of 22.7k to 26.6k. "Three large results deep" needs a step that cannot be answered
@@ -11591,7 +11597,7 @@ at one step leaves every later step unanswerable, and per-task scoring reports o
 - **The half-landed draft said only the run could say "at what length"** a transcript ends an
   investigation. The run did not find a length: none up to 122,107 tokens ended one.
 
-**What it left open.** It left two things open, and neither is in this entry's scope. Measuring the
-mutating tools the harness refuses is work, and is item 131. That every timing is one ARM64 Mac
-serving MLX builds is a caveat, and it went into `docs/local-model-eval.md`'s *What this does not
-cover*.
+**What it left open.** Three things, none in this entry's scope. Measuring the mutating tools the
+harness refuses is work, and is item 131. A transcript past the model's own window is item 132.
+That every timing is one ARM64 Mac serving MLX builds is a caveat, and it went into
+`docs/local-model-eval.md`'s *What this does not cover*.

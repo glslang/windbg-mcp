@@ -82,6 +82,14 @@ their ollama rows read `reasoning unrecorded` — beside the `unavailable` their
 those having no arm to be in either way. That is deliberate, and the distinction matters twice
 over, since resume reads the same absence as `off` while the identity block refuses to.
 
+**And since 2026-10-18 `think` can name a level, because off is no longer the realistic arm.** A
+model may declare several (`/api/show`'s `thinking.values`), and `true` asks for its default:
+`qwen3.8:27b-mlx` declares `low`, `medium` and `xhigh`, so `true` is `medium` and the top is asked
+for as `"think": "xhigh"`, while `gemma4:31b-mlx` declares only `true`. A level is sent and recorded
+as itself, so it is an arm of its own beside `on` and `off`. The driver refuses a level the model
+does not declare, because the runtime does not: ollama 0.40.6 took `think: "high"` for qwen, which
+has no such level, without an error.
+
 **The tools themselves.** The harness executes read-only tools and reports anything else back to
 the model as refused, so a wrong pick is *measured* rather than performed. `launch`, `execute` and
 `debug_batch` are on the surface and are never run: a debug host is the wrong place to discover
@@ -1479,12 +1487,18 @@ before it. The second run:
 | gemma | 262,144 | 7/9 | 8 | `next_above` (8) | `answer` | 70,841 | 18 | 667 s |
 | qwen | 262,144 | 2/9 | 5 | `stuck_operation` (3) | `gave up` | 122,107 | 36 | 1,281 s |
 
-**The transcript ended nothing.** No conversation in either run broke with `error`, at any length.
-qwen at a served 32,768 held all nine facts with its last prompt at 79,352 tokens, 2.4 times the
-window. Its step-8 answer is the evidence that this was not a truncation to the window. It needed
-the step's own question and the driver named at step 5, and both sat about 49,000 tokens before the
-end of that prompt. The 2026-08-23 grid found the same of an 8,192 window and a large surface.
-This is the same thing for a growing transcript, on a newer runtime.
+**No transcript came near the models' own window, so these runs cannot say what one filling it
+does.** No conversation in either run broke with `error`, at any length. The longest prompt was
+122,107 tokens, and both models' own window is 262,144 (`ollama show`'s `context length`), so the
+longest run used 47% of it.
+
+**The 32,768 cells did not run at 32,768.** `/api/ps` reported them served 32,768, and qwen held
+all nine facts there with its last prompt at 79,352 tokens. Its step-8 answer needed the step's own
+question and the driver named at step 5, both about 49,000 tokens before the end of that prompt, so
+the runtime did not cut the transcript to the figure it reported. On ollama 0.40.6 with MLX builds
+that figure bounds nothing. The plan's two windows were therefore one condition run twice, which is
+also the right reading of qwen's 9/9 against 2/9. The 2026-08-23 grid found the same of a served
+8,192 and a large surface; this is the same for a transcript.
 
 **Every break was about reading, not about length.**
 
@@ -1510,18 +1524,62 @@ clean: right, and not hedged.
 run and broke at step 2 in the second, on identical prompts for those steps. That makes its break a
 draw, not a property of the window, and "qwen does worse at 262,144" is the reading this table
 invites and does not support. What it does support is narrower: on this runtime, a growing
-transcript did not end an investigation at any length these four cells reached. The same goes for
-qwen holding all nine facts with a prompt 2.4 times the window it was served. One small thing
+transcript did not end an investigation at any length these four cells reached, and none reached
+half the models' own window. One small thing
 beside that: qwen's step-9 answer at 32,768 named the right module but gave its size as
 44,241,061 bytes, read back from the table step 8 had fetched rather than asked for again. The
 table says 44,216,320.
+
+### With reasoning on (2026-10-18)
+
+Every conversation above ran with reasoning off, and that is no longer how these models are used.
+[`tools/eval_plan_scenario_reasoning.json`](../tools/eval_plan_scenario_reasoning.json) runs the same
+nine steps against the same build (`0.22.0+gbfd1f388`) and the same weights, with each model at the
+highest level it declares: `xhigh` for qwen, the top of `low`, `medium` and `xhigh`, and `true` for
+gemma, which declares nothing else. It uses one window, 262,144, because the first arm showed the
+other one was never served. Each cell is one draw.
+
+| cell | reasoning | held | stated | broke at | peak prompt | turns | calls | reasoning text | wall |
+|---|---|---|---|---|---|---|---|---|---|
+| qwen | `xhigh` | 9/9 | 9 | - | 73,095 | 15 | 6 | 9,734 ch | 607 s |
+| gemma | on | 9/9 | 9 | - | 63,926 | 17 | 8 | 8,566 ch | 1,318 s |
+
+**Both held every fact, and both asked for the whole table at step 8.** qwen called `modules` with
+`limit: 300` and gemma with `limit: 256`. With reasoning off, gemma had taken the default 32-row
+page for the table at both windows. qwen named Arg4 as the IRP at step 2 and checked it with
+`irp_stack` before answering, which is the step its off-arm cell at 262,144 got wrong. Every answer
+was read as well as graded, and each states its fact in the role the step asks for, so none of these
+credits is containment finding a value in the wrong place. One slip beside the question: qwen's step
+9 listed `Netwtw08` third by size, where `nt` is.
+
+**Neither misreading recurred, and one draw cannot say that reasoning prevents them.** gemma's is
+the stronger reading of the two. It broke the same way in both off-arm cells, which were one
+condition run twice, and held in the one cell here. qwen's off-arm break was already a draw, since
+the same cell held all seven facts in `v1`. Two draws against one is a direction, not a rate.
+
+**Reasoning added little to the transcript, and cost gemma twice the wall clock.** Both peaks are
+below the off arm's (79,352 for qwen, 69,369 and 70,841 for gemma), with fewer or as many calls. qwen
+took 607 s against 637 s with reasoning off at the asked-for 32,768; its off-arm cell at 262,144
+took 1,281 s, most of it 41 calls down the wrong IRP. gemma took 1,318 s against 650 s and 667 s,
+and 925 s of that was steps 8 and 9, the two that carry the whole module table.
+
+**What `xhigh` bought over qwen's default is not established.** Its turns here reasoned a median of
+515 characters, 9,734 over 15 turns. The level reached the runtime, since the record carries it and
+the driver refuses one the model does not declare, but nothing measured whether it changed how much
+qwen reasons. On one counting question outside the scenario, asked three times at each level, the
+reasoning did not follow the level: 10,078, 5,021 and 4,565 characters at `low`; 5,098, 4,548 and
+4,068 at `medium`; 3,870, 1,326 and 7,268 at `xhigh`. Comparing levels needs draws of the scenario
+itself at each one, and this run is the first.
 
 ## What this does not cover
 
 The same list `local-model.md` carries, minus what this closed. A long investigation whose
 transcript outgrows the surface has been run now, once per cell, on one scenario and two models,
-with reasoning off. Still open: anything behind the read-only allow-list (`FOLLOWUPS.md` item 131),
-a box smaller than this one, and any model but these. And every wall-clock figure on this page is
+with reasoning off and on. One whose transcript outgrows the *model's* window has not: the longest
+prompt in the ten conversations was 122,107 tokens, against both models' 262,144, and on this
+runtime a smaller served figure is not enforced (`FOLLOWUPS.md` item 132). Still open beside it:
+anything behind the read-only allow-list (`FOLLOWUPS.md` item 131), a box smaller than this one,
+and any model but these. And every wall-clock figure on this page is
 one ARM64 Mac serving MLX builds: the correctness columns should travel, and the timings should not
 be quoted anywhere else.
 

@@ -174,7 +174,7 @@ def refuse_axes_this_model_does_not_have():
     either of these would leave two cells differing only in a field neither run honoured, which
     reads in the log as a controlled comparison and is not one.
     """
-    if os.environ.get("OLLAMA_THINK", "").strip().lower() in ("1", "true", "yes", "on"):
+    if drive.think_of(os.environ.get("OLLAMA_THINK")):
         raise SystemExit("fm_drive: this model reports `reasoning: false`; there is no think arm "
                          "to run. Unset OLLAMA_THINK for Foundation Models cells.")
     if drive.NUM_CTX:

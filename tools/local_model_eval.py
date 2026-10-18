@@ -203,7 +203,10 @@ def one_arm_per_log(plan, log_path):
                     f"cannot honour: {why}. Remove it - and if the arm matters for those rows, it "
                     f"is not a thing this harness can vary.")
             continue
-        think = bool(group.get("think", False))
+        if not isinstance(group.get("think", False), (bool, str)):
+            raise SystemExit(f"`think` is `true`, `false` or a level the model declares, not "
+                             f"{group['think']!r}")
+        think = arm_named(group.get("think", False))
         for model in group["models"]:
             for context in contexts_of(group):
                 for surface in group["surfaces"]:
@@ -231,12 +234,12 @@ def one_arm_per_log(plan, log_path):
         asked = seen.get((model, num_ctx, surface))
         if asked is None:
             continue
-        held = arms - {"on" if asked else "off"}
+        held = arms - {asked}
         if held:
             raise SystemExit(
                 f"`{log_path}` already holds reasoning {'/'.join(sorted(held))} records for "
                 f"{model} at ctx={num_ctx or 'default'} on `{surface}`, and this plan asks for "
-                f"reasoning {'on' if asked else 'off'}. This arm would run and be appended beside "
+                f"reasoning {asked}. This arm would run and be appended beside "
                 f"the other one, leaving a log that grades as whichever arm was written later "
                 f"with no way to recover either. Give this arm a log of its own and read the two "
                 f"with `--compare`. A record written before the axis existed carries no "
@@ -337,7 +340,29 @@ def arm_of(record):
     a plan asking `think: true` re-runs those cells instead of quietly reporting the legacy numbers
     as the reasoning arm's.
     """
-    return "on" if record.get("think") else "off"
+    return arm_named(record.get("think"))
+
+
+def arm_named(think):
+    """The arm a `think` value names: `off`, `on`, or a level such as `xhigh`, as itself.
+
+    `local_model_drive.reasoning_arm` is the same rule on the driver's side; this module cannot
+    import that one at load time (`verify_key` says why), and the rule is three lines.
+    """
+    if not think:
+        return "off"
+    return "on" if think is True else str(think)
+
+
+def think_env(think):
+    """A plan's `think` as the `OLLAMA_THINK` the driver reads back: `false`, `true`, or the level.
+
+    `local_model_drive.think_of` is the reader, and the two have to round-trip - a level written as
+    `true` would run the model's default and be recorded as `on`, a level nobody asked for.
+    """
+    if not think:
+        return "false"
+    return "true" if think is True else str(think)
 
 
 def already_done(log_path, tasks):
@@ -487,7 +512,7 @@ def run_cell(plan, tokens, backend, model, context, surface, draw, subset, plann
         # **The reasoning axis, set per cell group.** Only the ollama rows have it: a Claude row's
         # reasoning is the client's to decide and this bench does not own that knob, which is the
         # same reason those rows carry no `model_digest`.
-        env["OLLAMA_THINK"] = "true" if think else "false"
+        env["OLLAMA_THINK"] = think_env(think)
         argv = [sys.executable, "-u", DRIVER, plan["tasks"]]
     elif backend == "fm":
         # Nothing to set. The model is the one the OS ships, its window cannot be asked for, and it
@@ -700,13 +725,20 @@ WHOLE_TEXT = "@text"
 
 
 def field(result, path):
-    """One `read` path into a result — dotted, with two ways of entering a list.
+    """One `read` path into a result — dotted, with three ways of entering a list.
 
     An integer segment indexes it, and `name=pc` selects the first element whose `name` is `pc`.
     The second exists because **a position in a list is usually not the fact**: the `pc` register
     is entry 32 of the ARM64 bank, and pinning 32 would fail on an engine that reordered the bank
     while still answering the question the task asks. What the key rests on is that the register
     *called* `pc` holds that value, and this is how a pin says so.
+
+    The third is an order: `+start` or `-size` re-sorts the list by one numeric field, ascending or
+    descending, before the next segment reads it ([`ordered`]). That is for a fact that *is* a
+    position in an order - the second-largest image, the next one loaded above a driver - which a
+    pin by name cannot state, and a pin by index states only for as long as the server happens to
+    list in that order. `modules.-size.1.name` is the second-largest image whatever order the
+    table arrives in.
 
     Raises `KeyError` naming the path that ran out rather than returning a default, because a
     field that has *moved* is exactly the drift this mode exists to catch: a pin that quietly
@@ -716,6 +748,9 @@ def field(result, path):
     cursor = result
     for segment in path.split("."):
         if isinstance(cursor, list):
+            if segment[:1] in ("+", "-") and segment[1:]:
+                cursor = ordered(cursor, segment, path)
+                continue
             if "=" in segment:
                 key, _, want = segment.partition("=")
                 match = next((e for e in cursor
@@ -732,6 +767,30 @@ def field(result, path):
         else:
             raise KeyError(path)
     return cursor
+
+
+def ordered(rows, segment, path):
+    """`rows` sorted by the field `segment` names: `+start` ascending, `-size` descending.
+
+    **Every row has to carry that field as a number**, or the path is a `KeyError` like any other
+    that ran out. A row that could not be placed would make a rank a claim about the rows that
+    could, which is the false pass [`field`] exists to refuse. An address is a number here: the
+    server writes one as a `0x` string, and comparing those as text would put `0x9` above `0x10`.
+
+    **A rank pins nothing about a tie on its own**, because the sort is stable and a tie keeps the
+    server's order. So a key stating a rank pins the value on either side of it as well, and two
+    equal neighbours are then a pin that fails rather than an order that was chosen for it.
+    """
+    key, values = segment[1:], []
+    for row in rows:
+        value = row.get(key) if isinstance(row, dict) else None
+        if isinstance(value, str) and re.fullmatch(r"0x[0-9a-fA-F]+", value):
+            value = int(value, 16)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise KeyError(path)
+        values.append(value)
+    order = sorted(range(len(rows)), key=values.__getitem__, reverse=segment[0] == "-")
+    return [rows[i] for i in order]
 
 
 def spelling(text):
@@ -2383,8 +2442,13 @@ def is_scenario(suite):
     **The key is the marker, not a flag beside it**, so the two cannot disagree. A suite with facts
     and no flag would have been run as separate conversations and graded per task - which is the
     misreading this mode exists to replace, reached by forgetting a field.
+
+    **The field's presence decides, not its contents.** Reading `"facts": []` as "not a scenario"
+    ran the steps as a task list, and a step carries no `expect`, so `matches()` passed every
+    answer and the plan's report was green over nothing. Present and empty is a scenario with no
+    key, which [`scenario_key`] refuses by name.
     """
-    return bool(suite.get("facts"))
+    return "facts" in suite
 
 
 def scenario_key(suite):
@@ -2771,7 +2835,7 @@ def main():
                     subset = group.get("subset")
                     wanted = cell_tasks(plan["tasks"], subset)
                     for draw in range(1, draws + 1):
-                        arm = "on" if group.get("think", False) else "off"
+                        arm = arm_named(group.get("think", False))
                         outstanding = [t for t in wanted
                                        if (backend, model, context, surface, draw, t["id"], arm)
                                        not in done]
@@ -2782,7 +2846,7 @@ def main():
                             continue
                         run_cell(plan, tokens, backend, model, context, surface, draw, subset,
                                  [t["id"] for t in wanted], group.get("budget_s", 1800),
-                                 log_path, logs_dir, think=bool(group.get("think", False)),
+                                 log_path, logs_dir, think=group.get("think", False),
                                  scenario=scenario)
                         done = already_done(log_path, suite)
                 if backend == "ollama":
