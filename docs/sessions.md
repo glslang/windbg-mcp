@@ -266,7 +266,9 @@ anything. A KDNET port another process holds is refused that way, at `AttachKern
 was right when it was given. The refusal then proves nothing was attached, so the session closes as
 failed, its worker exits and the endpoint is free. `session_status` stops listing it, and a handoff
 sent afterwards is told the session never opened, with the refusal as the reason. A failure after
-the attach committed proves nothing about the target, and that session stays unresolved.
+the attach committed proves nothing about the target, and that session stays unresolved. So does
+one with a target-changing `execute` queued behind the attach, since that command may have given
+the worker a target of its own.
 
 Ordinary `end_session` reports `released: false`, `worker_terminated: false`, and
 `recovery_required: true`. No native teardown is queued for an unresolved controller. Idle/capacity
