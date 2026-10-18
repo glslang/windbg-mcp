@@ -1836,6 +1836,7 @@ impl<P: ControlProvider> LiveControl<P> {
         self.continue_to_breakpoints_inner(dispatcher, epoch, breakpoints, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn continue_to_breakpoints_until(
         &mut self,
         dispatcher: &mut impl EventDispatcher,
@@ -1846,6 +1847,7 @@ impl<P: ControlProvider> LiveControl<P> {
         self.continue_to_breakpoints_inner(dispatcher, epoch, breakpoints, Some(deadline))
     }
 
+    #[cfg(test)]
     fn continue_to_breakpoints_inner(
         &mut self,
         dispatcher: &mut impl EventDispatcher,

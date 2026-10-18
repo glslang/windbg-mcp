@@ -212,10 +212,11 @@ which single steps are refused, and what every other request is answered with:
   refused; so is a `rep`-prefixed string instruction, and anything that writes `ss` (`mov ss`,
   `pop ss`, `lss`), because the trap can land somewhere other than the successor. A decoded
   `mov cr3,r64` is carried to that successor with a temporary hardware breakpoint rather than TF;
-  the controller binds the resulting root and removes the slot before reporting the stop. `g`
-  needs at least one hardware breakpoint installed and is refused otherwise. A refusal resends the
-  held stop, so the session survives it. The facade reads one bit of `Continue2`, the trace flag;
-  whatever WinDbg sends for `p` is handled by those same two arms.
+  the controller binds the resulting root and removes the slot before reporting the stop. `g` is
+  refused before the retained event is released, even when WinDbg has installed a hardware
+  breakpoint. A refusal resends the held stop, so the session survives it. The facade recognizes
+  both the legacy continue request and `Continue2`; only `Continue2` with its trace flag set may
+  resume the target. Whatever WinDbg sends for `p` is handled by that same trace arm.
 - **The proven redirected step is one five-byte NOP.** On that bench the next instruction used the
   interrupted context's RBX, so the acceptance takes one step and quits.
 - **`SetContext` succeeds only for WinDbg's unchanged compatibility write**; a changed byte is
@@ -231,6 +232,13 @@ which single steps are refused, and what every other request is answered with:
   record. A short manipulate packet and an invalid
   `GetContextEx` range now receive failure without losing the stop. Framing errors request resend;
   three consecutive framing errors enter recovery.
+
+The `g` refusal was tightened after a 2026-10-18 live qualification. WinDbg installed
+`securekernel!KiTimerInterrupt`, sent non-trace `Continue2`, and the controller released its
+retained event, but no VTL1 breakpoint stop returned; the disposable VM reset and the managed call
+timed out. Both that packet and WinDbgX's measured legacy continue packet are now refused before
+any guest execution state is changed. Hardware breakpoint insertion, listing and removal remain
+available only for protocol inspection, not as a claimed execution-control path.
 
 ## What WinDbg reads that the guest never held
 

@@ -610,27 +610,6 @@ impl Session {
             .context("the live Secure Kernel service deadline underflowed")
     }
 
-    pub(crate) fn continue_to_breakpoints_until(
-        &mut self,
-        engine: &DebugEngine,
-        epoch: &crate::skcontrol::StopEpoch,
-        breakpoints: Vec<BreakpointGuard>,
-        deadline: Instant,
-    ) -> Result<LiveTransition> {
-        self.ensure_preparation_succeeded()?;
-        let control = self
-            .control
-            .as_mut()
-            .context("live Secure Kernel control has not completed target discovery")?;
-        let mut dispatcher = self.dispatcher.bind(engine);
-        let epoch =
-            control.continue_to_breakpoints_until(&mut dispatcher, epoch, breakpoints, deadline)?;
-        Ok(LiveTransition {
-            phase: control.phase(),
-            epoch,
-        })
-    }
-
     pub(crate) fn read_stopped_registers_until(
         &mut self,
         epoch: &crate::skcontrol::StopEpoch,

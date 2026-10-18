@@ -303,7 +303,7 @@ async fn run_async(options: Options) -> Result<()> {
                 let request = crate::kdapi::ManipulateRequest::decode(&packet.payload)?;
                 manipulate_apis.push(request.api_number());
                 last_activity_after_ack = Some(tokio::time::Instant::now());
-                let continue_request = request.continue2_trace().is_some();
+                let continue_request = request.continue_trace().is_some();
                 let response = if request.api_number() == crate::kdapi::DBGKD_GET_VERSION_API {
                     options.kernel_base.map(|kernel_base| {
                         request.get_version_response(crate::kdapi::Version64::fixture(kernel_base))
