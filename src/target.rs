@@ -686,7 +686,9 @@ mod tests {
     /// a machine bug-checking: it records whatever was on that machine, its paths are the
     /// evidence, and there is no re-run that produces the same bug check with a tidier layout.
     /// Scanning them would therefore only ever produce an allowlist of what is already in them,
-    /// which asserts nothing. What is in them is a separate question from this test's.
+    /// which asserts nothing. What is in them is kept as captured, machine paths included:
+    /// rewriting a string would make a sample no longer a real capture, which is the property that
+    /// makes it worth having ([#287](https://github.com/glslang/windbg-mcp/issues/287)).
     #[test]
     fn no_user_mode_fixture_names_a_directory_off_the_fixture_bench() {
         let samples = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/samples");
