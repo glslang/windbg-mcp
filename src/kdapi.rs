@@ -28,6 +28,7 @@ pub(crate) const DBGKD_RESTORE_BREAKPOINT_API: u32 = 0x3135;
 pub(crate) const DBGKD_GET_CONTEXT_EX_API: u32 = 0x315f;
 pub(crate) const DBGKD_SET_CONTEXT_API: u32 = 0x3133;
 pub(crate) const DBGKD_WRITE_BREAKPOINT_API: u32 = 0x3134;
+pub(crate) const DBGKD_CONTINUE_API: u32 = 0x3136;
 pub(crate) const DBGKD_CONTINUE_API2: u32 = 0x313c;
 
 const STATUS_SUCCESS: u32 = 0;
@@ -122,8 +123,14 @@ impl ManipulateRequest {
         Ok(response)
     }
 
-    pub(crate) fn continue2_trace(&self) -> Option<bool> {
-        (self.api_number() == DBGKD_CONTINUE_API2).then(|| word(&self.bytes, 20) != 0)
+    pub(crate) fn continue_trace(&self) -> Option<bool> {
+        match self.api_number() {
+            // WinDbg uses the legacy request for `g`; it has only the continue status and cannot
+            // ask for a trace. `t` uses Continue2 and carries the trace flag in its control set.
+            DBGKD_CONTINUE_API => Some(false),
+            DBGKD_CONTINUE_API2 => Some(word(&self.bytes, 20) != 0),
+            _ => None,
+        }
     }
 
     pub(crate) fn restore_breakpoint_handle(&self) -> Option<u32> {
@@ -602,6 +609,32 @@ mod tests {
         let request = ManipulateRequest::decode(&captured).unwrap();
         assert_eq!(request.restore_breakpoint_handle(), Some(1));
         assert_eq!(word(&request.success_response(), 8), STATUS_SUCCESS);
+    }
+
+    #[test]
+    fn decodes_legacy_go_and_continue2_trace_requests_from_windbg() {
+        let mut legacy = [0; MANIPULATE_BYTES];
+        legacy[..4].copy_from_slice(&DBGKD_CONTINUE_API.to_le_bytes());
+        assert_eq!(
+            ManipulateRequest::decode(&legacy).unwrap().continue_trace(),
+            Some(false)
+        );
+
+        let mut extended = [0; MANIPULATE_BYTES];
+        extended[..4].copy_from_slice(&DBGKD_CONTINUE_API2.to_le_bytes());
+        assert_eq!(
+            ManipulateRequest::decode(&extended)
+                .unwrap()
+                .continue_trace(),
+            Some(false)
+        );
+        extended[20..24].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(
+            ManipulateRequest::decode(&extended)
+                .unwrap()
+                .continue_trace(),
+            Some(true)
+        );
     }
 
     #[test]

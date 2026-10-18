@@ -1174,8 +1174,24 @@ async fn run_async(
             } else if let Some(handle) = request.restore_breakpoint_handle() {
                 breakpoints.remove(&handle);
                 request.success_response()
-            } else if let Some(trace) = request.continue2_trace() {
-                eprintln!("KD Continue2 trace={trace}");
+            } else if let Some(trace) = request.continue_trace() {
+                eprintln!("KD Continue api={:#x} trace={trace}", request.api_number());
+                if !trace {
+                    eprintln!(
+                        "KD continue-to-breakpoint refused; current held stop preserved: live qualification reset the target"
+                    );
+                    send_stop(
+                        &mut writer,
+                        &mut link,
+                        &reported_instruction.bytes,
+                        &values,
+                        stop.target.vp,
+                        stopped_since,
+                        service_pause,
+                    )
+                    .await?;
+                    continue;
+                }
                 report_managed_phase(managed_job, crate::proto::SecureKernelKdPhase::Running);
                 let activity = wait_activity(
                     options.idle_timeout,
@@ -1184,32 +1200,15 @@ async fn run_async(
                     managed_job,
                 );
                 wait_waker.begin(activity.clone());
-                let resume = if trace {
-                    stopped_low(&stop, RegisterName::Rip).and_then(|rip| {
-                        read_instruction_guard(session, rip, stopped_deadline)
-                            .and_then(fallthrough_step_guard)
-                            .and_then(|guard| {
-                                session
-                                    .step_until(engine, &stop.epoch, guard, stopped_deadline)
-                                    .map(|_| ())
-                            })
-                    })
-                } else {
-                    if breakpoints.is_empty() {
-                        Err(anyhow!(
-                            "WinDbg requested continue with no hardware breakpoint installed"
-                        ))
-                    } else {
-                        session
-                            .continue_to_breakpoints_until(
-                                engine,
-                                &stop.epoch,
-                                breakpoints.values().cloned().collect(),
-                                stopped_deadline,
-                            )
-                            .map(|_| ())
-                    }
-                };
+                let resume = stopped_low(&stop, RegisterName::Rip).and_then(|rip| {
+                    read_instruction_guard(session, rip, stopped_deadline)
+                        .and_then(fallthrough_step_guard)
+                        .and_then(|guard| {
+                            session
+                                .step_until(engine, &stop.epoch, guard, stopped_deadline)
+                                .map(|_| ())
+                        })
+                });
                 if let Err(error) = resume {
                     activity.finish();
                     wait_waker.finish();
@@ -1217,7 +1216,7 @@ async fn run_async(
                         return Err(error);
                     }
                     report_managed_phase(managed_job, crate::proto::SecureKernelKdPhase::Stopped);
-                    eprintln!("KD Continue2 refused; current held stop preserved: {error:#}");
+                    eprintln!("KD trace refused; current held stop preserved: {error:#}");
                     send_stop(
                         &mut writer,
                         &mut link,
