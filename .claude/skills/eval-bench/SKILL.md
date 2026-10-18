@@ -242,7 +242,7 @@ where the run broke rather than a score per step. What bites:
   string as a number. Pin the values on either side of the rank too, because a tie keeps the
   server's order and passes a name pin; and pin the last index (`226`), because `matched` counts the
   rows before `limit` cut them and only an index that exists says the sort saw them all.
-- **The window a scenario fills is the model's own, and the MLX runtime does not serve a smaller
+- **The window a scenario fills is the model's own, and the MLX runtime does not enforce a smaller
   one.** Both bench models are 262,144 (`ollama show`). A cell `/api/ps` reported at 32,768
   evaluated a 79,352-token prompt and answered from text 49,000 tokens back, so on ollama 0.40.6 a
   window axis is the same condition run twice. Compare a transcript with the model's own window:
@@ -257,9 +257,11 @@ has only `true`. ollama 0.40.6 accepted `think: "high"` for qwen without an erro
 refuses an undeclared level (`refuse_an_undeclared_level`) rather than recording a level nobody
 applied. A level is its own arm (`arm_named`): `xhigh` records as `xhigh`, so it cannot share a log
 with `on` (`one_arm_per_log`), and it reaches the driver through `think_env`, which has to
-round-trip with `think_of`. **What a level buys is unmeasured, so do not write that it reasons
-more.** On one counting question, three draws a level, qwen's reasoning text did not order by
-level (`xhigh` gave 1,326 once and 7,268 once; `low` gave 10,078 once).
+round-trip with `think_of`. So a plan spells it as the driver records it: `"XHigh"` or `"true"`
+would key an arm no record carries, and `one_arm_per_log` refuses both. **What a level buys is
+unmeasured, so do not write that it reasons more.** On one counting question, three draws a level,
+qwen's reasoning text did not order by level (`xhigh` gave 1,326 once and 7,268 once; `low` gave
+10,078 once).
 
 **Re-run against item 41** (2026-08-24): unserved calls 14 -> 6, with `debug_batch` going 10 -> 0
 and every name this server was teaching now gone. What that re-run mostly taught is **how easy it

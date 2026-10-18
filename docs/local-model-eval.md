@@ -86,9 +86,10 @@ over, since resume reads the same absence as `off` while the identity block refu
 model may declare several (`/api/show`'s `thinking.values`), and `true` asks for its default:
 `qwen3.8:27b-mlx` declares `low`, `medium` and `xhigh`, so `true` is `medium` and the top is asked
 for as `"think": "xhigh"`, while `gemma4:31b-mlx` declares only `true`. A level is sent and recorded
-as itself, so it is an arm of its own beside `on` and `off`. The driver refuses a level the model
-does not declare, because the runtime does not: ollama 0.40.6 took `think: "high"` for qwen, which
-has no such level, without an error.
+as itself, so it is an arm of its own beside `on` and `off`, and a plan writes it the way the
+model declares it: `"XHigh"` or `"true"` is refused, since the driver would record `xhigh` or
+`on`. The driver refuses a level the model does not declare, because the runtime does not: ollama
+0.40.6 took `think: "high"` for qwen, which has no such level, without an error.
 
 **The tools themselves.** The harness executes read-only tools and reports anything else back to
 the model as refused, so a wrong pick is *measured* rather than performed. `launch`, `execute` and
@@ -1377,7 +1378,7 @@ Every conversation the six runs above held was short: one question, a call or tw
 transcript filling the window rather than the surface: the tenth turn of a triage, with three
 large results already in it. `WINDBG_MCP_SCENARIO` has driven that case since the driver was
 written, keeping one transcript and one set of sessions across a task list. Nothing could grade it,
-because the unit was wrong. A wrong turn at step 2 leaves steps 3 to 7 nothing to read, so per-task
+because the unit was wrong. A wrong turn at step 2 leaves steps 3 to 8 nothing to read, so per-task
 scoring reports six failures for one mistake. What is worth measuring is the step at which the run
 stopped being recoverable (`FOLLOWUPS.md` item 39).
 
@@ -1410,7 +1411,7 @@ and step 8 starts from the driver they find. Step 9 is possible on `lean` too, s
 `inspect`.
 
 **A run is graded by when each fact was first stated, not by whether each step was right.**
-`--scenario` reports four things per fact: the step that stated it, the turn index counted across
+`--scenario` reports three things per fact: the step that stated it, the turn index counted across
 the whole conversation, and that turn's prompt-token count. That count is the length of the
 transcript the model was holding when it said it, and every driver already records it per turn, so
 the growth curve was in the log all along. The first fact never stated is the break, and it carries
@@ -1434,7 +1435,8 @@ Three rules, each closing a way of reading this wrong:
   belongs to, and the runner writes the same id into any note it leaves when it kills one. A cell's
   **last** conversation is graded. Deduplicating by task, as the per-task readers do, would splice
   two attempts into a transcript no model had: an attempt killed at step 5 followed by one killed
-  at step 3.
+  at step 3. Resume reads the same unit: a cell is done only when its last conversation has an
+  answer to every step as the suite now words it, however many an earlier attempt answered.
 - **Every per-task reader refuses a scenario log**, from the one gate in `records()` they all pass
   through. The steps carry no `expect`, and `all()` over no groups marks every answered step
   correct.

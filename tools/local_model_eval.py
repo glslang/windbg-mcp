@@ -203,10 +203,22 @@ def one_arm_per_log(plan, log_path):
                     f"cannot honour: {why}. Remove it - and if the arm matters for those rows, it "
                     f"is not a thing this harness can vary.")
             continue
-        if not isinstance(group.get("think", False), (bool, str)):
+        raw = group.get("think", False)
+        if not isinstance(raw, (bool, str)):
             raise SystemExit(f"`think` is `true`, `false` or a level the model declares, not "
-                             f"{group['think']!r}")
-        think = arm_named(group.get("think", False))
+                             f"{raw!r}")
+        # **A level is spelled as the driver records it, or refused.** `think_of` strips and
+        # lower-cases what it is handed and reads `true`, `on` and the rest as a switch, so a plan
+        # writing `"XHigh"` or `"true"` would key its arm as written while every record carried
+        # `xhigh` or `on`: resume would never find the cell done, and the next invocation would
+        # refuse the log as holding another arm (Codex and CodeRabbit on #504). Refused rather
+        # than normalised, so the plan says what the log will.
+        if isinstance(raw, str) and (raw != raw.strip().lower() or raw in SWITCH_WORDS):
+            raise SystemExit(
+                f"`think: {raw!r}` is not how the driver records it. Write a level in lower case "
+                f"as the model declares it (`\"xhigh\"`), and reasoning on or off as `true` or "
+                f"`false`.")
+        think = arm_named(raw)
         for model in group["models"]:
             for context in contexts_of(group):
                 for surface in group["surfaces"]:
@@ -343,6 +355,11 @@ def arm_of(record):
     return arm_named(record.get("think"))
 
 
+# The words `local_model_drive.think_of` reads as a switch rather than a level, restated for the
+# reason `arm_named` gives and pinned against the driver by `tools/test_local_model_eval.py`.
+SWITCH_WORDS = ("", "0", "false", "no", "off", "1", "true", "yes", "on")
+
+
 def arm_named(think):
     """The arm a `think` value names: `off`, `on`, or a level such as `xhigh`, as itself.
 
@@ -379,18 +396,30 @@ def already_done(log_path, tasks):
 
     `tasks` is the suite as it is *now*, because [`usable`] compares each record against the
     question currently being asked.
+
+    **A scenario's records count only from each cell's last conversation**, because that is the
+    one [`grade_scenario`] grades. Counted across attempts, a step reworded after one conversation
+    finished and a re-run killed before the end would cover every step between them - the earlier
+    attempt's later steps and the later one's earlier steps - so the cell read as done while the
+    conversation graded stopped short, and nothing would re-run it (CodeRabbit on #504). That is
+    the disagreement [`usable`] exists to prevent, met in the unit rather than the record.
     """
     by_id = {t["id"]: t for t in tasks}
     stale = 0
     seen = set()
     if not os.path.exists(log_path):
         return seen
+    last = {cell: attempts[-1]["id"] for cell, attempts in conversations(log_path)[0].items()}
     with open(log_path, encoding="utf-8") as log:
         for line in log:
             line = line.strip()
             if not line:
                 continue
             r = json.loads(line)
+            cell = (r.get("backend"), r.get("model"), r.get("num_ctx"),
+                    (r.get("surface") or {}).get("client"), draw_of(r))
+            if r.get("conversation") and r["conversation"] != last.get(cell):
+                continue
             if not usable(r, by_id.get(r.get("task"))):
                 # Not done: the window it ran at was not the one it asked for, or the question has
                 # changed since. It has to run again, and the grader will not score it either.
@@ -406,9 +435,7 @@ def already_done(log_path, tasks):
             # class rather than catching the next member of it. It stays out of the *cell* identity
             # that `summarise`, `matrix` and `compare` share, because that is what pairs arm A's
             # cells with arm B's: putting it there would leave the A/B with nothing to compare.
-            seen.add((r.get("backend"), r.get("model"), r.get("num_ctx"),
-                      (r.get("surface") or {}).get("client"), draw_of(r), r.get("task"),
-                      arm_of(r)))
+            seen.add((*cell, r.get("task"), arm_of(r)))
     if stale:
         print(f"  {stale} record(s) in the log no longer measure what this plan asks "
               f"(a changed prompt, or a window that was not the one requested); they will run again")
@@ -1462,12 +1489,13 @@ def records(log_path):
     # is deliberately not behind it, since resume tells the arms apart by key and appending to such
     # a log is how it would be repaired.
     refuse_pooled_arms(log_path)
-    latest, seen_at = {}, {}
+    latest, seen_at, scenario = {}, {}, 0
     for at, line in enumerate(open(log_path, encoding="utf-8")):
         line = line.strip()
         if not line:
             continue
         record = json.loads(line)
+        scenario += bool(record.get("conversation"))
         surface = (record.get("surface") or {})
         cell = (record.get("backend"), record.get("model"), record.get("num_ctx"),
                 surface.get("client"), draw_of(record))
@@ -1493,10 +1521,15 @@ def records(log_path):
     # with nothing to read, and scoring each step on its own reports that one mistake as many. The
     # steps carry no `expect` either - the key is the scenario's `facts` - and `matches()` runs
     # `all()` over the groups, so a per-task grade would mark every answered step correct.
-    scenario = sum(1 for record in latest.values() if record.get("conversation"))
+    #
+    # **Counted over the raw log, not over `latest`.** An ordinary record sharing a step's (cell,
+    # draw, task) replaces it in the deduplication, so a log whose scenario records had each been
+    # overwritten by a later task-list run passed this check and graded as that run (Codex on
+    # #504). A log that ever held a conversation is a scenario log, as one that ever held a loose
+    # record is not one to [`grade_scenario`].
     if scenario:
         raise SystemExit(
-            f"{os.path.basename(log_path)} holds {scenario} record(s) from a scenario run - one "
+            f"{os.path.basename(log_path)} holds {scenario} line(s) from a scenario run - one "
             "conversation across its tasks, where a wrong turn at one step leaves every later step "
             "unanswerable. Read per task, that is one mistake scored as many; grade it with "
             "`--scenario`.")

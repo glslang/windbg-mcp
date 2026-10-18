@@ -118,6 +118,26 @@ class ReasoningLevels(unittest.TestCase):
         with self.assertRaises(SystemExit):
             evaluator.one_arm_per_log({"cells": [group]}, os.devnull)
 
+    def test_a_level_the_driver_would_respell_is_refused(self):
+        """`"XHigh"` keyed its arm as written while every record carried `xhigh`, so resume never
+        found the cell done (Codex and CodeRabbit on #504). Accepted exactly when the driver reads
+        the string back as itself, which is also what pins `SWITCH_WORDS` to `think_of`."""
+        group = {"backend": "ollama", "models": ["qwen"], "surfaces": ["full"]}
+        # The driver's switch words written out rather than read from `SWITCH_WORDS`, so a word
+        # dropped from that tuple is a spelling this test still tries.
+        spellings = ("xhigh", "medium", "XHigh", " xhigh", "xhigh ", "On",
+                     "", "0", "false", "no", "off", "1", "true", "yes", "on")
+        for raw in spellings:
+            plan = {"out": os.devnull, "cells": [dict(group, think=raw)]}
+            with self.subTest(raw=raw):
+                if local_model_drive.think_of(raw) == raw:
+                    evaluator.one_arm_per_log(plan, os.devnull)
+                else:
+                    with self.assertRaises(SystemExit):
+                        evaluator.one_arm_per_log(plan, os.devnull)
+        self.assertTrue(all(isinstance(local_model_drive.think_of(word), bool)
+                            for word in evaluator.SWITCH_WORDS))
+
 
 class GraderReadsTheBlock(unittest.TestCase):
     def test_each_backend_reports_what_it_claimed(self):
@@ -329,6 +349,34 @@ class Scenario(unittest.TestCase):
         del loose["conversation"]
         with self.assertRaises(SystemExit):
             self.grade(step_record(suite, "s1", "0x9f", [100]), loose)
+
+    def test_resume_counts_a_scenario_cell_done_only_by_its_last_conversation(self):
+        """An attempt whose `s2` was reworded since, then a re-run killed after `s2`: across both,
+        every step has a usable record, but the conversation graded stops at `s3` (CodeRabbit on
+        #504). Resume has to read the unit the grader reads, or the cell is never re-run."""
+        suite = scenario_suite()
+        reworded = step_record(suite, "s2", "ffffe2850787bc20", [200], conversation="a")
+        reworded["prompt"] = "an older wording"
+        lines = (step_record(suite, "s1", "0x9f", [100], conversation="a"), reworded,
+                 step_record(suite, "s3", "nvlddmkm", [300], conversation="a"),
+                 step_record(suite, "s1", "0x9f", [100], conversation="b"),
+                 step_record(suite, "s2", "ffffe2850787bc20", [200], conversation="b"))
+        cell = ("ollama", "m", None, "full", 1)
+        done = evaluator.already_done(self.log(*lines), suite["tasks"])
+        self.assertEqual({key[len(cell)] for key in done if key[:len(cell)] == cell},
+                         {"s1", "s2"})
+        self.assertEqual(self.grade(*lines)["cut_short"], 3)
+
+    def test_a_scenario_log_is_refused_even_when_a_task_list_run_replaced_every_step(self):
+        """Deduplication keeps the later of two records sharing a (cell, draw, task), so a check
+        made after it saw only the task-list run (Codex on #504)."""
+        suite = scenario_suite()
+        loose = step_record(suite, "s1", "0x9f", [100])
+        del loose["conversation"]
+        path = self.log(step_record(suite, "s1", "0x9f", [100]), loose)
+        with self.assertRaises(SystemExit) as refused:
+            evaluator.records(path)
+        self.assertIn("--scenario", str(refused.exception))
 
     def test_every_per_task_reader_refuses_a_scenario_log(self):
         """One gate in `records()`, which `--grade`, `--matrix`, `--compare` and `--series` share."""
