@@ -49,6 +49,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   later and a second attach was refused as already reserved. After, it left `session_status` when
   the refusal landed (about 2.7 s), its worker exited, and the next attach was admitted.
 
+- **A target-changing command forwarded as an uncommitted open settles can no longer lose its
+  worker** (issue #505). When an opener fails before committing, the supervisor ends the worker
+  unless a target-changing `execute` queued behind the open has taken it over. The check and the
+  takeover were two steps on two threads: the settlement could read "not taken over", the queue
+  could record the takeover and forward `.attach <pid>`, and the settlement could then fail the
+  session and kill a worker already attaching to a process it would take down with it. Both
+  settlements, the queue's gate and the retirement it carries now decide under the session's state
+  lock, so exactly one wins: the settlement finds the takeover and declines, or the queue finds a
+  session that is no longer live and answers `stale_session` instead of forwarding. The takeover
+  is also the worker's to clear now. While a kernel attach is pending the worker refuses every
+  other request without running it, so a command refused that way took nothing over, and a
+  pre-commit refusal of the attach that lands after the deadline releases the session and its
+  endpoint rather than leaving both for an operator handoff. That holds whichever of the two
+  refusals the worker emits first, and when the caller saw the attach fail before the command's
+  refusal came back; before, the session stayed `kernel_unresolved` with its endpoint reserved for
+  a worker holding nothing. The lock's interleaving itself has no deterministic test; each ordering
+  that reaches the supervisor is staged through its queue and its reader.
+
 - **The Secure Kernel handoff probe could not run against this server since item 107**, and its
   own tests had been failing since the same commit. Item 107 made every tool refuse an argument
   its schema does not declare, and took the invented `timeout_ms` out of the probe's closing `bl`

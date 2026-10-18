@@ -698,6 +698,78 @@ impl SessionState {
     }
 }
 
+/// What a session's state lock guards: the state, when it was entered, and the claims on its
+/// worker that have to be read in the same instant as the state.
+///
+/// One lock rather than a state and a flag beside it, because of what the flag decides. When an
+/// opener fails before committing, the settlement ends the worker *unless* a target-changing
+/// command queued behind the open has taken it over — and `pump` records that takeover on its own
+/// thread, the instant before it forwards the command. Read as a separate atomic, the settlement
+/// could find "not taken over", `pump` could record the takeover and forward `.attach <pid>`, and
+/// the settlement could then fail the session and kill a worker already attaching to a process it
+/// would take down with it. Decided under one lock, exactly one of the two wins: the settlement
+/// finds the takeover and declines, or `pump` finds a session that is no longer live and answers
+/// `Stale` instead of forwarding (issue #505).
+#[derive(Debug)]
+struct Standing {
+    state: SessionState,
+    since: Instant,
+    claims: Claims,
+}
+
+impl Standing {
+    fn new(state: SessionState) -> Self {
+        Self {
+            state,
+            since: Instant::now(),
+            claims: Claims::default(),
+        }
+    }
+}
+
+/// What has been claimed about a session's worker besides its state. Read and written only
+/// through [`Session::transition`], under the state lock — see [`Standing`].
+#[derive(Debug, Default)]
+struct Claims {
+    /// The latest target-changing command [`pump`] has forwarded to this worker, by job id, which
+    /// can leave the worker holding a target its opener never claimed. Recorded beside
+    /// [`SessionState::Retired`] rather than read from it: a kernel deadline overwrites that state
+    /// with `KernelUnresolved`, and [`settle_open`] must still know the worker is not the refused
+    /// open's to end.
+    ///
+    /// **A job id rather than a flag, so the worker's own verdict can clear it.** While a kernel
+    /// attach is pending the worker refuses every other request without running it
+    /// (`worker::KernelSafety::hold`, answered `RecoveryRequired`), so a command forwarded then
+    /// took nothing over — and a pre-commit refusal of the attach landing after the deadline would
+    /// otherwise leave the session unresolved and its endpoint reserved for a worker holding
+    /// nothing, at the cost of an operator handoff. [`reader`] clears this when the job it names
+    /// is refused that way. **Only the latest, and that is sound because of how the hold ends**:
+    /// a returned pre-commit failure drops it for good (`KernelSafety::released`, after which
+    /// `preserve` is a no-op), so for a worker whose attach was refused before committing the
+    /// refused requests are a prefix of what it read — if the latest retiring command was refused,
+    /// every earlier one was too. Any other reply leaves the takeover standing, which is the
+    /// conservative reading: the command reached the engine, and whatever it holds now is not the
+    /// open's to end.
+    takeover: Option<u64>,
+    /// The reason a settlement would have failed this session with, withheld because
+    /// [`Self::takeover`] was set when it ran. Applied by [`reader`] if that takeover clears, so a
+    /// refusal that arrives *after* the attach's own does not leave the session preserved for a
+    /// worker that ran nothing. The worker emits the two replies from different threads, so the
+    /// supervisor cannot rely on which lands first.
+    withheld: Option<String>,
+}
+
+/// Where a [`Session::transition`] left the session, and whether it was this call that moved it.
+///
+/// `moved` is what decides a kill: a settlement ends the worker only when it was the one that
+/// failed the session. A settlement that found the session already over leaves the worker to
+/// whoever ended it — a teardown marked `Closed` at dispatch still has its `EndSession` on the
+/// way to that worker.
+struct Settled {
+    state: SessionState,
+    moved: bool,
+}
+
 /// Whether this op may run against a session of this kind, and what to say when it may not.
 ///
 /// **An allow-list, in both directions, and that is the whole of the design.** A Secure Kernel
@@ -840,7 +912,9 @@ pub struct Session {
     profile: Mutex<Option<crate::structured::ProfileFacts>>,
     pub pid: u32,
     created: Instant,
-    state: Mutex<(SessionState, Instant)>,
+    /// The state, when it was entered, and the claims that have to be read in the same instant
+    /// as it — see [`Standing`] for why they share a lock.
+    state: Mutex<Standing>,
     tx: mpsc::UnboundedSender<Job>,
     next_id: AtomicU64,
     /// Calls submitted and not yet answered. Non-empty means the worker owes a reply — including
@@ -886,11 +960,6 @@ pub struct Session {
     released: AtomicBool,
     /// Verified explicit worker exit, deliberately distinct from native target release.
     kernel_handoff_complete: AtomicBool,
-    /// Whether [`pump`] has forwarded a target-changing command to this worker, which can leave
-    /// it holding a target its opener never claimed. Recorded beside [`SessionState::Retired`]
-    /// rather than read from it: a kernel deadline overwrites that state with `KernelUnresolved`,
-    /// and [`settle_open`] must still know the worker is not the refused open's to end.
-    taken_over: AtomicBool,
     /// How long this session's worker said a transaction it was told to unwind still needs, or
     /// `None` while it has said nothing. Set from [`WorkerMessage::RollingBack`] and read by the
     /// teardown whose own request provoked it; see [`Sessions::release`].
@@ -1238,7 +1307,7 @@ impl Session {
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .0
+            .state
             .clone()
     }
 
@@ -1246,20 +1315,25 @@ impl Session {
     /// already stopped owning a worker, so a milestone arriving from a worker being torn down
     /// cannot undo or relabel the teardown.
     fn set_state(&self, next: SessionState) {
-        self.update_state(|state| {
-            if matches!(
-                state,
+        self.update_state(|state| self.ordinary_move(state, next));
+    }
+
+    /// [`Self::set_state`]'s rule, for a transition decided inside a closure that holds the state
+    /// lock: `next` only from a live state, and never off an unresolved controller that has not
+    /// been released. `None` leaves the state alone.
+    fn ordinary_move(&self, state: &SessionState, next: SessionState) -> Option<SessionState> {
+        if matches!(
+            state,
+            SessionState::KernelUnresolved(_) | SessionState::LiveControlUnresolved(_)
+        ) && !self.released.load(Ordering::SeqCst)
+            && !matches!(
+                next,
                 SessionState::KernelUnresolved(_) | SessionState::LiveControlUnresolved(_)
-            ) && !self.released.load(Ordering::SeqCst)
-                && !matches!(
-                    next,
-                    SessionState::KernelUnresolved(_) | SessionState::LiveControlUnresolved(_)
-                )
-            {
-                return None;
-            }
-            state.is_live().then_some(next)
-        });
+            )
+        {
+            return None;
+        }
+        state.is_live().then_some(next)
     }
 
     /// Replaces the dispatch-time reason for an explicit `end_session` with its final outcome.
@@ -1285,21 +1359,34 @@ impl Session {
     /// target-changing command, so a transition that decided on a state it no longer holds would
     /// overwrite that retirement — and the handle would go on certifying a target the queued
     /// command is about to replace. Every conditional transition goes through here for that
-    /// reason, not for tidiness.
+    /// reason, not for tidiness. A transition that also has to read or write the [`Claims`] on
+    /// the worker goes through [`Self::transition`], which this is the narrow form of.
     fn update_state(
         &self,
         next: impl FnOnce(&SessionState) -> Option<SessionState>,
     ) -> SessionState {
+        self.transition(|state, _| next(state)).state
+    }
+
+    /// [`Self::update_state`] with the [`Claims`] in reach of the same closure, so a decision that
+    /// turns on a takeover — recording one, declining a settlement for one, clearing one — is
+    /// taken in the same instant as the state it goes with. The rules on what may move are the
+    /// same; only the closure sees more.
+    fn transition(
+        &self,
+        next: impl FnOnce(&SessionState, &mut Claims) -> Option<SessionState>,
+    ) -> Settled {
         // Whether this *changed* anything, which is a different question from whether a transition
         // was taken: a transition to the state the session is already in restamps it — that is
         // what `in_state_for` measures and nothing here may quietly stop doing — while there is
         // nothing about it worth a line in a transcript. Every conditional transition comes
         // through here and most of them decline, so recording each call would fill a file with a
         // session repeatedly not moving.
-        let (settled, moved) = {
+        let settled = {
             let mut slot = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let proposed = next(&slot.0);
-            let allowed = slot.0.is_live()
+            let Standing { state, claims, .. } = &mut *slot;
+            let proposed = next(state, claims);
+            let allowed = state.is_live()
                 || (self.kind == SessionKind::Kernel
                     && !self.released.load(Ordering::SeqCst)
                     && matches!(proposed, Some(SessionState::KernelUnresolved(_))))
@@ -1307,35 +1394,54 @@ impl Session {
                     && !self.released.load(Ordering::SeqCst)
                     && matches!(proposed, Some(SessionState::LiveControlUnresolved(_))))
                 || matches!(
-                    (&slot.0, &proposed),
+                    (&*state, &proposed),
                     (SessionState::Closed(_), Some(SessionState::Closed(_)))
                 );
             if !allowed {
-                return slot.0.clone();
+                return Settled {
+                    state: state.clone(),
+                    moved: false,
+                };
             }
             let moved = match proposed {
                 Some(next) => {
-                    let moved = next != slot.0;
-                    *slot = (next, Instant::now());
+                    let moved = next != *state;
+                    slot.state = next;
+                    slot.since = Instant::now();
                     moved
                 }
                 None => false,
             };
-            (slot.0.clone(), moved)
+            Settled {
+                state: slot.state.clone(),
+                moved,
+            }
         };
-        if moved {
+        if settled.moved {
             // Outside the lock: writing a record touches a disk, and nothing that does belongs
             // inside the mutex every state read in this process contends on.
             let limit = self.rec.field_limit();
             self.rec.write(crate::record::Event::SessionState {
                 session: self.id.clone(),
-                state: settled.name().to_string(),
+                state: settled.state.name().to_string(),
                 detail: settled
+                    .state
                     .detail()
                     .map(|d| crate::record::Capped::of(&crate::kdconn::scrub(d), limit)),
             });
         }
         settled
+    }
+
+    /// The takeover on this worker, if any — see [`Claims::takeover`]. For assertions only: a
+    /// decision that turns on it belongs inside a [`Self::transition`].
+    #[cfg(test)]
+    fn takeover(&self) -> Option<u64> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .claims
+            .takeover
     }
 
     /// How far the opener got. See [`OpenPhase`] for why this is not read off the state.
@@ -1353,7 +1459,7 @@ impl Session {
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .1
+            .since
             .elapsed()
     }
 
@@ -3899,7 +4005,7 @@ impl Sessions {
             owner: crate::client::current(),
             last_used: Mutex::new(Instant::now()),
             secure_kernel_pause: Mutex::new(SecureKernelPause::default()),
-            state: Mutex::new((SessionState::Opening, Instant::now())),
+            state: Mutex::new(Standing::new(SessionState::Opening)),
             tx,
             // Job ids start *past* the opener's, which is reserved — see [`OPENER_JOB`].
             next_id: AtomicU64::new(OPENER_JOB + 1),
@@ -3908,7 +4014,6 @@ impl Sessions {
             phase: AtomicU8::new(OpenPhase::Started as u8),
             released: AtomicBool::new(false),
             kernel_handoff_complete: AtomicBool::new(false),
-            taken_over: AtomicBool::new(false),
             unwinding,
             execution: Mutex::new(None),
             submit_gate: Mutex::new(()),
@@ -4033,35 +4138,76 @@ fn unknown_handle(want: &str) -> String {
 /// may be about to hold a target of its own. Killing it because this open failed would discard
 /// something the caller explicitly asked for. So a retired session keeps its worker and its
 /// (retired) handle; only the open's own caller is told the slate is clean, which it is.
+///
+/// Decided under the state lock, in the same closure that reads the takeover, because `pump`
+/// records that takeover from another thread the instant before it forwards the command. Checked
+/// first and failed second, a settlement that read "not taken over" could kill the worker the
+/// command had just reached (issue #505). `Retired` is read as well as the takeover, because the
+/// worker's own observer retires a session without one (`WorkerMessage::TargetReplaced`) and can
+/// do so between the opener's reply reaching [`Sessions::open`] and `open` settling on it.
 fn settle_uncommitted(session: &Session, why: &str) -> bool {
-    if matches!(
-        session.state(),
-        SessionState::Retired(_)
-            | SessionState::KernelUnresolved(_)
-            | SessionState::LiveControlUnresolved(_)
-    ) {
-        return true;
+    let settled = session.transition(|state, claims| {
+        if matches!(
+            state,
+            SessionState::KernelUnresolved(_) | SessionState::LiveControlUnresolved(_)
+        ) {
+            return None;
+        }
+        if matches!(state, SessionState::Retired(_)) || claims.takeover.is_some() {
+            claims.withheld = Some(why.to_string());
+            return None;
+        }
+        fail_unclaimed(session, state, why)
+    });
+    if settled.moved {
+        session.kill();
     }
-    session.set_state(SessionState::Failed(why.to_string()));
-    session.kill();
-    false
+    settled.state.is_live()
 }
 
 /// Ends a kernel session whose attach returned a refusal from before it claimed anything, once
-/// nobody is left waiting for it — see [`settle_open`].
+/// nobody is left waiting for it — see [`settle_open`]. Returns whether it did: a takeover on its
+/// way to the worker makes it decline, as [`settle_uncommitted`] declines, and the refusal is then
+/// withheld for the takeover's verdict (see [`Claims::withheld`]).
 ///
-/// `released` first, because it is what every guard on this session reads: it lets the state
-/// leave `KernelUnresolved` and the worker be killed, and it makes the deadline's preservation
-/// decline rather than re-reserve the endpoint, whichever of the two runs first.
-fn release_unclaimed_kernel(session: &Session, refusal: &EngineError) {
-    session.released.store(true, Ordering::SeqCst);
-    session.update_state(|_| {
-        Some(SessionState::Failed(format!(
-            "the attach was refused before it claimed a target, after its caller had stopped \
-             waiting: {refusal}"
-        )))
+/// It does not stop at `KernelUnresolved`, which is what distinguishes it from
+/// [`settle_uncommitted`]: that state is the deadline's preservation of an outcome that was
+/// unknown, and the refusal is the outcome.
+fn release_unclaimed_kernel(session: &Session, refusal: &EngineError) -> bool {
+    let why = format!(
+        "the attach was refused before it claimed a target, after its caller had stopped \
+         waiting: {refusal}"
+    );
+    let settled = session.transition(|state, claims| {
+        if claims.takeover.is_some() {
+            claims.withheld = Some(why.clone());
+            return None;
+        }
+        fail_unclaimed(session, state, &why)
     });
-    session.kill();
+    if settled.moved {
+        session.kill();
+    }
+    !settled.state.is_live()
+}
+
+/// The failure of an open that claimed nothing, decided inside a [`Session::transition`] once its
+/// caller has established that nothing else holds the worker.
+///
+/// A kernel session is marked `released` in the same instant, because that is what every guard on
+/// it reads: it lets the state leave `KernelUnresolved` and the worker be killed, and it makes a
+/// deadline's preservation decline rather than re-reserve the endpoint for a killed worker,
+/// whichever of the two runs first. Stored under the lock rather than before it, so a settlement
+/// that goes on to decline has not released anything. And stored whether or not the state is
+/// still live, as it was before this was a function: an attach refused before committing held
+/// nothing, however the session was ended meanwhile.
+fn fail_unclaimed(session: &Session, state: &SessionState, why: &str) -> Option<SessionState> {
+    if session.kind == SessionKind::Kernel {
+        session.released.store(true, Ordering::SeqCst);
+    }
+    state
+        .is_live()
+        .then(|| SessionState::Failed(why.to_string()))
 }
 
 /// Settles a session from its opener's result when nobody is left to do it — the caller's timeout
@@ -4081,16 +4227,14 @@ fn settle_open(session: &Session, result: &Result<Output, EngineError>) -> bool 
     // it preserves, so this can run first, and a session failed here without `released` would
     // then be preserved with no worker behind it. And not for a worker a target-changing command
     // has taken over, which `settle_uncommitted` leaves alone for the reason it gives — the
-    // deadline erased the `Retired` that says so, which is why it is read from `taken_over`.
-    // Checked rather than locked, like `settle_uncommitted`'s own check, so a command `pump`
-    // forwards in the same instant can still lose its worker (#505).
+    // deadline erased the `Retired` that says so, which is why the release reads the takeover
+    // under the state lock rather than this state, and declines on it (#505).
     if let Err(e) = result
         && session.kind == SessionKind::Kernel
         && !session.phase().committed()
-        && !session.taken_over.load(Ordering::SeqCst)
         && !matches!(e, EngineError::RecoveryRequired(_))
+        && release_unclaimed_kernel(session, e)
     {
-        release_unclaimed_kernel(session, e);
         return false;
     }
     if session.kernel_unresolved() || session.live_control_unresolved() {
@@ -4944,6 +5088,12 @@ fn next_capped_line<R: BufRead>(stdout: &mut R, line: &mut Vec<u8>) -> Option<us
     }
 }
 
+/// Why [`pump`]'s gate turned a job away, decided under the state lock and answered outside it.
+enum Refused {
+    RecoveryRequired,
+    Stale,
+}
+
 /// Feeds one session's queue to its worker, one job at a time.
 ///
 /// This is the session's single serialization point, and the only place a [`Gate`] runs. Jobs are
@@ -4978,39 +5128,73 @@ fn pump(
             }
         };
 
-        // The gate, at the front of the queue. See `Gate`.
-        let state = session.state();
-        if (session.kernel_unresolved() && !matches!(job.op, EngineOp::PreserveKernel))
-            || (session.live_control_unresolved() && !matches!(job.op, EngineOp::EndSession))
-        {
-            answer(Err(EngineError::RecoveryRequired(stale_handle(
-                &session.id,
-                &state,
-            ))));
-            continue;
-        }
-        if !job.gate.admits(&state) {
-            answer(Err(EngineError::Stale(stale_handle(&session.id, &state))));
-            continue;
-        }
-        if let Some(why) = &job.gate.retires {
-            session.taken_over.store(true, Ordering::SeqCst);
-            session.set_state(SessionState::Retired(why.clone()));
-        }
-        if let Some(why) = &job.gate.closes {
-            session.set_state(match session.kind {
-                SessionKind::Kernel => SessionState::KernelUnresolved(
-                    "kernel release is in progress; completion is unconfirmed".into(),
-                ),
-                SessionKind::SecureKernelLive | SessionKind::SecureKernelKd => {
-                    SessionState::LiveControlUnresolved(
-                        "live Secure Kernel release is in progress; register restoration, handler \
-                     cleanup and handled detach are unconfirmed"
-                            .into(),
-                    )
-                }
-                _ => SessionState::Closed(why.clone()),
-            });
+        // The gate, at the front of the queue (see `Gate`), and the retirement or closing the job
+        // carries, decided in **one** acquisition of the state lock. The settlements that end an
+        // uncommitted open's worker decline under that lock when they find a takeover, so
+        // recording the takeover here under the same lock is what makes the two exclusive: either
+        // this finds the session still admitting and the settlement then finds the takeover, or
+        // the settlement has already failed the session and the gate answers `Stale` — which is
+        // what it would have said a moment later anyway (issue #505). Read, retired and closed in
+        // two acquisitions, a settlement could fall between them.
+        let mut refused = None;
+        let settled = session.transition(|state, claims| {
+            if (matches!(state, SessionState::KernelUnresolved(_))
+                && !matches!(job.op, EngineOp::PreserveKernel))
+                || (matches!(state, SessionState::LiveControlUnresolved(_))
+                    && !matches!(job.op, EngineOp::EndSession))
+            {
+                refused = Some(Refused::RecoveryRequired);
+                return None;
+            }
+            if !job.gate.admits(state) {
+                refused = Some(Refused::Stale);
+                return None;
+            }
+            let mut next = None;
+            if let Some(why) = &job.gate.retires {
+                // Recorded for the command that is about to be forwarded, whatever the state
+                // does: the worker is receiving it either way.
+                claims.takeover = Some(job.id);
+                next = session.ordinary_move(state, SessionState::Retired(why.clone()));
+            }
+            if let Some(why) = &job.gate.closes {
+                let closing = match session.kind {
+                    SessionKind::Kernel => SessionState::KernelUnresolved(
+                        "kernel release is in progress; completion is unconfirmed".into(),
+                    ),
+                    SessionKind::SecureKernelLive | SessionKind::SecureKernelKd => {
+                        SessionState::LiveControlUnresolved(
+                            "live Secure Kernel release is in progress; register restoration, \
+                             handler cleanup and handled detach are unconfirmed"
+                                .into(),
+                        )
+                    }
+                    _ => SessionState::Closed(why.clone()),
+                };
+                // Against the retirement if one was just decided, as the two `set_state`s this
+                // replaces would have done in turn; a closing that declines keeps it.
+                next = session
+                    .ordinary_move(next.as_ref().unwrap_or(state), closing)
+                    .or(next);
+            }
+            next
+        });
+        match refused {
+            Some(Refused::RecoveryRequired) => {
+                answer(Err(EngineError::RecoveryRequired(stale_handle(
+                    &session.id,
+                    &settled.state,
+                ))));
+                continue;
+            }
+            Some(Refused::Stale) => {
+                answer(Err(EngineError::Stale(stale_handle(
+                    &session.id,
+                    &settled.state,
+                ))));
+                continue;
+            }
+            None => {}
         }
 
         let mut op = job.op;
@@ -5268,6 +5452,37 @@ async fn reader(
                 );
             }
             WorkerMessage::Done { id, result } => {
+                // A target-changing command the worker refused **without running** took nothing
+                // over. While a kernel attach is pending the worker holds every other request
+                // and answers it `RecoveryRequired` (`worker::KernelSafety::hold`), and the only
+                // other `RecoveryRequired` a kernel worker returns is for the attach itself,
+                // which never retires. So this reply for the job the takeover names clears it —
+                // see [`Claims::takeover`] for why the latest is enough — and a refusal of the
+                // open that was withheld for its verdict is applied now, in the same transition.
+                // Before the waiter is answered, and before the opener's reply if that is still
+                // to come, so a settlement reading the takeover sees the worker's verdict.
+                if session.kind == SessionKind::Kernel
+                    && result.as_ref().is_err_and(|failed| {
+                        failed.category == Some(crate::structured::ErrorCategory::RecoveryRequired)
+                    })
+                {
+                    let settled = session.transition(|state, claims| {
+                        if claims.takeover != Some(id) {
+                            return None;
+                        }
+                        claims.takeover = None;
+                        let why = claims.withheld.take()?;
+                        fail_unclaimed(&session, state, &why)
+                    });
+                    if settled.moved {
+                        tracing::info!(
+                            "session {}: job {id} was refused by the worker without running, so \
+                             the open it was queued behind settles as it would have without it",
+                            session.id
+                        );
+                        session.kill();
+                    }
+                }
                 let waiter = waiters
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -8472,6 +8687,398 @@ mod tests {
         pumping.join().expect("the pump stops with its session");
     }
 
+    /// A kernel session with a worker stand-in, its queue fed to a real [`pump`] whose requests
+    /// land in a pipe this test reads, and a real [`reader`] fed from a channel this test sends on.
+    /// Everything the takeover tests stage goes through those two, because the pump is where a
+    /// takeover is recorded and the reader is where the worker's verdict on it arrives.
+    struct TakeoverRig {
+        kernel: Arc<Session>,
+        sessions: Sessions,
+        requests: BufReader<PipeReader>,
+        messages: mpsc::UnboundedSender<WorkerMessage>,
+        pumping: std::thread::JoinHandle<()>,
+        reading: tokio::task::JoinHandle<()>,
+    }
+
+    impl TakeoverRig {
+        fn new(id: &str) -> Self {
+            let kernel = kernel_with_child_in(id, SessionState::Opening);
+            let (jobs, queue) = mpsc::unbounded_channel();
+            let kernel = Arc::new(Session {
+                tx: jobs,
+                ..Arc::into_inner(kernel).unwrap()
+            });
+            let sessions = registry_of(std::slice::from_ref(&kernel));
+            // The opener's waiter as `call_as` leaves it at its deadline: registered, with its
+            // receiver closed, so the attach's reply has nobody to go to and reaches
+            // `settle_open` — the path a late refusal takes.
+            let (done, abandoned) = oneshot::channel();
+            drop(abandoned);
+            kernel.waiters.lock().unwrap().insert(
+                OPENER_JOB,
+                Waiting {
+                    done,
+                    ending: false,
+                    progress: None,
+                    resumed: None,
+                    unwound: false,
+                },
+            );
+            let (requests, worker) = std::io::pipe().expect("a pipe to stand in for the worker's");
+            let pumping = std::thread::spawn({
+                let session = Arc::downgrade(&kernel);
+                let waiters = Arc::clone(&kernel.waiters);
+                move || pump(session, queue, worker, waiters, Duration::from_secs(30))
+            });
+            let (messages, rx) = mpsc::unbounded_channel();
+            let reading = tokio::spawn(reader(
+                Arc::downgrade(&kernel),
+                rx,
+                kernel.waiters.clone(),
+                sessions.clone(),
+            ));
+            Self {
+                kernel,
+                sessions,
+                requests: BufReader::new(requests),
+                messages,
+                pumping,
+                reading,
+            }
+        }
+
+        /// Queues a target-changing `execute` and waits for the pump to forward it, which is the
+        /// moment the takeover is recorded. `named` is whether the caller supplied the handle:
+        /// only the first takeover can, since a retired session refuses its handle and admits
+        /// only an unnamed call (`SessionState::accepts_default`).
+        fn forward_retiring(&mut self, id: u64, named: bool) {
+            let call = Call::new(EngineOp::BoundedCommand {
+                command: r".opendump C:\dumps\other.dmp".to_string(),
+                patience_ms: 0,
+            })
+            .named(named)
+            .retiring("a raw `execute` command replaced or released the target");
+            self.kernel
+                .tx
+                .send(Job {
+                    id,
+                    op: call.op,
+                    startup_symbol_path: None,
+                    submitted: Instant::now(),
+                    gate: call.gate,
+                })
+                .expect("the pump's queue is open");
+            let mut line = String::new();
+            self.requests
+                .read_line(&mut line)
+                .expect("the command reaches the worker");
+            let request: WorkerRequest = serde_json::from_str(&line).expect("a worker request");
+            assert_eq!(request.id, id, "the forwarded request is the one queued");
+            assert_eq!(self.kernel.takeover(), Some(id));
+        }
+
+        /// What the worker's request reader answers for anything but the attach while that
+        /// attach is pending (`worker::KernelSafety::hold`): refused, never run.
+        fn worker_refuses(&self, id: u64) {
+            self.messages
+                .send(WorkerMessage::Done {
+                    id,
+                    result: Err(crate::proto::Failed::categorised(
+                        crate::structured::ErrorCategory::RecoveryRequired,
+                        "Remote kernel controller is unresolved; no further break, queued work, \
+                         or automatic teardown is permitted.",
+                    )),
+                })
+                .expect("the reader is running");
+        }
+
+        /// The attach's own reply: a refusal from before it claimed anything, with nobody left
+        /// waiting for it, so it reaches `settle_open`.
+        fn attach_refused(&self) {
+            self.messages
+                .send(WorkerMessage::Done {
+                    id: OPENER_JOB,
+                    result: Err(crate::proto::Failed::from(
+                        "Failed to attach to kernel: Unspecified error (0x80004005)",
+                    )),
+                })
+                .expect("the reader is running");
+        }
+
+        /// Waits until the reader has handled everything sent so far. The channel is in order,
+        /// so a reply to a job this installs a waiter for arrives after all of them.
+        async fn handled(&self, sentinel: u64) {
+            let (done, answered) = oneshot::channel();
+            self.kernel.waiters.lock().unwrap().insert(
+                sentinel,
+                Waiting {
+                    done,
+                    ending: false,
+                    progress: None,
+                    resumed: None,
+                    unwound: false,
+                },
+            );
+            self.messages
+                .send(WorkerMessage::Done {
+                    id: sentinel,
+                    result: Ok(Output::text("sentinel")),
+                })
+                .expect("the reader is running");
+            tokio::time::timeout(Duration::from_secs(5), answered)
+                .await
+                .expect("the reader handled the sentinel")
+                .expect("the sentinel was answered")
+                .expect("the sentinel's reply is the one sent");
+        }
+
+        fn endpoint_admits_the_next_attach(&self) -> bool {
+            self.sessions
+                .admit(&kernel_double("retry", SessionState::Opening, 50194))
+                .is_ok()
+        }
+
+        fn assert_released(&self) {
+            assert!(
+                matches!(self.kernel.state(), SessionState::Failed(_)),
+                "nothing claimed a target, so the session is failed: {:?}",
+                self.kernel.state()
+            );
+            assert!(
+                self.kernel.child.lock().unwrap().is_none(),
+                "a worker holding nothing is ended"
+            );
+            assert!(
+                self.endpoint_admits_the_next_attach(),
+                "the endpoint is free for the next attach"
+            );
+        }
+
+        fn assert_preserved(&self) {
+            assert!(
+                self.kernel.kernel_unresolved(),
+                "the worker may hold what the command gave it: {:?}",
+                self.kernel.state()
+            );
+            assert!(
+                self.kernel.child.lock().unwrap().is_some(),
+                "the queued command's worker is not the refused open's to end"
+            );
+            assert!(!self.endpoint_admits_the_next_attach());
+        }
+
+        /// Ends the rig. The pump parks on its queue until the session it holds a `Weak` to is
+        /// gone, so every strong reference has to go first — the registry's, the reader task's,
+        /// and this rig's own — or the join below waits for ever.
+        async fn finish(self) {
+            let Self {
+                kernel,
+                sessions,
+                requests,
+                messages,
+                pumping,
+                reading,
+            } = self;
+            reading.abort();
+            let _ = reading.await;
+            // The stand-in is our ping child, not a debugger or a live target.
+            kernel.released.store(true, Ordering::SeqCst);
+            kernel.kill();
+            drop(messages);
+            drop(requests);
+            drop(sessions);
+            drop(kernel);
+            pumping.join().expect("the pump stops with its session");
+        }
+    }
+
+    /// A target-changing command the worker refused **without running** took nothing over, so a
+    /// pre-commit refusal of the attach landing after the deadline releases the session as it
+    /// would have with nothing queued behind it — rather than leaving it unresolved and the
+    /// endpoint reserved for a worker holding nothing, at the cost of an operator handoff
+    /// (issue #505, the conservative-direction half). In both orders of the deadline and the
+    /// worker's refusal, since the worker answers at read time and the deadline is the caller's.
+    #[tokio::test]
+    async fn a_queued_command_the_worker_refused_without_running_takes_nothing_over() {
+        for refused_before_the_deadline in [true, false] {
+            let mut rig = TakeoverRig::new("refused-takeover");
+            rig.forward_retiring(7, true);
+            assert!(matches!(rig.kernel.state(), SessionState::Retired(_)));
+            if refused_before_the_deadline {
+                rig.worker_refuses(7);
+                rig.handled(90).await;
+                assert_eq!(
+                    rig.kernel.takeover(),
+                    None,
+                    "the worker's verdict cleared it"
+                );
+            }
+            rig.kernel
+                .preserve_kernel("the caller's deadline expired without confirmed completion");
+            assert!(rig.kernel.kernel_unresolved());
+            if !refused_before_the_deadline {
+                rig.worker_refuses(7);
+            }
+            rig.attach_refused();
+            rig.handled(91).await;
+            rig.assert_released();
+            rig.finish().await;
+        }
+    }
+
+    /// The same verdict arriving **after** the attach's own refusal. The worker emits the two from
+    /// different threads, so the supervisor cannot rely on which lands first: the attach's refusal
+    /// finds the takeover standing and is withheld rather than acted on — the worker is kept, which
+    /// is the race issue #505 is named for — and the refusal of the command then applies it.
+    #[tokio::test]
+    async fn a_refusal_of_the_takeover_that_lands_late_applies_the_withheld_release() {
+        let mut rig = TakeoverRig::new("late-verdict");
+        rig.forward_retiring(7, true);
+        rig.kernel
+            .preserve_kernel("the caller's deadline expired without confirmed completion");
+        rig.attach_refused();
+        rig.handled(90).await;
+        rig.assert_preserved();
+
+        rig.worker_refuses(7);
+        rig.handled(91).await;
+        rig.assert_released();
+        rig.finish().await;
+    }
+
+    /// Only the **latest** forwarded command's verdict counts, because the hold the worker refuses
+    /// under is a prefix of what it reads: a refusal of an earlier command says nothing about a
+    /// later one, which may have reached the engine after the hold dropped.
+    #[tokio::test]
+    async fn a_refusal_of_an_earlier_command_does_not_clear_a_later_takeover() {
+        let mut rig = TakeoverRig::new("two-takeovers");
+        rig.forward_retiring(7, true);
+        rig.forward_retiring(8, false);
+        rig.worker_refuses(7);
+        rig.handled(90).await;
+        assert_eq!(
+            rig.kernel.takeover(),
+            Some(8),
+            "the earlier command's refusal leaves the later takeover standing"
+        );
+        rig.kernel
+            .preserve_kernel("the caller's deadline expired without confirmed completion");
+        rig.attach_refused();
+        rig.handled(91).await;
+        rig.assert_preserved();
+
+        // The later command's own refusal is what settles it.
+        rig.worker_refuses(8);
+        rig.handled(92).await;
+        rig.assert_released();
+        rig.finish().await;
+    }
+
+    /// A reply that is not the worker's hold refusal — the command ran, whether it succeeded or
+    /// the engine rejected it — leaves the takeover standing. The worker reached the command, so
+    /// whatever it holds now is not the refused open's to end.
+    #[tokio::test]
+    async fn a_command_the_worker_ran_keeps_its_takeover() {
+        for ran in [
+            Ok(Output::text("Loading Dump File")),
+            Err(crate::proto::Failed::from(
+                "The system cannot find the file specified.",
+            )),
+        ] {
+            let mut rig = TakeoverRig::new("ran-takeover");
+            rig.forward_retiring(7, true);
+            rig.messages
+                .send(WorkerMessage::Done { id: 7, result: ran })
+                .expect("the reader is running");
+            rig.handled(90).await;
+            assert_eq!(rig.kernel.takeover(), Some(7));
+            rig.kernel
+                .preserve_kernel("the caller's deadline expired without confirmed completion");
+            rig.attach_refused();
+            rig.handled(91).await;
+            rig.assert_preserved();
+            rig.finish().await;
+        }
+    }
+
+    /// The caller's own path, with no deadline: `open` saw the refusal, `settle_uncommitted`
+    /// declined because a command had been forwarded, and the caller was told the slate is clean.
+    /// When the worker then refuses that command without running it, the session it was keeping
+    /// alive settles too — rather than lingering retired, holding a worker with no target and the
+    /// endpoint with it.
+    #[tokio::test]
+    async fn a_refused_takeover_settles_an_open_its_caller_already_saw_fail() {
+        let mut rig = TakeoverRig::new("caller-saw-it");
+        rig.forward_retiring(7, true);
+        assert!(
+            settle_uncommitted(
+                &rig.kernel,
+                "Failed to attach to kernel: Unspecified error (0x80004005)"
+            ),
+            "the forwarded command keeps the worker, so the session survives its open"
+        );
+        assert!(matches!(rig.kernel.state(), SessionState::Retired(_)));
+        assert!(rig.kernel.child.lock().unwrap().is_some());
+
+        rig.worker_refuses(7);
+        rig.handled(90).await;
+        rig.assert_released();
+        rig.finish().await;
+    }
+
+    /// From the pump's side of the lock: a target-changing command reaching the front of the
+    /// queue of a session a settlement has already failed is turned away, and no takeover is
+    /// recorded for it — the worker it would have reached is gone.
+    #[tokio::test]
+    async fn a_takeover_is_not_recorded_for_a_command_the_gate_turned_away() {
+        let (session, rx) = queued("failed-first", SessionState::Failed("no such file".into()));
+        let waiters = Arc::clone(&session.waiters);
+        let (_requests, worker) = std::io::pipe().expect("a pipe to stand in for the worker's");
+        let (done, answered) = oneshot::channel();
+        session.waiters.lock().unwrap().insert(
+            7,
+            Waiting {
+                done,
+                ending: false,
+                progress: None,
+                resumed: None,
+                unwound: false,
+            },
+        );
+        let call = Call::new(EngineOp::BoundedCommand {
+            command: r".opendump C:\dumps\other.dmp".to_string(),
+            patience_ms: 0,
+        })
+        .named(true)
+        .retiring("a raw `execute` command replaced or released the target");
+        session
+            .tx
+            .send(Job {
+                id: 7,
+                op: call.op,
+                startup_symbol_path: None,
+                submitted: Instant::now(),
+                gate: call.gate,
+            })
+            .expect("the pump's queue is open");
+        let pumping = std::thread::spawn({
+            let session = Arc::downgrade(&session);
+            move || pump(session, rx, worker, waiters, Duration::from_secs(30))
+        });
+        let refused = tokio::time::timeout(Duration::from_secs(5), answered)
+            .await
+            .expect("the pump answered")
+            .expect("the pump kept the answer");
+        assert!(
+            matches!(refused, Err(EngineError::Stale(_))),
+            "a failed session's gate turns the command away: {refused:?}"
+        );
+        assert_eq!(session.takeover(), None);
+        assert!(matches!(session.state(), SessionState::Failed(_)));
+        drop(session);
+        pumping.join().expect("the pump stops with its session");
+    }
+
     /// An uncommitted failure the worker answers as `RecoveryRequired` — an attach that panicked,
     /// which the worker keeps the controller after — is preserved, not released and not settled.
     /// Staged before the deadline's preservation, the order in which anything else would end it.
@@ -8746,7 +9353,7 @@ mod tests {
             owner: crate::client::current(),
             last_used: Mutex::new(Instant::now()),
             secure_kernel_pause: Mutex::new(SecureKernelPause::default()),
-            state: Mutex::new((state, Instant::now())),
+            state: Mutex::new(Standing::new(state)),
             tx,
             next_id: AtomicU64::new(1),
             waiters: Arc::new(Mutex::new(HashMap::new())),
@@ -8755,7 +9362,6 @@ mod tests {
             phase: AtomicU8::new(phase as u8),
             released: AtomicBool::new(false),
             kernel_handoff_complete: AtomicBool::new(false),
-            taken_over: AtomicBool::new(false),
             unwinding: Arc::new(Mutex::new(None)),
             execution: Mutex::new(None),
             submit_gate: Mutex::new(()),
