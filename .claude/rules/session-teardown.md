@@ -20,7 +20,20 @@ pre-commit attach failure claimed no target and must not retain an orphan either
 sides: the worker releases itself (`KernelSafety::finished_attach`), and `settle_open` ends a
 session the caller's deadline preserved when that refusal lands after it (issue #462). A failure
 after `Committed` stays unresolved, and so does a worker a target-changing command queued behind
-the attach took over — read from `Session::taken_over`, because the deadline overwrites `Retired`.
+the attach took over — read as `Claims::takeover` **under the state lock, in the transition that
+would fail the session**, because the deadline overwrites `Retired` and because `pump` records it
+from another thread the instant before it forwards the command (issue #505: checked on one
+acquisition and killed on the next, a command forwarded between the two lost its worker, and an
+`.attach <pid>` takes its process down with it). `Session::transition` is the form of
+`update_state` that reaches the claims; `pump` decides its gate and the retirement in one of them
+too, so it answers `Stale` rather than forwarding to a worker a settlement has just ended. The
+takeover names the **latest** forwarded job rather than being a flag, so the worker's own verdict
+can clear it: while the attach is pending the worker refuses every other request without running
+it (`KernelSafety::hold`, answered `RecoveryRequired`), and a command refused that way took nothing
+over. `reader` clears the takeover on that reply and applies a refusal of the open that a
+settlement withheld for it (`Claims::withheld`), whichever of the two replies the worker emitted
+first — they come from different threads. Latest is enough because a pre-commit refusal drops the
+hold for good, so the refused requests are a prefix of what that worker read.
 So does an attach that panicked, after which the worker keeps the controller: the phase cannot show
 that, so the worker answers `RecoveryRequired` (`worker::panicked_op`), and `settle_open` and `open`
 preserve on that category rather than settling.
