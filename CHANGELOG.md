@@ -25,16 +25,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   `tools/eval_scenario.json` is the first scenario: the walkthrough's `0x9F`, from the bug check to
   the driver holding the IRP, then two steps that each need the whole module table, nine in all.
-  `--verify-key tools/eval_scenario.json` re-reads its facts, and held on all nine on 2026-10-17.
+  `--verify-key tools/eval_scenario.json` re-reads its facts, and held on all nine on 2026-10-18.
+  The two table facts are pinned as ranks rather than positions: a pin path can re-sort a list by a
+  numeric field first, so `modules.-size.1.name` is the second-largest image whatever order the
+  table arrives in, with the values either side pinned so that a tie fails.
 
-  **What it measured** (`tools/eval_plan_scenario.json`: qwen and gemma at 262,144 and 32,768, one
-  draw each). A growing transcript ended no investigation at any length. qwen held all nine facts at
-  a served 32,768 with its prompt at 79,352 tokens, 2.4 times the window, and the longest prompt was
-  122,107 tokens. The two models that broke broke by misreading, not on length. gemma, at both
-  windows, took a 32-row `modules` page for the whole table, past a line saying how to get the rest.
-  qwen at 262,144 took the wrong bug-check parameter for the IRP at step 2. The grader reports that
-  break a step late, because the answer printed the right address in another role.
-  `docs/local-model-eval.md` has the table and what each figure does and does not support.
+  **What it measured.** With reasoning off (`tools/eval_plan_scenario.json`: qwen and gemma at
+  262,144 and 32,768, one draw each), a growing transcript ended no investigation, and the two
+  models that broke broke by misreading. gemma, at both windows, took a 32-row `modules` page for
+  the whole table, past a line saying how to get the rest. qwen at 262,144 took the wrong bug-check
+  parameter for the IRP at step 2, and the grader reports that break a step late because the answer
+  printed the right address in another role. With reasoning on
+  (`tools/eval_plan_scenario_reasoning.json`, qwen at `xhigh`, gemma on), both held all nine facts
+  and both asked for the whole table at step 8. No prompt came within half of the models' own
+  262,144-token window, the longest being 122,107. The 32,768 cells were not a smaller window: the
+  runtime reported serving 32,768 and evaluated a 79,352-token prompt, so a transcript past a real
+  window is still unmeasured (`FOLLOWUPS.md` item 132). `docs/local-model-eval.md` has the tables and what each
+  figure does and does not support.
+
+- **An eval plan can ask for a reasoning level, not only for reasoning on or off.** `think` takes a
+  level a model declares (`/api/show`'s `thinking.values`), sent and recorded as itself, so
+  `"think": "xhigh"` is its own arm beside `on` and `off` and cannot share a log with either.
+  `tools/local_model_drive.py` refuses a level the model does not declare before any turn is sent,
+  because the runtime does not: ollama 0.40.6 accepted `think: "high"` for `qwen3.8:27b-mlx`, whose
+  levels are `low`, `medium` and `xhigh`, without an error.
 
 ### Changed
 

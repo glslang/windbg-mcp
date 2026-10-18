@@ -40,9 +40,10 @@ Configuration:
     OLLAMA_KEEP_ALIVE   how long the runtime keeps the model resident after a request
                         (default `10m`); `0` evicts it, which is what frees the box
                         between one model's cells and the next
-    OLLAMA_THINK        whether the model reasons before answering (`think` on the request);
-                        default off, which is what every run before 2026-09-14 measured. It is
-                        an axis rather than a setting — see `THINK`
+    OLLAMA_THINK        whether the model reasons before answering (`think` on the request):
+                        `true`, or a level the model declares (`xhigh`); default off, which
+                        is what every run before 2026-09-14 measured. It is an axis rather
+                        than a setting — see `THINK`
     WINDBG_MCP_EVAL_OUT a file to append one JSON record per task to, for
                         `local_model_eval.py` to grade. Without it this script prints
                         and keeps nothing, which is what it did before the eval existed
@@ -107,7 +108,35 @@ SEED = int(os.environ["EVAL_SEED"]) if os.environ.get("EVAL_SEED", "").strip() e
 # compared with one that did - the same rule as the suite, the server and the weights
 # (`FOLLOWUPS.md` item 46). Two logs differing only here are an A/B; two that do not say are a
 # coincidence.
-THINK = os.environ.get("OLLAMA_THINK", "").strip().lower() in ("1", "true", "yes", "on")
+#
+# **And it may be a level rather than a switch** (2026-10-18). A model can declare several -
+# `qwen3.8:27b-mlx` takes `low`, `medium` and `xhigh`, and `true` means its default, `medium` - so a
+# run asking for more than the default has to say which. A level is sent as itself and recorded as
+# itself, and one the model does not declare is refused in `main` rather than sent: ollama 0.40.6
+# took `think: "high"` for that model with no error, so an undeclared level runs as whatever the
+# runtime makes of it while the record names a level nobody applied.
+def think_of(raw):
+    """`OLLAMA_THINK` as the request's `think`: `False`, `True`, or a level, lower-cased."""
+    word = (raw or "").strip().lower()
+    if word in ("", "0", "false", "no", "off"):
+        return False
+    if word in ("1", "true", "yes", "on"):
+        return True
+    return word
+
+
+def reasoning_arm(think):
+    """The arm a `think` value names: `off`, `on`, or the level itself.
+
+    `local_model_eval.arm_named` is the same rule on the grader's side, which cannot import this
+    module without a bearer token (`local_model_eval.verify_key` says why).
+    """
+    if not think:
+        return "off"
+    return "on" if think is True else think
+
+
+THINK = think_of(os.environ.get("OLLAMA_THINK"))
 
 # Tool calls this harness will actually execute. Everything else is reported back
 # to the model as refused, so a wrong pick is *measured* rather than performed —
@@ -417,6 +446,28 @@ def ollama(path, body=None):
         req.add_header("Content-Type", "application/json")
     with urllib.request.urlopen(req, timeout=60) as response:
         return json.load(response)
+
+
+def declared_levels():
+    """The reasoning levels `/api/show` says this model takes - `thinking.values`, as listed.
+
+    Empty when the runtime declares none, which `main` reads as "a level cannot be checked" and
+    refuses, rather than as "any level goes".
+    """
+    try:
+        thinking = ollama("/api/show", {"model": MODEL}).get("thinking") or {}
+    except Exception:  # noqa: BLE001 - an unanswered question is an empty answer, refused above
+        return []
+    return [v for v in thinking.get("values") or [] if isinstance(v, str)]
+
+
+def refuse_an_undeclared_level(think, levels):
+    """Refuse a reasoning level the model does not declare, before any turn is sent with it."""
+    if isinstance(think, str) and think not in levels:
+        raise SystemExit(f"OLLAMA_THINK={think} is not a level {MODEL} declares "
+                         f"({', '.join(levels) or 'none'}); the runtime would accept it and run "
+                         f"something nobody chose. Use one of those, or `true` for the model's "
+                         f"default.")
 
 
 def pick_model():
@@ -844,11 +895,12 @@ def identity_block(weights):
 
     - `weights` is the digest `runtime_identity()` read: the content address behind a *mutable*
       tag, which is the axis a comparison of two runs a month apart is entirely about.
-    - `reasoning` is the arm this process is running. Only these rows have the knob at all.
+    - `reasoning` is the arm this process is running - `off`, `on`, or the level it asked for. Only
+      these rows have the knob at all.
     - `harness` is null: the harness here is this script, which has no version to name. That is an
       answer this row does not have, not a field nobody thought to record.
     """
-    return {"weights": weights, "reasoning": "on" if THINK else "off", "harness": None}
+    return {"weights": weights, "reasoning": reasoning_arm(THINK), "harness": None}
 
 
 def surface_digest(wire):
@@ -919,6 +971,9 @@ def main():
         return
     MODEL = pick_model()
     print(f"model: {MODEL}")
+    if isinstance(THINK, str):
+        refuse_an_undeclared_level(THINK, declared_levels())
+        print(f"reasoning: {THINK}")
     if DRAW != 1 or SEED is not None:
         print(f"draw {DRAW}, " + (f"seed {SEED}" if SEED is not None else "unseeded"))
     try:

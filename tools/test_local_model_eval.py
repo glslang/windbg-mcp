@@ -62,6 +62,8 @@ class IdentityContract(unittest.TestCase):
             self.assertEqual(local_model_drive.identity_block("d")["reasoning"], "on")
             local_model_drive.THINK = False
             self.assertEqual(local_model_drive.identity_block("d")["reasoning"], "off")
+            local_model_drive.THINK = local_model_drive.think_of(" XHigh ")
+            self.assertEqual(local_model_drive.identity_block("d")["reasoning"], "xhigh")
         finally:
             local_model_drive.THINK = think
         # Null rather than `off` on both backends that have no arm - an absence, not a setting.
@@ -73,6 +75,48 @@ class IdentityContract(unittest.TestCase):
         self.assertEqual(fm_drive.identity_block("24G5027")["weights"], "24G5027")
         self.assertEqual(local_model_drive.identity_block("5642e9")["weights"], "5642e9")
         self.assertIsNone(claude_code_drive.identity_block("2.1.270")["weights"])
+
+
+class ReasoningLevels(unittest.TestCase):
+    def test_a_level_is_sent_as_itself_and_a_switch_as_a_boolean(self):
+        for raw, think in (("", False), ("off", False), ("0", False), ("true", True),
+                           ("ON", True), ("xhigh", "xhigh"), (" Low ", "low")):
+            with self.subTest(raw=raw):
+                self.assertIs(type(local_model_drive.think_of(raw)), type(think))
+                self.assertEqual(local_model_drive.think_of(raw), think)
+                self.assertEqual(evaluator.arm_named(think), local_model_drive.reasoning_arm(think))
+                self.assertEqual(local_model_drive.think_of(evaluator.think_env(think)), think)
+
+    def test_a_level_the_model_does_not_declare_is_refused_before_it_is_sent(self):
+        """ollama 0.40.6 took `think: "high"` for a model declaring `low`, `medium` and `xhigh`
+        without an error, so the runtime is no check on it."""
+        levels = ["low", "medium", "xhigh"]
+        local_model_drive.refuse_an_undeclared_level("xhigh", levels)
+        local_model_drive.refuse_an_undeclared_level(True, [])
+        for think, declared in (("high", levels), ("xhigh", [])):
+            with self.subTest(think=think, declared=declared), self.assertRaises(SystemExit):
+                local_model_drive.refuse_an_undeclared_level(think, declared)
+
+    def test_two_levels_of_one_cell_are_two_arms_and_refused_in_one_log(self):
+        group = {"backend": "ollama", "models": ["qwen"], "contexts": [262144], "surfaces": ["full"]}
+        plan = {"out": os.devnull, "cells": [dict(group, think=True), dict(group, think="xhigh")]}
+        with self.assertRaises(SystemExit) as refused:
+            evaluator.one_arm_per_log(plan, os.devnull)
+        self.assertIn("both reasoning arms", str(refused.exception))
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "log.jsonl")
+            with open(log, "w", encoding="utf-8") as f:
+                f.write(json.dumps(record("ollama", model="qwen", num_ctx=262144, think=True,
+                                          surface={"client": "full"})) + "\n")
+            with self.assertRaises(SystemExit) as refused:
+                evaluator.one_arm_per_log(dict(plan, cells=[dict(group, think="xhigh")]), log)
+            self.assertIn("already holds reasoning on records", str(refused.exception))
+            evaluator.one_arm_per_log(dict(plan, cells=[dict(group, think=True)]), log)
+
+    def test_a_think_that_is_neither_a_switch_nor_a_level_is_refused(self):
+        group = {"backend": "ollama", "models": ["qwen"], "surfaces": ["full"], "think": 1}
+        with self.assertRaises(SystemExit):
+            evaluator.one_arm_per_log({"cells": [group]}, os.devnull)
 
 
 class GraderReadsTheBlock(unittest.TestCase):
@@ -337,6 +381,17 @@ class ScenarioKey(unittest.TestCase):
                 self.assertEqual(failures, [])
                 self.assertEqual(set(how.values()), {"value"})
 
+    def test_an_emptied_key_is_a_scenario_with_no_key_rather_than_a_task_list(self):
+        """`"facts": []` used to read as "not a scenario", which ran the steps as tasks; a step
+        has no `expect`, so every answer passed and the plan's report was green over nothing."""
+        suite = scenario_suite()
+        suite["facts"] = []
+        self.assertTrue(evaluator.is_scenario(suite))
+        with self.assertRaises(SystemExit) as refused:
+            evaluator.scenario_cells_are_drivable({"cells": [{"backend": "ollama"}]}, suite)
+        self.assertIn("it has no `facts`", str(refused.exception))
+        self.assertFalse(evaluator.is_scenario({"tasks": suite["tasks"]}))
+
     def test_a_scenario_plan_refuses_a_driver_with_no_transcript_and_a_subset(self):
         suite = scenario_suite()
         for group in ({"backend": "claude-code", "models": ["opus"]},
@@ -344,6 +399,34 @@ class ScenarioKey(unittest.TestCase):
             with self.subTest(group=group), self.assertRaises(SystemExit):
                 evaluator.scenario_cells_are_drivable({"cells": [group]}, suite)
         evaluator.scenario_cells_are_drivable({"cells": [{"backend": "ollama"}]}, suite)
+
+
+class PinPaths(unittest.TestCase):
+    ROWS = [{"name": "c", "start": "0x10", "size": 5},
+            {"name": "a", "start": "0x9", "size": 40},
+            {"name": "b", "start": "0xff", "size": 12}]
+
+    def test_an_order_reads_a_rank_whatever_order_the_rows_arrive_in(self):
+        for rows in (self.ROWS, self.ROWS[::-1]):
+            with self.subTest(rows=[r["name"] for r in rows]):
+                table = {"modules": rows}
+                self.assertEqual(evaluator.field(table, "modules.-size.1.name"), "b")
+                # Numeric, not text: `0x9` sorts below `0x10`, where a string sort puts it last.
+                self.assertEqual([evaluator.field(table, f"modules.+start.{i}.name")
+                                  for i in range(3)], ["a", "c", "b"])
+
+    def test_a_row_that_cannot_be_placed_fails_the_path_rather_than_dropping_out(self):
+        for odd in ({"name": "d"}, {"name": "d", "size": True}, {"name": "d", "size": "12"}):
+            with self.subTest(row=odd), self.assertRaises(KeyError):
+                evaluator.field({"modules": self.ROWS + [odd]}, "modules.-size.0.name")
+
+    def test_a_tie_at_a_rank_fails_the_pin_beside_it(self):
+        step = {"pin": [{"read": "modules.-size.1.name", "is": "b"},
+                        {"read": "modules.-size.1.size", "is": 12},
+                        {"read": "modules.-size.2.size", "is": 5}]}
+        rows = self.ROWS + [{"name": "e", "start": "0x400", "size": 12}]
+        self.assertEqual([ok for _, ok, *_ in evaluator.check_pins(step, {"modules": rows}, "")],
+                         [True, True, False])
 
 
 if __name__ == "__main__":

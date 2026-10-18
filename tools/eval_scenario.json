@@ -201,7 +201,7 @@
     {
       "id": "next_above",
       "step": "s8_next_above",
-      "note": "The table `modules` answers is sorted by start address (all 227 rows, checked 2026-10-17), so the pins at indices 151 and 152 are the relation itself: `nvlddmkm` ends at 0xfffff80338eab000 and the next image to start is `fastfat`, at 0xfffff80338eb0000.",
+      "note": "`+start` re-sorts the table by start address before the index is read, so the pins at 151 and 152 are the relation itself whatever order the server lists in: `nvlddmkm` ends at 0xfffff80338eab000 and the next image to start is `fastfat`, at 0xfffff80338eb0000. Index 226 existing is what says the sort saw every row, since `matched` counts the rows before `limit` cut them. Read 2026-10-18 against 0.22.0+gbfd1f388, which also lists them in that order.",
       "expect": [["fastfat"]],
       "verify": [
         {
@@ -214,10 +214,11 @@
           "args": {"session_id": "$session", "limit": 2000},
           "pin": [
             {"read": "matched", "is": 227},
-            {"read": "modules.151.name", "is": "nvlddmkm"},
-            {"read": "modules.151.end", "is": "0xfffff80338eab000"},
-            {"read": "modules.152.name", "is": "fastfat"},
-            {"read": "modules.152.start", "is": "0xfffff80338eb0000"}
+            {"read": "modules.+start.151.name", "is": "nvlddmkm"},
+            {"read": "modules.+start.151.end", "is": "0xfffff80338eab000"},
+            {"read": "modules.+start.152.name", "is": "fastfat"},
+            {"read": "modules.+start.152.start", "is": "0xfffff80338eb0000"},
+            {"read": "modules.+start.226.name", "is": "hal"}
           ],
           "grounds": [0]
         }
@@ -226,7 +227,7 @@
     {
       "id": "second_largest",
       "step": "s9_second_largest",
-      "note": "Ranked from all 227 rows on 2026-10-17: `nvlddmkm` 112,766,976 B, `igdkmd64` 44,216,320, `nt` 21,299,200, no tie at second. The pins hold the three sizes; that no other row falls between the first two is the ranking, which a pin cannot state and the 2026-10-17 read did.",
+      "note": "`-size` ranks all 227 rows, largest first, so the pins state the ranking itself rather than three sizes beside it: `nvlddmkm` 112,766,976 B, `igdkmd64` 44,216,320, `nt` 21,299,200. The sizes on either side of rank 1 are pinned too, because a tie would keep the server's order and a pin on the name alone would pass it; with them, a tie at first or second is a pin that fails. Index 226 existing says the ranking saw every row. Read 2026-10-18 against 0.22.0+gbfd1f388.",
       "expect": [["igdkmd64"]],
       "verify": [
         {
@@ -239,10 +240,11 @@
           "args": {"session_id": "$session", "limit": 2000},
           "pin": [
             {"read": "matched", "is": 227},
-            {"read": "modules.name=nvlddmkm.size", "is": 112766976},
-            {"read": "modules.name=igdkmd64.name", "is": "igdkmd64"},
-            {"read": "modules.name=igdkmd64.size", "is": 44216320},
-            {"read": "modules.name=nt.size", "is": 21299200}
+            {"read": "modules.-size.0.size", "is": 112766976},
+            {"read": "modules.-size.1.name", "is": "igdkmd64"},
+            {"read": "modules.-size.1.size", "is": 44216320},
+            {"read": "modules.-size.2.size", "is": 21299200},
+            {"read": "modules.-size.226.name", "is": "hal"}
           ],
           "grounds": [0]
         }
