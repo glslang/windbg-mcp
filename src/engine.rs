@@ -886,6 +886,11 @@ pub struct Session {
     released: AtomicBool,
     /// Verified explicit worker exit, deliberately distinct from native target release.
     kernel_handoff_complete: AtomicBool,
+    /// Whether [`pump`] has forwarded a target-changing command to this worker, which can leave
+    /// it holding a target its opener never claimed. Recorded beside [`SessionState::Retired`]
+    /// rather than read from it: a kernel deadline overwrites that state with `KernelUnresolved`,
+    /// and [`settle_open`] must still know the worker is not the refused open's to end.
+    taken_over: AtomicBool,
     /// How long this session's worker said a transaction it was told to unwind still needs, or
     /// `None` while it has said nothing. Set from [`WorkerMessage::RollingBack`] and read by the
     /// teardown whose own request provoked it; see [`Sessions::release`].
@@ -2469,6 +2474,12 @@ impl Sessions {
         // never settles the open on nobody's behalf, and a refusal that proved nothing was claimed
         // leaves a preserved kernel session preserved. Closing first makes every later send fail,
         // which is what routes it to [`settle_open`].
+        //
+        // Whether to preserve is read *before* closing, because `reader` can settle the open the
+        // instant this closes: a refusal released there was still unknown when the deadline
+        // expired, and is owed the same answer as one released a moment after it, not "pending".
+        let preserve =
+            session.kind == SessionKind::Kernel && !session.released.load(Ordering::SeqCst);
         rx.close();
         if let Ok(reply) = rx.try_recv() {
             return reply;
@@ -2483,7 +2494,7 @@ impl Sessions {
             session: session.id.clone(),
             budget_ms: budget.as_millis().min(u128::from(u64::MAX)) as u64,
         });
-        if session.kind == SessionKind::Kernel && !session.released.load(Ordering::SeqCst) {
+        if preserve {
             return Err(EngineError::RecoveryRequired(session.preserve_kernel(
                 "the caller's deadline expired without confirmed completion",
             )));
@@ -3886,6 +3897,7 @@ impl Sessions {
             phase: AtomicU8::new(OpenPhase::Started as u8),
             released: AtomicBool::new(false),
             kernel_handoff_complete: AtomicBool::new(false),
+            taken_over: AtomicBool::new(false),
             unwinding,
             execution: Mutex::new(None),
             submit_gate: Mutex::new(()),
@@ -4024,18 +4036,18 @@ fn settle_uncommitted(session: &Session, why: &str) -> bool {
     false
 }
 
-/// Ends a kernel session that was preserved while its attach was outstanding, once the attach has
-/// returned a refusal from before it claimed anything — see [`settle_open`].
+/// Ends a kernel session whose attach returned a refusal from before it claimed anything, once
+/// nobody is left waiting for it — see [`settle_open`].
 ///
 /// `released` first, because it is what every guard on this session reads: it lets the state
-/// leave `KernelUnresolved` and the worker be killed, and it makes a preservation scheduled a
-/// moment late decline rather than re-reserve the endpoint.
+/// leave `KernelUnresolved` and the worker be killed, and it makes the deadline's preservation
+/// decline rather than re-reserve the endpoint, whichever of the two runs first.
 fn release_unclaimed_kernel(session: &Session, refusal: &EngineError) {
     session.released.store(true, Ordering::SeqCst);
     session.update_state(|_| {
         Some(SessionState::Failed(format!(
-            "the attach was refused after the caller's deadline, before it claimed a target: \
-             {refusal}"
+            "the attach was refused before it claimed a target, after its caller had stopped \
+             waiting: {refusal}"
         )))
     });
     session.kill();
@@ -4053,10 +4065,16 @@ fn settle_open(session: &Session, result: &Result<Output, EngineError>) -> bool 
     // known, and keeping the controller reserved would send an operator to recover a target that
     // nothing attached to — what a held KDNET port on a loaded runner did (issue #462). Ahead of
     // the sticky check below, which is about a target that may exist.
+    //
+    // Not conditioned on the preservation having happened: `call_as` closes its receiver before
+    // it preserves, so this can run first, and a session failed here without `released` would
+    // then be preserved with no worker behind it. And not for a worker a target-changing command
+    // has taken over, which `settle_uncommitted` leaves alone for the reason it gives — the
+    // deadline erased the `Retired` that says so, which is why it is read from `taken_over`.
     if let Err(e) = result
         && session.kind == SessionKind::Kernel
-        && session.kernel_unresolved()
         && !session.phase().committed()
+        && !session.taken_over.load(Ordering::SeqCst)
         && !matches!(e, EngineError::RecoveryRequired(_))
     {
         release_unclaimed_kernel(session, e);
@@ -4954,6 +4972,7 @@ fn pump(
             continue;
         }
         if let Some(why) = &job.gate.retires {
+            session.taken_over.store(true, Ordering::SeqCst);
             session.set_state(SessionState::Retired(why.clone()));
         }
         if let Some(why) = &job.gate.closes {
@@ -8336,6 +8355,101 @@ mod tests {
         }
     }
 
+    /// The same refusal in the other order. `call_as` closes its receiver before it preserves, so
+    /// `reader` can settle the open first — and a session failed there without `released` would
+    /// then be preserved by the deadline with its worker already gone, the endpoint reserved
+    /// against nothing.
+    #[tokio::test]
+    async fn a_refusal_settled_before_the_deadline_preserves_stays_released() {
+        let kernel = kernel_with_child_in("refused-first", SessionState::Opening);
+        let sessions = registry_of(std::slice::from_ref(&kernel));
+        assert!(!settle_open(
+            &kernel,
+            &Err(EngineError::Debugger(
+                "Failed to attach to kernel: Unspecified error (0x80004005)".into()
+            ))
+        ));
+        assert!(kernel.child.lock().unwrap().is_none());
+        // What `call_as` does next, having decided to preserve before it closed.
+        kernel.preserve_kernel("the caller's deadline expired without confirmed completion");
+        assert!(
+            matches!(kernel.state(), SessionState::Failed(_)),
+            "a preservation after the release must decline: {:?}",
+            kernel.state()
+        );
+        assert!(
+            sessions
+                .admit(&kernel_double("retry", SessionState::Opening, 50194))
+                .is_ok(),
+            "the endpoint is free for the next attach"
+        );
+    }
+
+    /// A refusal before the commit leaves alone a worker that a target-changing command queued
+    /// behind the open has taken over — `settle_uncommitted`'s rule, still applied after the
+    /// deadline has overwritten the `Retired` that recorded it. Driven through [`pump`], because
+    /// forwarding the command is where the takeover is recorded.
+    #[tokio::test]
+    async fn a_late_refusal_leaves_a_worker_a_queued_command_has_taken_over() {
+        let kernel = kernel_with_child_in("taken-over", SessionState::Opening);
+        let (jobs, queue) = mpsc::unbounded_channel();
+        let kernel = Arc::new(Session {
+            tx: jobs,
+            ..Arc::into_inner(kernel).unwrap()
+        });
+        let (requests, worker) = std::io::pipe().expect("a pipe to stand in for the worker's");
+        let pumping = std::thread::spawn({
+            let session = Arc::downgrade(&kernel);
+            let waiters = Arc::clone(&kernel.waiters);
+            move || pump(session, queue, worker, waiters, Duration::from_secs(30))
+        });
+        let call = Call::new(EngineOp::BoundedCommand {
+            command: r".opendump C:\dumps\other.dmp".to_string(),
+            patience_ms: 0,
+        })
+        .named(true)
+        .retiring("a raw `execute` command replaced or released the target");
+        kernel
+            .tx
+            .send(Job {
+                id: 7,
+                op: call.op,
+                startup_symbol_path: None,
+                submitted: Instant::now(),
+                gate: call.gate,
+            })
+            .expect("the pump's queue is open");
+        let mut requests = BufReader::new(requests);
+        let mut line = String::new();
+        requests
+            .read_line(&mut line)
+            .expect("the command reaches the worker");
+        assert!(matches!(kernel.state(), SessionState::Retired(_)));
+        kernel.preserve_kernel("the caller's deadline expired without confirmed completion");
+        assert!(
+            kernel.kernel_unresolved(),
+            "the deadline overwrites the retirement"
+        );
+
+        assert!(settle_open(
+            &kernel,
+            &Err(EngineError::Debugger(
+                "Failed to attach to kernel: Unspecified error (0x80004005)".into()
+            ))
+        ));
+        assert!(kernel.kernel_unresolved());
+        assert!(
+            kernel.child.lock().unwrap().is_some(),
+            "the queued command's worker is not the refused open's to end"
+        );
+
+        // The stand-in is our ping child, not a debugger or a live target.
+        kernel.released.store(true, Ordering::SeqCst);
+        kernel.kill();
+        drop(kernel);
+        pumping.join().expect("the pump stops with its session");
+    }
+
     #[test]
     fn kernel_endpoint_reservation_blocks_competing_and_unknown_transports() {
         let first = kernel_double("first", SessionState::Attaching, 50194);
@@ -8590,6 +8704,7 @@ mod tests {
             phase: AtomicU8::new(phase as u8),
             released: AtomicBool::new(false),
             kernel_handoff_complete: AtomicBool::new(false),
+            taken_over: AtomicBool::new(false),
             unwinding: Arc::new(Mutex::new(None)),
             execution: Mutex::new(None),
             submit_gate: Mutex::new(()),
