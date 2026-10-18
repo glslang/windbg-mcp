@@ -2633,6 +2633,17 @@ impl Sessions {
             }
             Err(EngineError::Timeout(message)) => Err(OpenError::Timeout { id, message }),
             Err(EngineError::RecoveryRequired(message)) => {
+                // Already preserved when it is the deadline's answer above. From the worker it is
+                // a verdict the phase cannot show — an attach that panicked — and the session has
+                // to hold it too, rather than go on reporting an attach in progress.
+                let message = if kind == SessionKind::Kernel
+                    && !session.kernel_unresolved()
+                    && !session.released.load(Ordering::SeqCst)
+                {
+                    session.preserve_kernel("the worker could not prove its attach claimed nothing")
+                } else {
+                    message
+                };
                 Err(OpenError::RecoveryRequired { id, message })
             }
             Err(e) => {
@@ -4071,6 +4082,8 @@ fn settle_open(session: &Session, result: &Result<Output, EngineError>) -> bool 
     // then be preserved with no worker behind it. And not for a worker a target-changing command
     // has taken over, which `settle_uncommitted` leaves alone for the reason it gives — the
     // deadline erased the `Retired` that says so, which is why it is read from `taken_over`.
+    // Checked rather than locked, like `settle_uncommitted`'s own check, so a command `pump`
+    // forwards in the same instant can still lose its worker (#505).
     if let Err(e) = result
         && session.kind == SessionKind::Kernel
         && !session.phase().committed()
@@ -4081,6 +4094,15 @@ fn settle_open(session: &Session, result: &Result<Output, EngineError>) -> bool 
         return false;
     }
     if session.kernel_unresolved() || session.live_control_unresolved() {
+        return true;
+    }
+    // The worker's own verdict that it may still hold the controller — an attach that panicked,
+    // which the phase cannot show (`worker::panicked_op`). Preserved, never settled: settling an
+    // uncommitted failure ends its worker.
+    if session.kind == SessionKind::Kernel
+        && matches!(result, Err(EngineError::RecoveryRequired(_)))
+    {
+        session.preserve_kernel("the worker could not prove its attach claimed nothing");
         return true;
     }
     if session.kind == SessionKind::Kernel
@@ -8448,6 +8470,35 @@ mod tests {
         kernel.kill();
         drop(kernel);
         pumping.join().expect("the pump stops with its session");
+    }
+
+    /// An uncommitted failure the worker answers as `RecoveryRequired` — an attach that panicked,
+    /// which the worker keeps the controller after — is preserved, not released and not settled.
+    /// Staged before the deadline's preservation, the order in which anything else would end it.
+    #[tokio::test]
+    async fn a_panicked_attach_keeps_the_worker_the_worker_kept() {
+        let kernel = kernel_with_child_in("panicked", SessionState::Opening);
+        let sessions = registry_of(std::slice::from_ref(&kernel));
+        assert!(settle_open(
+            &kernel,
+            &Err(engine_error(crate::worker::panicked_op(true)))
+        ));
+        assert!(
+            kernel.kernel_unresolved(),
+            "the worker kept the controller: {:?}",
+            kernel.state()
+        );
+        assert!(kernel.child.lock().unwrap().is_some());
+        assert!(
+            sessions
+                .admit(&kernel_double("retry", SessionState::Opening, 50194))
+                .is_err(),
+            "the endpoint stays reserved"
+        );
+
+        // The stand-in is our ping child, not a debugger or a live target.
+        kernel.released.store(true, Ordering::SeqCst);
+        kernel.kill();
     }
 
     #[test]

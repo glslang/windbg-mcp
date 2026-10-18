@@ -38,7 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attached. The worker already counted that refusal as claiming nothing. The supervisor now does
   too, and the session settles as failed with the refusal as its reason. A failure after the commit
   is unchanged, since that target may exist, and so is a session with a target-changing `execute`
-  queued behind the attach, since that command may have given the worker a target of its own. A
+  queued behind the attach, since that command may have given the worker a target of its own. An
+  attach that panics before committing now answers `recovery_required` and keeps its worker. Before,
+  it answered `target: no` and its worker was ended, though the worker had kept the controller,
+  because nothing told the supervisor the failure was a panic. A
   reply landing just as the deadline expires is no
   longer lost either: the wait closes its channel before declaring the timeout, so the reply is
   either taken or reaches the settling path. Measured with a temporary 2.5 s delay before

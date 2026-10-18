@@ -21,6 +21,9 @@ sides: the worker releases itself (`KernelSafety::finished_attach`), and `settle
 session the caller's deadline preserved when that refusal lands after it (issue #462). A failure
 after `Committed` stays unresolved, and so does a worker a target-changing command queued behind
 the attach took over — read from `Session::taken_over`, because the deadline overwrites `Retired`.
+So does an attach that panicked, after which the worker keeps the controller: the phase cannot show
+that, so the worker answers `RecoveryRequired` (`worker::panicked_op`), and `settle_open` and `open`
+preserve on that category rather than settling.
 `call_as` closes its receiver before declaring a deadline, so a reply that crosses it is either
 taken or reaches `settle_open` — never dropped with the receiver. That lets `settle_open` run
 *before* the deadline's preservation, which is why the release sets `released` first: a
