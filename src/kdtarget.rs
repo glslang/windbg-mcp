@@ -1069,7 +1069,7 @@ async fn run_async(
                     kernel_base = format_args!("{kernel_base:#x}"),
                     debugger_data_list = format_args!("{:#x}", metadata.debugger_data_list),
                     loaded_module_list = format_args!("{:#x}", metadata.loaded_module_list),
-                    compatibility_fields = "major=15,protocol=6,flags=NOMM|PTR64,machine=AMD64,max_packet=12,max_state_change=3,max_manipulate=0x36",
+                    compatibility_fields = "major=15,protocol=6,flags=NOMM|PTR64|HSS,machine=AMD64,max_packet=12,max_state_change=3,max_manipulate=0x36",
                     "serving synthesized Secure Kernel KD version record"
                 );
                 request.get_version_response(Version64 {
