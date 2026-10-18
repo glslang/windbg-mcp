@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A fact is searched for from the step that asks for it onward, because an earlier answer can
     carry it by accident.
   - Attempts are kept apart by a conversation id the runner mints and also writes into its kill
-    notes.
+    notes, and a cell's last conversation is the one both grading and resume read.
   - Every per-task reader refuses a scenario log, since scoring each step alone reports one wrong
     turn as many.
 
@@ -46,6 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **An eval plan can ask for a reasoning level, not only for reasoning on or off.** `think` takes a
   level a model declares (`/api/show`'s `thinking.values`), sent and recorded as itself, so
   `"think": "xhigh"` is its own arm beside `on` and `off` and cannot share a log with either.
+  A plan writes the level as the model declares it, and `"XHigh"` or `"true"` is refused.
   `tools/local_model_drive.py` refuses a level the model does not declare before any turn is sent,
   because the runtime does not: ollama 0.40.6 accepted `think: "high"` for `qwen3.8:27b-mlx`, whose
   levels are `low`, `medium` and `xhigh`, without an error.
