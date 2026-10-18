@@ -571,6 +571,12 @@ pub enum SessionState {
     /// afterwards, by comparing what its engine holds against what it held at the open
     /// ([`crate::worker`]'s `watch_the_target`), which is what covers a `.if`, an alias, and a
     /// breakpoint command run at a hit nobody watched.
+    ///
+    /// And left one way, which is the exception to its being sticky: a retirement made by name,
+    /// for a command the worker then **refused without running** — every request but the attach,
+    /// while a kernel attach is pending — predicted a replacement that never happened, and
+    /// [`reader`] undoes it to the state the opener's phase implies when that refusal lands
+    /// ([`Claims::takeover`]).
     Retired(String),
     /// The session is over: ended, reclaimed, or its worker died.
     Closed(String),
@@ -743,7 +749,9 @@ struct Claims {
     /// took nothing over — and a pre-commit refusal of the attach landing after the deadline would
     /// otherwise leave the session unresolved and its endpoint reserved for a worker holding
     /// nothing, at the cost of an operator handoff. [`reader`] clears this when the job it names
-    /// is refused that way. **Only the latest, and that is sound because of how the hold ends**:
+    /// is refused that way — and with it the `Retired` state `pump` set for that command, if
+    /// nothing has settled the session meanwhile, since the retirement predicted a replacement
+    /// that never happened. **Only the latest, and that is sound because of how the hold ends**:
     /// a returned pre-commit failure drops it for good (`KernelSafety::released`, after which
     /// `preserve` is a no-op), so for a worker whose attach was refused before committing the
     /// refused requests are a prefix of what it read — if the latest retiring command was refused,
@@ -1447,6 +1455,20 @@ impl Session {
     /// How far the opener got. See [`OpenPhase`] for why this is not read off the state.
     fn phase(&self) -> OpenPhase {
         OpenPhase::from_u8(self.phase.load(Ordering::Acquire))
+    }
+
+    /// The state the opener's milestones have earned this session, read off the phase: the state
+    /// it would be in had nothing retired it. Used to undo a retirement `pump` made for a command
+    /// the worker then refused without running (see [`Claims::takeover`]). The phase rather than
+    /// a remembered state, because a milestone that arrived while the session was retired was
+    /// declined by the state and recorded by the phase — which is the whole reason the two are
+    /// kept apart.
+    fn opener_state(&self) -> SessionState {
+        match self.phase() {
+            OpenPhase::Started => SessionState::Opening,
+            OpenPhase::Committed => SessionState::Attaching,
+            OpenPhase::Opened => SessionState::Open,
+        }
     }
 
     /// Advances the opener's phase. Monotonic, so a milestone can never walk it backwards.
@@ -4144,7 +4166,10 @@ fn unknown_handle(want: &str) -> String {
 /// first and failed second, a settlement that read "not taken over" could kill the worker the
 /// command had just reached (issue #505). `Retired` is read as well as the takeover, because the
 /// worker's own observer retires a session without one (`WorkerMessage::TargetReplaced`) and can
-/// do so between the opener's reply reaching [`Sessions::open`] and `open` settling on it.
+/// do so between the opener's reply reaching [`Sessions::open`] and `open` settling on it. A
+/// `Retired` that stood for a takeover the worker has since refused is not here to be read: the
+/// refusal undid it (see [`Claims::takeover`]), which is what keeps this check from keeping a
+/// worker that holds nothing.
 fn settle_uncommitted(session: &Session, why: &str) -> bool {
     let settled = session.transition(|state, claims| {
         if matches!(
@@ -5471,16 +5496,41 @@ async fn reader(
                             return None;
                         }
                         claims.takeover = None;
-                        let why = claims.withheld.take()?;
-                        fail_unclaimed(&session, state, &why)
+                        if let Some(why) = claims.withheld.take() {
+                            return fail_unclaimed(&session, state, &why);
+                        }
+                        // Nothing has settled yet, so the retirement `pump` made for this command
+                        // is still standing — and it is now known to stand for nothing: the
+                        // command never ran, so no target was replaced. **Undone, to the state
+                        // the opener's milestones imply** (`Session::opener_state`), rather than
+                        // left for a settlement to read as a takeover. Left standing, a refusal
+                        // of the attach that then reaches its *waiting* caller finds `Retired`,
+                        // keeps a worker holding nothing, and the session cannot even be ended:
+                        // `release` preserves a kernel session whose phase never reached `Opened`
+                        // — the operator handoff #505 exists to prevent, by a longer road. A
+                        // `Retired` on this worker can only be `pump`'s: the worker's own observer
+                        // takes no baseline from an engine holding nothing
+                        // (`worker::watch_the_target`), so it never retires a session whose
+                        // attach was refused before committing.
+                        matches!(state, SessionState::Retired(_)).then(|| session.opener_state())
                     });
                     if settled.moved {
-                        tracing::info!(
-                            "session {}: job {id} was refused by the worker without running, so \
-                             the open it was queued behind settles as it would have without it",
-                            session.id
-                        );
-                        session.kill();
+                        if settled.state.is_live() {
+                            tracing::info!(
+                                "session {}: job {id} was refused by the worker without running, \
+                                 so the retirement made for it is undone ({})",
+                                session.id,
+                                settled.state.name()
+                            );
+                        } else {
+                            tracing::info!(
+                                "session {}: job {id} was refused by the worker without running, \
+                                 so the open it was queued behind settles as it would have \
+                                 without it",
+                                session.id
+                            );
+                            session.kill();
+                        }
                     }
                 }
                 let waiter = waiters
@@ -8912,6 +8962,11 @@ mod tests {
                     None,
                     "the worker's verdict cleared it"
                 );
+                assert_eq!(
+                    rig.kernel.state(),
+                    SessionState::Opening,
+                    "and undid the retirement that stood for it"
+                );
             }
             rig.kernel
                 .preserve_kernel("the caller's deadline expired without confirmed completion");
@@ -9001,7 +9056,52 @@ mod tests {
         }
     }
 
-    /// The caller's own path, with no deadline: `open` saw the refusal, `settle_uncommitted`
+    /// The caller's own path in the usual order: the worker refuses the queued command the moment
+    /// it reads it, and the attach's own refusal reaches its still-waiting caller later. The
+    /// refusal undoes the retirement `pump` made for the command — to the state the opener's
+    /// phase implies, since a milestone that arrived while retired was declined by the state and
+    /// kept by the phase — so `settle_uncommitted` then finds nothing standing behind the worker
+    /// and ends it. Left `Retired`, it would have kept a worker holding nothing, with the endpoint
+    /// reserved, and `release` would have preserved it as unresolved for the phase it never
+    /// reached (review on #507).
+    #[tokio::test]
+    async fn a_takeover_refused_before_the_attachs_own_refusal_un_retires_the_session() {
+        for (phase, implied) in [
+            (OpenPhase::Started, SessionState::Opening),
+            (OpenPhase::Committed, SessionState::Attaching),
+        ] {
+            let mut rig = TakeoverRig::new("un-retired");
+            rig.forward_retiring(7, true);
+            assert!(matches!(rig.kernel.state(), SessionState::Retired(_)));
+            // A `Committed` milestone landing while retired: the phase moves, the state cannot.
+            rig.kernel.reach(phase);
+            rig.worker_refuses(7);
+            rig.handled(90).await;
+            assert_eq!(rig.kernel.takeover(), None);
+            assert_eq!(
+                rig.kernel.state(),
+                implied,
+                "the retirement stood for a command that never ran, so it is undone to what the \
+                 opener's phase {phase:?} implies"
+            );
+            assert!(
+                rig.kernel.child.lock().unwrap().is_some(),
+                "undoing a retirement ends nothing; the attach is still pending"
+            );
+
+            assert!(
+                !settle_uncommitted(
+                    &rig.kernel,
+                    "Failed to attach to kernel: Unspecified error (0x80004005)"
+                ),
+                "nothing stands behind the worker, so the open's failure ends it"
+            );
+            rig.assert_released();
+            rig.finish().await;
+        }
+    }
+
+    /// The caller's own path in the other order: `open` saw the refusal, `settle_uncommitted`
     /// declined because a command had been forwarded, and the caller was told the slate is clean.
     /// When the worker then refuses that command without running it, the session it was keeping
     /// alive settles too — rather than lingering retired, holding a worker with no target and the

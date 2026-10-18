@@ -30,10 +30,17 @@ too, so it answers `Stale` rather than forwarding to a worker a settlement has j
 takeover names the **latest** forwarded job rather than being a flag, so the worker's own verdict
 can clear it: while the attach is pending the worker refuses every other request without running
 it (`KernelSafety::hold`, answered `RecoveryRequired`), and a command refused that way took nothing
-over. `reader` clears the takeover on that reply and applies a refusal of the open that a
-settlement withheld for it (`Claims::withheld`), whichever of the two replies the worker emitted
-first — they come from different threads. Latest is enough because a pre-commit refusal drops the
-hold for good, so the refused requests are a prefix of what that worker read.
+over. `reader` clears the takeover on that reply and, in the same transition, either applies a
+refusal of the open that a settlement withheld for it (`Claims::withheld`) or — when nothing has
+settled yet — **undoes the `Retired` that `pump` set for that command**, to the state the opener's
+phase implies (`Session::opener_state`). Both are needed, one per order the two replies can land
+in — they come from different threads. Without the undo, the usual order (the worker refuses at
+read time, the attach fails later to a caller still waiting) left `settle_uncommitted` reading a
+`Retired` nothing stood behind, and the session could not even be ended: `release` preserves a
+kernel session whose phase never reached `Opened` (review on #507). Undoing is sound because a
+`Retired` on such a worker can only be `pump`'s — the observer takes no baseline from an engine
+holding nothing — and latest is enough because a pre-commit refusal drops the hold for good, so the
+refused requests are a prefix of what that worker read.
 So does an attach that panicked, after which the worker keeps the controller: the phase cannot show
 that, so the worker answers `RecoveryRequired` (`worker::panicked_op`), and `settle_open` and `open`
 preserve on that category rather than settling.

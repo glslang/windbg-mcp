@@ -106,10 +106,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   other request without running it, so a command refused that way took nothing over, and a
   pre-commit refusal of the attach that lands after the deadline releases the session and its
   endpoint rather than leaving both for an operator handoff. That holds whichever of the two
-  refusals the worker emits first, and when the caller saw the attach fail before the command's
-  refusal came back; before, the session stayed `kernel_unresolved` with its endpoint reserved for
-  a worker holding nothing. The lock's interleaving itself has no deterministic test; each ordering
-  that reaches the supervisor is staged through its queue and its reader.
+  refusals the worker emits first, with the caller waiting or gone: a refusal of the open that
+  arrives while the takeover stands is withheld and applied when it clears, and a takeover refused
+  first has the retirement made for it undone, back to the state the opener's own progress
+  implies, so the open's refusal then settles as it would have with nothing queued. Before, the
+  session stayed `kernel_unresolved` with its endpoint reserved for a worker holding nothing — or,
+  in the usual order, stayed `retired` holding that worker, and `end_session` on it answered
+  `recovery_required` for an attach that never reached a target. The lock's interleaving itself has
+  no deterministic test; each ordering that reaches the supervisor is staged through its queue and
+  its reader.
 
 - **The Secure Kernel handoff probe could not run against this server since item 107**, and its
   own tests had been failing since the same commit. Item 107 made every tool refuse an argument
