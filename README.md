@@ -25,7 +25,7 @@ This file is the map. Each topic is one document, and each document is the whole
 | | |
 |---|---|
 | [Install and engine setup](docs/install.md) | Requirements, prebuilt binaries, Scoop, and the one-time WinDbg engine copy that TTD replay, `!analyze`, the driver tools and 32-bit .NET SOS need |
-| [Use with an MCP client](docs/mcp-clients.md) | Client config, running the server on another machine (`--listen`), the Claude Code plugin, the MCP registry |
+| [Use with an MCP client](docs/mcp-clients.md) | Client config, running the server on another machine (`--listen`), the two Claude Code plugins (the server, and the WinDbg pane that draws its calls), the MCP registry |
 | [Architecture](docs/architecture.md) | Why a supervisor process and one engine worker per session, what each source file owns, and which MCP revisions are served |
 | [The tool surface](docs/tool-surface.md) | Serving fewer tools with `--tools`, what a typed operand may contain, and how the control-flow and TTD tools behave |
 | [Sessions and session handles](docs/sessions.md) | `session_id` routing, the four-session cap, `interrupt`, progress notifications, and recovering a parked attach |

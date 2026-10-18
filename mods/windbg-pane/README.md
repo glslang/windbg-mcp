@@ -11,8 +11,39 @@ showing the WinDbg equivalent of each call. It watches; it never changes a call.
 /windbg-pane shape      report what the last tool result actually looked like
 ```
 
-Load it for one session with `claude --plugin-dir mods/windbg-pane`, or copy the directory to
-`~/.claude/skills/windbg-pane/`, where Claude Code loads it in every session.
+## Install
+
+It is a plugin in this repository's marketplace, beside the server. At the prompt of a Claude Code
+session:
+
+```text
+/plugin install windbg-pane --marketplace glslang/windbg-mcp
+```
+
+Where the `windbg-mcp` marketplace is already added — it is, if the server was installed as a
+plugin — `/plugin install windbg-pane@windbg-mcp` is the same step. Then `/reload-plugins`, and
+`/windbg-pane` is there. From a shell: `claude plugin install windbg-pane --marketplace glslang/windbg-mcp`.
+In the desktop app, where `/plugin` does not run: click + next to the prompt box, then Plugins, Add
+marketplace with `glslang/windbg-mcp`, then Add plugin.
+
+It follows tool calls on any MCP server whose name contains `windbg` — the server plugin's own,
+which Claude Code names `plugin:windbg-mcp:windbg`, one registered by hand as `windbg`, or one
+reached over `--listen` under whatever name the client gave it, as long as that name says so. The
+pane opens on the first such call where the terminal is wide enough to seat it, and `/windbg-pane`
+opens it at any width.
+
+Built and tested on Claude Code 2.1.302, which is the build CI validates and tests it on. A mod's API
+is the build's — `.claude-plugin/types/` is written by the engine that loads it — so a newer Claude
+Code that moves the API shows up there first, and in the mod's own version rather than the
+server's: [`docs/releasing.md`](../../docs/releasing.md#releasing-the-pane-mod) says how a pane
+release is cut, and why its number is not the server's.
+
+### Developing it
+
+`claude --plugin-dir mods/windbg-pane` loads it from the working tree for one session and reloads it
+on each save. An installed copy runs the source at the version the marketplace listed when it was
+installed, so an edit here reaches it only as a new `version` in `.claude-plugin/plugin.json`.
+The test and validation commands are at the end of this file.
 
 ## What it is for
 

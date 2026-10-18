@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The WinDbg pane is installable from this marketplace, beside the server.** `mods/windbg-pane/`
+  — the Claude Code mod that draws a WinDbg-style pane from the server's tool calls as they happen
+  — is now the marketplace's second plugin, so `/plugin install windbg-pane@windbg-mcp` puts it in
+  every session, where before it loaded only from the working tree with `--plugin-dir`. Its
+  version is its own (`0.1.0`), because what it has to keep up with is the Claude Code build rather
+  than DbgEng; `docs/releasing.md` has the procedure, and CI now validates and tests the mod on the
+  build it was written against.
+
 - **The local-model eval can grade an investigation, not only a list of questions**
   (`FOLLOWUPS.md` item 39). Every conversation the grid ran was one question long, so it had never
   measured a transcript filling the window. A suite carrying `facts` is now run as one conversation

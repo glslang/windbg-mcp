@@ -78,8 +78,11 @@ jobs:
         shell: pwsh
         run: |
           # Guard against malformed plugin/marketplace manifests (the JSON that
-          # tells the marketplace how to install this plugin).
-          foreach ($f in '.claude-plugin/plugin.json', '.claude-plugin/marketplace.json') {
+          # tells the marketplace how to install the two plugins). The `pane` job
+          # below reads the mod's with the engine; this is the cheap parse that
+          # runs even when that job's Claude Code install is what broke.
+          foreach ($f in '.claude-plugin/plugin.json', '.claude-plugin/marketplace.json',
+                         'mods/windbg-pane/.claude-plugin/plugin.json', 'mods/windbg-pane/hooks/hooks.json') {
             Write-Host "Validating $f"
             Get-Content $f -Raw | ConvertFrom-Json | Out-Null
           }
@@ -361,6 +364,31 @@ jobs:
             CHANGELOG.md
             docs/**/*.md
             skills/**/*.md
+
+  pane:
+    name: WinDbg pane mod
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Claude Code
+        # Pinned to the build the mod was written and tested against. A mod's API is the
+        # engine's own — the engine writes it as types when it loads the mod — so a green run
+        # here is a statement about this build and nothing newer. Moving the pin is the change
+        # that shows a newer build moved the API (docs/releasing.md, "Releasing the pane mod").
+        run: npm install -g @anthropic-ai/claude-code@2.1.302
+
+      - name: Validate the marketplace and the mod
+        run: |
+          claude plugin validate .
+          claude plugin validate mods/windbg-pane
+
+      - name: Test the mod
+        run: claude plugin test mods/windbg-pane
 
   audit:
     name: Security audit
