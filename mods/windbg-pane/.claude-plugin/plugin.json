@@ -1,6 +1,12 @@
 {
   "name": "windbg-pane",
+  "displayName": "WinDbg Pane",
   "version": "0.1.0",
   "description": "A WinDbg-style pane that follows windbg-mcp tool calls: disassembly, registers, stack, memory, breakpoints and a command log.",
+  "author": { "name": "glslang", "email": "glslang@gmail.com" },
+  "homepage": "https://github.com/glslang/windbg-mcp/tree/main/mods/windbg-pane",
+  "repository": "https://github.com/glslang/windbg-mcp",
+  "license": "MIT",
+  "keywords": ["windbg", "dbgeng", "debugging", "pane", "mod", "windows"],
   "types": "./types/index.d.ts"
 }

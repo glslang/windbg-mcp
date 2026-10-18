@@ -56,9 +56,9 @@ decide whether it fits.
 
 ## As a Claude Code plugin
 
-This repo is also a single-plugin [Claude Code marketplace](https://code.claude.com/docs/en/plugin-marketplaces):
-installing it registers the `windbg` MCP server **and** a `windbg-debugging` skill that
-knows how to drive it (setup, crash-dump, live/kernel, and TTD playbooks).
+This repo is also a [Claude Code marketplace](https://code.claude.com/docs/en/plugin-marketplaces)
+with two plugins. `windbg-mcp` registers the `windbg` MCP server **and** a `windbg-debugging` skill
+that knows how to drive it (setup, crash-dump, live/kernel, and TTD playbooks):
 
 ```text
 /plugin marketplace add glslang/windbg-mcp
@@ -71,6 +71,22 @@ place — download a prebuilt release or build from source — and (for `.run` r
 walks through it, and it mirrors the [*Build or download*](./install.md#build-or-download) and
 [*Bundling the WinDbg engine*](./install.md#bundling-the-windbg-engine) sections of the install
 guide. Then `/reload-plugins` to connect the server. The plugin points at `${CLAUDE_PLUGIN_ROOT}/target/release/windbg-mcp.exe`.
+
+`windbg-pane` is a mod — a plugin of hooks rather than of a server — that draws a WinDbg-style pane
+beside the conversation from the server's tool calls as they happen: disassembly with the stop
+marked, registers with what changed since the last read, stack, memory, breakpoints, and a command
+window showing the WinDbg equivalent of each call. It watches and never changes a call, and it
+follows any MCP server whose name contains `windbg`, so it works with the plugin's server, with one
+registered by hand, and with one reached over `--listen`:
+
+```text
+/plugin install windbg-pane@windbg-mcp
+```
+
+Then `/reload-plugins`; the pane opens on the first `windbg` call, and `/windbg-pane` opens, closes
+and clears it. [`mods/windbg-pane/README.md`](../mods/windbg-pane/README.md) is its own document.
+It is versioned apart from the server, because what it has to keep up with is the Claude Code build
+rather than DbgEng — [*Releasing the pane mod*](./releasing.md#releasing-the-pane-mod) says how.
 
 ## From the official MCP registry
 

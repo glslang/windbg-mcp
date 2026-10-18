@@ -1,6 +1,6 @@
 {
   "name": "windbg-mcp",
-  "description": "WinDbg/DbgEng debugging tools for Claude Code: an MCP server plus a skill that drives crash-dump, live, Time Travel Debugging and Secure Kernel (VTL1) capture and control workflows.",
+  "description": "WinDbg/DbgEng debugging tools for Claude Code: an MCP server plus a skill that drives crash-dump, live, Time Travel Debugging and Secure Kernel (VTL1) capture and control workflows, and a pane that draws the debugger's state from the server's calls as they happen.",
   "owner": { "name": "glslang", "email": "glslang@gmail.com" },
   "plugins": [
     {
@@ -22,6 +22,24 @@
       ],
       "license": "MIT",
       "homepage": "https://github.com/glslang/windbg-mcp",
+      "repository": "https://github.com/glslang/windbg-mcp",
+      "author": { "name": "glslang", "email": "glslang@gmail.com" }
+    },
+    {
+      "name": "windbg-pane",
+      "source": "./mods/windbg-pane",
+      "description": "A WinDbg-style pane that follows windbg-mcp tool calls: disassembly, registers, stack, memory, breakpoints and a command log.",
+      "category": "debugging",
+      "keywords": [
+        "windbg",
+        "dbgeng",
+        "debugging",
+        "pane",
+        "mod",
+        "windows"
+      ],
+      "license": "MIT",
+      "homepage": "https://github.com/glslang/windbg-mcp/tree/main/mods/windbg-pane",
       "repository": "https://github.com/glslang/windbg-mcp",
       "author": { "name": "glslang", "email": "glslang@gmail.com" }
     }

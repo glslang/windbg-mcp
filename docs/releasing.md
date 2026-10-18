@@ -48,7 +48,9 @@ protection" if you stop there.
    badge — and **`Cargo.lock`**, which holds this crate's own version. `cargo update -p windbg-mcp`
    does it. The workflow builds `--locked`, so a stale lock fails the release build after the
    guards have passed, which is the expensive place to find out. Leave `server.json` and
-   `packaging/mcpb/manifest.json` alone: CI stamps both.
+   `packaging/mcpb/manifest.json` alone: CI stamps both. The pane mod's manifest is not on this
+   list either, for the opposite reason — its version moves on its own, when the mod changes
+   ([*Releasing the pane mod*](#releasing-the-pane-mod) below).
 
    **Not `--offline`, and not `--locked` either** — both fail here, for opposite reasons, and the
    flag that looks like the safe one is the one that breaks. `--offline` cannot check out the
@@ -130,6 +132,45 @@ protection" if you stop there.
 tag push publishes to the official MCP Registry, and a version number there is spent. A failed
 build can be re-run; a published `io.github.glslang/windbg-mcp` version cannot be taken back and
 reused.
+
+## Releasing the pane mod
+
+[`mods/windbg-pane/`](../mods/windbg-pane/README.md) is the second plugin the marketplace lists —
+a mod, a plugin of hooks rather than of a server — and it is released the way the skill is, not
+the way the binary is. **A mod has no artifact.** Installing it copies the folder out of this
+repository, and a user's `claude plugin update windbg-pane@windbg-mcp` reinstalls only when the
+`version` in
+[`mods/windbg-pane/.claude-plugin/plugin.json`](../mods/windbg-pane/.claude-plugin/plugin.json)
+has moved — the same rule as the skill at the top of this file, and for the same reason. So the
+whole of a pane release is that one field: `release.yml` does not build, zip, attest or publish
+it, the tag does not carry it, and the MCPB bundle and the MCP registry entry never include it —
+those are the server for clients that are not Claude Code, and a mod runs nowhere else.
+
+**Its version is its own, deliberately.** The server's compatibility axis is DbgEng and the MCP
+revision; the mod's is the **Claude Code build**, whose engine writes the mod's API as types when
+it loads it (`.claude-plugin/types/`, git-ignored). A new Claude Code can move that API with no
+change to this repository, and the fix is then a mod release with nothing to say about the server
+— tying the two numbers would cut a server release, with a registry version spent, to ship a pane
+fix. The reverse holds too: a server release that changes no payload the pane folds leaves the
+pane's version where it is, and a user's update finds nothing to do.
+
+So, when `mods/windbg-pane/` has changed since its version last moved:
+
+1. **Bump `version` in `mods/windbg-pane/.claude-plugin/plugin.json`**, in the PR that makes the
+   change or in the release-prep commit, whichever lands it. A documentation-only change under
+   `mods/` is the same case as a skill fix: it reaches nobody until the version moves.
+2. **Write its CHANGELOG entry under the server's section**, led by the mod's name and new version
+   (`**windbg-pane 0.2.0**: …`), so one file still says what a given date shipped and a reader of
+   the server's release notes sees that the pane changed without a second changelog to find.
+3. **Run what CI runs**: `claude plugin validate mods/windbg-pane` and
+   `claude plugin test mods/windbg-pane`. The *WinDbg pane mod* job runs both on a pinned Claude
+   Code build (`@anthropic-ai/claude-code@2.1.302` in [`ci.yml`](../.github/workflows/ci.yml)),
+   because a mod's tests are a statement about one build's engine: when a newer Claude Code moves
+   the API, moving that pin is the change that shows it, and a green run on the old pin says
+   nothing about the new build. Move the pin deliberately, with the mod, and say so in the entry.
+
+Nothing else in the checklist changes. The guards in `release.yml` compare the server's three
+manifests and never read the mod's, which is right: the tag is the server's.
 
 ## What the release is not
 
