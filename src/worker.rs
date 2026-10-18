@@ -392,6 +392,24 @@ fn kernel_recovery_required() -> Failed {
     )
 }
 
+/// What an op that panicked answers.
+///
+/// A kernel attach is the exception, because [`KernelSafety::finished_attach`] keeps the
+/// controller after a panic as surely as after a committed failure, and the supervisor sees
+/// only the reply: an uncommitted failure with no category reads to it as a refusal that claimed
+/// nothing, and it ends that worker. The category is how the verdict crosses the pipe.
+pub(crate) fn panicked_op(kernel_attach: bool) -> Failed {
+    if kernel_attach {
+        Failed::categorised(
+            crate::structured::ErrorCategory::RecoveryRequired,
+            "the kernel attach panicked before it could prove it claimed no target; the worker \
+             keeps the controller for an explicit recovery handoff",
+        )
+    } else {
+        Failed::from("debugger operation panicked")
+    }
+}
+
 fn retain_orphaned_kernel() -> ! {
     tracing::error!(
         "worker {}: retaining unresolved remote kernel controller after supervisor loss; target liveness is unknown. Operator recovery handoff required.",
@@ -1525,7 +1543,7 @@ fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
             )
         }));
         let panicked = result.is_err();
-        let result = result.unwrap_or_else(|_| Err(Failed::from("debugger operation panicked")));
+        let result = result.unwrap_or_else(|_| Err(panicked_op(kernel_attach)));
         if kernel_attach {
             KERNEL_SAFETY.finished_attach(result.is_err(), panicked);
         }
@@ -13659,6 +13677,17 @@ mod tests {
         safety.begin();
         safety.finished_attach(true, true);
         assert!(safety.hold(), "panic is not a returned pre-commit failure");
+    }
+
+    /// The same verdict has to reach the supervisor, which sees the reply and nothing else — and
+    /// ends the worker of an uncommitted failure that carries no category.
+    #[test]
+    fn a_panicked_kernel_attach_answers_that_recovery_is_required() {
+        assert_eq!(
+            super::panicked_op(true).category,
+            Some(crate::structured::ErrorCategory::RecoveryRequired)
+        );
+        assert_eq!(super::panicked_op(false).category, None);
     }
 
     /// The IRP a dispatch routine was entered with is **wherever this target puts a second
