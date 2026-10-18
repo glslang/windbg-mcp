@@ -208,6 +208,11 @@ which single steps are refused, and what every other request is answered with:
   selector returns real CR3 and debug-register state, with unavailable fields zero. The debugger
   diagnostics described above remain. An execution command after `r` has not been
   measured, so the gate does not claim that ordering yet.
+- **The version record advertises hardware stepping.** The facade translates the debugger's trace
+  request into its guarded target-assisted step. Without `DBGKD_VERS_FLAG_HSS`, WinDbgX 10.0.26100
+  tried to derive a software-step successor from NT compatibility state, truncated the redirected
+  RIP to its 16-bit offset (`0x512b` on the measured stop), and failed `t` before sending a trace
+  request. Classic KD had already selected the trace-enabled `Continue2` path without that flag.
 - **`t` steps the linear successor only.** A branch, call, return, interrupt or exception is
   refused; so is a `rep`-prefixed string instruction, and anything that writes `ss` (`mov ss`,
   `pop ss`, `lss`), because the trap can land somewhere other than the successor. A decoded

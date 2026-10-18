@@ -36,6 +36,7 @@ const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
 const DBGKD_64BIT_PROTOCOL_VERSION2: u8 = 6;
 const DBGKD_VERS_FLAG_PTR64: u16 = 0x0004;
 const DBGKD_VERS_FLAG_NOMM: u16 = 0x0008;
+const DBGKD_VERS_FLAG_HSS: u16 = 0x0010;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ManipulateRequest {
@@ -402,6 +403,8 @@ pub(crate) fn breakpoint_state_change(
 ///
 /// `NOMM` is essential here: this target reads the Secure Kernel's virtual address space directly
 /// and intentionally exposes no Windows physical-memory or page-table model to the debugger.
+/// `HSS` keeps WinDbg on the target-assisted trace path implemented by the guarded step rather
+/// than making it disassemble a software-step successor from NT compatibility state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Version64 {
     pub(crate) build: u16,
@@ -426,7 +429,9 @@ impl Version64 {
         out[0..2].copy_from_slice(&0x000fu16.to_le_bytes());
         out[2..4].copy_from_slice(&self.build.to_le_bytes());
         out[4] = DBGKD_64BIT_PROTOCOL_VERSION2;
-        out[6..8].copy_from_slice(&(DBGKD_VERS_FLAG_PTR64 | DBGKD_VERS_FLAG_NOMM).to_le_bytes());
+        out[6..8].copy_from_slice(
+            &(DBGKD_VERS_FLAG_PTR64 | DBGKD_VERS_FLAG_NOMM | DBGKD_VERS_FLAG_HSS).to_le_bytes(),
+        );
         out[8..10].copy_from_slice(&IMAGE_FILE_MACHINE_AMD64.to_le_bytes());
         // These are one past the highest packet, state-change and manipulate values understood by
         // current 64-bit KD.  Unsupported manipulate requests still receive an explicit status.
@@ -545,6 +550,10 @@ mod tests {
         assert_eq!(half(&response, 16), 0x000f);
         assert_eq!(half(&response, 18), 26_100);
         assert_eq!(response[20], DBGKD_64BIT_PROTOCOL_VERSION2);
+        assert_eq!(
+            half(&response, 22),
+            DBGKD_VERS_FLAG_PTR64 | DBGKD_VERS_FLAG_NOMM | DBGKD_VERS_FLAG_HSS
+        );
         assert_eq!(half(&response, 24), IMAGE_FILE_MACHINE_AMD64);
         assert_eq!(
             u64::from_le_bytes(response[32..40].try_into().unwrap()),
