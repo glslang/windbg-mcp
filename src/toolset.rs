@@ -1,7 +1,7 @@
-//! Which of this server's seventy-eight tools a run advertises.
+//! Which of this server's seventy-nine tools a run advertises.
 //!
 //! The tool surface is paid **once per conversation, before anything is debugged**, and it is
-//! 123,368 bytes — roughly 30k tokens (measured 2026-10-17; every figure here moves with any edit
+//! 125,448 bytes — roughly 31k tokens (measured 2026-10-19; every figure here moves with any edit
 //! to a description, so re-derive rather than cite). Seven tenths of that is prose, and the prose is what tells
 //! a model how to drive the tools, so there is no strip here the way there was in
 //! [`crate::schema`]: `FOLLOWUPS.md` item 24 measured it and the only honest lever left is the one
@@ -32,11 +32,11 @@
 //!   ioctl           11   16,088  driver objects, IRP stacks, reachability, hazards, IOCTL maps,
 //!                                  references to an address, device security and the
 //!                                  whole-driver survey
-//!   securekernel    12   19,834  captured and live VTL1 inspection and execution control
+//!   securekernel    13   21,914  captured and live VTL1 inspection and execution control
 //! ```
 //!
-//! Those bytes are a measurement of **2026-10-17** and move with any edit to a description — the
-//! whole surface they are shares of is 78 tools and 123,368 B, which is what the rows above sum to.
+//! Those bytes are a measurement of **2026-10-19** and move with any edit to a description — the
+//! whole surface they are shares of is 79 tools and 125,448 B, which is what the rows above sum to.
 //! Re-derive rather than quoting them.
 //!
 //! **Those are shares of the whole surface, and they do not sum to a narrowed one.** `crash` reads
@@ -61,7 +61,7 @@
 //!
 //! A listener names its clients already ([`crate::client`]), and they do not have one budget
 //! between them: the arrangement this exists for is a local model that can hold twenty-three tools
-//! and a hosted client that can hold seventy-eight, pointed at the same Windows box and the same debug
+//! and a hosted client that can hold seventy-nine, pointed at the same Windows box and the same debug
 //! sessions and told apart by their bearer tokens. So a client may be configured with a spec of
 //! its own — `WINDBG_MCP_TOOLS_<NAME>`, or a `tools` field in the credential file — and is served
 //! that instead of the run's. The run's `--tools` is the **default**, not a ceiling: a client's
@@ -226,6 +226,7 @@ const GROUPS: &[Group] = &[
             "sk_live_registers",
             "sk_live_read_memory",
             "sk_live_step",
+            "sk_live_continue_to_breakpoints",
             "sk_live_continue",
         ],
     },
@@ -575,7 +576,7 @@ mod tests {
         assert!(set.includes("end_session"));
         assert!(!set.includes("ttd_calls"));
         assert!(!set.includes("debug_batch"));
-        assert_eq!(set.summary(), "13 of 78 tools (session, crash)");
+        assert_eq!(set.summary(), "13 of 79 tools (session, crash)");
     }
 
     #[test]
@@ -586,7 +587,7 @@ mod tests {
         assert!(!set.includes("disassemble"));
         assert_eq!(
             set.summary(),
-            "12 of 78 tools (session, backtrace, registers)"
+            "12 of 79 tools (session, backtrace, registers)"
         );
     }
 
@@ -698,7 +699,7 @@ mod tests {
         // Both name the tool and what is served, because those do not depend on who chose it.
         for said in [&run, &own] {
             assert!(said.contains("`debug_batch`"), "{said}");
-            assert!(said.contains("13 of 78 tools (session, crash)"), "{said}");
+            assert!(said.contains("13 of 79 tools (session, crash)"), "{said}");
         }
     }
 

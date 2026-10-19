@@ -129,6 +129,12 @@ pub enum EngineOp {
         epoch: crate::skcontrol::StopEpoch,
         guard: crate::sklive::StepGuard,
     },
+    /// Consume the current stop epoch, replace the guarded hardware breakpoint set while the
+    /// dispatcher event is held, and resume armed for the next natural stop.
+    SkLiveContinueToBreakpoints {
+        epoch: crate::skcontrol::StopEpoch,
+        breakpoints: Vec<crate::sklive::BreakpointGuard>,
+    },
     /// Consume the current stop epoch, restore the complete baseline and resume.
     SkLiveContinue {
         epoch: crate::skcontrol::StopEpoch,

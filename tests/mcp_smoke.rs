@@ -2174,7 +2174,12 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// allocator call sites and the other reads what they recorded, two tools rather than one because
 /// the recording happens during a run neither call is waiting on. That left 408 B, so the ceiling
 /// moves with them and leaves 3,408 B (2.7%).
-const MODEL_VISIBLE_CEILING: usize = 126_000;
+///
+/// **126,000 -> 129,000 for guarded Secure Kernel continue-to-breakpoints** (2026-10-19). The
+/// surface moves 123,368 -> 125,448 B across 78 -> 79 tools. The new tool is the complete 2,080 B
+/// difference: it carries an epoch plus one to four exact instruction guards, and no other model
+/// row moved. The new ceiling leaves 3,552 B (2.8%).
+const MODEL_VISIBLE_CEILING: usize = 129_000;
 
 /// Ceiling on the whole `tools/list` payload — the serialized result, not the sum of its tools, so
 /// the array's own punctuation and every result-level field are inside it. 216,839 bytes as of
@@ -2332,7 +2337,12 @@ const MODEL_VISIBLE_CEILING: usize = 126_000;
 /// new tools' 4,458 and 3,736 plus two array commas. Each is under `driver_hazards`' 5,872, and for
 /// the same reason -- a result carrying a `CodeLocation` per call site, plus the error closure every
 /// outcome carries. The new ceiling leaves 8,489 B (2.4%).
-const WIRE_CEILING: usize = 355_000;
+///
+/// **355,000 -> 360,000 for guarded Secure Kernel continue-to-breakpoints** (2026-10-19). The
+/// payload moves 350,674 -> 354,262 B: the new tool is 3,587 B and the remaining byte is the array
+/// comma. Its output reuses `LiveTransition`; the additional wire cost is one input schema rather
+/// than a shared-output multiplication. The new ceiling leaves 5,738 B (1.6%).
+const WIRE_CEILING: usize = 360_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,296
 /// bytes (2026-10-14), because its `inputSchema` pulls the whole `StepAction`/`Check` vocabulary
@@ -3496,6 +3506,15 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
             "error",
         ),
         (
+            "sk_live_continue_to_breakpoints",
+            json!({
+                "epoch": "0123456789abcdef",
+                "address": "0xfffff80000001000",
+                "bytes": "90"
+            }),
+            "error",
+        ),
+        (
             "sk_live_continue",
             json!({ "epoch": "fedcba9876543210" }),
             "error",
@@ -4630,7 +4649,7 @@ fn a_listener_serves_the_narrowed_surface_it_was_started_with() {
     // was typed — `session` is added whatever it said.
     let log = listener.stderr();
     assert!(
-        log.contains("serving 13 of 78 tools (session, crash)"),
+        log.contains("serving 13 of 79 tools (session, crash)"),
         "the listener does not report the surface it ended up with: {log}"
     );
 }
@@ -4662,7 +4681,7 @@ fn two_clients_on_one_listener_are_served_two_surfaces() {
     let local_token = server.token.clone();
     assert!(
         server.wait_for_stderr(
-            "serving 20 of 78 tools (session, inspect) — except bench serves 13 of 78 tools \
+            "serving 20 of 79 tools (session, inspect) — except bench serves 13 of 79 tools \
              (session, crash)",
             Duration::from_secs(30)
         ),
@@ -22042,6 +22061,57 @@ fn a_live_secure_kernel_session_stops_steps_inspects_resumes_and_closes() {
                 .as_str()
                 .expect("the step stop carries its epoch")
                 .to_string();
+        }
+
+        // M1's opt-in qualification cases. Each row names an exact natural-flow site and guard;
+        // the transition and wait stay separate so only the pure DbgEng wait is interruptible.
+        // Repeating rows is deliberate: the private config can drive the 100-cycle gate without
+        // baking target-specific symbols or addresses into this repository.
+        if let Some(replacements) = config
+            .get("continue_to_breakpoints")
+            .and_then(Value::as_array)
+        {
+            for replacement in replacements {
+                let mut arguments = json!({
+                    "session_id": id,
+                    "epoch": final_epoch,
+                    "address": replacement
+                        .get("address")
+                        .unwrap_or_else(|| panic!("replacement case omits `address`: {replacement}")),
+                    "bytes": replacement
+                        .get("bytes")
+                        .unwrap_or_else(|| panic!("replacement case omits `bytes`: {replacement}")),
+                });
+                if let Some(slot) = replacement.get("slot") {
+                    arguments["slot"] = slot.clone();
+                }
+                if let Some(additional) = replacement.get("additional_breakpoints") {
+                    arguments["additional_breakpoints"] = additional.clone();
+                }
+                let running =
+                    server.tool_data("sk_live_continue_to_breakpoints", arguments, TARGET_STEP);
+                assert_eq!(running["phase"], "running", "{running}");
+
+                let next =
+                    server.tool_data("sk_live_wait", json!({ "session_id": id }), TARGET_STEP);
+                assert_eq!(
+                    next["event"]["reason"]["reason"], "hardware_breakpoint",
+                    "{next}"
+                );
+                assert_eq!(
+                    next["event"]["reason"]["slot"],
+                    replacement
+                        .get("expected_slot")
+                        .cloned()
+                        .unwrap_or(json!(0)),
+                    "{next}"
+                );
+                assert_ne!(next["epoch"], final_epoch, "{next}");
+                final_epoch = next["epoch"]
+                    .as_str()
+                    .expect("the replacement breakpoint stop carries its epoch")
+                    .to_string();
+            }
         }
         let resumed = server.tool_data(
             "sk_live_continue",

@@ -38,18 +38,21 @@ travel on every request; reads and compare-and-write register updates are refuse
 and the debugger-owned process publishes the exact held dispatcher event without giving the
 provider a VID receive loop. `--sk-control-probe` validates the non-mutating handshake. The contract
 and its state machine are documented in
-[`live-control-provider.md`](live-control-provider.md). Seven MCP tools open and drive that
+[`live-control-provider.md`](live-control-provider.md). The live-control MCP tools drive that
 dedicated worker session: `open_sk_live_control`, `sk_live_arm`, `sk_live_wait`,
-`sk_live_registers`, `sk_live_read_memory`, `sk_live_step` and `sk_live_continue`.
+`sk_live_registers`, `sk_live_read_memory`, `sk_live_step`,
+`sk_live_continue_to_breakpoints` and `sk_live_continue`. The current run/break/correlation work is
+tracked in the [Secure Kernel call-debugging roadmap](skcall-debugging-roadmap.md).
 
 **And since 0.22.0 an installed WinDbg can sit in front of that controller.**
 `open_sk_kd` owns the controller as an MCP session, returns a generated local named pipe, and
 serves the serial KD packet stream to WinDbg while MCP retains lifecycle and recovery. The
 standalone `windbg-mcp --sk-kd-target` role remains for compatibility and diagnostics. The facade
-translates the requests it understands — context, virtual reads, hardware breakpoints, a
-fall-through single step, continue to a breakpoint, quit — into the same guarded operations the
-seven tools make ([#463](https://github.com/glslang/windbg-mcp/pull/463)). It is a facade for the
-debugger over the root-driven controller, not a KD transport inside the guest: Secure Kernel still
+translates the requests it understands — context, virtual reads, hardware-breakpoint bookkeeping,
+a fall-through single step and quit — into the same guarded controller operations
+([#463](https://github.com/glslang/windbg-mcp/pull/463)). Non-trace continue remains refused after
+the 2026-10-18 live qualification reset K3; the roadmap's M1 gate decides when it can return. It is
+a facade for the debugger over the root-driven controller, not a KD transport inside the guest: Secure Kernel still
 ships none, which is gate S5a below. What it can do, what WinDbg is told that the guest never held,
 and the one live run it rests on are in [`kd-facade.md`](kd-facade.md).
 

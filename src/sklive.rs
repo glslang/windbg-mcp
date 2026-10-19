@@ -1836,7 +1836,6 @@ impl<P: ControlProvider> LiveControl<P> {
         self.continue_to_breakpoints_inner(dispatcher, epoch, breakpoints, None)
     }
 
-    #[cfg(test)]
     pub(crate) fn continue_to_breakpoints_until(
         &mut self,
         dispatcher: &mut impl EventDispatcher,
@@ -1847,7 +1846,6 @@ impl<P: ControlProvider> LiveControl<P> {
         self.continue_to_breakpoints_inner(dispatcher, epoch, breakpoints, Some(deadline))
     }
 
-    #[cfg(test)]
     fn continue_to_breakpoints_inner(
         &mut self,
         dispatcher: &mut impl EventDispatcher,
@@ -1857,6 +1855,12 @@ impl<P: ControlProvider> LiveControl<P> {
     ) -> Result<StopEpoch> {
         validate_breakpoints(&breakpoints, ArmMode::Natural)?;
         self.require_stop_epoch(epoch)?;
+        if self.providers.len() != 1 {
+            bail!(
+                "continue-to-breakpoints currently requires exactly one selected VP; multi-VP \
+                 re-arming needs a new VM-wide quiescence proof"
+            );
+        }
         // Verification is read-only and precedes the releasing state. A stale breakpoint guard
         // therefore leaves the exact stop and epoch available for correction.
         for breakpoint in &breakpoints {
@@ -1943,6 +1947,13 @@ impl<P: ControlProvider> LiveControl<P> {
         self.dispatcher_event = None;
         self.expected_stop = Some(ExpectedStop::Hardware);
         self.state = State::Running;
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            vm_id = %self.providers[active].target.vm_id,
+            vp = self.providers[active].target.vp,
+            breakpoint_count = self.breakpoints.len(),
+            "live Secure Kernel control replaced execution breakpoints and resumed"
+        );
         Ok(self.commit_epoch(next_epoch))
     }
 
@@ -3519,6 +3530,85 @@ mod tests {
                 Action::Release(ReleaseMode::Resume),
             ]
         );
+    }
+
+    #[test]
+    fn a_replacement_breakpoint_timeout_restores_the_original_baseline() {
+        let baseline = register_values(BASE_RIP, 0xffff_0ff0, 0x400, 0x46);
+        let replacement = InstructionGuard {
+            address: HexU64(TARGET_RIP + 0x20),
+            bytes: vec![0x90],
+        };
+        let mut dispatcher =
+            FakeDispatcher::new([observed(StopReason::HardwareBreakpoint { slot: 0 })]);
+        let mut control = LiveControl::open(FakeProvider::new()).unwrap();
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Redirect)
+            .unwrap();
+        let first = control.wait_for_stop(&mut dispatcher).unwrap();
+
+        control
+            .continue_to_breakpoints(
+                &mut dispatcher,
+                &first.epoch,
+                vec![BreakpointGuard {
+                    slot: 2,
+                    instruction: replacement,
+                }],
+            )
+            .unwrap();
+        dispatcher.fail_wait = Some("replacement breakpoint did not fire");
+
+        let error = control.wait_for_stop(&mut dispatcher).unwrap_err();
+
+        assert!(error.to_string().contains("did not fire"), "{error:#}");
+        assert_eq!(control.phase(), LivePhase::Faulted);
+        assert!(!control.fault().unwrap().target_left_paused);
+        assert_eq!(control.test_provider().registers, baseline);
+        assert_eq!(
+            dispatcher.actions.last(),
+            Some(&Action::Recover {
+                safe: true,
+                owned_event: false,
+            })
+        );
+    }
+
+    #[test]
+    fn replacement_breakpoints_refuse_multi_vp_without_consuming_the_stop() {
+        let replacement = InstructionGuard {
+            address: HexU64(TARGET_RIP + 0x20),
+            bytes: vec![0x90],
+        };
+        let mut vp1_event = event(StopReason::DebugException);
+        vp1_event.vp = 1;
+        let mut dispatcher = FakeDispatcher::new([ObservedStop {
+            event: vp1_event,
+            instructions: vec![instruction()],
+        }]);
+        let mut control =
+            LiveControl::open_many(vec![FakeProvider::new(), FakeProvider::new().with_vp(1)])
+                .unwrap();
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Natural)
+            .unwrap();
+        let stop = control.wait_for_stop(&mut dispatcher).unwrap();
+
+        let error = control
+            .continue_to_breakpoints(
+                &mut dispatcher,
+                &stop.epoch,
+                vec![BreakpointGuard {
+                    slot: 2,
+                    instruction: replacement,
+                }],
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("exactly one selected VP"));
+        assert_eq!(control.phase(), LivePhase::Stopped);
+        assert_eq!(control.stopped().unwrap().epoch, stop.epoch);
+        assert_eq!(dispatcher.actions.last(), Some(&Action::ReleaseAndPause));
     }
 
     #[test]
