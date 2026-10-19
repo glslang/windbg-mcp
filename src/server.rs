@@ -1265,6 +1265,26 @@ pub struct SkLiveArmArgs {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct SkLiveContinueToBreakpointsArgs {
+    /// The opaque epoch from the current stopped record. It is consumed exactly once.
+    pub epoch: String,
+    /// Exact VTL1 virtual address to stop before, decimal or `0x` hexadecimal.
+    pub address: String,
+    /// Exact 1..=15 instruction bytes expected there, as hexadecimal with optional spaces or `-`.
+    pub bytes: String,
+    /// Debug-register slot for the primary replacement breakpoint. Defaults to DR0.
+    #[serde(default)]
+    pub slot: Option<u8>,
+    /// Further guarded replacement breakpoints, up to four distinct slots and addresses total.
+    #[serde(default)]
+    pub additional_breakpoints: Vec<SkLiveBreakpointArgs>,
+    /// Which live Secure Kernel session owns the stopped epoch. Omit for the current one.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SkLiveEpochArgs {
     /// The opaque epoch from the current stopped record. It is consumed exactly once.
     pub epoch: String,
@@ -1306,6 +1326,34 @@ pub struct SkLiveReadArgs {
     /// Which live Secure Kernel session to read. Omit for the current one.
     #[serde(default)]
     pub session_id: Option<String>,
+}
+
+fn parse_live_breakpoints(
+    address: &str,
+    bytes: &str,
+    slot: Option<u8>,
+    additional: &[SkLiveBreakpointArgs],
+    mode: crate::sklive::ArmMode,
+) -> Result<Vec<crate::sklive::BreakpointGuard>, String> {
+    let mut breakpoints = vec![crate::sklive::BreakpointGuard {
+        slot: slot.unwrap_or(0),
+        instruction: crate::sklive::InstructionGuard {
+            address: crate::skcontrol::HexU64(parse_u64(address)?),
+            bytes: crate::skdispatch::parse_hex_bytes(bytes).map_err(|error| error.to_string())?,
+        },
+    }];
+    for breakpoint in additional {
+        breakpoints.push(crate::sklive::BreakpointGuard {
+            slot: breakpoint.slot,
+            instruction: crate::sklive::InstructionGuard {
+                address: crate::skcontrol::HexU64(parse_u64(&breakpoint.address)?),
+                bytes: crate::skdispatch::parse_hex_bytes(&breakpoint.bytes)
+                    .map_err(|error| error.to_string())?,
+            },
+        });
+    }
+    crate::sklive::validate_breakpoints(&breakpoints, mode).map_err(|error| error.to_string())?;
+    Ok(breakpoints)
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -4559,61 +4607,18 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SkLiveArmArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let address = match parse_u64(&args.address) {
-            Ok(value) => value,
+        let breakpoints = match parse_live_breakpoints(
+            &args.address,
+            &args.bytes,
+            args.slot,
+            &args.additional_breakpoints,
+            args.mode,
+        ) {
+            Ok(breakpoints) => breakpoints,
             Err(why) => {
                 return typed_error(ErrorCategory::InvalidArgument, why, args.session_id);
             }
         };
-        let bytes = match crate::skdispatch::parse_hex_bytes(&args.bytes) {
-            Ok(value) => value,
-            Err(error) => {
-                return typed_error(
-                    ErrorCategory::InvalidArgument,
-                    error.to_string(),
-                    args.session_id,
-                );
-            }
-        };
-        let mut breakpoints = vec![crate::sklive::BreakpointGuard {
-            slot: args.slot.unwrap_or(0),
-            instruction: crate::sklive::InstructionGuard {
-                address: crate::skcontrol::HexU64(address),
-                bytes,
-            },
-        }];
-        for breakpoint in args.additional_breakpoints {
-            let address = match parse_u64(&breakpoint.address) {
-                Ok(value) => value,
-                Err(why) => {
-                    return typed_error(ErrorCategory::InvalidArgument, why, args.session_id);
-                }
-            };
-            let bytes = match crate::skdispatch::parse_hex_bytes(&breakpoint.bytes) {
-                Ok(value) => value,
-                Err(error) => {
-                    return typed_error(
-                        ErrorCategory::InvalidArgument,
-                        error.to_string(),
-                        args.session_id,
-                    );
-                }
-            };
-            breakpoints.push(crate::sklive::BreakpointGuard {
-                slot: breakpoint.slot,
-                instruction: crate::sklive::InstructionGuard {
-                    address: crate::skcontrol::HexU64(address),
-                    bytes,
-                },
-            });
-        }
-        if let Err(error) = crate::sklive::validate_breakpoints(&breakpoints, args.mode) {
-            return typed_error(
-                ErrorCategory::InvalidArgument,
-                error.to_string(),
-                args.session_id,
-            );
-        }
         let out = self
             .run(
                 args.session_id.as_deref(),
@@ -4793,6 +4798,56 @@ impl WindbgServer {
             .run(
                 args.session_id.as_deref(),
                 EngineOp::SkLiveStep { epoch, guard },
+            )
+            .await;
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
+    /// Consume the current stopped epoch, verify and install a replacement set of natural-flow
+    /// hardware breakpoints while the dispatcher event is still held, then resume. M1 currently
+    /// requires a session with exactly one selected VP. This is the guarded run/break transition;
+    /// immediately use the live wait operation afterward to collect the next stop. The managed KD
+    /// facade does not yet route WinDbg `g` through this experimental path.
+    #[rmcp::tool(
+        annotations(
+            title = "Continue to live Secure Kernel breakpoints",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<Outcome<crate::sklive::LiveTransition>>()
+    )]
+    async fn sk_live_continue_to_breakpoints(
+        &self,
+        Parameters(args): Parameters<SkLiveContinueToBreakpointsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let epoch = match crate::skcontrol::StopEpoch::new(args.epoch) {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                return typed_error(
+                    ErrorCategory::InvalidArgument,
+                    error.to_string(),
+                    args.session_id,
+                );
+            }
+        };
+        let breakpoints = match parse_live_breakpoints(
+            &args.address,
+            &args.bytes,
+            args.slot,
+            &args.additional_breakpoints,
+            crate::sklive::ArmMode::Natural,
+        ) {
+            Ok(breakpoints) => breakpoints,
+            Err(why) => {
+                return typed_error(ErrorCategory::InvalidArgument, why, args.session_id);
+            }
+        };
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::SkLiveContinueToBreakpoints { epoch, breakpoints },
             )
             .await;
         engine_result_for(args.session_id.as_deref(), out)

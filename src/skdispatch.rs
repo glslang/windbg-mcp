@@ -536,6 +536,31 @@ impl Session {
         })
     }
 
+    pub(crate) fn continue_to_breakpoints(
+        &mut self,
+        engine: &DebugEngine,
+        epoch: &crate::skcontrol::StopEpoch,
+        breakpoints: Vec<BreakpointGuard>,
+    ) -> Result<LiveTransition> {
+        let deadline = self.stopped_service_deadline()?;
+        self.ensure_preparation_succeeded()?;
+        let control = self
+            .control
+            .as_mut()
+            .context("live Secure Kernel control has not completed target discovery")?;
+        let mut dispatcher = self.dispatcher.bind(engine);
+        let epoch =
+            control.continue_to_breakpoints_until(&mut dispatcher, epoch, breakpoints, deadline)?;
+        // The retained event has been completed. A later stop starts a fresh bounded pause window
+        // in `wait_for_stop`; carrying this one across guest execution would spend that budget
+        // while the target is running and could make the next stop impossible to service.
+        self.pause_window = None;
+        Ok(LiveTransition {
+            phase: control.phase(),
+            epoch,
+        })
+    }
+
     pub(crate) fn continue_from(
         &mut self,
         engine: &DebugEngine,
@@ -4892,7 +4917,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_step_wait_continue_reuses_then_ends_one_pause_window() {
+    fn ordinary_step_reuses_and_both_continue_paths_end_the_pause_window() {
         let source = include_str!("skdispatch.rs").replace("\r\n", "\n");
         let wait = source
             .split_once("pub(crate) fn wait_for_stop(\n")
@@ -4904,6 +4929,13 @@ mod tests {
         let step = source
             .split_once("pub(crate) fn step_until(\n")
             .expect("the ordinary step exists")
+            .1
+            .split_once("pub(crate) fn continue_to_breakpoints(\n")
+            .expect("continue-to-breakpoints follows it")
+            .0;
+        let rearmed = source
+            .split_once("pub(crate) fn continue_to_breakpoints(\n")
+            .expect("continue-to-breakpoints exists")
             .1
             .split_once("pub(crate) fn continue_from(\n")
             .expect("continue follows it")
@@ -4924,6 +4956,10 @@ mod tests {
         assert!(
             !step.contains("self.pause_window = None"),
             "step must not end the original absolute pause window: {step}"
+        );
+        assert!(
+            rearmed.contains("self.pause_window = None"),
+            "continue-to-breakpoints must end the retained event's pause window: {rearmed}"
         );
         assert!(
             continued.contains("self.pause_window = None"),

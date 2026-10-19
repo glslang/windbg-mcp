@@ -541,6 +541,15 @@
       "wire": 2106
     },
     {
+      "annotations": 142,
+      "description": 433,
+      "inputSchema": 1575,
+      "modelVisible": 2080,
+      "name": "sk_live_continue_to_breakpoints",
+      "outputSchema": 1334,
+      "wire": 3587
+    },
+    {
       "annotations": 129,
       "description": 183,
       "inputSchema": 543,
@@ -704,15 +713,15 @@
     }
   ],
   "totals": {
-    "annotations": 8555,
-    "description": 46760,
-    "inputSchema": 72477,
+    "annotations": 8697,
+    "description": 47193,
+    "inputSchema": 74052,
     "instructions": 2022,
-    "modelVisible": 123368,
-    "outputSchema": 216484,
-    "payload": 350674,
-    "tools": 78,
-    "wire": 350585,
+    "modelVisible": 125448,
+    "outputSchema": 217818,
+    "payload": 354262,
+    "tools": 79,
+    "wire": 354172,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10296
   }

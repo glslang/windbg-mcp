@@ -821,6 +821,7 @@ fn refuse_op_on_kind(kind: SessionKind, op: &EngineOp) -> Option<String> {
             | EngineOp::SkLiveRegisters
             | EngineOp::SkLiveRead { .. }
             | EngineOp::SkLiveStep { .. }
+            | EngineOp::SkLiveContinueToBreakpoints { .. }
             | EngineOp::SkLiveContinue { .. }
     );
     let kd_op = matches!(op, EngineOp::OpenSecureKernelKd(_) | EngineOp::SkKdServe);
@@ -5805,6 +5806,16 @@ mod tests {
                     instruction: None,
                     expected_rips: Vec::new(),
                 },
+            },
+            EngineOp::SkLiveContinueToBreakpoints {
+                epoch: epoch.clone(),
+                breakpoints: vec![crate::sklive::BreakpointGuard {
+                    slot: 0,
+                    instruction: crate::sklive::InstructionGuard {
+                        address: crate::skcontrol::HexU64(0xfffff80000001000),
+                        bytes: vec![0x90],
+                    },
+                }],
             },
             EngineOp::SkLiveContinue { epoch },
         ];

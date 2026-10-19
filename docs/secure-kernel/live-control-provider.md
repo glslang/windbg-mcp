@@ -220,9 +220,16 @@ proved VM pause to keep provider state stable:
    `step_over` with `new_cr3`, and removes the borrowed slot before returning the stop. It may be
    repeated from any owned stop. Each later step supplies the exact current instruction; the next
    wait accepts only the supplied bounded destination set.
-6. `sk_live_continue` consumes that new epoch, restores and verifies the complete baseline, clears
+6. `sk_live_continue_to_breakpoints` consumes a stopped epoch, verifies one to four replacement
+   instruction guards while the event is still held, restores the prior owned debug state, installs
+   the new natural-flow DR set, and resumes. The next operation must be `sk_live_wait`; keeping the
+   transition and wait separate makes the mutation non-interruptible while leaving only the pure
+   DbgEng wait open to Ctrl+Break. This path is an M1 qualification surface and is not yet used by
+   the managed KD facade's `g` command. The M1 surface currently accepts exactly one selected VP;
+   multi-VP re-arm is refused while preserving the held epoch.
+7. `sk_live_continue` consumes that new epoch, restores and verifies the complete baseline, clears
    execution control and completes the owned event. The session can then be armed again.
-7. `end_session` restores any held state, removes the handler and scratch allocation, and performs
+8. `end_session` restores any held state, removes the handler and scratch allocation, and performs
    the handled `vmwp` detach.
 
 Ordinary debugger and capture operations are refused on this session: its DbgEng target is the
@@ -238,13 +245,15 @@ cleanup itself and remains resident if it cannot prove it. Once adapter cleanup 
 failure ending the worker's idle image target cannot relabel the proved VTL1 release as unresolved.
 
 The opt-in smoke test reads its private inputs from `WINDBG_MCP_SMOKE_SK_LIVE`, whose JSON
-must explicitly say `"disposable": true`. It drives the seven calls above through the built MCP
+must explicitly say `"disposable": true`. It drives the calls above through the built MCP
 binary. `WINDBG_MCP_SK_LIVE_POLICY` must admit the VM, exact provider command templates, profile
 root and an absolute `max_pause_ms` bound before the server starts. The same file admits canonical
 `kit_roots` for capture provider loading. The live request cannot choose the pause bound, and
 ordinary request activity does not extend a retained stop: expiry invokes the same fail-closed
 teardown as `end_session`. The profile, privileged provider and bench evidence remain outside
-version control.
+version control. Optional `continue_to_breakpoints` rows exercise M1's replacement transition and
+next-stop wait; repeating rows lets the private harness run the cycle gate without committing
+machine-specific addresses.
 
 On 2026-10-03 that MCP test completed the full bind, arm, stop, inspect, step, second-stop,
 continue and close lifecycle against the allowlisted disposable K3 VM. An independent wrapper then
