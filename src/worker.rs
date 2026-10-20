@@ -21,11 +21,11 @@
 //! **The one call that crosses that line, and why it is not a hole in it.** `SetInterrupt` is the
 //! single DbgEng entry point Microsoft documents as safe from any thread, and it is the only one
 //! this process ever makes off the engine thread. Ordinary workers call it from
-//! [`interrupt_running`] on the request reader. The isolated `--sk-kd-target` role calls the same
-//! narrow handle from its pipe reader only while [`crate::skdispatch::WaitActivity`] proves the
-//! engine thread is inside the owned vmwp event wait. Everything else about the engine stays where
-//! it always was: it is created on the engine thread, never sent anywhere, and every other call is
-//! made there.
+//! [`interrupt_running`] or the live-control job-bound wake on the request reader. The isolated
+//! `--sk-kd-target` role calls the same narrow handle from its pipe reader only while
+//! [`crate::skdispatch::WaitActivity`] proves the engine thread is inside the owned vmwp event
+//! wait. Everything else about the engine stays where it always was: it is created on the engine
+//! thread, never sent anywhere, and every other call is made there.
 //!
 //! The exception is not optional and not an optimisation. An interrupt exists to stop an operation
 //! that is *running*, which means the engine thread is by definition busy; routed through that
@@ -610,6 +610,18 @@ struct Running {
     /// spans the service job so teardown can bar later work, this is the exact interval where a
     /// cross-thread `SetInterrupt` has somewhere valid to land.
     kd_waiting: bool,
+    /// A `sk_live_wait` claimed by the engine thread, including the short interval before it
+    /// enters DbgEng. A break request binds to this job rather than to whichever operation happens
+    /// to be current when `SetInterrupt` is delivered.
+    live_wait_job: Option<u64>,
+    /// The exact DbgEng wait interval for [`Self::live_wait_job`]. The activity contains only
+    /// atomics and deadlines; no debugger or controller object crosses the engine-thread boundary.
+    live_wait_activity: Option<(u64, crate::skdispatch::WaitActivity)>,
+    /// The first break request bound to the current live wait and the stop that fulfilled it.
+    live_break: Option<LiveBreakWake>,
+    /// A wait result published before its claim is released, closing the race where the break
+    /// request is read after DbgEng returns but before the worker emits that wait's reply.
+    live_wait_outcome: Option<(u64, LiveBreakOutcome)>,
     /// Jobs that were broken in before they reached the engine thread, and must not start.
     ///
     /// The other half of what [`Self::tearing_down`] does for a teardown, for one run rather than
@@ -660,6 +672,20 @@ struct Running {
     /// names, and the two need opposite advice: a rollback is over shortly and `end_session` is
     /// the way out of it, while for a teardown `end_session` *is* what is running.
     uninterruptible: Option<(u64, Cleanup)>,
+}
+
+struct LiveBreakWake {
+    wait_job: u64,
+    break_job: u64,
+    interrupt_filed: bool,
+    outcome: LiveBreakOutcome,
+}
+
+#[derive(Clone)]
+enum LiveBreakOutcome {
+    Pending,
+    Stopped(crate::skcontrol::StopEpoch),
+    Failed(String),
 }
 
 /// Which cleanup a sealed job is running. See [`Running::uninterruptible`].
@@ -721,6 +747,10 @@ static RUNNING: Mutex<Running> = Mutex::new(Running {
     interrupted: None,
     pumping: None,
     kd_waiting: false,
+    live_wait_job: None,
+    live_wait_activity: None,
+    live_break: None,
+    live_wait_outcome: None,
     barred: BTreeSet::new(),
     tearing_down: false,
     uninterruptible: None,
@@ -819,6 +849,58 @@ impl Running {
         self.pumping
     }
 
+    /// Bind the first queued break request to the live-wait claim that is current now.
+    fn stage_live_break(&mut self, break_job: u64) -> Option<(u64, bool)> {
+        if self.tearing_down || self.live_break.is_some() {
+            return None;
+        }
+        let wait_job = self.live_wait_job.filter(|job| self.job == Some(*job))?;
+        let outcome = self
+            .live_wait_outcome
+            .as_ref()
+            .filter(|(job, _)| *job == wait_job)
+            .map(|(_, outcome)| outcome.clone())
+            .unwrap_or(LiveBreakOutcome::Pending);
+        let completed = !matches!(&outcome, LiveBreakOutcome::Pending);
+        self.live_break = Some(LiveBreakWake {
+            wait_job,
+            break_job,
+            interrupt_filed: false,
+            outcome,
+        });
+        Some((wait_job, completed))
+    }
+
+    fn finish_live_break(
+        &mut self,
+        wait_job: u64,
+        outcome: Result<crate::skcontrol::StopEpoch, String>,
+    ) {
+        let outcome = match outcome {
+            Ok(epoch) => LiveBreakOutcome::Stopped(epoch),
+            Err(error) => LiveBreakOutcome::Failed(error),
+        };
+        self.live_wait_outcome = Some((wait_job, outcome.clone()));
+        if let Some(request) = self
+            .live_break
+            .as_mut()
+            .filter(|request| request.wait_job == wait_job)
+        {
+            request.outcome = outcome;
+        }
+    }
+
+    fn take_live_break(&mut self, break_job: u64) -> Option<LiveBreakOutcome> {
+        if self
+            .live_break
+            .as_ref()
+            .is_some_and(|request| request.break_job == break_job)
+        {
+            return self.live_break.take().map(|request| request.outcome);
+        }
+        None
+    }
+
     /// Ends `id`'s claim, reporting whether an interrupt was bound to it.
     ///
     /// Taken rather than read, so an interrupt is spent by the job it reached: the next job starts
@@ -828,6 +910,23 @@ impl Running {
         self.job = None;
         self.pumping = None;
         self.kd_waiting = false;
+        if self.live_wait_job == Some(id) {
+            self.live_wait_job = None;
+        }
+        if self
+            .live_wait_outcome
+            .as_ref()
+            .is_some_and(|(job, _)| *job == id)
+        {
+            self.live_wait_outcome = None;
+        }
+        if self
+            .live_wait_activity
+            .as_ref()
+            .is_some_and(|(job, _)| *job == id)
+        {
+            self.live_wait_activity = None;
+        }
         self.uninterruptible = None;
         self.interrupted.take() == Some(id)
     }
@@ -858,9 +957,10 @@ static INTERRUPT: OnceLock<InterruptHandle> = OnceLock::new();
 /// [`interrupt_running`] takes it too, so a break is either raised before the claim — binding to
 /// nothing, since no job was claimed — or refused with the [`Interrupted::Sealed`] answer that was
 /// promised.
-fn claim(e: &DebugEngine, id: u64, cleanup: Option<Cleanup>) {
+fn claim(e: &DebugEngine, id: u64, cleanup: Option<Cleanup>, live_wait: bool) {
     let mut running = running();
     running.claim(id);
+    running.live_wait_job = live_wait.then_some(id);
     if let Some(cleanup) = cleanup {
         seal_locked(&mut running, e, id, cleanup);
     }
@@ -942,6 +1042,147 @@ pub(crate) fn begin_kd_wait(id: u64) -> Option<KdWaitGuard> {
     }
     current.kd_waiting = true;
     Some(KdWaitGuard { id })
+}
+
+/// The exact live-control wait scope, analogous to [`KdWaitGuard`] but carrying the activity whose
+/// wake reason the dispatcher reads after DbgEng returns.
+pub(crate) struct LiveWaitGuard {
+    id: u64,
+    activity: crate::skdispatch::WaitActivity,
+}
+
+impl Drop for LiveWaitGuard {
+    fn drop(&mut self) {
+        let mut current = running();
+        if current
+            .live_wait_activity
+            .as_ref()
+            .is_some_and(|(job, activity)| *job == self.id && activity.same_wait(&self.activity))
+        {
+            current.live_wait_activity = None;
+        }
+    }
+}
+
+pub(crate) enum LiveWaitEntry {
+    Entered(LiveWaitGuard),
+    BreakRequested,
+    Refused,
+}
+
+/// Publish the exact interval in which a bound break request may use `SetInterrupt` to leave the
+/// host wait. A request that arrived before this point needs no interrupt: the engine thread has
+/// not entered DbgEng and can proceed directly to the target-side rendezvous.
+pub(crate) fn begin_live_wait(id: u64, activity: crate::skdispatch::WaitActivity) -> LiveWaitEntry {
+    let mut current = running();
+    if current.job != Some(id) || current.live_wait_job != Some(id) || current.tearing_down {
+        return LiveWaitEntry::Refused;
+    }
+    if current
+        .live_break
+        .as_ref()
+        .is_some_and(|request| request.wait_job == id)
+    {
+        return LiveWaitEntry::BreakRequested;
+    }
+    current.live_wait_activity = Some((id, activity.clone()));
+    tracing::info!("worker: Secure Kernel live-wait job {id} entered its owned DbgEng wait");
+    LiveWaitEntry::Entered(LiveWaitGuard { id, activity })
+}
+
+/// Bind a queued `sk_live_break` to the live wait that is running now. Only the scoped DbgEng wait
+/// is interrupted; the queued job performs the target pause and all provider mutations later on
+/// the engine thread.
+fn request_live_break(break_job: u64) -> Result<bool, String> {
+    let mut current = running();
+    let Some((wait_job, completed)) = current.stage_live_break(break_job) else {
+        return Ok(false);
+    };
+    let activity = current
+        .live_wait_activity
+        .as_ref()
+        .filter(|(job, _)| *job == wait_job)
+        .map(|(_, activity)| activity.clone());
+    if completed {
+        return Ok(true);
+    }
+    let Some(activity) = activity else {
+        tracing::info!(
+            "worker: Secure Kernel break job {break_job} bound to live-wait job {wait_job} before DbgEng wait entry"
+        );
+        return Ok(true);
+    };
+    if !activity.request_break() {
+        current.live_break = None;
+        return Err(format!(
+            "live-wait job {wait_job} already has a target-side break wake reason"
+        ));
+    }
+    let Some(handle) = INTERRUPT.get() else {
+        activity.cancel_break();
+        current.live_break = None;
+        return Err("the live-control worker has no interrupt handle yet".to_string());
+    };
+    // `WaitActivity::enter` publishes the worker binding before it publishes the active DbgEng
+    // interval. Drop RUNNING before taking the activity's scope gate: entry takes those locks in
+    // the opposite order. If entry is still between the two publications, this waits for it; if
+    // the wait already returned, no interrupt is filed and the bound request inherits its exact
+    // outcome instead.
+    drop(current);
+    let Some(interrupted) = activity.while_active(|| handle.interrupt()) else {
+        tracing::info!(
+            "worker: Secure Kernel break job {break_job} bound to completed live-wait job {wait_job}"
+        );
+        return Ok(true);
+    };
+    match interrupted {
+        Ok(filed) => {
+            let mut current = running();
+            if let Some(request) = current
+                .live_break
+                .as_mut()
+                .filter(|request| request.wait_job == wait_job && request.break_job == break_job)
+            {
+                request.interrupt_filed = true;
+            }
+            tracing::info!(
+                "worker: Secure Kernel break job {break_job} woke live-wait job {wait_job}, filed as {filed:?}"
+            );
+            Ok(true)
+        }
+        Err(error) => {
+            activity.cancel_break();
+            let mut current = running();
+            current.live_break = None;
+            Err(format!(
+                "could not wake live-wait job {wait_job} for break job {break_job}: {}",
+                es(error)
+            ))
+        }
+    }
+}
+
+fn finish_live_break(wait_job: u64, outcome: Result<crate::skcontrol::StopEpoch, String>) {
+    running().finish_live_break(wait_job, outcome);
+}
+
+/// Drain a scoped wake before another engine operation can inherit it. The owned wait normally
+/// consumes the request; the natural-event-won race can return first and leave it pending.
+fn drain_live_break_interrupt(engine: &DebugEngine, wait_job: u64) {
+    let mut current = running();
+    let Some(request) = current
+        .live_break
+        .as_mut()
+        .filter(|request| request.wait_job == wait_job && request.interrupt_filed)
+    else {
+        return;
+    };
+    let _ = engine.interrupted();
+    request.interrupt_filed = false;
+}
+
+fn take_live_break(break_job: u64) -> Option<LiveBreakOutcome> {
+    running().take_live_break(break_job)
 }
 
 /// Closes `id` to further interrupts and consumes anything already pending on the engine.
@@ -1086,6 +1327,19 @@ pub fn run(args: &[String]) -> ! {
                     emit(&WorkerMessage::Done {
                         id: request.id,
                         result: Err(kernel_recovery_required()),
+                    });
+                    continue;
+                }
+                // A live break request is still queued for the engine thread, which is the only
+                // place allowed to pause the VM or touch provider state. Its one reader-thread
+                // action is waking the exact `sk_live_wait` job that would otherwise sit ahead of
+                // it in DbgEng until a natural breakpoint or timeout.
+                if matches!(request.op, EngineOp::SkLiveBreak)
+                    && let Err(why) = request_live_break(request.id)
+                {
+                    emit(&WorkerMessage::Done {
+                        id: request.id,
+                        result: Err(Failed::from(why)),
                     });
                     continue;
                 }
@@ -1522,7 +1776,12 @@ fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
         // Claimed around the whole op, so an interrupt arriving while it runs names *this* job.
         // Outside the `catch_unwind` below, so a panicking op gives the claim back too. A teardown
         // is also sealed here rather than inside itself — see [`claim`] for the window that closes.
-        claim(&engine, id, sealed_as(&request.op));
+        claim(
+            &engine,
+            id,
+            sealed_as(&request.op),
+            matches!(request.op, EngineOp::SkLiveWait),
+        );
         // A panic inside a dbgscope method (several use `.expect`) must not kill the session —
         // surface it as an error for this one op. The engine survives, so this stays a
         // debugger-level failure the model can work around by trying something else.
@@ -1669,28 +1928,53 @@ fn announce_teardown(id: u64) {
 /// arrives — queued behind a long `pool_census`, or already pumping — and the halves are taken
 /// under one lock in the order that leaves no window between them.
 ///
-/// **The one job a teardown cannot simply wait for.** Every other operation on the engine thread
-/// ends on a clock this process owns: a command has a watchdog, a walk checks a deadline, a batch
-/// stops at its next step. A resume ends when the *target* stops, which may be the bound the
-/// caller named — minutes, or an hour — and until then the `EndSession` behind it is not even
-/// dequeued. Its grace would expire against a worker that is working perfectly, and the worker
-/// would be killed still holding the target: a live kernel left halted, an attached process taken
-/// down with the debug port.
+/// **The two jobs a teardown cannot simply wait for.** A resume ends when the target stops, which
+/// may be minutes away. A live Secure Kernel wait has a shorter idle bound, but its teardown grace
+/// is shorter still and killing that worker would discard a controller instead of running its
+/// proved restore. Both waits are therefore left through their exact scoped DbgEng interval.
 ///
-/// Narrow on purpose. It raises a break **only** for a job that is pumping a resumed target, not
-/// for whatever happens to be running: a teardown arriving behind a long `pool_census` still lets
-/// that finish, which is the behaviour every release here has had. Widening it would change what
-/// `end_session` does to every other operation, which is not what this is for.
+/// Narrow on purpose. It raises a break **only** for a job pumping a resumed target or an ordinary
+/// live-control wait whose scope guard is active, not for whatever happens to be running: a
+/// teardown arriving behind a long `pool_census` still lets that finish.
 ///
-/// It goes through [`interrupt_running`], so the seal a [`crate::batch`] takes for its `always`
-/// block is honoured here too — a batch is never pumping, but the check costs nothing and the
-/// alternative is a second road to `SetInterrupt` with its own idea of what may be broken.
+/// The resume path goes through [`interrupt_running`], so batch seals remain authoritative. The
+/// live path mirrors managed KD: it raises only while its scope record is present under this same
+/// lock, then marks that exact job interrupted so the next operation cannot inherit the request.
 fn stop_resuming() {
-    // Two statements, so the guard is unmistakably dropped before `interrupt_running` below takes
-    // the same lock. A `let ... else` over `running()` directly would leave that to the rule about
-    // when a temporary in a `let` initializer dies — correct, and not a thing to have to be right
-    // about when being wrong is a deadlock in a teardown.
-    let pumping = running().begin_teardown();
+    let mut current = running();
+    let pumping = current.begin_teardown();
+    if let Some((job, activity)) = current.live_wait_activity.clone() {
+        let Some(handle) = INTERRUPT.get() else {
+            tracing::warn!("worker: live-control teardown found no interrupt handle");
+            return;
+        };
+        // Mark the exact job before releasing RUNNING. The engine thread cannot release this job
+        // without observing the record, even if it returns from DbgEng in the narrow interval
+        // between the interrupt call and this reader thread regaining the lock.
+        current.interrupt_raised();
+        drop(current);
+        let Some(interrupted) = activity.while_active(|| handle.interrupt()) else {
+            tracing::info!(
+                "worker: live-control teardown found live-wait job {job} leaving its owned wait"
+            );
+            return;
+        };
+        match interrupted {
+            Ok(filed) => {
+                tracing::info!(
+                    "worker: live-control teardown interrupted owned wait for job {job}, filed as {filed:?}"
+                );
+            }
+            Err(error) => tracing::warn!(
+                "worker: live-control teardown could not interrupt owned wait for job {job} ({})",
+                es(error)
+            ),
+        }
+        return;
+    }
+    // Drop before `interrupt_running` takes this same lock. Being wrong here is a teardown
+    // deadlock, so keep the boundary explicit.
+    drop(current);
     let Some(job) = pumping else { return };
     tracing::info!(
         "worker: session ending while job {job} pumps a resumed target; breaking in so the \
@@ -3123,16 +3407,46 @@ fn execute(
         EngineOp::SkLiveWait => {
             let session = held_live_control(&mut sk_live.session)?;
             let max_pause_ms = session.max_pause_ms();
-            let stop = session
-                .wait_for_stop(e, || {
-                    emit(&WorkerMessage::SecureKernelPauseStarted { max_pause_ms });
-                })
-                .map_err(failed)?;
+            let stop = session.wait_for_stop_for_job(e, id, || {
+                emit(&WorkerMessage::SecureKernelPauseStarted { max_pause_ms });
+            });
+            drain_live_break_interrupt(e, id);
+            finish_live_break(
+                id,
+                stop.as_ref()
+                    .map(|stop| stop.epoch.clone())
+                    .map_err(|error| format!("{error:#}")),
+            );
+            let stop = stop.map_err(failed)?;
             Ok(Output::typed(crate::skdispatch::render_stop(&stop), stop))
         }
 
         EngineOp::SkLiveBreak => {
+            let queued = take_live_break(id);
             let session = held_live_control(&mut sk_live.session)?;
+            match queued {
+                Some(LiveBreakOutcome::Stopped(epoch)) => {
+                    let stop = session.stopped().cloned().ok_or_else(|| {
+                        Failed::categorised(
+                            structured::ErrorCategory::StaleSession,
+                            "The stop produced for this break request was consumed before the request could return it.",
+                        )
+                    })?;
+                    if stop.epoch != epoch {
+                        return Err(Failed::categorised(
+                            structured::ErrorCategory::StaleSession,
+                            "The stop produced for this break request was replaced before the request could return it.",
+                        ));
+                    }
+                    return Ok(Output::typed(crate::skdispatch::render_stop(&stop), stop));
+                }
+                Some(LiveBreakOutcome::Failed(error)) => {
+                    return Err(Failed::from(format!(
+                        "the live wait could not service this bound break request: {error}"
+                    )));
+                }
+                Some(LiveBreakOutcome::Pending) | None => {}
+            }
             let max_pause_ms = session.max_pause_ms();
             let stop = session
                 .break_on_demand(e, || {
@@ -13067,12 +13381,47 @@ mod tests {
             .0;
 
         assert!(
-            arm.contains(".wait_for_stop(e, || {")
+            arm.contains(".wait_for_stop_for_job(e, id, || {")
                 && arm.contains("emit(&WorkerMessage::SecureKernelPauseStarted"),
             "the supervisor pause notice must be emitted by the callback invoked at retained-stop \
              time, not after wait validation returns: {arm}"
         );
         assert_eq!(arm.matches("SecureKernelPauseStarted").count(), 1);
+    }
+
+    #[test]
+    fn live_break_wakes_the_bound_wait_before_it_queues_for_the_engine_thread() {
+        let source = include_str!("worker.rs");
+        let reader = source
+            .split_once("for line in BufReader::new(requests).lines()")
+            .expect("the request reader exists")
+            .1
+            .split_once("// The request channel closed")
+            .expect("the request-reader boundary exists")
+            .0;
+        let wake = reader
+            .find("request_live_break(request.id)")
+            .expect("the reader binds live break requests");
+        let queue = reader
+            .find("tx.send(Job::Run")
+            .expect("ordinary requests are queued");
+        assert!(
+            wake < queue,
+            "the request must wake the wait before queueing behind it"
+        );
+
+        let wake_path = source
+            .split_once("fn request_live_break(")
+            .expect("the live-break wake path exists")
+            .1
+            .split_once("fn finish_live_break(")
+            .expect("the wake-path boundary exists")
+            .0;
+        assert!(wake_path.contains("live_wait_activity"));
+        assert!(wake_path.contains("activity.while_active(|| handle.interrupt())"));
+        assert!(wake_path.contains("handle.interrupt()"));
+        assert!(!wake_path.contains(".provider"));
+        assert!(!wake_path.contains("begin_disarm"));
     }
 
     #[test]
@@ -17181,6 +17530,10 @@ mod tests {
             interrupted: None,
             pumping: None,
             kd_waiting: false,
+            live_wait_job: None,
+            live_wait_activity: None,
+            live_break: None,
+            live_wait_outcome: None,
             uninterruptible: None,
         }
     }
@@ -17219,6 +17572,60 @@ mod tests {
             !running.kd_waiting,
             "a service claim given back must close its interrupt interval"
         );
+    }
+
+    #[test]
+    fn a_live_break_is_bound_to_one_wait_job_and_survives_its_release() {
+        let mut running = idle();
+        running.claim(7);
+        running.live_wait_job = Some(7);
+
+        assert_eq!(running.stage_live_break(11), Some((7, false)));
+        assert_eq!(
+            running.stage_live_break(12),
+            None,
+            "a second request cannot replace the job already bound to this wait"
+        );
+        let epoch = crate::skcontrol::StopEpoch::new("stopped-0000000000000001").unwrap();
+        running.finish_live_break(7, Ok(epoch.clone()));
+        running.release(7);
+
+        assert!(running.live_wait_job.is_none());
+        assert!(matches!(
+            running.take_live_break(11),
+            Some(LiveBreakOutcome::Stopped(found)) if found == epoch
+        ));
+        assert!(running.take_live_break(12).is_none());
+    }
+
+    #[test]
+    fn a_break_read_after_wait_completion_inherits_that_exact_outcome() {
+        let mut running = idle();
+        running.claim(7);
+        running.live_wait_job = Some(7);
+        let epoch = crate::skcontrol::StopEpoch::new("stopped-0000000000000002").unwrap();
+        running.finish_live_break(7, Ok(epoch.clone()));
+
+        assert_eq!(
+            running.stage_live_break(11),
+            Some((7, true)),
+            "the result-publication/claim-release gap is still part of this wait"
+        );
+        assert!(matches!(
+            running.take_live_break(11),
+            Some(LiveBreakOutcome::Stopped(found)) if found == epoch
+        ));
+    }
+
+    #[test]
+    fn teardown_prevents_a_new_break_from_binding_to_the_old_wait() {
+        let mut running = idle();
+        running.claim(7);
+        running.live_wait_job = Some(7);
+        running.begin_teardown();
+
+        assert_eq!(running.stage_live_break(11), None);
+        assert!(running.live_break.is_none());
     }
 
     /// A teardown reaches a resume in either of the two states it can be in, and there is no

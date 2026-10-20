@@ -158,16 +158,22 @@ tested result and restore the complete baseline.
 
 The first implementation slice adds direct `sk_live_break`: for one naturally armed VP it proves
 a VM pause, samples RIP/CR3, guards a transient execute breakpoint at that instruction and reuses
-the ordinary bounded vector-1 wait. Offline tests cover a transient hit, a natural breakpoint
-winning the race, an already-stopped refusal that preserves its epoch, and no-hit recovery with
-exact baseline restoration. It is not yet the concurrent request path: an already-running
-`sk_live_wait` still needs a job-bound wake reason that uses the existing scoped `SetInterrupt`
-solely to leave the host wait before the engine thread performs this target-side transition.
+the ordinary bounded vector-1 wait. The second binds a request racing an in-flight `sk_live_wait`
+to that exact worker job. The request reader uses scoped `SetInterrupt` only to leave the host
+wait; the engine thread performs the pause, register writes and target-side rendezvous, and both
+callers receive the same retained epoch. A natural event already at the owned dispatcher site wins
+the race and keeps its `hardware_breakpoint` reason. Teardown also wakes that scoped wait so the
+controller can run its proved recovery before release.
+
+Offline tests cover a transient hit, the job and result-publication race bindings, a natural
+breakpoint winning the request race, an already-stopped refusal that preserves its epoch, and
+no-hit recovery with exact baseline restoration.
 
 M2 implementation slices:
 
-1. **Direct rendezvous:** add the guarded transient-break operation and its typed stop reason.
-2. **Job-bound wake:** route a break request racing `sk_live_wait` to that exact wait, never the
+1. **Direct rendezvous — complete:** add the guarded transient-break operation and its typed stop
+   reason.
+2. **Job-bound wake — complete offline:** route a break request racing `sk_live_wait` to that exact wait, never the
    operation before or after it.
 3. **Race contract:** distinguish natural stop won, already stopped, teardown, timeout and request
    accepted outcomes without consuming a retained epoch accidentally.

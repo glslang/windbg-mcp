@@ -14,6 +14,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind, Register};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::time::Instant;
 
 use crate::skcontrol::{
@@ -177,6 +178,24 @@ pub(crate) struct ObservedStop {
     pub(crate) event: HeldEvent,
     /// A second read of every exact instruction selected when the breakpoints were armed.
     pub(crate) instructions: Vec<InstructionGuard>,
+}
+
+/// The request reader woke the exact in-flight live wait so the engine thread can service a
+/// queued target-side break request. This is control flow rather than a controller fault: no
+/// guest event was accepted and the armed state remains owned by the session.
+#[derive(Debug)]
+pub(crate) struct BreakWake;
+
+impl fmt::Display for BreakWake {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("the live wait yielded to a bound break request")
+    }
+}
+
+impl std::error::Error for BreakWake {}
+
+pub(crate) fn is_break_wake(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<BreakWake>().is_some()
 }
 
 /// The narrow boundary around the one-thread DbgEng owner.
@@ -1421,6 +1440,7 @@ impl<P: ControlProvider> LiveControl<P> {
         };
         let observed = match dispatcher.wait_for_stop(&targets, &expected_instructions) {
             Ok(observed) => observed,
+            Err(error) if is_break_wake(&error) => return Err(error),
             Err(error) => return Err(self.enter_fault(dispatcher, error, None)),
         };
         let Some(active) = self
@@ -3245,6 +3265,7 @@ mod tests {
         fail_release: bool,
         fail_begin: Option<&'static str>,
         fail_wait: Option<&'static str>,
+        break_wake: bool,
         fail_wait_quiesced: bool,
         fail_recovery_pause: Option<&'static str>,
         provider_writes_quiesced: bool,
@@ -3271,6 +3292,7 @@ mod tests {
                 fail_release: false,
                 fail_begin: None,
                 fail_wait: None,
+                break_wake: false,
                 fail_wait_quiesced: true,
                 fail_recovery_pause: None,
                 provider_writes_quiesced: false,
@@ -3373,6 +3395,10 @@ mod tests {
             self.wait_targets
                 .push(targets.iter().map(|target| target.vp).collect());
             self.wait_instructions.push(instructions.to_vec());
+            if self.break_wake {
+                self.break_wake = false;
+                return Err(BreakWake.into());
+            }
             if let Some(reason) = self.fail_wait {
                 self.provider_writes_quiesced = self.fail_wait_quiesced;
                 bail!("{reason}");
@@ -3592,6 +3618,44 @@ mod tests {
         let stop = control.wait_for_stop(&mut dispatcher).unwrap();
         assert_eq!(stop.event.reason, StopReason::BreakRequest { slot: 1 });
         assert_eq!(stop.registers.low(RegisterName::Rip).unwrap(), BASE_RIP);
+    }
+
+    #[test]
+    fn bound_break_wake_preserves_the_running_arm_for_the_engine_thread() {
+        let transient = InstructionGuard {
+            address: HexU64(BASE_RIP),
+            bytes: vec![0x90],
+        };
+        let mut dispatcher = FakeDispatcher::new([ObservedStop {
+            event: event(StopReason::DebugException),
+            instructions: vec![instruction(), transient],
+        }]);
+        dispatcher.break_wake = true;
+        let mut control = LiveControl::open(FakeProvider::new().with_hardware_slot(1)).unwrap();
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Natural)
+            .unwrap();
+
+        let wake = control.wait_for_stop(&mut dispatcher).unwrap_err();
+
+        assert!(is_break_wake(&wake));
+        assert_eq!(control.phase(), LivePhase::Running);
+        assert!(control.fault().is_none());
+        assert!(
+            !dispatcher
+                .actions
+                .iter()
+                .any(|action| matches!(action, Action::Recover { .. }))
+        );
+
+        control
+            .request_break_until(
+                &mut dispatcher,
+                Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+        let stop = control.wait_for_stop(&mut dispatcher).unwrap();
+        assert_eq!(stop.event.reason, StopReason::BreakRequest { slot: 1 });
     }
 
     #[test]

@@ -40,8 +40,9 @@ use crate::sk;
 use crate::sk::RawSource;
 use crate::skcontrol::{HeldEvent, HexU64, StopReason, TargetIdentity};
 use crate::sklive::{
-    ArmMode, BreakpointGuard, DispatcherProfile, DispatcherSite, EventDispatcher, InstructionGuard,
-    LiveControl, LivePhase, LiveTransition, ObservedStop, ReleaseMode, StopRecord,
+    ArmMode, BreakWake, BreakpointGuard, DispatcherProfile, DispatcherSite, EventDispatcher,
+    InstructionGuard, LiveControl, LivePhase, LiveTransition, ObservedStop, ReleaseMode,
+    StopRecord, is_break_wake,
 };
 
 pub(crate) const LIVE_CONTROL_FLAG: &str = "--sk-live-control";
@@ -434,21 +435,44 @@ impl Session {
     pub(crate) fn wait_for_stop(
         &mut self,
         engine: &DebugEngine,
+        retained: impl FnMut(),
+    ) -> Result<StopRecord> {
+        self.wait_for_stop_inner(engine, None, retained)
+    }
+
+    /// The ordinary MCP wait, bound to the worker job that may be woken by `sk_live_break`.
+    pub(crate) fn wait_for_stop_for_job(
+        &mut self,
+        engine: &DebugEngine,
+        job: u64,
+        retained: impl FnMut(),
+    ) -> Result<StopRecord> {
+        self.wait_for_stop_inner(engine, Some(job), retained)
+    }
+
+    fn wait_for_stop_inner(
+        &mut self,
+        engine: &DebugEngine,
+        live_job: Option<u64>,
         mut retained: impl FnMut(),
     ) -> Result<StopRecord> {
         self.ensure_preparation_succeeded()?;
         let max_pause = Duration::from_millis(self.max_pause_ms);
-        let activity = match self.pause_window {
-            Some(window) => WaitActivity::for_kd_until(
-                Duration::from_millis(u64::from(DEBUG_WAIT)),
+        let idle = Duration::from_millis(u64::from(DEBUG_WAIT));
+        let activity = match (self.pause_window, live_job) {
+            (Some(window), Some(job)) => WaitActivity::for_live_control_until(
+                idle,
                 window.service_deadline,
                 window.recovery_deadline,
+                job,
             ),
-            None => WaitActivity::for_kd(
-                Duration::from_millis(u64::from(DEBUG_WAIT)),
-                service_pause_bound(max_pause),
-                max_pause,
-            ),
+            (Some(window), None) => {
+                WaitActivity::for_kd_until(idle, window.service_deadline, window.recovery_deadline)
+            }
+            (None, Some(job)) => {
+                WaitActivity::for_live_control(idle, service_pause_bound(max_pause), max_pause, job)
+            }
+            (None, None) => WaitActivity::for_kd(idle, service_pause_bound(max_pause), max_pause),
         };
         self.dispatcher.wait_activity = Some(activity.clone());
         let result = (|| {
@@ -485,6 +509,9 @@ impl Session {
         }
         activity.finish();
         self.dispatcher.wait_activity = None;
+        if result.as_ref().is_err_and(is_break_wake) {
+            return self.break_on_demand(engine, retained);
+        }
         result
     }
 
@@ -1487,6 +1514,8 @@ pub(crate) struct VmwpDispatcher<'a> {
 const WAIT_ARMED: u8 = 0;
 const WAIT_ACTIVE: u8 = 1;
 const WAIT_FINISHED: u8 = 2;
+const WAKE_NONE: u8 = 0;
+const WAKE_BREAK: u8 = 1;
 
 /// Cross-thread observation of the exact interval in which DbgEng waits for the owned vmwp site.
 ///
@@ -1497,15 +1526,22 @@ pub(crate) struct WaitActivity(Arc<WaitActivityState>);
 
 struct WaitActivityState {
     phase: AtomicU8,
+    wake: AtomicU8,
     scope_gate: Mutex<()>,
     last_traffic: Mutex<Instant>,
     idle_timeout: Duration,
-    managed_job: Option<u64>,
+    owner: Option<WaitOwner>,
     pause_bound: Option<Duration>,
     recovery_bound: Option<Duration>,
     absolute_pause_deadline: Option<Instant>,
     absolute_recovery_deadline: Option<Instant>,
     retained_since: Mutex<Option<Instant>>,
+}
+
+#[derive(Clone, Copy)]
+enum WaitOwner {
+    ManagedKd(u64),
+    LiveControl(u64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1539,7 +1575,21 @@ impl WaitActivity {
             idle_timeout,
             Some(pause_bound),
             Some(recovery_bound),
-            Some(job),
+            Some(WaitOwner::ManagedKd(job)),
+        )
+    }
+
+    fn for_live_control(
+        idle_timeout: Duration,
+        pause_bound: Duration,
+        recovery_bound: Duration,
+        job: u64,
+    ) -> Self {
+        Self::with_options(
+            idle_timeout,
+            Some(pause_bound),
+            Some(recovery_bound),
+            Some(WaitOwner::LiveControl(job)),
         )
     }
 
@@ -1556,11 +1606,26 @@ impl WaitActivity {
         activity
     }
 
+    fn for_live_control_until(
+        idle_timeout: Duration,
+        pause_deadline: Instant,
+        recovery_deadline: Instant,
+        job: u64,
+    ) -> Self {
+        debug_assert!(pause_deadline <= recovery_deadline);
+        let mut activity =
+            Self::with_options(idle_timeout, None, None, Some(WaitOwner::LiveControl(job)));
+        let state = Arc::get_mut(&mut activity.0).expect("a new wait activity is uniquely owned");
+        state.absolute_pause_deadline = Some(pause_deadline);
+        state.absolute_recovery_deadline = Some(recovery_deadline);
+        activity
+    }
+
     fn with_options(
         idle_timeout: Duration,
         pause_bound: Option<Duration>,
         recovery_bound: Option<Duration>,
-        managed_job: Option<u64>,
+        owner: Option<WaitOwner>,
     ) -> Self {
         debug_assert!(
             pause_bound
@@ -1569,10 +1634,11 @@ impl WaitActivity {
         );
         Self(Arc::new(WaitActivityState {
             phase: AtomicU8::new(WAIT_ARMED),
+            wake: AtomicU8::new(WAKE_NONE),
             scope_gate: Mutex::new(()),
             last_traffic: Mutex::new(Instant::now()),
             idle_timeout,
-            managed_job,
+            owner,
             pause_bound,
             recovery_bound,
             absolute_pause_deadline: None,
@@ -1636,6 +1702,26 @@ impl WaitActivity {
         self.0.phase.store(WAIT_FINISHED, Ordering::Release);
     }
 
+    pub(crate) fn request_break(&self) -> bool {
+        self.0
+            .wake
+            .compare_exchange(WAKE_NONE, WAKE_BREAK, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn cancel_break(&self) {
+        let _ = self.0.wake.compare_exchange(
+            WAKE_BREAK,
+            WAKE_NONE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn break_requested(&self) -> bool {
+        self.0.wake.load(Ordering::Acquire) == WAKE_BREAK
+    }
+
     pub(crate) fn while_active<T>(&self, operation: impl FnOnce() -> T) -> Option<T> {
         let _scope = self
             .0
@@ -1679,15 +1765,28 @@ impl WaitActivity {
         if self.0.phase.load(Ordering::Acquire) != WAIT_ARMED {
             bail!("the interruptible DbgEng wait was entered more than once");
         }
-        let managed = match self.0.managed_job {
-            Some(job) => match crate::worker::begin_kd_wait(job) {
-                Some(guard) => Some(guard),
+        let (managed, live) = match self.0.owner {
+            Some(WaitOwner::ManagedKd(job)) => match crate::worker::begin_kd_wait(job) {
+                Some(guard) => (Some(guard), None),
                 None => {
                     self.0.phase.store(WAIT_FINISHED, Ordering::Release);
                     bail!("the managed Secure Kernel KD session is ending");
                 }
             },
-            None => None,
+            Some(WaitOwner::LiveControl(job)) => {
+                match crate::worker::begin_live_wait(job, self.clone()) {
+                    crate::worker::LiveWaitEntry::Entered(guard) => (None, Some(guard)),
+                    crate::worker::LiveWaitEntry::BreakRequested => {
+                        self.0.phase.store(WAIT_FINISHED, Ordering::Release);
+                        return Err(BreakWake.into());
+                    }
+                    crate::worker::LiveWaitEntry::Refused => {
+                        self.0.phase.store(WAIT_FINISHED, Ordering::Release);
+                        bail!("the live Secure Kernel session is ending");
+                    }
+                }
+            }
+            None => (None, None),
         };
         // Publish the interruptible phase only after the worker's binding guard exists. The scope
         // gate also prevents a transport interrupt from racing the closing transition below.
@@ -1696,6 +1795,7 @@ impl WaitActivity {
         Ok(WaitActivityGuard {
             activity: self.clone(),
             managed,
+            live,
         })
     }
 }
@@ -1703,6 +1803,7 @@ impl WaitActivity {
 struct WaitActivityGuard {
     activity: WaitActivity,
     managed: Option<crate::worker::KdWaitGuard>,
+    live: Option<crate::worker::LiveWaitGuard>,
 }
 
 impl Drop for WaitActivityGuard {
@@ -1711,6 +1812,7 @@ impl Drop for WaitActivityGuard {
         // releasing the worker's binding guard. The published interval is therefore wholly
         // contained by the owned DbgEng wait.
         self.activity.finish();
+        drop(self.live.take());
         drop(self.managed.take());
     }
 }
@@ -4053,8 +4155,22 @@ impl VmwpDispatcher<'_> {
             if let Some(interruption) = run.cut_short {
                 match interruption {
                     Interruption::OnRequest => {
+                        // The event-site breakpoint may have won the race with the request. Keep
+                        // that real guest stop; treating it as a wake would discard the native
+                        // event that the controller is already at the exact owned site to retain.
+                        if self.engine.instruction_pointer().map_err(debugger)? == expected {
+                            return Ok(());
+                        }
                         if matches!(self.state.phase, DispatcherPhase::ReadyForStop) {
                             self.state.phase = DispatcherPhase::ReadyForStopInterrupted;
+                        }
+                        if self
+                            .state
+                            .wait_activity
+                            .as_ref()
+                            .is_some_and(WaitActivity::break_requested)
+                        {
+                            return Err(BreakWake.into());
                         }
                         bail!("the debugger wait was interrupted on request")
                     }
@@ -4994,6 +5110,13 @@ mod tests {
         cancelled_before_entry.finish();
         assert_eq!(cancelled_before_entry.phase(), WaitActivityPhase::Finished);
         assert!(cancelled_before_entry.enter().is_err());
+
+        let break_wake = WaitActivity::new(Duration::from_secs(1));
+        assert!(break_wake.request_break());
+        assert!(break_wake.break_requested());
+        assert!(!break_wake.request_break());
+        break_wake.cancel_break();
+        assert!(!break_wake.break_requested());
     }
 
     #[test]
