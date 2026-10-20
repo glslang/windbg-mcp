@@ -23,6 +23,7 @@ use dbgscope::dbgeng::{
     BreakpointAt, BreakpointKind, BreakpointSpec, DebugEngine, Interruption, PendingTarget,
     WaitOutcome,
 };
+use iced_x86::{Decoder, DecoderOptions};
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
 #[cfg(target_arch = "x86_64")]
 use windows_sys::Win32::System::Diagnostics::Debug::{
@@ -59,6 +60,7 @@ pub(crate) const CLEANUP_RESERVE: Duration = Duration::from_secs(30);
 pub(crate) const MIN_PAUSE_MS: u64 = CLEANUP_RESERVE.as_millis() as u64 * 2;
 const POLL: Duration = Duration::from_millis(20);
 const EVENT_TYPE_VECTOR_1: u64 = 0x0100_0002;
+const MAX_AMD64_INSTRUCTION_BYTES: usize = 15;
 
 /// Stop accepting work early enough to preserve a bounded controller-cleanup interval.
 pub(crate) fn service_pause_bound(max_pause: Duration) -> Duration {
@@ -484,6 +486,33 @@ impl Session {
         activity.finish();
         self.dispatcher.wait_activity = None;
         result
+    }
+
+    /// Request a stop without depending on a preselected guest instruction.
+    ///
+    /// This first M2 surface runs as one engine-thread operation. The controller pauses and arms
+    /// the transient target-side breakpoint before entering the ordinary owned-event wait, so the
+    /// mutation remains uninterruptible and the rendezvous retains the existing recovery rules.
+    pub(crate) fn break_on_demand(
+        &mut self,
+        engine: &DebugEngine,
+        retained: impl FnMut(),
+    ) -> Result<StopRecord> {
+        self.ensure_preparation_succeeded()?;
+        let now = Instant::now();
+        let deadline = now
+            .checked_add(Duration::from_millis(u64::from(DEBUG_WAIT)))
+            .unwrap_or(now);
+        {
+            let control = self
+                .control
+                .as_mut()
+                .context("live Secure Kernel control has not completed target discovery")?;
+            let mut dispatcher = self.dispatcher.bind(engine);
+            control.request_break_until(&mut dispatcher, deadline)?;
+        }
+        self.pause_window = None;
+        self.wait_for_stop(engine, retained)
     }
 
     /// Wait while exposing only the lifetime of the owned DbgEng wait to a transport thread.
@@ -1997,6 +2026,47 @@ impl LiveGuestMemory {
         })
     }
 
+    fn read_instruction_until(
+        &self,
+        address: u64,
+        deadline: Option<Instant>,
+    ) -> Result<InstructionGuard> {
+        let bytes_in_page = sk::PAGE - (address & (sk::PAGE - 1));
+        let first_count =
+            usize::try_from(bytes_in_page.min(u64::try_from(MAX_AMD64_INSTRUCTION_BYTES).unwrap()))
+                .unwrap();
+        let mut bytes = self
+            .read_span_until(
+                sk::Gva(address),
+                first_count,
+                "live VTL1 break-request instruction read",
+                deadline,
+            )
+            .map_err(|why| anyhow!("reading the break-request instruction failed: {why:?}"))?;
+        if instruction_length(&bytes, address).is_none()
+            && first_count < MAX_AMD64_INSTRUCTION_BYTES
+        {
+            let continuation_address = address
+                .checked_add(first_count as u64)
+                .context("break-request instruction address overflowed at a page boundary")?;
+            bytes.extend(
+                self.read_span_until(
+                    sk::Gva(continuation_address),
+                    MAX_AMD64_INSTRUCTION_BYTES - first_count,
+                    "live VTL1 break-request instruction continuation read",
+                    deadline,
+                )
+                .context("reading the next page of the break-request instruction")?,
+            );
+        }
+        let length = instruction_length(&bytes, address)
+            .context("the paused VTL1 bytes do not decode as one AMD64 instruction")?;
+        Ok(InstructionGuard {
+            address: HexU64(address),
+            bytes: bytes[..length].to_vec(),
+        })
+    }
+
     fn validate_kernel_base(&self, kernel_base: u64) -> Result<()> {
         if kernel_base & (sk::PAGE - 1) != 0 {
             bail!("live-memory source kernel_base must be page aligned");
@@ -2029,6 +2099,12 @@ impl LiveGuestMemory {
         }
         Ok(())
     }
+}
+
+fn instruction_length(bytes: &[u8], address: u64) -> Option<usize> {
+    let mut decoder = Decoder::with_ip(64, bytes, address, DecoderOptions::NONE);
+    let instruction = decoder.decode();
+    (!instruction.is_invalid() && instruction.len() != 0).then(|| instruction.len())
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2301,6 +2377,26 @@ impl EventDispatcher for VmwpDispatcher<'_> {
         deadline: Instant,
     ) -> Result<()> {
         VmwpDispatcher::verify_instruction_until(self, instruction, deadline)
+    }
+
+    fn capture_instruction(&mut self, address: u64) -> Result<InstructionGuard> {
+        self.state
+            .memory
+            .as_ref()
+            .context("the live VTL1 memory source is absent")?
+            .read_instruction_until(address, None)
+    }
+
+    fn capture_instruction_until(
+        &mut self,
+        address: u64,
+        deadline: Instant,
+    ) -> Result<InstructionGuard> {
+        self.state
+            .memory
+            .as_ref()
+            .context("the live VTL1 memory source is absent")?
+            .read_instruction_until(address, Some(deadline))
     }
 
     fn retained_pause_deadline(&self) -> Option<Instant> {
@@ -5737,6 +5833,13 @@ mod tests {
             LiveGuestMemory::initial_root(&sk::GuestShape::default(), &target(), true).unwrap_err();
 
         assert!(error.to_string().contains("source is not walkable"));
+    }
+
+    #[test]
+    fn break_request_instruction_decoder_requires_one_complete_instruction() {
+        assert_eq!(instruction_length(&[0x90], 0x1fff), Some(1));
+        assert_eq!(instruction_length(&[0xe8], 0x1fff), None);
+        assert_eq!(instruction_length(&[0xe8, 0, 0, 0, 0], 0x1fff), Some(5));
     }
 
     fn profile() -> DispatcherProfile {

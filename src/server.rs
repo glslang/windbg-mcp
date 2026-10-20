@@ -4653,6 +4653,27 @@ impl WindbgServer {
         engine_result_for(args.session_id.as_deref(), out)
     }
 
+    /// Stop a naturally armed VTL1 VP at a guarded transient breakpoint planted at its paused RIP.
+    #[rmcp::tool(
+        annotations(
+            title = "Break live Secure Kernel on demand",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<Outcome<crate::sklive::StopRecord>>()
+    )]
+    async fn sk_live_break(
+        &self,
+        Parameters(args): Parameters<SessionArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self
+            .run(args.session_id.as_deref(), EngineOp::SkLiveBreak)
+            .await;
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
     /// Return the complete register and event evidence retained for the current live VTL1 stop.
     #[rmcp::tool(
         annotations(

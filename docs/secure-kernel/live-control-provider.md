@@ -212,24 +212,30 @@ proved VM pause to keep provider state stable:
    register snapshots, binds the
    observed CR3, and rechecks the guarded instruction bytes through that root before returning the
    winning DR slot with complete stop evidence and a fresh controller epoch.
-4. `sk_live_registers` and `sk_live_read_memory` inspect only that stopped epoch. The memory path
+4. `sk_live_break` begins M2's target-side break path for one naturally armed VP. It proves a VM
+   pause, samples the current RIP and CR3, decodes and records the exact instruction bytes, uses a
+   free hardware slot or temporarily replaces one owned slot, and resumes into the ordinary owned
+   vector-1 wait. A transient hit reports `break_request`; an already-armed breakpoint that wins
+   the race keeps its `hardware_breakpoint` reason. This first slice is synchronous and does not
+   yet wake an in-flight `sk_live_wait`.
+5. `sk_live_registers` and `sk_live_read_memory` inspect only that stopped epoch. The memory path
    uses the validated stop CR3 and refuses an unmapped range whole.
-5. `sk_live_step` consumes the stopped epoch once and clears the original hardware breakpoint.
+6. `sk_live_step` consumes the stopped epoch once and clears the original hardware breakpoint.
    It arms TF for an ordinary instruction. For a decoded CR3 write in natural mode it instead
    borrows an owned slot for the linear successor, accepts the resulting root transition, reports
    `step_over` with `new_cr3`, and removes the borrowed slot before returning the stop. It may be
    repeated from any owned stop. Each later step supplies the exact current instruction; the next
    wait accepts only the supplied bounded destination set.
-6. `sk_live_continue_to_breakpoints` consumes a stopped epoch, verifies one to four replacement
+7. `sk_live_continue_to_breakpoints` consumes a stopped epoch, verifies one to four replacement
    instruction guards while the event is still held, restores the prior owned debug state, installs
    the new natural-flow DR set, and resumes. The next operation must be `sk_live_wait`; keeping the
    transition and wait separate makes the mutation non-interruptible while leaving only the pure
    DbgEng wait open to Ctrl+Break. This path is an M1 qualification surface and is not yet used by
    the managed KD facade's `g` command. The M1 surface currently accepts exactly one selected VP;
    multi-VP re-arm is refused while preserving the held epoch.
-7. `sk_live_continue` consumes that new epoch, restores and verifies the complete baseline, clears
+8. `sk_live_continue` consumes that new epoch, restores and verifies the complete baseline, clears
    execution control and completes the owned event. The session can then be armed again.
-8. `end_session` restores any held state, removes the handler and scratch allocation, and performs
+9. `end_session` restores any held state, removes the handler and scratch allocation, and performs
    the handled `vmwp` detach.
 
 Ordinary debugger and capture operations are refused on this session: its DbgEng target is the

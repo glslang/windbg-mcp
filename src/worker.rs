@@ -885,6 +885,7 @@ fn sealed_as(op: &EngineOp) -> Option<Cleanup> {
         | EngineOp::SkSymbol { .. }
         | EngineOp::OpenSecureKernelLive(_)
         | EngineOp::SkLiveArm { .. }
+        | EngineOp::SkLiveBreak
         | EngineOp::SkLiveRegisters
         | EngineOp::SkLiveRead { .. }
         | EngineOp::SkLiveStep { .. }
@@ -1994,6 +1995,7 @@ fn refuse_when_the_target_is_gone(e: &DebugEngine, op: &EngineOp) -> Option<Fail
             // VTL1 state, so DbgEng's target-presence gate is the wrong question for all of them.
             | EngineOp::SkLiveArm { .. }
             | EngineOp::SkLiveWait
+            | EngineOp::SkLiveBreak
             | EngineOp::SkLiveRegisters
             | EngineOp::SkLiveRead { .. }
             | EngineOp::SkLiveStep { .. }
@@ -2434,6 +2436,7 @@ fn watch_for(op: &EngineOp) -> Watch {
         | EngineOp::SkSymbol { .. }
         | EngineOp::SkLiveArm { .. }
         | EngineOp::SkLiveWait
+        | EngineOp::SkLiveBreak
         | EngineOp::SkLiveRegisters
         | EngineOp::SkLiveRead { .. }
         | EngineOp::SkLiveStep { .. }
@@ -3122,6 +3125,17 @@ fn execute(
             let max_pause_ms = session.max_pause_ms();
             let stop = session
                 .wait_for_stop(e, || {
+                    emit(&WorkerMessage::SecureKernelPauseStarted { max_pause_ms });
+                })
+                .map_err(failed)?;
+            Ok(Output::typed(crate::skdispatch::render_stop(&stop), stop))
+        }
+
+        EngineOp::SkLiveBreak => {
+            let session = held_live_control(&mut sk_live.session)?;
+            let max_pause_ms = session.max_pause_ms();
+            let stop = session
+                .break_on_demand(e, || {
                     emit(&WorkerMessage::SecureKernelPauseStarted { max_pause_ms });
                 })
                 .map_err(failed)?;
@@ -13048,7 +13062,7 @@ mod tests {
             .split_once("EngineOp::SkLiveWait =>")
             .expect("the live-wait dispatch arm exists")
             .1
-            .split_once("EngineOp::SkLiveRegisters")
+            .split_once("EngineOp::SkLiveBreak =>")
             .expect("the next live dispatch arm exists")
             .0;
 

@@ -342,28 +342,35 @@ None of these is a bug. They are recorded because they were invisible, and
    and, since item 41, for the sentences the tools it keeps used to spend on pointing at them.
    Where the bytes sit, and what each profile costs:
 
-   Both tables are measurements of **2026-10-19** and move with any edit to a description. The
+   Both tables are measurements of **2026-10-20** and move with any edit to a description. The
    `securekernel` row is an extra group: the absent spec omits it, while `all` includes it.
 
    | group | tools | bytes | share |
    |---|---:|---:|---:|
-   | `allocator` | 12 | 19,807 | 15.8% |
+   | `allocator` | 12 | 19,807 | 15.7% |
    | `ioctl` | 11 | 16,088 | 12.8% |
-   | `securekernel` | 13 | 21,914 | 17.5% |
+   | `securekernel` | 14 | 22,404 | 17.8% |
    | `exec` | 10 | 15,087 | 12.0% |
    | `session` | 10 | 14,208 | 11.3% |
    | `inspect` | 10 | 13,485 | 10.7% |
    | `batch` | 1 | 10,296 | 8.2% |
-   | `crash` | 3 | 7,473 | 6.0% |
-   | `ttd` | 9 | 7,090 | 5.7% |
+   | `crash` | 3 | 7,473 | 5.9% |
+   | `ttd` | 9 | 7,090 | 5.6% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
    | *(absent)* | 66 | 103,534 |
-   | `all` | 79 | 125,448 |
+   | `all` | 80 | 125,938 |
    | `session,inspect,exec,crash` | 33 | 49,332 |
    | `session,inspect,crash` | 23 | 34,092 |
    | `crash` | 13 | 20,515 |
+
+   M2's direct `sk_live_break` addition moves the complete surface from 79 tools and 125,448 B to
+   **80 tools and 125,938 B**. On the wire it moves 354,262 -> **359,927 B**: 5,242 B for the new
+   tool, 211 B in each of the two existing stop-record outputs for the typed `break_request`
+   reason, and one array comma. The existing 129,000 B model ceiling still has 3,062 B available;
+   the 360,000 B wire ceiling has only 73 B, so another schema-bearing tool needs a surface
+   reduction or an explicit ceiling decision.
 
    **The two tables do not reconcile, and that is the point of item 41.** The first is each group's
    share of the whole surface; the second is what a spec actually serves, which is less — `crash`

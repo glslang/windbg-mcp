@@ -136,7 +136,7 @@ first `sk_live_arm` pauses the VM,
 validates the VM-to-`vmwp` binding, live-memory CR3, guarded instructions and local `vmwp.exe`
 build, and proceeds to register or breakpoint mutation only after those checks pass.
 
-Six tools drive that session after the open:
+Eight tools drive that session after the open:
 
 - `sk_live_arm` saves every selected VP's baseline and installs one to four guarded execution
   breakpoints on each. Each address carries the exact live instruction bytes expected there.
@@ -145,11 +145,16 @@ Six tools drive that session after the open:
   loser; the returned stop remains pause-backed for the winning VP. Its
   stop record carries the target and event identity, two-read register evidence, guarded instruction,
   accepted next addresses, arm mode and a new opaque epoch.
+- `sk_live_break` pauses one naturally armed VP, captures and guards its current instruction,
+  installs a transient hardware breakpoint, and resumes into the same bounded event wait. This
+  first M2 slice is a direct operation; it does not yet wake an already-running `sk_live_wait`.
 - `sk_live_registers` returns that retained stop record without changing it, and
   `sk_live_read_memory` reads VTL1 virtual memory only while the stop remains held. The memory answer
   is tied to the same epoch and includes its starting GPA.
 - `sk_live_step` consumes the current stop epoch, proves the current instruction and its bounded
   destinations, and arms the next trap. Collect that stop with `sk_live_wait`.
+- `sk_live_continue_to_breakpoints` atomically replaces the guarded breakpoint set while consuming
+  the held epoch, then resumes for another `sk_live_wait`.
 - `sk_live_continue` consumes the current epoch, restores the complete saved baseline, clears the
   execution breakpoints and resumes. The session stays open for another arm.
 
