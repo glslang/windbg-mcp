@@ -98,6 +98,14 @@ fn end_session_timeout(kind: SessionKind) -> Duration {
 /// the worker had to be terminated.
 const END_SESSION_CLOSING: &str = "end_session is releasing its target";
 
+/// The guarded-controller variant stays unresolved until its worker proves restoration and
+/// detach. A live-break queued behind this exact transition still reaches the worker reader so it
+/// can return the teardown-first `stale_session` result without interrupting or mutating anything.
+const LIVE_CONTROL_END_SESSION_CLOSING: &str = concat!(
+    "live Secure Kernel release is in progress; register restoration, ",
+    "handler cleanup and handled detach are unconfirmed"
+);
+
 /// What a `launch` session's end says about its debuggee.
 ///
 /// Deliberately not "was terminated with it", which would be a causal claim this side cannot make:
@@ -5136,6 +5144,16 @@ enum Refused {
     Stale,
 }
 
+fn live_break_follows_teardown(kind: SessionKind, state: &SessionState, op: &EngineOp) -> bool {
+    kind == SessionKind::SecureKernelLive
+        && matches!(op, EngineOp::SkLiveBreak)
+        && matches!(
+            state,
+            SessionState::LiveControlUnresolved(why)
+                if why == LIVE_CONTROL_END_SESSION_CLOSING
+        )
+}
+
 /// Feeds one session's queue to its worker, one job at a time.
 ///
 /// This is the session's single serialization point, and the only place a [`Gate`] runs. Jobs are
@@ -5180,15 +5198,17 @@ fn pump(
         // two acquisitions, a settlement could fall between them.
         let mut refused = None;
         let settled = session.transition(|state, claims| {
+            let break_follows_teardown = live_break_follows_teardown(session.kind, state, &job.op);
             if (matches!(state, SessionState::KernelUnresolved(_))
                 && !matches!(job.op, EngineOp::PreserveKernel))
                 || (matches!(state, SessionState::LiveControlUnresolved(_))
-                    && !matches!(job.op, EngineOp::EndSession))
+                    && !matches!(job.op, EngineOp::EndSession)
+                    && !break_follows_teardown)
             {
                 refused = Some(Refused::RecoveryRequired);
                 return None;
             }
-            if !job.gate.admits(state) {
+            if !break_follows_teardown && !job.gate.admits(state) {
                 refused = Some(Refused::Stale);
                 return None;
             }
@@ -5205,11 +5225,7 @@ fn pump(
                         "kernel release is in progress; completion is unconfirmed".into(),
                     ),
                     SessionKind::SecureKernelLive | SessionKind::SecureKernelKd => {
-                        SessionState::LiveControlUnresolved(
-                            "live Secure Kernel release is in progress; register restoration, \
-                             handler cleanup and handled detach are unconfirmed"
-                                .into(),
-                        )
+                        SessionState::LiveControlUnresolved(LIVE_CONTROL_END_SESSION_CLOSING.into())
                     }
                     _ => SessionState::Closed(why.clone()),
                 };
@@ -6816,6 +6832,32 @@ mod tests {
                 "the queue-front gate and the caller-side check disagree about {state:?}"
             );
         }
+    }
+
+    #[test]
+    fn only_a_live_break_queued_behind_live_teardown_reaches_the_worker_reader() {
+        let releasing =
+            SessionState::LiveControlUnresolved(LIVE_CONTROL_END_SESSION_CLOSING.to_string());
+        assert!(live_break_follows_teardown(
+            SessionKind::SecureKernelLive,
+            &releasing,
+            &EngineOp::SkLiveBreak
+        ));
+        assert!(!live_break_follows_teardown(
+            SessionKind::SecureKernelLive,
+            &releasing,
+            &EngineOp::SkLiveWait
+        ));
+        assert!(!live_break_follows_teardown(
+            SessionKind::SecureKernelLive,
+            &SessionState::LiveControlUnresolved("restore unconfirmed".into()),
+            &EngineOp::SkLiveBreak
+        ));
+        assert!(!live_break_follows_teardown(
+            SessionKind::SecureKernelKd,
+            &releasing,
+            &EngineOp::SkLiveBreak
+        ));
     }
 
     /// A stale-handle message has to say which of the three ways it went stale, because the
