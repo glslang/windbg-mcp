@@ -219,7 +219,10 @@ proved VM pause to keep provider state stable:
    the race keeps its `hardware_breakpoint` reason. If `sk_live_wait` is already inside its owned
    DbgEng wait, the request reader binds the request to that exact job and uses scoped
    `SetInterrupt` only to return control to the engine thread; the engine thread then performs the
-   pause and target-side rendezvous. Both callers receive the same retained stop epoch.
+   pause and target-side rendezvous. Both callers receive the same retained stop epoch. A wait
+   failure is inherited by the bound request with its category intact. If teardown reaches the
+   request reader first, the later break is refused as `stale_session` without filing an interrupt
+   or beginning a rendezvous.
 5. `sk_live_registers` and `sk_live_read_memory` inspect only that stopped epoch. The memory path
    uses the validated stop CR3 and refuses an unmapped range whole.
 6. `sk_live_step` consumes the stopped epoch once and clears the original hardware breakpoint.

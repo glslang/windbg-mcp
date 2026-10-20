@@ -685,7 +685,14 @@ struct LiveBreakWake {
 enum LiveBreakOutcome {
     Pending,
     Stopped(crate::skcontrol::StopEpoch),
-    Failed(String),
+    Failed(Failed),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveBreakDisposition {
+    Unbound,
+    Bound { wait_job: u64, completed: bool },
+    RefusedTeardown,
 }
 
 /// Which cleanup a sealed job is running. See [`Running::uninterruptible`].
@@ -850,11 +857,16 @@ impl Running {
     }
 
     /// Bind the first queued break request to the live-wait claim that is current now.
-    fn stage_live_break(&mut self, break_job: u64) -> Option<(u64, bool)> {
-        if self.tearing_down || self.live_break.is_some() {
-            return None;
+    fn stage_live_break(&mut self, break_job: u64) -> LiveBreakDisposition {
+        if self.tearing_down {
+            return LiveBreakDisposition::RefusedTeardown;
         }
-        let wait_job = self.live_wait_job.filter(|job| self.job == Some(*job))?;
+        if self.live_break.is_some() {
+            return LiveBreakDisposition::Unbound;
+        }
+        let Some(wait_job) = self.live_wait_job.filter(|job| self.job == Some(*job)) else {
+            return LiveBreakDisposition::Unbound;
+        };
         let outcome = self
             .live_wait_outcome
             .as_ref()
@@ -868,13 +880,16 @@ impl Running {
             interrupt_filed: false,
             outcome,
         });
-        Some((wait_job, completed))
+        LiveBreakDisposition::Bound {
+            wait_job,
+            completed,
+        }
     }
 
     fn finish_live_break(
         &mut self,
         wait_job: u64,
-        outcome: Result<crate::skcontrol::StopEpoch, String>,
+        outcome: Result<crate::skcontrol::StopEpoch, Failed>,
     ) {
         let outcome = match outcome {
             Ok(epoch) => LiveBreakOutcome::Stopped(epoch),
@@ -1093,10 +1108,15 @@ pub(crate) fn begin_live_wait(id: u64, activity: crate::skdispatch::WaitActivity
 /// Bind a queued `sk_live_break` to the live wait that is running now. Only the scoped DbgEng wait
 /// is interrupted; the queued job performs the target pause and all provider mutations later on
 /// the engine thread.
-fn request_live_break(break_job: u64) -> Result<bool, String> {
+fn request_live_break(break_job: u64) -> Result<LiveBreakDisposition, String> {
     let mut current = running();
-    let Some((wait_job, completed)) = current.stage_live_break(break_job) else {
-        return Ok(false);
+    let disposition = current.stage_live_break(break_job);
+    let LiveBreakDisposition::Bound {
+        wait_job,
+        completed,
+    } = disposition
+    else {
+        return Ok(disposition);
     };
     let activity = current
         .live_wait_activity
@@ -1104,13 +1124,13 @@ fn request_live_break(break_job: u64) -> Result<bool, String> {
         .filter(|(job, _)| *job == wait_job)
         .map(|(_, activity)| activity.clone());
     if completed {
-        return Ok(true);
+        return Ok(disposition);
     }
     let Some(activity) = activity else {
         tracing::info!(
             "worker: Secure Kernel break job {break_job} bound to live-wait job {wait_job} before DbgEng wait entry"
         );
-        return Ok(true);
+        return Ok(disposition);
     };
     if !activity.request_break() {
         current.live_break = None;
@@ -1133,7 +1153,7 @@ fn request_live_break(break_job: u64) -> Result<bool, String> {
         tracing::info!(
             "worker: Secure Kernel break job {break_job} bound to completed live-wait job {wait_job}"
         );
-        return Ok(true);
+        return Ok(disposition);
     };
     match interrupted {
         Ok(filed) => {
@@ -1148,7 +1168,7 @@ fn request_live_break(break_job: u64) -> Result<bool, String> {
             tracing::info!(
                 "worker: Secure Kernel break job {break_job} woke live-wait job {wait_job}, filed as {filed:?}"
             );
-            Ok(true)
+            Ok(disposition)
         }
         Err(error) => {
             activity.cancel_break();
@@ -1162,7 +1182,7 @@ fn request_live_break(break_job: u64) -> Result<bool, String> {
     }
 }
 
-fn finish_live_break(wait_job: u64, outcome: Result<crate::skcontrol::StopEpoch, String>) {
+fn finish_live_break(wait_job: u64, outcome: Result<crate::skcontrol::StopEpoch, Failed>) {
     running().finish_live_break(wait_job, outcome);
 }
 
@@ -1334,14 +1354,27 @@ pub fn run(args: &[String]) -> ! {
                 // place allowed to pause the VM or touch provider state. Its one reader-thread
                 // action is waking the exact `sk_live_wait` job that would otherwise sit ahead of
                 // it in DbgEng until a natural breakpoint or timeout.
-                if matches!(request.op, EngineOp::SkLiveBreak)
-                    && let Err(why) = request_live_break(request.id)
-                {
-                    emit(&WorkerMessage::Done {
-                        id: request.id,
-                        result: Err(Failed::from(why)),
-                    });
-                    continue;
+                if matches!(request.op, EngineOp::SkLiveBreak) {
+                    match request_live_break(request.id) {
+                        Ok(LiveBreakDisposition::RefusedTeardown) => {
+                            emit(&WorkerMessage::Done {
+                                id: request.id,
+                                result: Err(Failed::categorised(
+                                    structured::ErrorCategory::StaleSession,
+                                    "The Secure Kernel session teardown was read before this break request. No interrupt was filed and no target-side rendezvous started.",
+                                )),
+                            });
+                            continue;
+                        }
+                        Err(why) => {
+                            emit(&WorkerMessage::Done {
+                                id: request.id,
+                                result: Err(Failed::from(why)),
+                            });
+                            continue;
+                        }
+                        Ok(LiveBreakDisposition::Unbound | LiveBreakDisposition::Bound { .. }) => {}
+                    }
                 }
                 // Acted on here, before it is queued, because the thread that will run it is the
                 // one it is about: a batch on that thread has to be told to stop *now* if the
@@ -3407,17 +3440,19 @@ fn execute(
         EngineOp::SkLiveWait => {
             let session = held_live_control(&mut sk_live.session)?;
             let max_pause_ms = session.max_pause_ms();
-            let stop = session.wait_for_stop_for_job(e, id, || {
-                emit(&WorkerMessage::SecureKernelPauseStarted { max_pause_ms });
-            });
+            let stop = session
+                .wait_for_stop_for_job(e, id, || {
+                    emit(&WorkerMessage::SecureKernelPauseStarted { max_pause_ms });
+                })
+                .map_err(failed);
             drain_live_break_interrupt(e, id);
             finish_live_break(
                 id,
                 stop.as_ref()
                     .map(|stop| stop.epoch.clone())
-                    .map_err(|error| format!("{error:#}")),
+                    .map_err(|error| (*error).clone()),
             );
-            let stop = stop.map_err(failed)?;
+            let stop = stop?;
             Ok(Output::typed(crate::skdispatch::render_stop(&stop), stop))
         }
 
@@ -3441,9 +3476,9 @@ fn execute(
                     return Ok(Output::typed(crate::skdispatch::render_stop(&stop), stop));
                 }
                 Some(LiveBreakOutcome::Failed(error)) => {
-                    return Err(Failed::from(format!(
-                        "the live wait could not service this bound break request: {error}"
-                    )));
+                    return Err(error.and_note(
+                        "This break request was bound to that exact live wait; no separate target-side rendezvous was started.",
+                    ));
                 }
                 Some(LiveBreakOutcome::Pending) | None => {}
             }
@@ -13422,6 +13457,8 @@ mod tests {
         assert!(wake_path.contains("handle.interrupt()"));
         assert!(!wake_path.contains(".provider"));
         assert!(!wake_path.contains("begin_disarm"));
+        assert!(reader.contains("LiveBreakDisposition::RefusedTeardown"));
+        assert!(reader.contains("structured::ErrorCategory::StaleSession"));
     }
 
     #[test]
@@ -17580,10 +17617,16 @@ mod tests {
         running.claim(7);
         running.live_wait_job = Some(7);
 
-        assert_eq!(running.stage_live_break(11), Some((7, false)));
+        assert_eq!(
+            running.stage_live_break(11),
+            LiveBreakDisposition::Bound {
+                wait_job: 7,
+                completed: false,
+            }
+        );
         assert_eq!(
             running.stage_live_break(12),
-            None,
+            LiveBreakDisposition::Unbound,
             "a second request cannot replace the job already bound to this wait"
         );
         let epoch = crate::skcontrol::StopEpoch::new("stopped-0000000000000001").unwrap();
@@ -17608,7 +17651,10 @@ mod tests {
 
         assert_eq!(
             running.stage_live_break(11),
-            Some((7, true)),
+            LiveBreakDisposition::Bound {
+                wait_job: 7,
+                completed: true,
+            },
             "the result-publication/claim-release gap is still part of this wait"
         );
         assert!(matches!(
@@ -17624,8 +17670,37 @@ mod tests {
         running.live_wait_job = Some(7);
         running.begin_teardown();
 
-        assert_eq!(running.stage_live_break(11), None);
+        assert_eq!(
+            running.stage_live_break(11),
+            LiveBreakDisposition::RefusedTeardown
+        );
         assert!(running.live_break.is_none());
+    }
+
+    #[test]
+    fn a_bound_break_inherits_the_exact_wait_failure() {
+        let mut running = idle();
+        running.claim(7);
+        running.live_wait_job = Some(7);
+        assert!(matches!(
+            running.stage_live_break(11),
+            LiveBreakDisposition::Bound {
+                wait_job: 7,
+                completed: false
+            }
+        ));
+        let failure = Failed::categorised(
+            structured::ErrorCategory::Interrupted,
+            "the owned wait ended first",
+        );
+
+        running.finish_live_break(7, Err(failure.clone()));
+        running.release(7);
+
+        assert!(matches!(
+            running.take_live_break(11),
+            Some(LiveBreakOutcome::Failed(found)) if found == failure
+        ));
     }
 
     /// A teardown reaches a resume in either of the two states it can be in, and there is no

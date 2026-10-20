@@ -1587,10 +1587,22 @@ impl<P: ControlProvider> LiveControl<P> {
         dispatcher: &mut impl EventDispatcher,
         deadline: Instant,
     ) -> Result<StopEpoch> {
-        if !matches!(self.state, State::Running)
-            || !matches!(self.expected_stop, Some(ExpectedStop::Hardware))
-        {
-            bail!("break on demand requires a naturally armed running session");
+        match &self.state {
+            State::Running if matches!(self.expected_stop, Some(ExpectedStop::Hardware)) => {}
+            State::Running => {
+                bail!("break on demand requires a naturally armed running session")
+            }
+            State::Stopped(stop) => bail!(
+                "break on demand cannot replace retained stop epoch `{}`; continue or release that exact stop first",
+                stop.epoch
+            ),
+            State::Faulted => bail!(
+                "break on demand cannot run because live Secure Kernel control is faulted; use end_session to complete recovery"
+            ),
+            State::Arming | State::Releasing => {
+                bail!("break on demand cannot start during a live-control transition")
+            }
+            State::Closed => bail!("break on demand cannot run on closed live-control state"),
         }
         if self.arm_mode != Some(ArmMode::Natural) {
             bail!("break on demand requires natural arm mode");
@@ -3705,7 +3717,12 @@ mod tests {
             )
             .unwrap_err();
 
-        assert!(error.to_string().contains("naturally armed running"));
+        assert!(
+            error
+                .to_string()
+                .contains("cannot replace retained stop epoch")
+        );
+        assert!(error.to_string().contains(&stop.epoch.to_string()));
         assert_eq!(control.phase(), LivePhase::Stopped);
         assert_eq!(control.stopped().unwrap().epoch, stop.epoch);
         assert_eq!(dispatcher.actions, actions);
@@ -3743,6 +3760,16 @@ mod tests {
                 owned_event: false,
             })
         );
+
+        let actions = dispatcher.actions.clone();
+        let refused = control
+            .request_break_until(
+                &mut dispatcher,
+                Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap_err();
+        assert!(refused.to_string().contains("control is faulted"));
+        assert_eq!(dispatcher.actions, actions);
     }
 
     #[test]
