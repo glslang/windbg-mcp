@@ -1855,6 +1855,12 @@ enum ArmPreparation {
     Reattach,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunningDisarmPreparation {
+    SettleNativeExecution,
+    AlreadyInterrupted,
+}
+
 impl DispatcherPhase {
     fn arm_preparation(&self) -> Result<ArmPreparation> {
         match self {
@@ -1876,6 +1882,14 @@ impl DispatcherPhase {
             | Self::HandleReturn(event)
             | Self::ReturningNative(event)
             | Self::NativeReturn(event) => Some(event),
+            _ => None,
+        }
+    }
+
+    fn running_disarm_preparation(&self) -> Option<RunningDisarmPreparation> {
+        match self {
+            Self::ReadyForStop => Some(RunningDisarmPreparation::SettleNativeExecution),
+            Self::ReadyForStopInterrupted => Some(RunningDisarmPreparation::AlreadyInterrupted),
             _ => None,
         }
     }
@@ -2376,8 +2390,9 @@ impl VmwpDispatcher<'_> {
         targets
             .first()
             .context("running disarm requires at least one selected VP")?;
+        let preparation = self.state.phase.running_disarm_preparation();
         if self.state.targets != targets
-            || !matches!(self.state.phase, DispatcherPhase::ReadyForStop)
+            || preparation.is_none()
             || self.state.retained_event.is_some()
             || !self.state.attached
             || self.state.breakpoint.is_none()
@@ -2389,7 +2404,11 @@ impl VmwpDispatcher<'_> {
         // Stop vmwp with the ordinary watchdog, remove the exact owned breakpoint, and detach
         // before asking Hyper-V to pause. Reattach only after that pause proves provider-write
         // quiescence; teardown still owns the registered callback and scratch allocation.
-        self.settle_native_completion(deadline)?;
+        // A request-scoped SetInterrupt has already produced the debugger stop in the interrupted
+        // phase. Resuming it here would discard that wake and enter a second owned wait.
+        if preparation == Some(RunningDisarmPreparation::SettleNativeExecution) {
+            self.settle_native_completion(deadline)?;
+        }
         self.pause_armed_without_event_inner(targets, deadline)
     }
 }
@@ -5446,6 +5465,19 @@ mod tests {
             ArmPreparation::OpenAndRegister
         );
         assert!(DispatcherPhase::Closed.arm_preparation().is_err());
+    }
+
+    #[test]
+    fn running_disarm_preserves_a_request_owned_debugger_stop() {
+        assert_eq!(
+            DispatcherPhase::ReadyForStop.running_disarm_preparation(),
+            Some(RunningDisarmPreparation::SettleNativeExecution)
+        );
+        assert_eq!(
+            DispatcherPhase::ReadyForStopInterrupted.running_disarm_preparation(),
+            Some(RunningDisarmPreparation::AlreadyInterrupted)
+        );
+        assert_eq!(DispatcherPhase::Detached.running_disarm_preparation(), None);
     }
 
     #[test]
