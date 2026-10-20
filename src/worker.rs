@@ -1003,6 +1003,7 @@ fn sealed_as(op: &EngineOp) -> Option<Cleanup> {
         | EngineOp::SkLiveBreak
         | EngineOp::SkLiveRegisters
         | EngineOp::SkLiveRead { .. }
+        | EngineOp::SkLiveWrite { .. }
         | EngineOp::SkLiveStep { .. }
         | EngineOp::SkLiveContinueToBreakpoints { .. }
         | EngineOp::SkLiveContinue { .. }
@@ -2315,6 +2316,7 @@ fn refuse_when_the_target_is_gone(e: &DebugEngine, op: &EngineOp) -> Option<Fail
             | EngineOp::SkLiveBreak
             | EngineOp::SkLiveRegisters
             | EngineOp::SkLiveRead { .. }
+            | EngineOp::SkLiveWrite { .. }
             | EngineOp::SkLiveStep { .. }
             | EngineOp::SkLiveContinueToBreakpoints { .. }
             | EngineOp::SkLiveContinue { .. }
@@ -2756,6 +2758,7 @@ fn watch_for(op: &EngineOp) -> Watch {
         | EngineOp::SkLiveBreak
         | EngineOp::SkLiveRegisters
         | EngineOp::SkLiveRead { .. }
+        | EngineOp::SkLiveWrite { .. }
         | EngineOp::SkLiveStep { .. }
         | EngineOp::SkLiveContinueToBreakpoints { .. }
         | EngineOp::SkLiveContinue { .. }
@@ -3504,6 +3507,16 @@ fn execute(
                 .read_memory(address, size)
                 .map_err(failed)?;
             Ok(Output::typed(crate::skdispatch::render_read(&read), read))
+        }
+
+        EngineOp::SkLiveWrite { epoch, write } => {
+            let written = held_live_control(&mut sk_live.session)?
+                .write_memory(e, &epoch, write)
+                .map_err(failed)?;
+            Ok(Output::typed(
+                crate::skdispatch::render_write(&written),
+                written,
+            ))
         }
 
         EngineOp::SkLiveStep { epoch, guard } => {
@@ -13400,6 +13413,7 @@ mod tests {
             },
             max_pause_ms: 600_000,
             allow_transition_cr3: false,
+            allow_memory_writes: false,
             additional_vps: Vec::new(),
         }))
     }
@@ -17958,6 +17972,15 @@ mod tests {
             EngineOp::SkLiveRead {
                 address: 0xfffff80000001000,
                 size: 16,
+            },
+            EngineOp::SkLiveWrite {
+                epoch: crate::skcontrol::StopEpoch::new("0123456789abcdef")
+                    .expect("the fixture epoch is valid"),
+                write: crate::sklive::GuardedMemoryWrite {
+                    address: crate::skcontrol::HexU64(0xfffff80000001000),
+                    expected: vec![0x90],
+                    replacement: vec![0xcc],
+                },
             },
             EngineOp::SkLiveStep {
                 epoch: crate::skcontrol::StopEpoch::new("0123456789abcdef")

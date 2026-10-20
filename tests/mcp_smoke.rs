@@ -2183,6 +2183,10 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// **M2 direct break stays under 129,000** (2026-10-20). `sk_live_break` adds 490 B and moves the
 /// surface 125,448 -> 125,938 B across 79 -> 80 tools. The ceiling therefore does not move; 3,062 B
 /// (2.4%) remain.
+///
+/// **M3 guarded writes stay under 129,000** (2026-10-20). `sk_live_write_memory` adds 1,361 B and
+/// moves the surface to 127,299 B across 81 tools. The ceiling remains fixed with 1,701 B (1.3%)
+/// available; this is a deliberately small mutation surface rather than a general write API.
 const MODEL_VISIBLE_CEILING: usize = 129_000;
 
 /// Ceiling on the whole `tools/list` payload — the serialized result, not the sum of its tools, so
@@ -2351,7 +2355,11 @@ const MODEL_VISIBLE_CEILING: usize = 129_000;
 /// the new tool is 5,242 B, the new stop-reason variant adds 211 B to each of `sk_live_wait` and
 /// `sk_live_registers`, and the array adds one comma. This leaves 73 B; the next schema-bearing
 /// tool must shrink the surface or deliberately revise the ceiling.
-const WIRE_CEILING: usize = 360_000;
+///
+/// **360,000 -> 370,000 for M3 guarded writes** (2026-10-20). The payload moves 359,927 ->
+/// 362,953 B. The new tool accounts for the 3,025 B row and the remaining byte is the array comma;
+/// no shared output shape grew. The ceiling leaves 7,047 B (1.9%).
+const WIRE_CEILING: usize = 370_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,296
 /// bytes (2026-10-14), because its `inputSchema` pulls the whole `StepAction`/`Check` vocabulary
@@ -3511,6 +3519,16 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
             "error",
         ),
         (
+            "sk_live_write_memory",
+            json!({
+                "epoch": "0123456789abcdef",
+                "address": "0xfffff80000001000",
+                "expected": "90",
+                "bytes": "CC"
+            }),
+            "error",
+        ),
+        (
             "sk_live_step",
             json!({ "epoch": "0123456789abcdef" }),
             "error",
@@ -4659,7 +4677,7 @@ fn a_listener_serves_the_narrowed_surface_it_was_started_with() {
     // was typed — `session` is added whatever it said.
     let log = listener.stderr();
     assert!(
-        log.contains("serving 13 of 80 tools (session, crash)"),
+        log.contains("serving 13 of 81 tools (session, crash)"),
         "the listener does not report the surface it ended up with: {log}"
     );
 }
@@ -4691,7 +4709,7 @@ fn two_clients_on_one_listener_are_served_two_surfaces() {
     let local_token = server.token.clone();
     assert!(
         server.wait_for_stderr(
-            "serving 20 of 80 tools (session, inspect) — except bench serves 13 of 80 tools \
+            "serving 20 of 81 tools (session, inspect) — except bench serves 13 of 81 tools \
              (session, crash)",
             Duration::from_secs(30)
         ),

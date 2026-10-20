@@ -216,6 +216,14 @@ Only if four hardware slots are insufficient, add compare-before-write, original
 cache-coherency handling and unconditional rollback. Keep it behind an explicit capability and
 policy gate. A failure to prove restoration contains the VM instead of resuming it.
 
+Status: **in progress**. The first slice is the deliberately non-executing mutation primitive:
+`sk_live_write_memory` accepts 1–64 compare bytes at a retained stop, converts its native event to
+a proved VM-wide pause, resolves exactly one virtual/physical page, writes and reads back, and
+retains the original for reverse-order verified rollback. Startup policy and transport capability
+are independent gates. Continue, step, recovery and teardown cannot release guest execution while
+any original remains unproved. The next slice owns vector 3 end to end and is the only slice allowed
+to keep an `INT3` patch across guest execution; the generic write tool never does.
+
 ### M4 — VTL0 secure-call tracer
 
 Use the existing ordinary kernel worker to instrument the exact-build entry to

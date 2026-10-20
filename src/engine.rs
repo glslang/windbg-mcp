@@ -842,6 +842,7 @@ fn refuse_op_on_kind(kind: SessionKind, op: &EngineOp) -> Option<String> {
             | EngineOp::SkLiveBreak
             | EngineOp::SkLiveRegisters
             | EngineOp::SkLiveRead { .. }
+            | EngineOp::SkLiveWrite { .. }
             | EngineOp::SkLiveStep { .. }
             | EngineOp::SkLiveContinueToBreakpoints { .. }
             | EngineOp::SkLiveContinue { .. }
@@ -5850,6 +5851,14 @@ mod tests {
             EngineOp::SkLiveRead {
                 address: 0xfffff80000000000,
                 size: 16,
+            },
+            EngineOp::SkLiveWrite {
+                epoch: epoch.clone(),
+                write: crate::sklive::GuardedMemoryWrite {
+                    address: crate::skcontrol::HexU64(0xfffff80000000000),
+                    expected: vec![0x90],
+                    replacement: vec![0xcc],
+                },
             },
             EngineOp::SkLiveStep {
                 epoch: epoch.clone(),

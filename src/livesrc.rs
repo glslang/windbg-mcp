@@ -57,6 +57,9 @@
 //! <- <16 raw bytes>
 //! -> READ 0x107593000 16
 //! <- REFUSED ReadIntercept
+//! -> WRITE 0xCD12DF 1
+//! -> <1 raw byte>
+//! <- OK 1
 //! -> READ 0xFFFFFFFFFF 16
 //! <- NOTPRESENT
 //! -> READ 0x1000 16
@@ -68,6 +71,12 @@
 //! missing register as a machine not in long mode. An unknown key is **refused** rather than
 //! ignored — a transport whose `cr3` was misspelled would otherwise look like a guest with no
 //! page-table root, which is a different and much more plausible-looking result.
+//!
+//! Writes are absent unless `SHAPE` supplies both `max_write` and
+//! `write_coherency=instruction_coherent`. The first bounds one physical write to a page; the
+//! second is the provider's explicit promise that a write made while the controller owns a
+//! VM-wide pause is visible to instruction fetch after resume. Startup policy is a separate gate:
+//! transport capability cannot authorize itself.
 //!
 //! The four status words are the four [`sk::ReadFailure`] variants, and keeping them distinct is the
 //! whole point of the trait: a source that collapsed them would produce silent zeros exactly where
@@ -123,6 +132,11 @@ const TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 /// would have us allocate 4 GB before a byte was read.
 const MAX_DECLARED_READ: usize = 1 << 20;
 
+/// A guarded write is deliberately no larger than one base page. Besides matching the measured
+/// direct provider, this keeps the request body below the anonymous pipe's ordinary buffering and
+/// makes every physical mutation one provider transaction.
+const MAX_DECLARED_WRITE: usize = 1 << 12;
+
 type CancelCheck = fn() -> bool;
 type SetCancel<R> = fn(&mut R, Option<CancelCheck>);
 
@@ -134,6 +148,7 @@ pub(crate) struct Transport<R: BufRead, W: Write> {
     reader: R,
     writer: W,
     max_read: usize,
+    max_write: Option<usize>,
     response_wait: Option<Duration>,
     set_deadline: Option<fn(&mut R, Option<Instant>)>,
     set_cancelled: Option<SetCancel<R>>,
@@ -146,6 +161,8 @@ pub(crate) struct Transport<R: BufRead, W: Write> {
 pub(crate) struct ShapeReply {
     pub(crate) shape: GuestShape,
     pub(crate) max_read: usize,
+    pub(crate) max_write: Option<usize>,
+    pub(crate) instruction_writes_coherent: bool,
     /// Secure Kernel's live virtual image base when the provider can name it. It is transport
     /// evidence only until the caller reads and validates the PE at this address.
     pub(crate) kernel_base: Option<u64>,
@@ -160,6 +177,7 @@ impl<R: BufRead, W: Write> Transport<R, W> {
             // Until `SHAPE` answers. One byte is a legal transfer width and a useless one, which is
             // the right default for a field that must not be guessed generously.
             max_read: 1,
+            max_write: None,
             response_wait: None,
             set_deadline: None,
             set_cancelled: None,
@@ -178,6 +196,7 @@ impl<R: BufRead, W: Write> Transport<R, W> {
             reader,
             writer,
             max_read: 1,
+            max_write: None,
             response_wait: Some(response_wait),
             set_deadline: Some(set_deadline),
             set_cancelled: Some(set_cancelled),
@@ -248,7 +267,8 @@ impl<R: BufRead, W: Write> Transport<R, W> {
         )
     }
 
-    /// Send one request line — **the only path to the writer**, and that is the point.
+    /// Send one request line and its optional fixed-size body — **the only path to the writer**,
+    /// and that is the point.
     ///
     /// Every exchange has exactly two IO chokepoints, this and [`Transport::line`], and the rule for
     /// both is total: *refuse a poisoned transport before touching a pipe, and poison it on any
@@ -262,7 +282,7 @@ impl<R: BufRead, W: Write> Transport<R, W> {
     /// | path | poisons | because |
     /// |---|---|---|
     /// | already poisoned | n/a | nothing is written; this is the refusal |
-    /// | `write_all`/`flush` fails | **yes** | the request may be half on the wire, so the child's next read is a truncated line |
+    /// | `write_all`/`flush` fails | **yes** | the request line or body may be half on the wire, so the child's next read is misframed |
     /// | `line` read fails, or EOF, or over-long | **yes** | bytes may already be consumed, and the over-long case certainly consumed [`MAX_LINE_BYTES`] |
     /// | `parse_status` says `REFUSED`/`NOTPRESENT` | **no** | a complete status line with no payload: the stream is still aligned, and poisoning would make one protected page kill the walk |
     /// | `parse_status` fails otherwise, or a payload is short or unsent | **yes** | sender and reader disagree about where the next line starts |
@@ -270,7 +290,7 @@ impl<R: BufRead, W: Write> Transport<R, W> {
     /// Only the one row that is an *answer* declines to poison, which is why it is the row with the
     /// reason spelled out. With the writer private to this method, forgetting the check means not
     /// sending anything at all.
-    fn send(&mut self, request: &str) -> Result<()> {
+    fn send(&mut self, request: &str, body: &[u8]) -> Result<()> {
         if self.poisoned {
             bail!(
                 "this transport desynchronised on an earlier framing fault, so nothing further may \
@@ -281,6 +301,7 @@ impl<R: BufRead, W: Write> Transport<R, W> {
         // framing fault like any other.
         self.poisoned = true;
         self.writer.write_all(request.as_bytes())?;
+        self.writer.write_all(body)?;
         self.writer.flush()?;
         // Cleared only once the whole request is on the wire. Set-then-clear rather than
         // set-on-failure so that a `?` added to this method later cannot skip it.
@@ -294,10 +315,11 @@ impl<R: BufRead, W: Write> Transport<R, W> {
     }
 
     fn shape_inner(&mut self) -> Result<ShapeReply> {
-        self.send("SHAPE\n")?;
+        self.send("SHAPE\n", &[])?;
         let line = self.line()?;
         let reply = parse_shape(&line)?;
         self.max_read = reply.max_read;
+        self.max_write = reply.max_write;
         Ok(reply)
     }
 
@@ -331,7 +353,7 @@ impl<R: BufRead, W: Write> Transport<R, W> {
     }
 
     fn read_chunk_inner(&mut self, gpa: Gpa, out: &mut [u8]) -> Result<(), ReadFailure> {
-        self.send(&format!("READ {:#X} {}\n", gpa.0, out.len()))
+        self.send(&format!("READ {:#X} {}\n", gpa.0, out.len()), &[])
             .map_err(|e| ReadFailure::SourceError {
                 detail: format!("sending the request failed: {e}"),
             })?;
@@ -370,6 +392,55 @@ impl<R: BufRead, W: Write> Transport<R, W> {
                     }
                 })?;
                 Ok(())
+            }
+            None => unreachable!("parse_status returns Err for every non-OK status"),
+        }
+    }
+
+    fn write_chunk_until_cancelled(
+        &mut self,
+        gpa: Gpa,
+        bytes: &[u8],
+        deadline: Instant,
+        cancelled: CancelCheck,
+    ) -> Result<()> {
+        self.bounded_until_cancelled(Some(deadline), Some(cancelled), |transport| {
+            transport.write_chunk_inner(gpa, bytes)
+        })
+    }
+
+    fn write_chunk_inner(&mut self, gpa: Gpa, bytes: &[u8]) -> Result<()> {
+        let max_write = self
+            .max_write
+            .context("the transport did not advertise guarded writes")?;
+        if bytes.is_empty() || bytes.len() > max_write {
+            bail!(
+                "a physical write must contain 1..={max_write} bytes, got {}",
+                bytes.len()
+            );
+        }
+        if (gpa.0 & 0xfff) + bytes.len() as u64 > 0x1000 {
+            bail!("a physical write must remain within one 4 KiB page");
+        }
+
+        self.send(&format!("WRITE {:#X} {}\n", gpa.0, bytes.len()), bytes)?;
+
+        let line = self.line()?;
+        let status = parse_status(&line, bytes.len())
+            .inspect_err(|failure| {
+                if framing_fault(failure) {
+                    self.poisoned = true;
+                }
+            })
+            .map_err(|failure| anyhow::anyhow!("physical write failed: {failure:?}"))?;
+        match status {
+            Some(written) if written == bytes.len() => Ok(()),
+            Some(written) => {
+                self.poisoned = true;
+                bail!(
+                    "transport reported writing {written} bytes for a {}-byte request",
+                    bytes.len()
+                )
             }
             None => unreachable!("parse_status returns Err for every non-OK status"),
         }
@@ -531,6 +602,8 @@ pub(crate) fn parse_shape(line: &str) -> Result<ShapeReply> {
         .with_context(|| format!("expected a SHAPE reply, got {line:?}"))?;
     let mut reply = ShapeReply::default();
     let mut max_read = None;
+    let mut max_write = None;
+    let mut instruction_writes_coherent = false;
     for field in rest.split_whitespace() {
         let (key, value) = field
             .split_once('=')
@@ -553,6 +626,11 @@ pub(crate) fn parse_shape(line: &str) -> Result<ShapeReply> {
             // walk as tens of millions of one-byte exchanges instead of refusing the handshake.
             // Raised in review on #434.
             "max_read" => max_read = Some(number(key, value)?),
+            "max_write" => max_write = Some(number(key, value)?),
+            "write_coherency" => match value {
+                "instruction_coherent" => instruction_writes_coherent = true,
+                other => bail!("write_coherency must be instruction_coherent, got {other:?}"),
+            },
             "vtl_enabled" => {
                 reply.shape.vtl_enabled = Some(match value {
                     "1" => true,
@@ -598,6 +676,22 @@ pub(crate) fn parse_shape(line: &str) -> Result<ShapeReply> {
     // would mean the bound and the target width disagree, which is worth an error rather than a cast.
     reply.max_read = usize::try_from(declared)
         .with_context(|| format!("max_read={declared} does not fit this build's usize"))?;
+    match (max_write, instruction_writes_coherent) {
+        (None, false) => {}
+        (Some(_), false) => {
+            bail!("SHAPE max_write requires write_coherency=instruction_coherent")
+        }
+        (None, true) => bail!("SHAPE write_coherency requires max_write"),
+        (Some(declared), true) => {
+            if declared == 0 || declared > MAX_DECLARED_WRITE as u64 {
+                bail!("max_write={declared} is outside 1..={MAX_DECLARED_WRITE}");
+            }
+            reply.max_write = Some(usize::try_from(declared).with_context(|| {
+                format!("max_write={declared} does not fit this build's usize")
+            })?);
+            reply.instruction_writes_coherent = true;
+        }
+    }
     Ok(reply)
 }
 
@@ -677,6 +771,8 @@ pub(crate) struct LiveSource {
     transport: std::cell::RefCell<Option<Transport<BufReader<DeadlineChildStdout>, ChildStdin>>>,
     shape: GuestShape,
     max_read: usize,
+    max_write: Option<usize>,
+    instruction_writes_coherent: bool,
     kernel_base: Option<u64>,
 }
 
@@ -737,6 +833,8 @@ impl LiveSource {
             ))),
             shape: GuestShape::default(),
             max_read: 1,
+            max_write: None,
+            instruction_writes_coherent: false,
             kernel_base: None,
         };
         source.handshake()?;
@@ -757,6 +855,8 @@ impl LiveSource {
         drop(held);
         self.shape = reply.shape;
         self.max_read = reply.max_read;
+        self.max_write = reply.max_write;
+        self.instruction_writes_coherent = reply.instruction_writes_coherent;
         self.kernel_base = reply.kernel_base;
         Ok(())
     }
@@ -764,6 +864,12 @@ impl LiveSource {
     /// Provider-reported Secure Kernel image base. A consumer must still validate the image.
     pub(crate) fn kernel_base(&self) -> Option<u64> {
         self.kernel_base
+    }
+
+    pub(crate) fn guarded_write_capability(&self) -> Option<usize> {
+        self.instruction_writes_coherent
+            .then_some(self.max_write)
+            .flatten()
     }
 }
 
@@ -840,6 +946,21 @@ impl LiveSource {
             None => Err(ReadFailure::SourceError {
                 detail: "the transport has already been closed".to_string(),
             }),
+        }
+    }
+
+    pub(crate) fn write_chunk_until_cancelled(
+        &self,
+        gpa: Gpa,
+        bytes: &[u8],
+        deadline: Instant,
+        cancelled: CancelCheck,
+    ) -> Result<()> {
+        match self.transport.borrow_mut().as_mut() {
+            Some(transport) => {
+                transport.write_chunk_until_cancelled(gpa, bytes, deadline, cancelled)
+            }
+            None => bail!("the transport has already been closed"),
         }
     }
 }
@@ -1103,6 +1224,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reply.max_read, 4096);
+        assert_eq!(reply.max_write, None);
+        assert!(!reply.instruction_writes_coherent);
         assert_eq!(reply.shape.cr3, Some(0x1201000));
         assert_eq!(reply.shape.cr0, Some(0x8005_0033));
         assert_eq!(reply.shape.vtl_enabled, Some(true));
@@ -1129,6 +1252,51 @@ mod tests {
     fn a_shape_without_max_read_is_refused_because_the_width_must_not_be_guessed() {
         let err = parse_shape("SHAPE cr3=0x1201000").unwrap_err();
         assert!(format!("{err}").contains("max_read"), "{err}");
+    }
+
+    #[test]
+    fn write_width_and_instruction_coherency_must_be_advertised_together() {
+        let width_only = parse_shape("SHAPE max_read=16 max_write=16").unwrap_err();
+        assert!(
+            width_only.to_string().contains("write_coherency"),
+            "{width_only:#}"
+        );
+        let coherency_only =
+            parse_shape("SHAPE max_read=16 write_coherency=instruction_coherent").unwrap_err();
+        assert!(
+            coherency_only.to_string().contains("requires max_write"),
+            "{coherency_only:#}"
+        );
+        let reply =
+            parse_shape("SHAPE max_read=4096 max_write=4096 write_coherency=instruction_coherent")
+                .unwrap();
+        assert_eq!(reply.max_write, Some(4096));
+        assert!(reply.instruction_writes_coherent);
+    }
+
+    #[test]
+    fn guarded_write_sends_one_bounded_frame_and_accepts_exact_readback_count() {
+        let mut transport = exchange("OK 1\n");
+        transport.max_write = Some(4096);
+        transport.write_chunk_inner(Gpa(0xCD12DF), &[0xcc]).unwrap();
+        assert_eq!(transport.writer, b"WRITE 0xCD12DF 1\n\xCC");
+        assert!(!transport.poisoned);
+    }
+
+    #[test]
+    fn guarded_write_refuses_an_unadvertised_or_cross_page_mutation_before_sending() {
+        let mut absent = exchange("OK 1\n");
+        let error = absent.write_chunk_inner(Gpa(0x1000), &[0xcc]).unwrap_err();
+        assert!(error.to_string().contains("did not advertise"), "{error:#}");
+        assert!(absent.writer.is_empty());
+
+        let mut crossing = exchange("OK 2\n");
+        crossing.max_write = Some(4096);
+        let error = crossing
+            .write_chunk_inner(Gpa(0x1fff), &[0xcc, 0xcc])
+            .unwrap_err();
+        assert!(error.to_string().contains("one 4 KiB page"), "{error:#}");
+        assert!(crossing.writer.is_empty());
     }
 
     #[test]

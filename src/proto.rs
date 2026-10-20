@@ -126,6 +126,11 @@ pub enum EngineOp {
         address: u64,
         size: u32,
     },
+    /// Compare, replace and retain a small stopped VTL1 range for rollback before release.
+    SkLiveWrite {
+        epoch: crate::skcontrol::StopEpoch,
+        write: crate::sklive::GuardedMemoryWrite,
+    },
     /// Consume the current stop epoch and arm one step. CR3 writes use a bounded successor
     /// breakpoint; other instructions use trap flag.
     SkLiveStep {
