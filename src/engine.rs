@@ -77,6 +77,19 @@ pub(crate) const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// gracefully, short enough that recovering a parked attach is not a wait.
 const END_SESSION_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Live VTL1 release can spend the controller's complete cleanup reserve. Leave reply headroom
+/// outside that worker-side bound so a proved release or fail-closed result crosses the pipe
+/// before the supervisor preserves the worker as unresolved.
+const SECURE_KERNEL_LIVE_END_SESSION_TIMEOUT: Duration = Duration::from_secs(35);
+
+fn end_session_timeout(kind: SessionKind) -> Duration {
+    if kind == SessionKind::SecureKernelLive {
+        SECURE_KERNEL_LIVE_END_SESSION_TIMEOUT
+    } else {
+        END_SESSION_TIMEOUT
+    }
+}
+
 /// What a session says while an explicit `end_session` is in flight.
 ///
 /// This is written by [`pump`] when it forwards the teardown, not when the call is submitted:
@@ -3209,7 +3222,9 @@ impl Sessions {
         let call = Call::new(EngineOp::EndSession)
             .releasing(named)
             .closing(END_SESSION_CLOSING);
-        let outcome = self.release(session, call, END_SESSION_TIMEOUT).await;
+        let outcome = self
+            .release(session, call, end_session_timeout(session.kind))
+            .await;
         if let Release::Preserved(why) = outcome {
             return Ok(Output::typed(
                 why,
@@ -3553,7 +3568,7 @@ impl Sessions {
                 .release(
                     &session.clone(),
                     Call::supervisor(EngineOp::EndSession),
-                    END_SESSION_TIMEOUT,
+                    end_session_timeout(session.kind),
                 )
                 .await;
             note_release("idle reclamation", session, &outcome);
@@ -3628,7 +3643,7 @@ impl Sessions {
             .release(
                 &session,
                 Call::supervisor(EngineOp::EndSession),
-                END_SESSION_TIMEOUT,
+                end_session_timeout(session.kind),
             )
             .await;
         note_release("Secure Kernel pause expiry", &session, &outcome);
@@ -3860,7 +3875,7 @@ impl Sessions {
                     .release(
                         &victim,
                         Call::supervisor(EngineOp::EndSession),
-                        END_SESSION_TIMEOUT,
+                        end_session_timeout(victim.kind),
                     )
                     .await;
                 // Reported for the same reason the comment above releases carefully: this path
@@ -10272,7 +10287,7 @@ mod tests {
                 continue;
             }
             // The caller-facing one: `end` builds a `SessionEnded` and a rendered message instead.
-            if window.contains("let outcome = self.release(session, call, END_SESSION_TIMEOUT)") {
+            if window.contains(".release(session, call, end_session_timeout(session.kind))") {
                 continue;
             }
             unaccounted.push(line);
@@ -10285,6 +10300,27 @@ mod tests {
              it through the same classification, or -- if it answers a caller the way `end` does \
              -- say so here."
         );
+    }
+
+    #[test]
+    fn live_control_release_outlasts_its_worker_cleanup_bound() {
+        assert_eq!(
+            end_session_timeout(SessionKind::SecureKernelLive),
+            SECURE_KERNEL_LIVE_END_SESSION_TIMEOUT
+        );
+        assert!(SECURE_KERNEL_LIVE_END_SESSION_TIMEOUT > crate::skdispatch::CLEANUP_RESERVE);
+        for kind in [
+            SessionKind::Dump,
+            SessionKind::Trace,
+            SessionKind::KernelLocal,
+            SessionKind::Kernel,
+            SessionKind::Process,
+            SessionKind::Launch,
+            SessionKind::SecureKernel,
+            SessionKind::SecureKernelKd,
+        ] {
+            assert_eq!(end_session_timeout(kind), END_SESSION_TIMEOUT, "{kind:?}");
+        }
     }
 
     /// The outcomes that are already unambiguous are not touched by the flag.

@@ -1745,6 +1745,7 @@ impl<P: ControlProvider> LiveControl<P> {
     }
 
     /// Restore the complete writable baseline and release the exact event once.
+    #[cfg(test)]
     pub(crate) fn continue_from(
         &mut self,
         dispatcher: &mut impl EventDispatcher,
@@ -1996,14 +1997,9 @@ impl<P: ControlProvider> LiveControl<P> {
                 self.state = State::Closed;
                 return Ok(());
             }
-            State::Stopped(stop) => match deadline {
-                Some(deadline) => {
-                    self.continue_from_until(dispatcher, &stop.epoch, deadline)?;
-                }
-                None => {
-                    self.continue_from(dispatcher, &stop.epoch)?;
-                }
-            },
+            State::Stopped(stop) => {
+                self.restore_stopped_for_close(dispatcher, &stop.epoch, deadline)?;
+            }
             State::Running
                 if self
                     .providers
@@ -2037,7 +2033,7 @@ impl<P: ControlProvider> LiveControl<P> {
                             Some(ExpectedStop::StepOver { .. })
                         ) && self.active_provider == Some(index)
                         {
-                            self.refresh_step_over_cr3(index)?;
+                            self.refresh_recovery_cr3(index)?;
                         }
                         self.restore_owned_state(index)?;
                         self.providers[index].provider.finish_arm()?;
@@ -2086,6 +2082,68 @@ impl<P: ControlProvider> LiveControl<P> {
             vp = self.providers[0].target.vp,
             "live Secure Kernel control completed guarded teardown"
         );
+        Ok(())
+    }
+
+    /// Restore a stopped provider while keeping the VM quiescent for handler teardown.
+    ///
+    /// An ordinary continue resumes guest execution immediately. Close has more work after the
+    /// provider baseline is restored: the vmwp handler and its deferred cleanup must be removed.
+    /// Completing the retained event into a proved VM-wide pause prevents a busy VTL1 workload
+    /// from continuing to enqueue callbacks while that removal is in progress.
+    fn restore_stopped_for_close(
+        &mut self,
+        dispatcher: &mut impl EventDispatcher,
+        epoch: &StopEpoch,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        self.require_stop_epoch(epoch)?;
+        let dispatcher_event = self.dispatcher_event.clone();
+        let active = self
+            .active_provider
+            .context("the stopped session has no active VP provider")?;
+        let recovery_deadline = dispatcher.retained_recovery_deadline().or(deadline);
+        let targets = self.targets();
+        self.providers[active].provider.set_outer_deadline(deadline);
+        self.state = State::Releasing;
+        let result = (|| {
+            self.restore_owned_state(active)?;
+            match self.providers[active].provider_phase {
+                ProviderPhase::Stopped => self.providers[active].provider.release()?,
+                ProviderPhase::Arming => self.providers[active].provider.finish_arm()?,
+                ProviderPhase::Running => bail!("the active provider is already running"),
+            }
+            self.providers[active].provider_phase = ProviderPhase::Running;
+            match (&dispatcher_event, deadline) {
+                (Some(event), Some(deadline)) => {
+                    dispatcher.release_event_and_pause_until(event, &targets, deadline)?
+                }
+                (Some(event), None) => dispatcher.release_event_and_pause(event, &targets)?,
+                // A multi-provider stop has already completed its event into this pause before it
+                // was exposed. Keep that pause instead of undoing and immediately recreating it.
+                (None, _) if dispatcher.provider_writes_quiesced() => {}
+                (None, _) => bail!("the stopped session has no retained event or proved VM pause"),
+            }
+            if !dispatcher.provider_writes_quiesced() {
+                bail!("close did not prove a VM pause before handler teardown");
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let error =
+                self.enter_fault_inner(dispatcher, error, dispatcher_event, recovery_deadline);
+            self.providers[active].provider.set_outer_deadline(None);
+            return Err(error);
+        }
+        self.providers[active].provider.set_outer_deadline(None);
+        self.providers[active].baseline = None;
+        self.providers[active].observed_cr3 = None;
+        self.active_provider = None;
+        self.breakpoints.clear();
+        self.arm_mode = None;
+        self.dispatcher_event = None;
+        self.expected_stop = None;
+        self.state = State::Running;
         Ok(())
     }
 
@@ -2243,7 +2301,7 @@ impl<P: ControlProvider> LiveControl<P> {
         )
     }
 
-    fn refresh_step_over_cr3(&mut self, provider: usize) -> Result<()> {
+    fn refresh_recovery_cr3(&mut self, provider: usize) -> Result<()> {
         let snapshot = self.read_allowed_transition_snapshot(provider)?;
         self.providers[provider].observed_cr3 = Some(snapshot.low(RegisterName::Cr3)?);
         Ok(())
@@ -2604,16 +2662,17 @@ impl<P: ControlProvider> LiveControl<P> {
                     safe_to_resume = false;
                     continue;
                 }
-                // The wait may expire after the CR3 write executed but before its successor event
-                // was accepted. Learn that root while the recovery pause is proved so restoring
-                // the temporary breakpoint is not rejected against the pre-step address space.
-                if step_over_provider == Some(provider) {
-                    match self.refresh_step_over_cr3(provider) {
+                // Natural execution may enter a trustlet address space before a breakpoint fires,
+                // just as a CR3 step-over may change roots before its successor is accepted. Learn
+                // the paused root before restoring register-only state; the session explicitly
+                // opted into transition CR3s, and the recovery barrier proves writes are quiesced.
+                if self.allow_transition_cr3 || step_over_provider == Some(provider) {
+                    match self.refresh_recovery_cr3(provider) {
                         Ok(()) => {}
                         Err(error) => {
                             safe_to_resume = false;
                             recovery_errors.push(format!(
-                                "read VP {} transition state for step-over recovery: {error:#}",
+                                "read VP {} transition state for fault recovery: {error:#}",
                                 self.providers[provider].target.vp
                             ));
                             continue;
@@ -4338,6 +4397,12 @@ mod tests {
         control.close(&mut dispatcher).unwrap();
 
         assert_eq!(control.phase(), LivePhase::Closed);
+        assert!(dispatcher.actions.contains(&Action::ReleaseAndPause));
+        assert!(
+            !dispatcher
+                .actions
+                .contains(&Action::Release(ReleaseMode::Resume))
+        );
         assert_eq!(dispatcher.actions.last(), Some(&Action::Teardown));
         assert_eq!(
             control.test_provider().registers,
@@ -4371,6 +4436,44 @@ mod tests {
         assert_eq!(dispatcher.release_deadlines, [Some(deadline)]);
         assert_eq!(dispatcher.teardown_deadlines, [Some(deadline)]);
         assert_eq!(control.phase(), LivePhase::Closed);
+    }
+
+    #[test]
+    fn multi_provider_close_keeps_the_pause_already_established_for_the_stop() {
+        let mut vp1_event = event(StopReason::DebugException);
+        vp1_event.vp = 1;
+        let mut dispatcher = FakeDispatcher::new([ObservedStop {
+            event: vp1_event,
+            instructions: vec![instruction()],
+        }]);
+        let mut control =
+            LiveControl::open_many(vec![FakeProvider::new(), FakeProvider::new().with_vp(1)])
+                .unwrap();
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Natural)
+            .unwrap();
+        control.wait_for_stop(&mut dispatcher).unwrap();
+        let pauses_before_close = dispatcher
+            .actions
+            .iter()
+            .filter(|action| **action == Action::ReleaseAndPause)
+            .count();
+
+        control.close(&mut dispatcher).unwrap();
+
+        assert_eq!(control.phase(), LivePhase::Closed);
+        assert!(control.providers.iter().all(|provider| {
+            provider.baseline.is_none() && provider.provider.phase == FakePhase::Running
+        }));
+        assert_eq!(
+            dispatcher
+                .actions
+                .iter()
+                .filter(|action| **action == Action::ReleaseAndPause)
+                .count(),
+            pauses_before_close
+        );
+        assert_eq!(dispatcher.actions.last(), Some(&Action::Teardown));
     }
 
     #[test]
@@ -4504,6 +4607,67 @@ mod tests {
         assert_eq!(
             control.test_provider().registers,
             register_values(BASE_RIP, 0xffff_0ff0, 0x400, 0x46)
+        );
+        assert_eq!(
+            dispatcher.actions.last(),
+            Some(&Action::Recover {
+                safe: true,
+                owned_event: false,
+            })
+        );
+    }
+
+    #[test]
+    fn natural_transition_timeout_restores_control_state_in_the_paused_root() {
+        let baseline = register_values(BASE_RIP, 0xffff_0ff0, 0x400, 0x46);
+        let mut dispatcher = FakeDispatcher::new([]);
+        dispatcher.fail_wait = Some("dispatcher wait timed out");
+        let mut control = LiveControl::open_with_transition(FakeProvider::new(), true).unwrap();
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Natural)
+            .unwrap();
+        set_low(
+            &mut control.providers[0].provider.registers,
+            RegisterName::Cr3,
+            0xdead_0000,
+        );
+
+        let error = control.wait_for_stop(&mut dispatcher).unwrap_err();
+
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        assert_eq!(control.phase(), LivePhase::Faulted);
+        assert!(!control.fault().unwrap().target_left_paused);
+        let restored = &control.test_provider().registers;
+        for name in [
+            RegisterName::Dr0,
+            RegisterName::Dr1,
+            RegisterName::Dr2,
+            RegisterName::Dr3,
+            RegisterName::Dr6,
+            RegisterName::Dr7,
+        ] {
+            assert_eq!(
+                restored.iter().find(|value| value.name == name).unwrap(),
+                baseline.iter().find(|value| value.name == name).unwrap()
+            );
+        }
+        assert_eq!(
+            restored
+                .iter()
+                .find(|value| value.name == RegisterName::Rflags)
+                .unwrap(),
+            baseline
+                .iter()
+                .find(|value| value.name == RegisterName::Rflags)
+                .unwrap()
+        );
+        assert_eq!(
+            restored
+                .iter()
+                .find(|value| value.name == RegisterName::Cr3)
+                .unwrap()
+                .low,
+            HexU64(0xdead_0000)
         );
         assert_eq!(
             dispatcher.actions.last(),
