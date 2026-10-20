@@ -1832,6 +1832,10 @@ impl Call {
         }
     }
 
+    pub(crate) fn is_live_break(&self) -> bool {
+        matches!(&self.op, EngineOp::SkLiveBreak)
+    }
+
     /// Records whether the caller supplied `session_id`; see [`On`].
     pub fn named(mut self, named: bool) -> Self {
         self.gate.on = if named { On::Handle } else { On::Default };
@@ -2234,7 +2238,21 @@ impl Sessions {
     /// `end_session` — and recording at the funnel is what stops them, and the next one like
     /// them, from being missed.
     pub fn resolve(&self, supplied: Option<&str>) -> Result<Arc<Session>, EngineError> {
-        self.resolve_admitting(supplied, SessionState::accepts_handle)
+        self.resolve_admitting(supplied, |session| session.state().accepts_handle())
+    }
+
+    /// [`Self::resolve`] for the one operation whose teardown-first result is decided by the
+    /// worker reader. The exact live-release placeholder admits only `sk_live_break`; the queue
+    /// gate repeats the same test before the request can be written.
+    pub fn resolve_for_live_break(
+        &self,
+        supplied: Option<&str>,
+    ) -> Result<Arc<Session>, EngineError> {
+        self.resolve_admitting(supplied, |session| {
+            let state = session.state();
+            state.accepts_handle()
+                || live_break_follows_teardown(session.kind, &state, &EngineOp::SkLiveBreak)
+        })
     }
 
     /// [`Self::resolve`] for a call that **releases** the session rather than working on its
@@ -2247,7 +2265,7 @@ impl Sessions {
         &self,
         supplied: Option<&str>,
     ) -> Result<Arc<Session>, EngineError> {
-        self.resolve_admitting(supplied, SessionState::accepts_teardown)
+        self.resolve_admitting(supplied, |session| session.state().accepts_teardown())
     }
 
     /// [`Self::resolve`] for a call that **collects a result already recorded** for this handle
@@ -2257,13 +2275,13 @@ impl Sessions {
         &self,
         supplied: Option<&str>,
     ) -> Result<Arc<Session>, EngineError> {
-        self.resolve_admitting(supplied, SessionState::accepts_execution_read)
+        self.resolve_admitting(supplied, |session| session.state().accepts_execution_read())
     }
 
     fn resolve_admitting(
         &self,
         supplied: Option<&str>,
-        admits: fn(&SessionState) -> bool,
+        admits: impl Fn(&Session) -> bool,
     ) -> Result<Arc<Session>, EngineError> {
         let registry = self.registry();
         let caller = crate::client::current();
@@ -2287,7 +2305,7 @@ impl Sessions {
             Some(session) if session.owner != caller => {
                 Err(EngineError::Stale(unknown_handle(want)))
             }
-            Some(session) if admits(&session.state()) => {
+            Some(session) if admits(&session) => {
                 crate::record::routed_to(&session.id);
                 Ok(session)
             }
@@ -6858,6 +6876,29 @@ mod tests {
             &releasing,
             &EngineOp::SkLiveBreak
         ));
+
+        let live = secure_kernel_live_double("sess-live", releasing.clone(), 4100);
+        let faulted = secure_kernel_live_double(
+            "sess-faulted",
+            SessionState::LiveControlUnresolved("restore unconfirmed".into()),
+            4200,
+        );
+        let mut kd = Arc::into_inner(dormant("sess-kd", releasing)).unwrap();
+        kd.kind = SessionKind::SecureKernelKd;
+        let kd = Arc::new(kd);
+        let sessions = registry_of(&[live, faulted, kd]);
+
+        assert!(matches!(
+            sessions.resolve(Some("sess-live")),
+            Err(EngineError::RecoveryRequired(_))
+        ));
+        assert!(sessions.resolve_for_live_break(Some("sess-live")).is_ok());
+        for refused in ["sess-faulted", "sess-kd"] {
+            assert!(matches!(
+                sessions.resolve_for_live_break(Some(refused)),
+                Err(EngineError::RecoveryRequired(_))
+            ));
+        }
     }
 
     /// A stale-handle message has to say which of the three ways it went stale, because the
