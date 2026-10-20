@@ -205,13 +205,16 @@ status line on stdout, and for a successful read exactly the requested bytes aft
     the table below, which is where every number in this protocol lives)
 <- windbg-mcp-gpa/1        the ready sentinel — the lines before it are ignored, not unlimited
 -> SHAPE
-<- SHAPE cr3=0x1201000 vtl_enabled=1 paging=long max_read=4096
+<- SHAPE cr3=0x1201000 vtl_enabled=1 paging=long max_read=4096 max_write=4096 write_coherency=instruction_coherent
 <- SHAPE max_read=16 switch_refused=VTL_switch_denied unreadable=efer:not_exposed
                            a VBS-off guest, and a register the source cannot get: both are
                            answers that travel, and both spell a space as `_`
 -> READ 0xCD12DF 16
 <- OK 16
 <- <16 raw bytes>
+-> WRITE 0xCD12DF 1
+-> <1 raw byte>
+<- OK 1
 <- REFUSED ReadIntercept   the hypervisor withheld that page
 <- NOTPRESENT              no such mapping
 <- ERROR the driver is not loaded
@@ -227,6 +230,7 @@ the transport's side, and none is clamped — each refuses.
 | lines before the sentinel | **63** (64 are read in all) | rejected as "probably not a transport", with what it said quoted back |
 | bytes in **any** one line | under **64 KiB**, newline included | 64 KiB with no newline is "not one line"; the exchange is refused and the transport poisoned |
 | `max_read` declared | **`1..=1048576`** | the handshake is refused — declare the smaller of your real capacity and 1 MiB |
+| `max_write` declared | **`1..=4096`**, and only with `write_coherency=instruction_coherent` | the handshake is refused; the two fields are one capability and must be absent or present together |
 | `SHAPE` keys | the documented ones only | an unknown key is refused, not ignored |
 | `vtl_enabled` | `0` or `1` | anything else is refused |
 | `paging` | `long` | refused; this decode walks long mode only |
@@ -258,7 +262,8 @@ Things to know besides the numbers and the grammar:
 
 - **After the sentinel, say nothing that was not asked for.** Every line the client reads from then
   on is read as the reply to the request it just sent, and there are only two requests ever sent:
-  `SHAPE`, once, and then `READ <0xADDR> <len>` — the address in uppercase hex with an `0x` prefix.
+  `SHAPE`, once, and then `READ <0xADDR> <len>` or an authorized `WRITE <0xADDR> <len>` followed
+  by exactly that many raw bytes — the address in uppercase hex with an `0x` prefix.
   A progress line, a warning or a log written to stdout after the handshake is therefore consumed as
   a status line and desynchronises the stream. Diagnostics belong on **stderr**, which is never
   read as protocol and is the right place for them anyway: it reaches the operator's terminal
@@ -279,6 +284,10 @@ Things to know besides the numbers and the grammar:
   otherwise look like a guest with no page-table root, which is a far more plausible-looking wrong
   answer. One `SHAPE` field is **not** a failure: `switch_refused=<reason>` is how a transport says
   the VTL could not be selected, which on a VBS-off guest is the result and travels as one.
+- **Write capability cannot authorize itself.** `max_write` and
+  `write_coherency=instruction_coherent` only say the transport can make one bounded physical
+  write whose instruction-fetch visibility it handles. The startup policy must independently set
+  `allow_memory_writes: true`; without both gates, `sk_live_write_memory` is unavailable.
 - **The four status words must stay distinct, and collapsing them fails in two different
   directions.** `REFUSED` is the hypervisor withholding a page, and over `HvCallReadGpa` on a VBS
   guest it is the **expected** answer. **Only `OK` with zero-filled bytes turns a protected guest
@@ -299,7 +308,7 @@ Things to know besides the numbers and the grammar:
 ## Live execution control: a separate MCP session
 
 The `--sk-live` role above decodes a running guest once. It does not stop or resume anything. For a
-controlled VTL1 kernel-mode stop, use the seven live-control tools. They create a dedicated worker
+controlled VTL1 kernel-mode stop, use the ten live-control tools. They create a dedicated worker
 session whose DbgEng target is the host's `vmwp` and whose operator-supplied providers access the
 selected VP's VTL1 registers and memory. The repository ships neither provider and ordinary debugger
 tools are refused on this session so they cannot report `vmwp` state as guest state.
@@ -330,7 +339,10 @@ The sequence is:
    complete two-read register evidence, guarded instruction, expected next RIPs and a new opaque
    stopped epoch.
 4. While that event is held, use `sk_live_registers` or `sk_live_read_memory`. Reads are bound to the
-   stop and refused while running.
+   stop and refused while running. If both independent write gates are enabled,
+   `sk_live_write_memory` compares and replaces 1–64 same-length bytes without consuming the stop
+   epoch. It retains the original until a later transition restores and verifies it; do not treat
+   its `rollback_pending: true` result as a persistent patch.
 5. Pass the exact current epoch to `sk_live_step`, then call `sk_live_wait` for the next stop. For
    repeated steps, give the new current instruction and its bounded destinations.
 6. Pass the final stopped epoch to `sk_live_continue`, then call `end_session`. Require the teardown
@@ -347,7 +359,7 @@ Note that `live_control_unresolved` also appears **transiently** on a healthy re
 Six things about that sequence are not visible from the tool signatures, and each one costs a run
 against somebody's VM to discover:
 
-- **These twelve tools are an `extra` group**, so a client that asks for nothing is served none of
+- **These fifteen tools are an `extra` group**, so a client that asks for nothing is served none of
   them and `open_sk_live_control` is refused `-32602` naming `--tools`. The group is widened on the
   server's command line — except on a listener, where a client may carry its own surface
   (`WINDBG_MCP_TOOLS_<NAME>`, or a `tools` field in the credential file) that replaces the run's

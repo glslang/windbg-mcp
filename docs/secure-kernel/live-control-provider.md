@@ -224,7 +224,11 @@ proved VM pause to keep provider state stable:
    request reader first, the later break is refused as `stale_session` without filing an interrupt
    or beginning a rendezvous.
 5. `sk_live_registers` and `sk_live_read_memory` inspect only that stopped epoch. The memory path
-   uses the validated stop CR3 and refuses an unmapped range whole.
+   uses the validated stop CR3 and refuses an unmapped range whole. Optional
+   `sk_live_write_memory` first converts the retained native event to a proved VM-wide pause, then
+   compares and replaces 1–64 bytes within one virtual and physical page. It requires the startup
+   policy's `allow_memory_writes: true` and a memory transport advertising both `max_write` and
+   `write_coherency=instruction_coherent`. The unchanged stop epoch retains rollback ownership.
 6. `sk_live_step` consumes the stopped epoch once and clears the original hardware breakpoint.
    It arms TF for an ordinary instruction. For a decoded CR3 write in natural mode it instead
    borrows an owned slot for the linear successor, accepts the resulting root transition, reports
@@ -238,9 +242,12 @@ proved VM pause to keep provider state stable:
    DbgEng wait open to Ctrl+Break. This path is an M1 qualification surface and is not yet used by
    the managed KD facade's `g` command. The M1 surface currently accepts exactly one selected VP;
    multi-VP re-arm is refused while preserving the held epoch.
-8. `sk_live_continue` consumes that new epoch, restores and verifies the complete baseline, clears
+8. Before any continue, step, recovery or teardown releases guest execution, every guarded memory
+   write is restored in reverse order and read back through the stopped virtual address. Failure
+   to prove an original byte leaves the VM contained.
+9. `sk_live_continue` consumes that new epoch, restores and verifies the complete baseline, clears
    execution control and completes the owned event. The session can then be armed again.
-9. `end_session` restores any held state, removes the handler and scratch allocation, and performs
+10. `end_session` restores any held state, removes the handler and scratch allocation, and performs
    the handled `vmwp` detach.
 
 Ordinary debugger and capture operations are refused on this session: its DbgEng target is the
@@ -258,7 +265,9 @@ failure ending the worker's idle image target cannot relabel the proved VTL1 rel
 The opt-in smoke test reads its private inputs from `WINDBG_MCP_SMOKE_SK_LIVE`, whose JSON
 must explicitly say `"disposable": true`. It drives the calls above through the built MCP
 binary. `WINDBG_MCP_SK_LIVE_POLICY` must admit the VM, exact provider command templates, profile
-root and an absolute `max_pause_ms` bound before the server starts. The same file admits canonical
+root and an absolute `max_pause_ms` bound before the server starts. `allow_memory_writes` is
+optional and defaults false; it grants no capability by itself, because the selected live-memory
+transport must independently advertise bounded instruction-coherent writes. The same file admits canonical
 `kit_roots` for capture provider loading. The live request cannot choose the pause bound, and
 ordinary request activity does not extend a retained stop: expiry invokes the same fail-closed
 teardown as `end_session`. The profile, privileged provider and bench evidence remain outside

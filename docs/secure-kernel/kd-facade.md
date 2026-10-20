@@ -90,7 +90,8 @@ the server starts. The JSON file fixes all authority that a client may select:
   ],
   "profile_roots": ["D:\\windbg-mcp-private\\profiles"],
   "kit_roots": ["C:\\Program Files (x86)\\Windows Kits\\10"],
-  "max_pause_ms": 600000
+  "max_pause_ms": 600000,
+  "allow_memory_writes": false
 }
 ```
 
@@ -100,6 +101,8 @@ different script or `-c` payload. Profiles must be files below an allowed root, 
 must be in the disposable allow-list. Windows Kit roots are canonicalized too; capture provider
 loading is disabled when none is admitted. `max_pause_ms` is the absolute bound for each retained
 ordinary live-control stop and each managed-KD stop. The request cannot choose or widen it. An
+optional `allow_memory_writes` defaults false and gates the ordinary live session's guarded write
+tool; the managed KD facade does not expose guest-memory writes. An
 invalid or absent policy fails before a VM lookup, provider load or worker spawn.
 A capture-only deployment may omit the three live-authority arrays and `max_pause_ms`; a live
 deployment must provide all three arrays together and a pause bound of at least 60,000 ms. The

@@ -459,6 +459,7 @@ impl ManagedRequest {
                 target,
                 max_pause_ms: max_pause.as_millis() as u64,
                 allow_transition_cr3: false,
+                allow_memory_writes: false,
                 additional_vps: Vec::new(),
             },
             pipe,

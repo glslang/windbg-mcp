@@ -40,7 +40,7 @@ provider a VID receive loop. `--sk-control-probe` validates the non-mutating han
 and its state machine are documented in
 [`live-control-provider.md`](live-control-provider.md). The live-control MCP tools drive that
 dedicated worker session: `open_sk_live_control`, `sk_live_arm`, `sk_live_wait`, `sk_live_break`,
-`sk_live_registers`, `sk_live_read_memory`, `sk_live_step`,
+`sk_live_registers`, `sk_live_read_memory`, optional policy-gated `sk_live_write_memory`, `sk_live_step`,
 `sk_live_continue_to_breakpoints` and `sk_live_continue`. The current run/break/correlation work is
 tracked in the [Secure Kernel call-debugging roadmap](skcall-debugging-roadmap.md).
 

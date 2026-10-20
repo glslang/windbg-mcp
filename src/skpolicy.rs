@@ -25,6 +25,10 @@ struct PolicyFile {
     kit_roots: Vec<PathBuf>,
     #[serde(default)]
     max_pause_ms: Option<u64>,
+    /// Separately authorize mutation through a write-capable live-memory transport. Provider
+    /// capability is necessary but cannot grant this operator authority by itself.
+    #[serde(default)]
+    allow_memory_writes: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -34,6 +38,7 @@ pub(crate) struct Policy {
     profile_roots: Vec<String>,
     kit_roots: Vec<String>,
     max_pause_ms: Option<u64>,
+    allow_memory_writes: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -42,6 +47,7 @@ pub(crate) struct AuthorizedLive {
     pub(crate) control_transport: String,
     pub(crate) live_transport: String,
     pub(crate) max_pause_ms: u64,
+    pub(crate) allow_memory_writes: bool,
 }
 
 impl Policy {
@@ -72,6 +78,9 @@ impl Policy {
         }
         if has_live_authority && file.max_pause_ms.is_none() {
             bail!("Secure Kernel live policy must fix max_pause_ms at server startup");
+        }
+        if file.allow_memory_writes && !has_live_authority {
+            bail!("Secure Kernel memory writes require complete live authority in startup policy");
         }
         if !has_live_authority && file.kit_roots.is_empty() {
             bail!("Secure Kernel policy must admit live authority, at least one kit root, or both");
@@ -116,6 +125,7 @@ impl Policy {
             profile_roots,
             kit_roots,
             max_pause_ms: file.max_pause_ms,
+            allow_memory_writes: file.allow_memory_writes,
         })
     }
 
@@ -153,6 +163,7 @@ impl Policy {
             control_transport,
             live_transport,
             max_pause_ms,
+            allow_memory_writes: self.allow_memory_writes,
         })
     }
 
@@ -304,6 +315,7 @@ mod tests {
             profile_roots: Vec::new(),
             kit_roots: Vec::new(),
             max_pause_ms: None,
+            allow_memory_writes: false,
         };
         assert!(Policy::from_file(empty).is_err());
     }
@@ -317,6 +329,7 @@ mod tests {
             profile_roots: Vec::new(),
             kit_roots: vec![root.clone()],
             max_pause_ms: None,
+            allow_memory_writes: false,
         };
         let policy = Policy::from_file(capture_only).unwrap();
         assert_eq!(
@@ -333,8 +346,23 @@ mod tests {
             profile_roots: Vec::new(),
             kit_roots: vec![std::env::temp_dir()],
             max_pause_ms: Some(600_000),
+            allow_memory_writes: false,
         };
         assert!(Policy::from_file(partial).is_err());
+    }
+
+    #[test]
+    fn memory_write_authority_cannot_exist_without_live_authority() {
+        let write_only = PolicyFile {
+            disposable_vm_ids: Vec::new(),
+            transport_commands: Vec::new(),
+            profile_roots: Vec::new(),
+            kit_roots: vec![std::env::temp_dir()],
+            max_pause_ms: None,
+            allow_memory_writes: true,
+        };
+        let error = Policy::from_file(write_only).unwrap_err();
+        assert!(error.to_string().contains("memory writes"), "{error:#}");
     }
 
     #[test]
@@ -348,6 +376,7 @@ mod tests {
             profile_roots: vec![directory],
             kit_roots: Vec::new(),
             max_pause_ms: None,
+            allow_memory_writes: false,
         };
 
         let error = Policy::from_file(file).unwrap_err();
@@ -371,6 +400,7 @@ mod tests {
                 profile_roots: vec![directory.clone()],
                 kit_roots: Vec::new(),
                 max_pause_ms: Some(max_pause_ms),
+                allow_memory_writes: false,
             };
             let error = Policy::from_file(file).unwrap_err();
             assert!(
@@ -385,6 +415,7 @@ mod tests {
             profile_roots: vec![directory],
             kit_roots: Vec::new(),
             max_pause_ms: Some(crate::skdispatch::MIN_PAUSE_MS),
+            allow_memory_writes: false,
         };
         assert!(Policy::from_file(minimum).is_ok());
     }
@@ -412,6 +443,7 @@ mod tests {
             profile_roots: Vec::new(),
             kit_roots: vec![normalized_path(&canonical)],
             max_pause_ms: None,
+            allow_memory_writes: false,
         };
 
         assert_eq!(
@@ -450,6 +482,7 @@ mod tests {
             profile_roots: Vec::new(),
             kit_roots: Vec::new(),
             max_pause_ms: None,
+            allow_memory_writes: false,
         };
         assert!(policy.transport_commands.contains(&allowed));
 
@@ -477,6 +510,7 @@ mod tests {
             profile_roots: Vec::new(),
             kit_roots: Vec::new(),
             max_pause_ms: None,
+            allow_memory_writes: false,
         };
 
         let launch = policy
@@ -510,6 +544,7 @@ mod tests {
             profile_roots: vec![normalized_path(&directory.canonicalize().unwrap())],
             kit_roots: Vec::new(),
             max_pause_ms: Some(600_000),
+            allow_memory_writes: false,
         };
 
         let authorized = policy
@@ -551,6 +586,7 @@ mod tests {
             profile_roots: vec![normalized_path(volume_root)],
             kit_roots: Vec::new(),
             max_pause_ms: Some(600_000),
+            allow_memory_writes: false,
         };
 
         let authorized = policy

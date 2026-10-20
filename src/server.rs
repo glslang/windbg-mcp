@@ -1328,6 +1328,42 @@ pub struct SkLiveReadArgs {
     pub session_id: Option<String>,
 }
 
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SkLiveWriteArgs {
+    /// The opaque epoch from the current stopped record. The write does not consume it.
+    pub epoch: String,
+    /// Guest virtual address in the stopped VTL1 address space, decimal or `0x` hexadecimal.
+    pub address: String,
+    /// Exact bytes required at `address`, as hexadecimal with optional spaces or `-`.
+    pub expected: String,
+    /// Same-length replacement bytes. They are read back immediately and restored before any
+    /// guest execution is released.
+    pub bytes: String,
+    /// Which live Secure Kernel session owns the stop. Omit for the current one.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+fn parse_guarded_write_bytes(name: &str, text: &str) -> Result<Vec<u8>, String> {
+    let compact: String = text
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace() && *character != '-')
+        .collect();
+    if compact.is_empty() || compact.len() > 128 || !compact.len().is_multiple_of(2) {
+        return Err(format!(
+            "{name} must contain 1..=64 whole hexadecimal bytes"
+        ));
+    }
+    (0..compact.len())
+        .step_by(2)
+        .map(|at| {
+            u8::from_str_radix(&compact[at..at + 2], 16)
+                .map_err(|_| format!("{name} contains a non-hexadecimal byte"))
+        })
+        .collect()
+}
+
 fn parse_live_breakpoints(
     address: &str,
     bytes: &str,
@@ -4430,6 +4466,7 @@ impl WindbgServer {
                 target,
                 max_pause_ms: authorized.max_pause_ms,
                 allow_transition_cr3: args.allow_transition_cr3,
+                allow_memory_writes: authorized.allow_memory_writes,
                 additional_vps,
             })),
         )
@@ -4577,6 +4614,7 @@ impl WindbgServer {
                     target,
                     max_pause_ms,
                     allow_transition_cr3: false,
+                    allow_memory_writes: false,
                     additional_vps: Vec::new(),
                 },
                 pipe,
@@ -4731,6 +4769,74 @@ impl WindbgServer {
                     address,
                     size: args.size,
                 },
+            )
+            .await;
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
+    /// Compare and replace 1..=64 bytes while a live Secure Kernel stop is held. Startup policy
+    /// and the memory transport must both authorize the operation. The worker converts the held
+    /// event into a VM-wide pause, verifies the expected bytes, writes through one physical page,
+    /// reads the replacement back, and retains the original bytes for rollback. Continue, step,
+    /// teardown and fault recovery all restore and verify every retained write before resuming.
+    #[rmcp::tool(
+        annotations(
+            title = "Guarded write to live Secure Kernel memory",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<Outcome<crate::sklive::LiveMemoryWrite>>()
+    )]
+    async fn sk_live_write_memory(
+        &self,
+        Parameters(args): Parameters<SkLiveWriteArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let epoch = match crate::skcontrol::StopEpoch::new(args.epoch) {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                return typed_error(
+                    ErrorCategory::InvalidArgument,
+                    error.to_string(),
+                    args.session_id,
+                );
+            }
+        };
+        let address = match parse_u64(&args.address) {
+            Ok(value) => value,
+            Err(why) => {
+                return typed_error(ErrorCategory::InvalidArgument, why, args.session_id);
+            }
+        };
+        let expected = match parse_guarded_write_bytes("expected", &args.expected) {
+            Ok(bytes) => bytes,
+            Err(why) => {
+                return typed_error(ErrorCategory::InvalidArgument, why, args.session_id);
+            }
+        };
+        let replacement = match parse_guarded_write_bytes("bytes", &args.bytes) {
+            Ok(bytes) => bytes,
+            Err(why) => {
+                return typed_error(ErrorCategory::InvalidArgument, why, args.session_id);
+            }
+        };
+        let write = crate::sklive::GuardedMemoryWrite {
+            address: crate::skcontrol::HexU64(address),
+            expected,
+            replacement,
+        };
+        if let Err(error) = write.validate() {
+            return typed_error(
+                ErrorCategory::InvalidArgument,
+                error.to_string(),
+                args.session_id,
+            );
+        }
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::SkLiveWrite { epoch, write },
             )
             .await;
         engine_result_for(args.session_id.as_deref(), out)

@@ -40,9 +40,9 @@ use crate::sk;
 use crate::sk::RawSource;
 use crate::skcontrol::{HeldEvent, HexU64, StopReason, TargetIdentity};
 use crate::sklive::{
-    ArmMode, BreakWake, BreakpointGuard, DispatcherProfile, DispatcherSite, EventDispatcher,
-    InstructionGuard, LiveControl, LivePhase, LiveTransition, ObservedStop, ReleaseMode,
-    StopRecord, is_break_wake,
+    AppliedMemoryWrite, ArmMode, BreakWake, BreakpointGuard, DispatcherProfile, DispatcherSite,
+    EventDispatcher, GuardedMemoryWrite, InstructionGuard, LiveControl, LiveMemoryWrite, LivePhase,
+    LiveTransition, ObservedStop, PreparedMemoryWrite, ReleaseMode, StopRecord, is_break_wake,
 };
 
 pub(crate) const LIVE_CONTROL_FLAG: &str = "--sk-live-control";
@@ -62,6 +62,7 @@ pub(crate) const MIN_PAUSE_MS: u64 = CLEANUP_RESERVE.as_millis() as u64 * 2;
 const POLL: Duration = Duration::from_millis(20);
 const EVENT_TYPE_VECTOR_1: u64 = 0x0100_0002;
 const MAX_AMD64_INSTRUCTION_BYTES: usize = 15;
+const MAX_PENDING_MEMORY_WRITES: usize = 64;
 
 /// Stop accepting work early enough to preserve a bounded controller-cleanup interval.
 pub(crate) fn service_pause_bound(max_pause: Duration) -> Duration {
@@ -186,6 +187,7 @@ struct PendingControl {
     live_transport: String,
     target: TargetRequest,
     allow_transition_cr3: bool,
+    allow_memory_writes: bool,
     additional_vps: Vec<AdditionalVp>,
 }
 
@@ -234,6 +236,7 @@ impl Session {
                     live_transport: request.live_transport.clone(),
                     target: request.target.clone(),
                     allow_transition_cr3: request.allow_transition_cr3,
+                    allow_memory_writes: request.allow_memory_writes,
                     additional_vps: request.additional_vps.clone(),
                 }),
                 preparation_failed: None,
@@ -340,6 +343,7 @@ impl Session {
             live_transport,
             &target,
             pending.allow_transition_cr3,
+            pending.allow_memory_writes,
         )?;
         let mut providers = vec![provider];
         let mut skipped = skipped
@@ -679,6 +683,22 @@ impl Session {
             .read_memory(stop.epoch.clone(), address, size, deadline)
     }
 
+    pub(crate) fn write_memory(
+        &mut self,
+        engine: &DebugEngine,
+        epoch: &crate::skcontrol::StopEpoch,
+        write: GuardedMemoryWrite,
+    ) -> Result<LiveMemoryWrite> {
+        let deadline = self.stopped_service_deadline()?;
+        self.ensure_preparation_succeeded()?;
+        let control = self
+            .control
+            .as_mut()
+            .context("live Secure Kernel control has not completed target discovery")?;
+        let mut dispatcher = self.dispatcher.bind(engine);
+        control.guarded_write_until(&mut dispatcher, epoch, write, deadline)
+    }
+
     /// End ordinary stopped work before the absolute deadline's cleanup reserve begins.
     fn stopped_service_deadline(&self) -> Result<Instant> {
         if let Some(window) = self.pause_window {
@@ -815,6 +835,10 @@ pub(crate) struct OpenRequest {
     pub(crate) max_pause_ms: u64,
     #[serde(default)]
     pub(crate) allow_transition_cr3: bool,
+    /// Startup-policy authority for guarded live-memory mutation. The transport must separately
+    /// advertise bounded instruction-coherent writes during its handshake.
+    #[serde(default)]
+    pub(crate) allow_memory_writes: bool,
     #[serde(default)]
     pub(crate) additional_vps: Vec<AdditionalVp>,
 }
@@ -858,6 +882,7 @@ impl fmt::Debug for OpenRequest {
             .field("dispatcher_vnd", &self.dispatcher_vnd.map(HexU64))
             .field("target", &self.target)
             .field("max_pause_ms", &self.max_pause_ms)
+            .field("allow_memory_writes", &self.allow_memory_writes)
             .field("additional_vps", &self.additional_vps.len())
             .finish()
     }
@@ -905,6 +930,13 @@ pub(crate) fn render_read(read: &LiveMemoryRead) -> String {
     format!(
         "{} byte(s) of stopped VTL1 at {:#x} (physical {:#x}, epoch {})\n{}",
         read.read_size, read.address.0, read.gpa.0, read.epoch, read.data
+    )
+}
+
+pub(crate) fn render_write(write: &LiveMemoryWrite) -> String {
+    format!(
+        "Guarded {} byte live VTL1 write at {:#x} (physical {:#x}, epoch {}) verified; rollback is pending until release.\n{} -> {}",
+        write.size, write.address.0, write.gpa.0, write.epoch, write.before, write.after
     )
 }
 
@@ -997,6 +1029,7 @@ impl AcceptanceRequest {
                 target,
                 max_pause_ms: 600_000,
                 allow_transition_cr3: false,
+                allow_memory_writes: false,
                 additional_vps: Vec::new(),
             },
             instruction,
@@ -1115,8 +1148,11 @@ pub(crate) struct VmwpDispatcherState {
     identity_discovered: bool,
     live_transport: Option<String>,
     allow_transition_cr3: bool,
+    allow_memory_writes: bool,
     targets: Vec<TargetIdentity>,
     memory: Option<LiveGuestMemory>,
+    /// Applied in stopped order and restored in reverse before guest execution is released.
+    memory_writes: Vec<PreparedMemoryWrite>,
     vmwp_base: Option<u64>,
     handler_context: Option<u64>,
     scratch_allocated: bool,
@@ -1171,8 +1207,10 @@ impl VmwpDispatcherState {
             identity_discovered: false,
             live_transport: None,
             allow_transition_cr3: false,
+            allow_memory_writes: false,
             targets: Vec::new(),
             memory: None,
+            memory_writes: Vec::new(),
             vmwp_base: None,
             handler_context: None,
             scratch_allocated: false,
@@ -1216,6 +1254,7 @@ impl VmwpDispatcherState {
         live_transport: String,
         target: &TargetIdentity,
         allow_transition_cr3: bool,
+        allow_memory_writes: bool,
     ) -> Result<()> {
         if live_transport.trim().is_empty() {
             bail!("the live-memory transport command line is empty");
@@ -1230,6 +1269,7 @@ impl VmwpDispatcherState {
         self.identity_discovered = true;
         self.live_transport = Some(live_transport);
         self.allow_transition_cr3 = allow_transition_cr3;
+        self.allow_memory_writes = allow_memory_writes;
         Ok(())
     }
 
@@ -1241,7 +1281,102 @@ impl VmwpDispatcherState {
                     .context("the live-memory transport has not been bound")?,
                 target,
                 self.allow_transition_cr3,
+                self.allow_memory_writes,
             )?);
+        }
+        Ok(())
+    }
+
+    fn prepare_guarded_write_until(
+        &self,
+        write: &GuardedMemoryWrite,
+        deadline: Instant,
+    ) -> Result<PreparedMemoryWrite> {
+        if !self.allow_memory_writes {
+            bail!("Secure Kernel memory writes are disabled by startup policy");
+        }
+        if self.memory_writes.len() >= MAX_PENDING_MEMORY_WRITES {
+            bail!(
+                "a stopped session may retain at most {MAX_PENDING_MEMORY_WRITES} guarded writes"
+            );
+        }
+        let prepared = self
+            .memory
+            .as_ref()
+            .context("the live VTL1 memory source is absent")?
+            .prepare_guarded_write_until(write, deadline)?;
+        let start = prepared.address.0;
+        let end = start + prepared.original.len() as u64;
+        if self.memory_writes.iter().any(|earlier| {
+            let earlier_start = earlier.address.0;
+            let earlier_end = earlier_start + earlier.original.len() as u64;
+            start < earlier_end && earlier_start < end
+        }) {
+            bail!("guarded writes in one stop may not overlap");
+        }
+        Ok(prepared)
+    }
+
+    fn apply_guarded_write_until(
+        &mut self,
+        write: PreparedMemoryWrite,
+        deadline: Instant,
+    ) -> Result<AppliedMemoryWrite> {
+        if !self.vm_paused || !self.provider_writes_quiesced {
+            bail!("guarded memory mutation requires a proved VM-wide pause");
+        }
+        // Record rollback ownership before the first mutation attempt. A failed provider response
+        // is ambiguous about whether bytes landed, so recovery must restore this range too.
+        self.memory_writes.push(write.clone());
+        let memory = self
+            .memory
+            .as_ref()
+            .context("the live VTL1 memory source is absent")?;
+        memory.write_physical_until(write.gpa, &write.replacement, deadline)?;
+        memory.verify_virtual_until(
+            write.address,
+            &write.replacement,
+            "guarded live VTL1 write read-back",
+            deadline,
+        )?;
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            address = format_args!("{:#x}", write.address.0),
+            gpa = format_args!("{:#x}", write.gpa.0),
+            size = write.replacement.len(),
+            "live Secure Kernel control verified a guarded memory write"
+        );
+        Ok(AppliedMemoryWrite {
+            address: write.address,
+            gpa: write.gpa,
+            original: write.original,
+            replacement: write.replacement,
+        })
+    }
+
+    fn restore_memory_writes_until(&mut self, deadline: Option<Instant>) -> Result<()> {
+        while let Some(write) = self.memory_writes.last().cloned() {
+            require_completion_deadline(deadline)?;
+            let deadline = deadline.unwrap_or_else(|| Instant::now() + LIVE_MEMORY_WAIT);
+            let memory = self
+                .memory
+                .as_ref()
+                .context("the live VTL1 memory source is absent during rollback")?;
+            memory.write_physical_until(write.gpa, &write.original, deadline)?;
+            memory.verify_virtual_until(
+                write.address,
+                &write.original,
+                "guarded live VTL1 rollback read-back",
+                deadline,
+            )?;
+            self.memory_writes.pop();
+            tracing::info!(
+                target: "windbg_mcp::secure_kernel_mutation",
+                address = format_args!("{:#x}", write.address.0),
+                gpa = format_args!("{:#x}", write.gpa.0),
+                size = write.original.len(),
+                "live Secure Kernel control restored a guarded memory write"
+            );
         }
         Ok(())
     }
@@ -2018,7 +2153,12 @@ impl LiveGuestMemory {
         Ok(sk::Gpa(target.expected_cr3.0))
     }
 
-    fn open(command: &str, target: &TargetIdentity, allow_transition_cr3: bool) -> Result<Self> {
+    fn open(
+        command: &str,
+        target: &TargetIdentity,
+        allow_transition_cr3: bool,
+        allow_memory_writes: bool,
+    ) -> Result<Self> {
         let source = crate::livesrc::LiveSource::spawn(command)?;
         let provider = crate::livesrc::split_command(command)
             .into_iter()
@@ -2032,6 +2172,12 @@ impl LiveGuestMemory {
             "started the operator-authorized Secure Kernel memory provider"
         );
         let kernel_base = source.kernel_base();
+        if allow_memory_writes && source.guarded_write_capability().is_none() {
+            bail!(
+                "startup policy authorized Secure Kernel memory writes, but the live-memory \
+                 transport did not advertise bounded instruction-coherent writes"
+            );
+        }
         let shape = source.shape();
         let root = Self::initial_root(&shape, target, allow_transition_cr3)?;
         let space = Self::walk_space(&source, root, "walk")?;
@@ -2183,6 +2329,91 @@ impl LiveGuestMemory {
         })
     }
 
+    fn prepare_guarded_write_until(
+        &self,
+        write: &GuardedMemoryWrite,
+        deadline: Instant,
+    ) -> Result<PreparedMemoryWrite> {
+        write.validate()?;
+        let max_write = self
+            .source
+            .guarded_write_capability()
+            .context("the live-memory transport does not support guarded writes")?;
+        if write.replacement.len() > max_write {
+            bail!(
+                "the guarded write is {} bytes, exceeding the transport's {max_write}-byte limit",
+                write.replacement.len()
+            );
+        }
+        let address = write.address.0;
+        if (address & (sk::PAGE - 1)) + write.replacement.len() as u64 > sk::PAGE {
+            bail!("a guarded write must remain within one 4 KiB virtual page");
+        }
+        let gpa = self
+            .space
+            .translate(sk::Gva(address))
+            .with_context(|| format!("nothing in live VTL1 maps {address:#x}"))?;
+        if (gpa.0 & (sk::PAGE - 1)) + write.replacement.len() as u64 > sk::PAGE {
+            bail!("a guarded write must remain within one 4 KiB physical page");
+        }
+        let observed = self
+            .read_span_until(
+                sk::Gva(address),
+                write.expected.len(),
+                "guarded live VTL1 compare read",
+                Some(deadline),
+            )
+            .with_context(|| format!("comparing guarded VTL1 bytes at {address:#x}"))?;
+        if observed != write.expected {
+            bail!(
+                "guarded write compare failed at {address:#x}: expected {}, observed {}",
+                hex(&write.expected),
+                hex(&observed)
+            );
+        }
+        Ok(PreparedMemoryWrite {
+            address: write.address,
+            gpa: HexU64(gpa.0),
+            original: observed,
+            replacement: write.replacement.clone(),
+        })
+    }
+
+    fn write_physical_until(&self, gpa: HexU64, bytes: &[u8], deadline: Instant) -> Result<()> {
+        self.source.write_chunk_until_cancelled(
+            sk::Gpa(gpa.0),
+            bytes,
+            deadline,
+            crate::worker::kd_teardown_requested,
+        )
+    }
+
+    fn verify_virtual_until(
+        &self,
+        address: HexU64,
+        expected: &[u8],
+        operation: &str,
+        deadline: Instant,
+    ) -> Result<()> {
+        let observed = self
+            .read_span_until(
+                sk::Gva(address.0),
+                expected.len(),
+                operation,
+                Some(deadline),
+            )
+            .with_context(|| format!("reading live VTL1 at {:#x}", address.0))?;
+        if observed != expected {
+            bail!(
+                "{operation} mismatch at {:#x}: expected {}, observed {}",
+                address.0,
+                hex(expected),
+                hex(&observed)
+            );
+        }
+        Ok(())
+    }
+
     fn validate_kernel_base(&self, kernel_base: u64) -> Result<()> {
         if kernel_base & (sk::PAGE - 1) != 0 {
             bail!("live-memory source kernel_base must be page aligned");
@@ -2215,6 +2446,10 @@ impl LiveGuestMemory {
         }
         Ok(())
     }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02X}")).collect()
 }
 
 fn instruction_length(bytes: &[u8], address: u64) -> Option<usize> {
@@ -2520,6 +2755,22 @@ impl EventDispatcher for VmwpDispatcher<'_> {
             .read_instruction_until(address, Some(deadline))
     }
 
+    fn prepare_guarded_write_until(
+        &mut self,
+        write: &GuardedMemoryWrite,
+        deadline: Instant,
+    ) -> Result<PreparedMemoryWrite> {
+        self.state.prepare_guarded_write_until(write, deadline)
+    }
+
+    fn apply_guarded_write_until(
+        &mut self,
+        write: PreparedMemoryWrite,
+        deadline: Instant,
+    ) -> Result<AppliedMemoryWrite> {
+        self.state.apply_guarded_write_until(write, deadline)
+    }
+
     fn retained_pause_deadline(&self) -> Option<Instant> {
         self.state
             .wait_activity
@@ -2718,6 +2969,7 @@ impl VmwpDispatcher<'_> {
         if retained != event {
             bail!("post-event pause does not name the event held by the dispatcher");
         }
+        self.state.restore_memory_writes_until(deadline)?;
         self.complete_retained_event(event, deadline)?;
         self.pause_armed_without_event_inner(targets, deadline)?;
         self.state.recovery_deadline = None;
@@ -2732,6 +2984,7 @@ impl VmwpDispatcher<'_> {
         {
             bail!("release_paused requires a proved post-event VM pause");
         }
+        self.state.restore_memory_writes_until(deadline)?;
         require_completion_deadline(deadline)?;
         if self.state.breakpoint.is_some() {
             self.remove_owned_breakpoint()?;
@@ -2808,6 +3061,8 @@ impl VmwpDispatcher<'_> {
             }
             _ => {}
         }
+
+        self.state.restore_memory_writes_until(deadline)?;
 
         // A successful native unregister is irreversible. If its later deferred-cleanup sequence
         // failed, resume that recorded sequence before any generic breakpoint removal or detach;
@@ -2934,6 +3189,7 @@ impl VmwpDispatcher<'_> {
             return self.complete_event(ReleaseMode::Resume, deadline);
         }
 
+        self.state.restore_memory_writes_until(deadline)?;
         require_completion_deadline(deadline)?;
         if self.state.breakpoint.is_some() {
             self.remove_owned_breakpoint()?;
@@ -2956,6 +3212,9 @@ impl VmwpDispatcher<'_> {
     }
 
     fn finish_teardown(&mut self, deadline: Option<Instant>) -> Result<()> {
+        if !self.state.memory_writes.is_empty() {
+            bail!("refusing to finish teardown with guarded memory writes still applied");
+        }
         require_completion_deadline(deadline)?;
         if self.state.vm_paused {
             self.state.begin_vm_resume();
@@ -3167,6 +3426,7 @@ impl VmwpDispatcher<'_> {
                     .context("the live-memory transport has not been bound")?,
                 target,
                 self.state.allow_transition_cr3,
+                self.state.allow_memory_writes,
             )?);
         }
         self.verify_breakpoints(breakpoints)?;
@@ -3691,8 +3951,9 @@ impl VmwpDispatcher<'_> {
     }
 
     fn complete_event(&mut self, mode: ReleaseMode, deadline: Option<Instant>) -> Result<()> {
-        inject_live_debugger_loss_after_restore()?;
         require_completion_deadline(deadline)?;
+        self.state.restore_memory_writes_until(deadline)?;
+        inject_live_debugger_loss_after_restore()?;
         let event = self
             .state
             .retained_event
@@ -5398,6 +5659,7 @@ mod tests {
             target: target_request(),
             max_pause_ms: 600_000,
             allow_transition_cr3: false,
+            allow_memory_writes: false,
             additional_vps: vec![AdditionalVp {
                 control_transport: "provider --vp 1".into(),
                 target: additional,

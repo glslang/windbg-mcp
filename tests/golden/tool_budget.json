@@ -595,6 +595,15 @@
       "wire": 5319
     },
     {
+      "annotations": 142,
+      "description": 452,
+      "inputSchema": 848,
+      "modelVisible": 1361,
+      "name": "sk_live_write_memory",
+      "outputSchema": 1491,
+      "wire": 3025
+    },
+    {
       "annotations": 126,
       "description": 475,
       "inputSchema": 343,
@@ -722,15 +731,15 @@
     }
   ],
   "totals": {
-    "annotations": 8831,
-    "description": 47286,
-    "inputSchema": 74395,
+    "annotations": 8973,
+    "description": 47738,
+    "inputSchema": 75243,
     "instructions": 2022,
-    "modelVisible": 125938,
-    "outputSchema": 222827,
-    "payload": 359927,
-    "tools": 80,
-    "wire": 359836,
+    "modelVisible": 127299,
+    "outputSchema": 224318,
+    "payload": 362953,
+    "tools": 81,
+    "wire": 362861,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10296
   }

@@ -347,20 +347,20 @@ None of these is a bug. They are recorded because they were invisible, and
 
    | group | tools | bytes | share |
    |---|---:|---:|---:|
-   | `allocator` | 12 | 19,807 | 15.7% |
-   | `ioctl` | 11 | 16,088 | 12.8% |
-   | `securekernel` | 14 | 22,404 | 17.8% |
-   | `exec` | 10 | 15,087 | 12.0% |
-   | `session` | 10 | 14,208 | 11.3% |
-   | `inspect` | 10 | 13,485 | 10.7% |
-   | `batch` | 1 | 10,296 | 8.2% |
+   | `allocator` | 12 | 19,807 | 15.6% |
+   | `ioctl` | 11 | 16,088 | 12.6% |
+   | `securekernel` | 15 | 23,765 | 18.7% |
+   | `exec` | 10 | 15,087 | 11.9% |
+   | `session` | 10 | 14,208 | 11.2% |
+   | `inspect` | 10 | 13,485 | 10.6% |
+   | `batch` | 1 | 10,296 | 8.1% |
    | `crash` | 3 | 7,473 | 5.9% |
    | `ttd` | 9 | 7,090 | 5.6% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
    | *(absent)* | 66 | 103,534 |
-   | `all` | 80 | 125,938 |
+   | `all` | 81 | 127,299 |
    | `session,inspect,exec,crash` | 33 | 49,332 |
    | `session,inspect,crash` | 23 | 34,092 |
    | `crash` | 13 | 20,515 |
@@ -371,6 +371,11 @@ None of these is a bug. They are recorded because they were invisible, and
    reason, and one array comma. The existing 129,000 B model ceiling still has 3,062 B available;
    the 360,000 B wire ceiling has only 73 B, so another schema-bearing tool needs a surface
    reduction or an explicit ceiling decision.
+
+   M3's bounded `sk_live_write_memory` addition moves the complete surface to **81 tools and
+   127,299 B**. The new tool accounts for all 1,361 model-visible bytes. On the wire it adds a
+   3,025 B row plus the array comma, reaching **362,953 B**. The model ceiling remains 129,000 B;
+   the wire ceiling deliberately moves to 370,000 B, leaving 7,047 B (1.9%).
 
    **The two tables do not reconcile, and that is the point of item 41.** The first is each group's
    share of the whole surface; the second is what a spec actually serves, which is less — `crash`

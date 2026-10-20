@@ -28,6 +28,7 @@ const DR6_CAUSE_MASK: u64 = 0xe00f;
 const DR7_ENABLE_MASK: u64 = 0xff;
 const MAX_INSTRUCTION_BYTES: usize = 15;
 const MAX_HARDWARE_BREAKPOINTS: usize = 4;
+const MAX_GUARDED_WRITE_BYTES: usize = 64;
 pub(crate) const MAX_LIVE_CONTROL_VPS: usize = 16;
 const MAX_STEP_DESTINATIONS: usize = 4;
 const PROFILE_SCHEMA: &str = "windbg-mcp.sk-live-dispatcher-profile.v1";
@@ -246,6 +247,23 @@ pub(crate) trait EventDispatcher {
         _deadline: Instant,
     ) -> Result<InstructionGuard> {
         self.capture_instruction(address)
+    }
+    /// Compare a stopped virtual range and resolve its one-page physical destination without
+    /// changing target memory.
+    fn prepare_guarded_write_until(
+        &mut self,
+        _write: &GuardedMemoryWrite,
+        _deadline: Instant,
+    ) -> Result<PreparedMemoryWrite> {
+        bail!("this dispatcher does not support guarded live-memory writes")
+    }
+    /// Apply a prepared write, retain its original bytes for rollback, and prove read-back.
+    fn apply_guarded_write_until(
+        &mut self,
+        _write: PreparedMemoryWrite,
+        _deadline: Instant,
+    ) -> Result<AppliedMemoryWrite> {
+        bail!("this dispatcher does not support guarded live-memory writes")
     }
     fn retained_pause_deadline(&self) -> Option<Instant> {
         None
@@ -820,6 +838,71 @@ impl InstructionGuard {
     }
 }
 
+/// One compare-before-write request against the exact stopped address space.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GuardedMemoryWrite {
+    pub(crate) address: HexU64,
+    pub(crate) expected: Vec<u8>,
+    pub(crate) replacement: Vec<u8>,
+}
+
+impl GuardedMemoryWrite {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.address.0 == 0 {
+            bail!("a guarded write address must be nonzero");
+        }
+        if self.expected.is_empty()
+            || self.expected.len() > MAX_GUARDED_WRITE_BYTES
+            || self.expected.len() != self.replacement.len()
+        {
+            bail!(
+                "guarded write expected and replacement bytes must have the same length in 1..={MAX_GUARDED_WRITE_BYTES}"
+            );
+        }
+        if self.expected == self.replacement {
+            bail!("a guarded write must change at least one byte");
+        }
+        self.address
+            .0
+            .checked_add(self.expected.len() as u64)
+            .context("the guarded write crosses the address-space limit")?;
+        Ok(())
+    }
+}
+
+/// A compare-validated virtual write resolved to one physical page. It is private to the worker
+/// boundary and cannot be supplied by an MCP caller.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedMemoryWrite {
+    pub(crate) address: HexU64,
+    pub(crate) gpa: HexU64,
+    pub(crate) original: Vec<u8>,
+    pub(crate) replacement: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AppliedMemoryWrite {
+    pub(crate) address: HexU64,
+    pub(crate) gpa: HexU64,
+    pub(crate) original: Vec<u8>,
+    pub(crate) replacement: Vec<u8>,
+}
+
+/// A successful stopped write. The bytes remain controller-owned and are restored before any
+/// guest execution is released.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LiveMemoryWrite {
+    pub(crate) epoch: StopEpoch,
+    pub(crate) address: HexU64,
+    pub(crate) gpa: HexU64,
+    pub(crate) size: u32,
+    pub(crate) before: String,
+    pub(crate) after: String,
+    pub(crate) rollback_pending: bool,
+}
+
 /// Exact current instruction and the bounded RIP set accepted after one architectural step.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1266,6 +1349,86 @@ impl<P: ControlProvider> LiveControl<P> {
             bail!("VTL1 registers changed while the dispatcher event was held");
         }
         Ok(first)
+    }
+
+    /// Compare and replace a small stopped virtual range while retaining its original bytes for
+    /// unconditional rollback. The native event is first converted into a proved VM-wide pause,
+    /// so unselected VPs cannot fetch or alter the range during the transaction.
+    pub(crate) fn guarded_write_until(
+        &mut self,
+        dispatcher: &mut impl EventDispatcher,
+        epoch: &StopEpoch,
+        write: GuardedMemoryWrite,
+        deadline: Instant,
+    ) -> Result<LiveMemoryWrite> {
+        write.validate()?;
+        self.require_stop_epoch(epoch)?;
+        let active = self
+            .active_provider
+            .context("the stopped session has no active VP provider")?;
+        self.providers[active]
+            .provider
+            .set_outer_deadline(Some(deadline));
+
+        if let Some(event) = self.dispatcher_event.clone() {
+            let targets = self.targets();
+            let quiesced = (|| {
+                match self.providers[active].provider_phase {
+                    ProviderPhase::Stopped => self.providers[active].provider.release()?,
+                    ProviderPhase::Arming => {}
+                    ProviderPhase::Running => bail!("the active provider is already running"),
+                }
+                self.providers[active].provider_phase = ProviderPhase::Running;
+                dispatcher.release_event_and_pause_until(&event, &targets, deadline)?;
+                if !dispatcher.provider_writes_quiesced() {
+                    bail!("the dispatcher did not prove a VM-wide pause for a guarded write");
+                }
+                self.providers[active].provider.begin_arm()?;
+                self.providers[active].provider_phase = ProviderPhase::Arming;
+                Ok(())
+            })();
+            if let Err(error) = quiesced {
+                self.providers[active].provider.set_outer_deadline(None);
+                return Err(self.enter_fault_inner(dispatcher, error, Some(event), Some(deadline)));
+            }
+            self.dispatcher_event = None;
+        }
+        if !dispatcher.provider_writes_quiesced() {
+            self.providers[active].provider.set_outer_deadline(None);
+            return Err(self.enter_fault_inner(
+                dispatcher,
+                anyhow!("guarded memory write lacks a proved VM-wide pause"),
+                None,
+                Some(deadline),
+            ));
+        }
+
+        // A stale compare is a correctable refusal: no bytes have changed and the exact stop
+        // remains available. Only failures after apply begins enter fail-closed recovery.
+        let prepared = match dispatcher.prepare_guarded_write_until(&write, deadline) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.providers[active].provider.set_outer_deadline(None);
+                return Err(error);
+            }
+        };
+        let applied = match dispatcher.apply_guarded_write_until(prepared, deadline) {
+            Ok(applied) => applied,
+            Err(error) => {
+                self.providers[active].provider.set_outer_deadline(None);
+                return Err(self.enter_fault_inner(dispatcher, error, None, Some(deadline)));
+            }
+        };
+        self.providers[active].provider.set_outer_deadline(None);
+        Ok(LiveMemoryWrite {
+            epoch: epoch.clone(),
+            address: applied.address,
+            gpa: applied.gpa,
+            size: applied.original.len() as u32,
+            before: hex_bytes(&applied.original),
+            after: hex_bytes(&applied.replacement),
+            rollback_pending: true,
+        })
     }
 
     #[cfg(test)]
@@ -2934,6 +3097,10 @@ impl<P: ControlProvider> LiveControl<P> {
     }
 }
 
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02X}")).collect()
+}
+
 fn require_registers(
     capabilities: &Capabilities,
     registers: &[RegisterName],
@@ -3257,6 +3424,8 @@ mod tests {
         FinishArm,
         Verify(InstructionGuard),
         Capture(u64),
+        PrepareWrite(u64),
+        ApplyWrite(u64),
         Wait,
         EstablishRecoveryPause,
         Release(ReleaseMode),
@@ -3391,6 +3560,34 @@ mod tests {
             Ok(InstructionGuard {
                 address: HexU64(address),
                 bytes: vec![0x90],
+            })
+        }
+
+        fn prepare_guarded_write_until(
+            &mut self,
+            write: &GuardedMemoryWrite,
+            _deadline: Instant,
+        ) -> Result<PreparedMemoryWrite> {
+            self.actions.push(Action::PrepareWrite(write.address.0));
+            Ok(PreparedMemoryWrite {
+                address: write.address,
+                gpa: HexU64(write.address.0 & 0x000f_ffff_ffff_ffff),
+                original: write.expected.clone(),
+                replacement: write.replacement.clone(),
+            })
+        }
+
+        fn apply_guarded_write_until(
+            &mut self,
+            write: PreparedMemoryWrite,
+            _deadline: Instant,
+        ) -> Result<AppliedMemoryWrite> {
+            self.actions.push(Action::ApplyWrite(write.address.0));
+            Ok(AppliedMemoryWrite {
+                address: write.address,
+                gpa: write.gpa,
+                original: write.original,
+                replacement: write.replacement,
             })
         }
 
@@ -3592,6 +3789,54 @@ mod tests {
                 Action::Release(ReleaseMode::Resume),
             ]
         );
+    }
+
+    #[test]
+    fn guarded_write_converts_the_retained_event_to_a_vm_pause_and_keeps_the_epoch() {
+        let mut dispatcher =
+            FakeDispatcher::new([observed(StopReason::HardwareBreakpoint { slot: 0 })]);
+        let mut control = LiveControl::open(FakeProvider::new()).unwrap();
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Natural)
+            .unwrap();
+        let stop = control.wait_for_stop(&mut dispatcher).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+
+        let written = control
+            .guarded_write_until(
+                &mut dispatcher,
+                &stop.epoch,
+                GuardedMemoryWrite {
+                    address: HexU64(TARGET_RIP),
+                    expected: vec![0x90],
+                    replacement: vec![0xcc],
+                },
+                deadline,
+            )
+            .unwrap();
+
+        assert_eq!(written.epoch, stop.epoch);
+        assert_eq!(written.before, "90");
+        assert_eq!(written.after, "CC");
+        assert!(written.rollback_pending);
+        assert!(matches!(control.state, State::Stopped(_)));
+        assert_eq!(control.providers[0].provider_phase, ProviderPhase::Arming);
+        assert!(control.dispatcher_event.is_none());
+        assert_eq!(
+            dispatcher.actions,
+            vec![
+                Action::BeginArm,
+                Action::FinishArm,
+                Action::Wait,
+                Action::ReleaseAndPause,
+                Action::PrepareWrite(TARGET_RIP),
+                Action::ApplyWrite(TARGET_RIP),
+            ]
+        );
+
+        control.continue_from(&mut dispatcher, &stop.epoch).unwrap();
+        assert_eq!(dispatcher.actions.last(), Some(&Action::ReleasePaused));
+        assert_eq!(control.phase(), LivePhase::Running);
     }
 
     #[test]

@@ -136,7 +136,7 @@ first `sk_live_arm` pauses the VM,
 validates the VM-to-`vmwp` binding, live-memory CR3, guarded instructions and local `vmwp.exe`
 build, and proceeds to register or breakpoint mutation only after those checks pass.
 
-Eight tools drive that session after the open:
+Nine tools drive that session after the open:
 
 - `sk_live_arm` saves every selected VP's baseline and installs one to four guarded execution
   breakpoints on each. Each address carries the exact live instruction bytes expected there.
@@ -152,6 +152,10 @@ Eight tools drive that session after the open:
 - `sk_live_registers` returns that retained stop record without changing it, and
   `sk_live_read_memory` reads VTL1 virtual memory only while the stop remains held. The memory answer
   is tied to the same epoch and includes its starting GPA.
+- `sk_live_write_memory` optionally compares and replaces 1–64 bytes within one mapped page. It
+  requires both startup-policy authority and a transport advertising bounded instruction-coherent
+  writes. The stop epoch remains held, the original bytes remain rollback-owned, and every path
+  which would resume, step, fault or tear down restores and verifies them first.
 - `sk_live_step` consumes the current stop epoch, proves the current instruction and its bounded
   destinations, and arms the next trap. Collect that stop with `sk_live_wait`.
 - `sk_live_continue_to_breakpoints` atomically replaces the guarded breakpoint set while consuming
@@ -161,7 +165,8 @@ Eight tools drive that session after the open:
 
 Ordinary debugger tools are refused on this session because its DbgEng target is the host's
 `vmwp`, not the guest Secure Kernel. Public epochs are scoped to one controller and every mutating
-stopped operation rejects a stale epoch. Reads and register writes are refused while running.
+stopped operation rejects a stale epoch. Reads, guarded memory writes and register writes are
+refused while running.
 
 Teardown is fail-closed. A confirmed `end_session` restores every selected VP, completes any owned
 event through the native dispatcher, removes the temporary handler, detaches from `vmwp` and leaves
