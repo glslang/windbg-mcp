@@ -167,16 +167,30 @@ controller can run its proved recovery before release.
 
 Offline tests cover a transient hit, the job and result-publication race bindings, a natural
 breakpoint winning the request race, an already-stopped refusal that preserves its epoch, and
-no-hit recovery with exact baseline restoration.
+no-hit recovery with exact baseline restoration. The request reader is the race's linearization
+point:
+
+| First fact observed | Break result |
+|---|---|
+| An active `sk_live_wait` claim | Bound to that job; both calls return its exact stop epoch |
+| A natural stop while the bound request is waking the wait | The same retained stop with `hardware_breakpoint`; no transient reason is invented |
+| The bound wait's timeout or recovery failure | The same error category and cause, plus a note that no second rendezvous ran |
+| A retained stop after the wait claim was released | Direct already-stopped refusal; the retained epoch is unchanged |
+| `end_session` read first | `stale_session` refusal from the reader; no interrupt or target mutation occurs |
+
+If the break is read first, it is accepted and teardown later releases whatever stop it produces.
+If teardown is read first, teardown wins and the break is refused. A second break cannot replace a
+request already bound to the wait; it queues normally and observes the stopped or faulted state
+left by the first.
 
 M2 implementation slices:
 
 1. **Direct rendezvous — complete:** add the guarded transient-break operation and its typed stop
    reason.
-2. **Job-bound wake — complete offline:** route a break request racing `sk_live_wait` to that exact wait, never the
-   operation before or after it.
-3. **Race contract:** distinguish natural stop won, already stopped, teardown, timeout and request
-   accepted outcomes without consuming a retained epoch accidentally.
+2. **Job-bound wake — complete offline:** route a break request racing `sk_live_wait` to that
+   exact wait, never the operation before or after it.
+3. **Race contract — complete offline:** distinguish natural stop won, already stopped, teardown,
+   timeout and request-accepted outcomes without consuming a retained epoch accidentally.
 4. **Live qualification:** repeat running, already-stopped, timeout and teardown races across clean
    boots, with final debug-state, attachment, VM identity and uptime audits.
 
