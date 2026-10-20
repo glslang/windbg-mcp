@@ -2742,7 +2742,11 @@ impl WindbgServer {
     /// at the front of the session's own queue is whether the handle survived work queued ahead
     /// of it, and that is `engine::Gate`'s job.
     async fn run_call(&self, session_id: Option<&str>, call: Call) -> Result<Output, EngineError> {
-        let session = self.sessions.resolve(session_id)?;
+        let session = if call.is_live_break() {
+            self.sessions.resolve_for_live_break(session_id)?
+        } else {
+            self.sessions.resolve(session_id)?
+        };
         self.sessions
             .call(&session, call.named(session_id.is_some()))
             .await
