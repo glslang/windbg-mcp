@@ -332,8 +332,12 @@ impl Session {
             true,
             Some((self.dispatcher.vmwp_pid, found.partition_handle)),
         )?;
-        self.dispatcher
-            .bind_identity(found, live_transport, &target)?;
+        self.dispatcher.bind_identity(
+            found,
+            live_transport,
+            &target,
+            pending.allow_transition_cr3,
+        )?;
         let mut providers = vec![provider];
         let mut skipped = skipped
             .into_iter()
@@ -646,7 +650,13 @@ impl Session {
     }
 
     pub(crate) fn close(&mut self, engine: &DebugEngine) -> Result<()> {
-        self.close_inner(engine, None)
+        // A caller-facing teardown needs its own bound even while no retained stop lends it one.
+        // The supervisor waits slightly longer than this reserve so the worker can report either
+        // proved release or a fail-closed error instead of becoming an unresolved operation at
+        // the supervisor's shorter ordinary-session deadline.
+        let now = Instant::now();
+        let deadline = now.checked_add(CLEANUP_RESERVE).unwrap_or(now);
+        self.close_inner(engine, Some(deadline))
     }
 
     pub(crate) fn close_until(&mut self, engine: &DebugEngine, deadline: Instant) -> Result<()> {
@@ -1048,6 +1058,7 @@ pub(crate) struct VmwpDispatcherState {
     discovered_identity: Option<DiscoveredIdentity>,
     identity_discovered: bool,
     live_transport: Option<String>,
+    allow_transition_cr3: bool,
     targets: Vec<TargetIdentity>,
     memory: Option<LiveGuestMemory>,
     vmwp_base: Option<u64>,
@@ -1103,6 +1114,7 @@ impl VmwpDispatcherState {
             discovered_identity: None,
             identity_discovered: false,
             live_transport: None,
+            allow_transition_cr3: false,
             targets: Vec::new(),
             memory: None,
             vmwp_base: None,
@@ -1147,6 +1159,7 @@ impl VmwpDispatcherState {
         found: DiscoveredIdentity,
         live_transport: String,
         target: &TargetIdentity,
+        allow_transition_cr3: bool,
     ) -> Result<()> {
         if live_transport.trim().is_empty() {
             bail!("the live-memory transport command line is empty");
@@ -1160,6 +1173,7 @@ impl VmwpDispatcherState {
         self.discovered_identity = Some(found);
         self.identity_discovered = true;
         self.live_transport = Some(live_transport);
+        self.allow_transition_cr3 = allow_transition_cr3;
         Ok(())
     }
 
@@ -1170,6 +1184,7 @@ impl VmwpDispatcherState {
                     .as_deref()
                     .context("the live-memory transport has not been bound")?,
                 target,
+                self.allow_transition_cr3,
             )?);
         }
         Ok(())
@@ -1838,7 +1853,27 @@ impl RawSource for DeadlineLiveSource<'_> {
 }
 
 impl LiveGuestMemory {
-    fn open(command: &str, target: &TargetIdentity) -> Result<Self> {
+    fn initial_root(
+        shape: &sk::GuestShape,
+        target: &TargetIdentity,
+        allow_transition_cr3: bool,
+    ) -> Result<sk::Gpa> {
+        let source_root = sk::walkable(shape)
+            .map_err(|why| anyhow!("live-memory source is not walkable: {why:?}"))?;
+        if source_root.0 != target.expected_cr3.0 && !allow_transition_cr3 {
+            bail!(
+                "live-memory source CR3 {:?} does not match the bound CR3 {:#x}",
+                shape.cr3,
+                target.expected_cr3.0
+            );
+        }
+        // The memory transport advertises the canonical Secure Kernel root, while a transition
+        // provider may currently be stopped in a trustlet root. Physical reads support either;
+        // breakpoint validation must start in the provider's paused address space.
+        Ok(sk::Gpa(target.expected_cr3.0))
+    }
+
+    fn open(command: &str, target: &TargetIdentity, allow_transition_cr3: bool) -> Result<Self> {
         let source = crate::livesrc::LiveSource::spawn(command)?;
         let provider = crate::livesrc::split_command(command)
             .into_iter()
@@ -1853,15 +1888,7 @@ impl LiveGuestMemory {
         );
         let kernel_base = source.kernel_base();
         let shape = source.shape();
-        if shape.cr3 != Some(target.expected_cr3.0) {
-            bail!(
-                "live-memory source CR3 {:?} does not match the bound CR3 {:#x}",
-                shape.cr3,
-                target.expected_cr3.0
-            );
-        }
-        let root = sk::walkable(&shape)
-            .map_err(|why| anyhow!("live-memory source is not walkable: {why:?}"))?;
+        let root = Self::initial_root(&shape, target, allow_transition_cr3)?;
         let space = Self::walk_space(&source, root, "walk")?;
         let memory = Self {
             source,
@@ -2922,6 +2949,7 @@ impl VmwpDispatcher<'_> {
                     .as_deref()
                     .context("the live-memory transport has not been bound")?,
                 target,
+                self.state.allow_transition_cr3,
             )?);
         }
         self.verify_breakpoints(breakpoints)?;
@@ -5019,6 +5047,24 @@ mod tests {
     }
 
     #[test]
+    fn session_close_is_bounded_by_the_cleanup_reserve() {
+        let source = include_str!("skdispatch.rs").replace("\r\n", "\n");
+        let body = source
+            .split_once("pub(crate) fn close(&mut self, engine: &DebugEngine) -> Result<()> {\n")
+            .expect("the session close method exists")
+            .1
+            .split_once("\n    }")
+            .expect("the session close method ends")
+            .0;
+
+        assert!(body.contains("checked_add(CLEANUP_RESERVE)"), "{body}");
+        assert!(
+            body.contains("self.close_inner(engine, Some(deadline))"),
+            "{body}"
+        );
+    }
+
+    #[test]
     fn dispatcher_completion_reuses_the_absolute_pause_deadline() {
         let deadline = Instant::now() + Duration::from_secs(10);
         assert_eq!(completion_wait_deadline(Some(deadline)), deadline);
@@ -5658,6 +5704,39 @@ mod tests {
             vp: target.vp,
             expected_cr3: Some(target.expected_cr3),
         }
+    }
+
+    #[test]
+    fn strict_memory_binding_rejects_a_different_source_root() {
+        let shape = sk::GuestShape {
+            cr3: Some(0x220_1000),
+            ..sk::GuestShape::default()
+        };
+
+        let error = LiveGuestMemory::initial_root(&shape, &target(), false).unwrap_err();
+
+        assert!(error.to_string().contains("does not match the bound CR3"));
+    }
+
+    #[test]
+    fn transition_memory_binding_starts_in_the_paused_provider_root() {
+        let shape = sk::GuestShape {
+            cr3: Some(0x220_1000),
+            ..sk::GuestShape::default()
+        };
+
+        assert_eq!(
+            LiveGuestMemory::initial_root(&shape, &target(), true).unwrap(),
+            sk::Gpa(target().expected_cr3.0)
+        );
+    }
+
+    #[test]
+    fn transition_memory_binding_still_requires_a_walkable_source() {
+        let error =
+            LiveGuestMemory::initial_root(&sk::GuestShape::default(), &target(), true).unwrap_err();
+
+        assert!(error.to_string().contains("source is not walkable"));
     }
 
     fn profile() -> DispatcherProfile {

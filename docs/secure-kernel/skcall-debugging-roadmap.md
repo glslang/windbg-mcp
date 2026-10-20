@@ -99,7 +99,7 @@ same authority and cleanup boundaries.
 
 ### M1 — repeatable VTL1 run/break/run
 
-Status: in progress as of 2026-10-19.
+Status: complete as of 2026-10-20.
 
 Deliver a direct MCP loop over natural hardware execute breakpoints. The first qualification
 surface accepts exactly one selected VP; re-arming a multi-VP session needs a new VM-wide
@@ -127,6 +127,21 @@ Live qualification uses a build-guarded site reached by a deterministic guest ac
 - K3 uptime/identity unchanged, no unexpected reset, and no retained `vmwp` debugger attachment.
 
 Only after those checks may the KD facade translate WinDbg `g` into this path.
+
+Qualification record (machine-local raw evidence under ignored `target/` paths):
+
+- `target/codex-m1/forced-teardown-probes/20261020T135835` proved teardown from a
+  naturally held `KiSystemCall64` stop: the provider baseline and event were released, the worker
+  was terminated, and K3 was left running.
+- `target/codex-m1/m1-qualification/20261020T135928` passed 300/300 transitions: 100 cycles on
+  each of three clean boots, with distinct `vmwp` processes, partition ids, Secure Kernel bases
+  and guest boot times.
+- Boot 1 passed stale-epoch, stale-byte and no-hit timeout cases. Boot 2 passed forced teardown.
+  Every cycle ended with exact DR0-DR3, DR6, DR7 and RFLAGS restoration, released ownership and a
+  running target. No boot reset or retained `vmwp` debugger attachment was observed.
+- The fixed VHDX length remained 13,281,263,616 bytes. Runtime free-space changes followed the
+  running VM's memory state and were reclaimed by the clean-boot shutdowns; the qualification did
+  not grow the disk image.
 
 ### M2 — break on demand
 
@@ -206,5 +221,5 @@ $env:WINDBG_MCP_SMOKE_SK_LIVE = '<private live config path>'
 cargo test --test mcp_smoke a_live_secure_kernel_session_stops_steps_inspects_resumes_and_closes -- --ignored --exact --nocapture
 ```
 
-Passing offline tests proves state-machine behavior, not live safety. M1 remains incomplete until
-the recorded live matrix passes.
+Passing offline tests proves state-machine behavior, not live safety. M1's live-safety gate is the
+recorded qualification matrix above; later milestones need their own live evidence.
