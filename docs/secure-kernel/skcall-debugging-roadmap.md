@@ -145,7 +145,7 @@ Qualification record (machine-local raw evidence under ignored `target/` paths):
 
 ### M2 — break on demand
 
-Status: in progress as of 2026-10-20.
+Status: complete as of 2026-10-20.
 
 Add a target-side break request that can stop a naturally running VTL1 session without depending
 on a preselected code address. First prove the exact build's supported request path; if none exists,
@@ -187,12 +187,28 @@ M2 implementation slices:
 
 1. **Direct rendezvous — complete:** add the guarded transient-break operation and its typed stop
    reason.
-2. **Job-bound wake — complete offline:** route a break request racing `sk_live_wait` to that
+2. **Job-bound wake — complete:** route a break request racing `sk_live_wait` to that
    exact wait, never the operation before or after it.
-3. **Race contract — complete offline:** distinguish natural stop won, already stopped, teardown,
+3. **Race contract — complete:** distinguish natural stop won, already stopped, teardown,
    timeout and request-accepted outcomes without consuming a retained epoch accidentally.
-4. **Live qualification:** repeat running, already-stopped, timeout and teardown races across clean
-   boots, with final debug-state, attachment, VM identity and uptime audits.
+4. **Live qualification — complete:** repeat running, already-stopped, timeout and teardown races
+   on one live boot, with final debug-state, attachment, VM identity and uptime audits.
+
+Qualification record (machine-local raw evidence under ignored `target/` paths):
+
+- `target/codex-m2/live-qualification/20261020T173513` passed the concurrent break, timeout,
+  teardown and complete debug-state audit on K3.
+- The concurrent request interrupted its exact owned wait and both callers received the same
+  `break_request` stop epoch. A second request refused the retained stop without replacing it,
+  after which continue and teardown released the session normally.
+- The timeout case entered fail-closed recovery, refused a later break against the faulted
+  control, and ended with the target running. In the teardown-first race, teardown interrupted
+  its exact wait and the later break returned `stale_session` without filing an interrupt or
+  starting a target-side rendezvous.
+- DR0–DR3, DR6, DR7 and the complete RFLAGS value exactly matched the pre-test baseline. The VM
+  remained running with a healthy heartbeat, the same `vmwp` PID and the same immutable
+  Kernel-General boot-event identity while Hyper-V uptime advanced. The audit deliberately uses
+  that boot event because `Win32_OperatingSystem.LastBootUpTime` moves after Hyper-V pauses.
 
 ### M3 — optional guarded writes and software breakpoints
 
