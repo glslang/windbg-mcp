@@ -2179,6 +2179,10 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// surface moves 123,368 -> 125,448 B across 78 -> 79 tools. The new tool is the complete 2,080 B
 /// difference: it carries an epoch plus one to four exact instruction guards, and no other model
 /// row moved. The new ceiling leaves 3,552 B (2.8%).
+///
+/// **M2 direct break stays under 129,000** (2026-10-20). `sk_live_break` adds 490 B and moves the
+/// surface 125,448 -> 125,938 B across 79 -> 80 tools. The ceiling therefore does not move; 3,062 B
+/// (2.4%) remain.
 const MODEL_VISIBLE_CEILING: usize = 129_000;
 
 /// Ceiling on the whole `tools/list` payload — the serialized result, not the sum of its tools, so
@@ -2342,6 +2346,11 @@ const MODEL_VISIBLE_CEILING: usize = 129_000;
 /// payload moves 350,674 -> 354,262 B: the new tool is 3,587 B and the remaining byte is the array
 /// comma. Its output reuses `LiveTransition`; the additional wire cost is one input schema rather
 /// than a shared-output multiplication. The new ceiling leaves 5,738 B (1.6%).
+///
+/// **M2 direct break stays under 360,000** (2026-10-20). The payload moves 354,262 -> 359,927 B:
+/// the new tool is 5,242 B, the new stop-reason variant adds 211 B to each of `sk_live_wait` and
+/// `sk_live_registers`, and the array adds one comma. This leaves 73 B; the next schema-bearing
+/// tool must shrink the surface or deliberately revise the ceiling.
 const WIRE_CEILING: usize = 360_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,296
@@ -3494,6 +3503,7 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
             "error",
         ),
         ("sk_live_wait", json!({}), "error"),
+        ("sk_live_break", json!({}), "error"),
         ("sk_live_registers", json!({}), "error"),
         (
             "sk_live_read_memory",
@@ -4649,7 +4659,7 @@ fn a_listener_serves_the_narrowed_surface_it_was_started_with() {
     // was typed — `session` is added whatever it said.
     let log = listener.stderr();
     assert!(
-        log.contains("serving 13 of 79 tools (session, crash)"),
+        log.contains("serving 13 of 80 tools (session, crash)"),
         "the listener does not report the surface it ended up with: {log}"
     );
 }
@@ -4681,7 +4691,7 @@ fn two_clients_on_one_listener_are_served_two_surfaces() {
     let local_token = server.token.clone();
     assert!(
         server.wait_for_stderr(
-            "serving 20 of 79 tools (session, inspect) — except bench serves 13 of 79 tools \
+            "serving 20 of 80 tools (session, inspect) — except bench serves 13 of 80 tools \
              (session, crash)",
             Duration::from_secs(30)
         ),

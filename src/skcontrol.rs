@@ -324,6 +324,10 @@ pub(crate) enum StopReason {
     HardwareBreakpoint {
         slot: u8,
     },
+    /// A target-side break request planted a transient execute breakpoint at the paused RIP.
+    BreakRequest {
+        slot: u8,
+    },
     SingleStep,
     /// A CR3 write was carried to its linear successor with a temporary execute breakpoint.
     StepOver {
@@ -367,7 +371,9 @@ impl HeldEvent {
         }
         if matches!(
             self.reason,
-            StopReason::HardwareBreakpoint { slot } | StopReason::StepOver { slot, .. }
+            StopReason::HardwareBreakpoint { slot }
+                | StopReason::BreakRequest { slot }
+                | StopReason::StepOver { slot, .. }
                 if slot > 3
         ) {
             bail!("hardware breakpoint slot must be in 0..=3");

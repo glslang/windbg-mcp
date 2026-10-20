@@ -116,6 +116,9 @@ pub enum EngineOp {
     },
     /// Pump the existing `vmwp` dispatcher until it holds the exact owned vector-1 event.
     SkLiveWait,
+    /// Pause the selected VP, plant a transient guarded execute breakpoint at its measured RIP,
+    /// and retain the resulting vector-1 event through the ordinary live wait path.
+    SkLiveBreak,
     /// Re-read the complete evidence retained for the current stop without touching the target.
     SkLiveRegisters,
     /// Read live VTL1 through the validated page-table walk while the named stop is held.

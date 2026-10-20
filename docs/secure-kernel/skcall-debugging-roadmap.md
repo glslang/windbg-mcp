@@ -145,6 +145,8 @@ Qualification record (machine-local raw evidence under ignored `target/` paths):
 
 ### M2 — break on demand
 
+Status: in progress as of 2026-10-20.
+
 Add a target-side break request that can stop a naturally running VTL1 session without depending
 on a preselected code address. First prove the exact build's supported request path; if none exists,
 use a guarded transient hardware-breakpoint strategy with a bounded rendezvous. The request must be
@@ -153,6 +155,24 @@ cross-thread DbgEng exception.
 
 Exit: break requests in running, already-stopped, teardown and timeout races each have a unique,
 tested result and restore the complete baseline.
+
+The first implementation slice adds direct `sk_live_break`: for one naturally armed VP it proves
+a VM pause, samples RIP/CR3, guards a transient execute breakpoint at that instruction and reuses
+the ordinary bounded vector-1 wait. Offline tests cover a transient hit, a natural breakpoint
+winning the race, an already-stopped refusal that preserves its epoch, and no-hit recovery with
+exact baseline restoration. It is not yet the concurrent request path: an already-running
+`sk_live_wait` still needs a job-bound wake reason that uses the existing scoped `SetInterrupt`
+solely to leave the host wait before the engine thread performs this target-side transition.
+
+M2 implementation slices:
+
+1. **Direct rendezvous:** add the guarded transient-break operation and its typed stop reason.
+2. **Job-bound wake:** route a break request racing `sk_live_wait` to that exact wait, never the
+   operation before or after it.
+3. **Race contract:** distinguish natural stop won, already stopped, teardown, timeout and request
+   accepted outcomes without consuming a retained epoch accidentally.
+4. **Live qualification:** repeat running, already-stopped, timeout and teardown races across clean
+   boots, with final debug-state, attachment, VM identity and uptime audits.
 
 ### M3 — optional guarded writes and software breakpoints
 

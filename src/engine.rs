@@ -831,6 +831,7 @@ fn refuse_op_on_kind(kind: SessionKind, op: &EngineOp) -> Option<String> {
         EngineOp::OpenSecureKernelLive(_)
             | EngineOp::SkLiveArm { .. }
             | EngineOp::SkLiveWait
+            | EngineOp::SkLiveBreak
             | EngineOp::SkLiveRegisters
             | EngineOp::SkLiveRead { .. }
             | EngineOp::SkLiveStep { .. }
@@ -5810,6 +5811,7 @@ mod tests {
             .expect("the fixture epoch is valid");
         let live_ops = [
             EngineOp::SkLiveWait,
+            EngineOp::SkLiveBreak,
             EngineOp::SkLiveRegisters,
             EngineOp::SkLiveRead {
                 address: 0xfffff80000000000,
