@@ -475,13 +475,15 @@ partial output at the price of an invariant nobody could see from the type.
 explicit about, because the rule is otherwise absolute and the code visibly departs from it.
 `SetInterrupt` is the one DbgEng entry point Microsoft documents as safe from any thread; it is the
 only call this server makes off the engine thread. Ordinary MCP workers route it through
-`worker::interrupt_running` on the request reader. The native Secure Kernel KD role also uses the
-same narrow handle from its pipe reader, but only while an atomic `WaitActivity` proves the engine
-thread is inside the owned vmwp event wait. Reset, disconnect, Ctrl+Break and idle expiry therefore
-cancel that wait and enter the existing fail-closed recovery instead of leaving the VM running
-behind an unread pipe. The reader receives no engine, dispatcher or provider object. The engine is
-still created on the engine thread, never sent anywhere, and every other call is made there. The
-exception is unavoidable rather than convenient: an interrupt
+`worker::interrupt_running` on the request reader. M2's live Secure Kernel break request uses the
+same handle only while a job-bound `WaitActivity` proves that exact `sk_live_wait` is inside the
+owned vmwp event wait; the reader records a wake reason, and the engine thread alone performs the
+VM pause, provider writes and target-side rendezvous. The native Secure Kernel KD role likewise
+uses the handle from its pipe reader only during its atomic owned wait. Reset, disconnect,
+Ctrl+Break and idle expiry therefore cancel that wait and enter the existing fail-closed recovery
+instead of leaving the VM running behind an unread pipe. The reader receives no engine, dispatcher
+or provider object. The engine is still created on the engine thread, never sent anywhere, and
+every other call is made there. The exception is unavoidable rather than convenient: an interrupt
 exists to stop an operation that is *running*, so the engine thread is busy by definition, and a
 request routed through it would be read only once there was nothing left to interrupt — the
 alternative is not a safer interrupt but no interrupt. It is also not new. dbgscope's two watchdogs

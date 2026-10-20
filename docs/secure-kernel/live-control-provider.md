@@ -216,8 +216,10 @@ proved VM pause to keep provider state stable:
    pause, samples the current RIP and CR3, decodes and records the exact instruction bytes, uses a
    free hardware slot or temporarily replaces one owned slot, and resumes into the ordinary owned
    vector-1 wait. A transient hit reports `break_request`; an already-armed breakpoint that wins
-   the race keeps its `hardware_breakpoint` reason. This first slice is synchronous and does not
-   yet wake an in-flight `sk_live_wait`.
+   the race keeps its `hardware_breakpoint` reason. If `sk_live_wait` is already inside its owned
+   DbgEng wait, the request reader binds the request to that exact job and uses scoped
+   `SetInterrupt` only to return control to the engine thread; the engine thread then performs the
+   pause and target-side rendezvous. Both callers receive the same retained stop epoch.
 5. `sk_live_registers` and `sk_live_read_memory` inspect only that stopped epoch. The memory path
    uses the validated stop CR3 and refuses an unmapped range whole.
 6. `sk_live_step` consumes the stopped epoch once and clears the original hardware breakpoint.

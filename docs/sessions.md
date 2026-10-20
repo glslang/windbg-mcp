@@ -146,8 +146,9 @@ Eight tools drive that session after the open:
   stop record carries the target and event identity, two-read register evidence, guarded instruction,
   accepted next addresses, arm mode and a new opaque epoch.
 - `sk_live_break` pauses one naturally armed VP, captures and guards its current instruction,
-  installs a transient hardware breakpoint, and resumes into the same bounded event wait. This
-  first M2 slice is a direct operation; it does not yet wake an already-running `sk_live_wait`.
+  installs a transient hardware breakpoint, and resumes into the same bounded event wait. If an
+  ordinary `sk_live_wait` is already in DbgEng, the break request wakes only that job; all target
+  mutation still runs on the engine thread, and both calls return the same retained stop epoch.
 - `sk_live_registers` returns that retained stop record without changing it, and
   `sk_live_read_memory` reads VTL1 virtual memory only while the stop remains held. The memory answer
   is tied to the same epoch and includes its starting GPA.
