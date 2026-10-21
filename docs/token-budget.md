@@ -342,25 +342,25 @@ None of these is a bug. They are recorded because they were invisible, and
    and, since item 41, for the sentences the tools it keeps used to spend on pointing at them.
    Where the bytes sit, and what each profile costs:
 
-   Both tables are measurements of **2026-10-20** and move with any edit to a description. The
+   Both tables are measurements of **2026-10-21** and move with any edit to a description. The
    `securekernel` row is an extra group: the absent spec omits it, while `all` includes it.
 
    | group | tools | bytes | share |
    |---|---:|---:|---:|
-   | `allocator` | 12 | 19,807 | 15.6% |
-   | `ioctl` | 11 | 16,088 | 12.6% |
-   | `securekernel` | 15 | 23,765 | 18.7% |
-   | `exec` | 10 | 15,087 | 11.9% |
-   | `session` | 10 | 14,208 | 11.2% |
-   | `inspect` | 10 | 13,485 | 10.6% |
-   | `batch` | 1 | 10,296 | 8.1% |
-   | `crash` | 3 | 7,473 | 5.9% |
-   | `ttd` | 9 | 7,090 | 5.6% |
+   | `allocator` | 12 | 19,807 | 15.4% |
+   | `ioctl` | 11 | 16,088 | 12.5% |
+   | `securekernel` | 16 | 25,252 | 19.6% |
+   | `exec` | 10 | 15,087 | 11.7% |
+   | `session` | 10 | 14,208 | 11% |
+   | `inspect` | 10 | 13,485 | 10.5% |
+   | `batch` | 1 | 10,296 | 8% |
+   | `crash` | 3 | 7,473 | 5.8% |
+   | `ttd` | 9 | 7,090 | 5.5% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
    | *(absent)* | 66 | 103,534 |
-   | `all` | 81 | 127,299 |
+   | `all` | 82 | 128,786 |
    | `session,inspect,exec,crash` | 33 | 49,332 |
    | `session,inspect,crash` | 23 | 34,092 |
    | `crash` | 13 | 20,515 |
@@ -376,6 +376,11 @@ None of these is a bug. They are recorded because they were invisible, and
    127,299 B**. The new tool accounts for all 1,361 model-visible bytes. On the wire it adds a
    3,025 B row plus the array comma, reaching **362,953 B**. The model ceiling remains 129,000 B;
    the wire ceiling deliberately moves to 370,000 B, leaving 7,047 B (1.9%).
+
+   M3's one-shot `sk_live_continue_to_software_breakpoints` transition moves the complete surface
+   to **82 tools and 128,786 B**. It accounts for the 1,487 model-visible bytes. The vector-3 reason
+   also expands three existing stop-record output schemas, taking the wire payload to **366,944 B**.
+   Both existing ceilings remain fixed, leaving 214 model-visible bytes and 3,056 wire bytes.
 
    **The two tables do not reconcile, and that is the point of item 41.** The first is each group's
    share of the whole surface; the second is what a spec actually serves, which is less — `crash`

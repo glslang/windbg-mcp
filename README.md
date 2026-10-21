@@ -158,7 +158,7 @@ native analysis of it works and always has — and says so in the opener's `limi
 
 ## Tools
 
-Eighty tools in nine `--tools` groups; the rows below split some of those groups by theme. The
+Eighty-two tools in nine `--tools` groups; the rows below split some of those groups by theme. The
 `--tools` column is the name that selects one — see
 [Serving fewer tools](docs/tool-surface.md#serving-fewer-tools---tools).
 
@@ -178,10 +178,10 @@ Eighty tools in nine `--tools` groups; the rows below split some of those groups
 | User Segment Heap | `allocator` | `heap_list`, `heap_allocations`, `heap_chunk`, `heap_census`, `heap_diagnostics` |
 | Structure walk | `allocator` | `walk_memory` |
 | Raw     | `inspect` | `execute` — run any debugger command, returns full text output |
-| Secure Kernel (extra) | `securekernel` | Capture: `open_sk_capture`, `sk_modules`, `sk_read_memory`, `sk_symbol`. Live selected-VP control: `open_sk_live_control`, `sk_live_arm`, `sk_live_wait`, `sk_live_break`, `sk_live_registers`, `sk_live_read_memory`, `sk_live_write_memory`, `sk_live_step`, `sk_live_continue_to_breakpoints`, `sk_live_continue`, plus the managed `open_sk_kd` facade. A live session may arm additional selected VPs through independently validated providers. This extra group is omitted by default; name it or use `--tools all`. Capture needs an admitted Windows SDK saved-state provider root; live control needs startup policy, an operator-supplied privileged provider and an exact-build `vmwp` profile. Writes additionally need explicit startup-policy authority and a bounded instruction-coherent transport capability. |
+| Secure Kernel (extra) | `securekernel` | Capture: `open_sk_capture`, `sk_modules`, `sk_read_memory`, `sk_symbol`. Live selected-VP control: `open_sk_live_control`, `sk_live_arm`, `sk_live_wait`, `sk_live_break`, `sk_live_registers`, `sk_live_read_memory`, `sk_live_write_memory`, `sk_live_step`, `sk_live_continue_to_breakpoints`, `sk_live_continue_to_software_breakpoints`, `sk_live_continue`, plus the managed `open_sk_kd` facade. A live session may arm additional selected VPs through independently validated providers. This extra group is omitted by default; name it or use `--tools all`. Capture needs an admitted Windows SDK saved-state provider root; live control needs startup policy, an operator-supplied privileged provider and an exact-build `vmwp` profile. Writes and software breakpoints additionally need explicit startup-policy authority and a bounded instruction-coherent transport capability; the first software-breakpoint slice also requires a Hyper-V VM proved to have one vCPU. |
 
 The ordinary eight groups are served by default; the `securekernel` extra is opt-in. Explicit
-`--tools all` serves all eighty-one. `--tools session,inspect,crash` cuts the surface to twenty-three
+`--tools all` serves all eighty-two. `--tools session,inspect,crash` cuts the surface to twenty-three
 tools, and a `--listen` client can be given a different surface from the run's default. The exact
 byte figures are **not restated here**: they live in the
 [`docs/tool-surface.md`](docs/tool-surface.md) tables, which

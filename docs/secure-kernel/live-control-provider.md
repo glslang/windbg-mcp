@@ -43,7 +43,9 @@ provider per selected VP; their VM, partition, VTL and CR3 coordinates must agre
 By default every accepted stop must report that same root. `open_sk_live_control` may opt into
 `allow_transition_cr3` for natural mode when VTL1 user execution enters Secure Kernel through a
 different address space. The first hardware stop may then establish a different nonzero,
-page-aligned CR3; redirect mode cannot use the option.
+page-aligned CR3; redirect mode cannot use the option. A one-shot software-breakpoint transition
+binds its patches to that accepted stop CR3, and its vector-3 stop must return in exactly that
+address space before restoration and restart-RIP normalization can proceed.
 
 Provider stdout is read on a dedicated non-DbgEng thread. Each complete protocol line has a
 10-second deadline, including the startup banner and hello, so a provider which remains alive but
@@ -71,7 +73,7 @@ monotonic session epoch for each public running or stopped transition. Each cont
 also carries a 256-bit nonce from the Windows system RNG, so equal epoch strings from two provider
 processes or two concurrent MCP sessions cannot authorize a replay against another VP or VM.
 
-The first revision has seven capabilities:
+The protocol has seven required capabilities:
 
 - `begin_arm` and `finish_arm` bracket debugger-paused breakpoint setup;
 - `publish_stop` records the exact vector-1 event observed by the debugger worker;
@@ -81,6 +83,11 @@ The first revision has seven capabilities:
 - `release` consumes one held epoch immediately before the worker completes that event through
   `vmwp`'s native path.
 
+`breakpoint_events` is optional. A provider advertising it can retain raw vector-3
+`breakpoint_exception` events in addition to vector-1 `debug_exception` events. The worker refuses
+software-breakpoint execution before mutation unless this capability and the dispatcher's separate
+vector-3 context are both present.
+
 The ordering on the last operation is load-bearing. Once native completion runs, the next vector-1
 event may arrive immediately, so the provider must already accept a new `publish_stop`. The worker's
 outer state machine remains in `releasing` between the provider transition and native completion;
@@ -88,11 +95,12 @@ failure in that interval faults the session and runs bounded recovery.
 
 The readable bank is `rip`, `rsp`, `rflags`, `cr3`, `cs`, `dr0` through `dr3`, `dr6`, `dr7`, and
 `vsm_vp_status`. `cr3`, `cs`, and `vsm_vp_status` are read-only. A held event records message type,
-vector, VP, VTL, CPL, dispatcher context, advance flag, and an unclassified debug-exception reason.
+vector, VP, VTL, CPL, dispatcher context, advance flag, and an unclassified exception reason.
 The worker reads DR6 only after publication and reports the validated hardware slot, trap-step, or
 CR3 step-over cause in the MCP stop record. Revision 2 accepts only mapped exception type
-`0x01000002`, vector 1,
-a selected VP at VTL1 CPL0, a nonzero dispatcher context, and native advance clear.
+`0x01000002`, vector 1 with `debug_exception`, or—only with `breakpoint_events`—vector 3 with
+`breakpoint_exception`, a selected VP at VTL1 CPL0, the corresponding nonzero registered dispatcher
+context, and native advance clear.
 
 Revision 2 changes the `publish_stop` event reason from the already-classified v1 hardware or step
 cause to `debug_exception`. This is an intentional incompatible revision: a v1 provider is refused
@@ -245,9 +253,26 @@ proved VM pause to keep provider state stable:
 8. Before any continue, step, recovery or teardown releases guest execution, every guarded memory
    write is restored in reverse order and read back through the stopped virtual address. Failure
    to prove an original byte leaves the VM contained.
-9. `sk_live_continue` consumes that new epoch, restores and verifies the complete baseline, clears
+9. `sk_live_continue_to_software_breakpoints` is the sole exception to the no-write-across-run
+   rule. It requires `allow_memory_writes`, the instruction-coherent transport, a provider that
+   advertises `breakpoint_events`, and the dispatcher's separately registered vector-3 context. It
+   requires the processor count cached from Hyper-V during write-enabled target preparation to
+   prove that the VM has exactly one virtual processor, so no unselected VP can consume an `INT3`.
+   The count is resolved before target discovery can pause or debugger-stop `vmwp`; the retained
+   transition performs no Hyper-V management query. It accepts up to 64 exact instructions and
+   plants one-byte `INT3` patches under a VM-wide pause for one execution interval. The immediately
+   following `sk_live_wait` retains that pause's absolute deadline, installs the `vmwp` event-site
+   breakpoint, and only then starts Resume-VM. VID may report an intercepted `INT3` at its byte or
+   one byte past it, so a stop is accepted only when RIP has exactly one of those two relationships
+   to an owned patch; adjacent patch addresses are refused before mutation to keep that mapping
+   unique. The worker uses that event on the Hyper-V-proved sole VP as an execution barrier,
+   restores and verifies all patches, normalizes RIP to the patch, then converts the
+   native event to a VM-wide pause before returning the stop. Timeout, validation failure and
+   teardown use the same restoration path and contain the VM if any original remains unproved.
+10. `sk_live_continue` consumes that new epoch, restores and verifies the complete baseline, clears
    execution control and completes the owned event. The session can then be armed again.
-10. `end_session` restores any held state, removes the handler and scratch allocation, and performs
+11. `end_session` restores any held state, removes every registered owned exception handler and
+    its shared scratch allocation, and performs
    the handled `vmwp` detach.
 
 Ordinary debugger and capture operations are refused on this session: its DbgEng target is the

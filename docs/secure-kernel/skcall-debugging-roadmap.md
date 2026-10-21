@@ -216,13 +216,39 @@ Only if four hardware slots are insufficient, add compare-before-write, original
 cache-coherency handling and unconditional rollback. Keep it behind an explicit capability and
 policy gate. A failure to prove restoration contains the VM instead of resuming it.
 
-Status: **in progress**. The first slice is the deliberately non-executing mutation primitive:
+Status: **complete**. The first slice is the deliberately
+non-executing mutation primitive:
 `sk_live_write_memory` accepts 1–64 compare bytes at a retained stop, converts its native event to
 a proved VM-wide pause, resolves exactly one virtual/physical page, writes and reads back, and
 retains the original for reverse-order verified rollback. Startup policy and transport capability
 are independent gates. Continue, step, recovery and teardown cannot release guest execution while
-any original remains unproved. The next slice owns vector 3 end to end and is the only slice allowed
-to keep an `INT3` patch across guest execution; the generic write tool never does.
+any original remains unproved. The second slice, `sk_live_continue_to_software_breakpoints`, owns
+vector 3 through a separately registered callback context. It accepts up to 64 exact instruction
+guards, installs one-byte `INT3` patches under a proved VM-wide pause, and is the only path allowed
+to retain patches across guest execution. The immediately following wait retains the original
+absolute pause deadline, installs the `vmwp` event-site breakpoint, and only then starts Resume-VM.
+A stop must report RIP at an owned patch or exactly one byte past it, the two forms VID exposes for
+an intercepted `INT3`; adjacent patch addresses are refused so the mapping is unique. The controller
+uses that retained event on the proved sole VP as an execution barrier, restores and verifies every
+patch, normalizes RIP to the patch, and converts the event to a VM-wide pause before exposing the
+stop. The patches are one-shot and must be explicitly rearmed. Write-enabled target preparation
+caches the Hyper-V processor count before target discovery can pause or debugger-stop `vmwp`; the
+software-breakpoint slice requires that
+cached count to prove a single-vCPU VM, so an unselected VP cannot consume an `INT3` without issuing
+a management query during the retained stop. Each patch is also bound to the exact accepted stop
+CR3 where its instruction guard was verified, including an allowed transition CR3; vector 3 must
+return in that address space. Multi-VP software breakpoints remain future work. The generic write
+tool never persists across execution.
+
+Live qualification on 2026-10-21 used the one-vCPU K3 guest and a long-lived divide-error VTL1
+workload. A hardware vector-1 stop and the subsequent software vector-3 stop both reported CR3
+`0x1071df000`; the software stop named `0xfffff80546604900`, restored `48 83 EC 08`, and returned
+RIP normalized to the patched byte. VID exposed the native vector-3 RIP at that byte rather than
+one past it, confirming the bounded two-form contract and the need to refuse adjacent patches.
+Teardown restored DR0–DR3, DR6, DR7 and the complete RFLAGS baseline, terminated the worker, and
+left the same booted VM running with a healthy heartbeat and advancing Hyper-V uptime. The
+machine-local evidence is under
+`target/codex-m3/software-breakpoint-probes/20261021T080255/`.
 
 ### M4 — VTL0 secure-call tracer
 

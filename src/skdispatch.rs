@@ -60,7 +60,9 @@ pub(crate) const CLEANUP_RESERVE: Duration = Duration::from_secs(30);
 /// Smallest pause window that leaves equal service and bounded controller-cleanup intervals.
 pub(crate) const MIN_PAUSE_MS: u64 = CLEANUP_RESERVE.as_millis() as u64 * 2;
 const POLL: Duration = Duration::from_millis(20);
-const EVENT_TYPE_VECTOR_1: u64 = 0x0100_0002;
+const EVENT_TYPE_VECTOR: u64 = 0x0100_0002;
+const DEBUG_VECTOR: u8 = 1;
+const BREAKPOINT_VECTOR: u8 = 3;
 const MAX_AMD64_INSTRUCTION_BYTES: usize = 15;
 const MAX_PENDING_MEMORY_WRITES: usize = 64;
 
@@ -304,6 +306,9 @@ impl Session {
         engine: &DebugEngine,
         pending: PendingControl,
     ) -> Result<Vec<String>> {
+        if pending.allow_memory_writes {
+            self.dispatcher.cache_vm_processor_count()?;
+        }
         let found = {
             let mut dispatcher = self.dispatcher.bind(engine);
             dispatcher.prepare_identity(pending.target.partition_id.map(|value| value.0))?
@@ -383,6 +388,8 @@ impl Session {
         }
         let control =
             LiveControl::open_many_with_transition(providers, pending.allow_transition_cr3)?;
+        self.dispatcher
+            .bind_software_breakpoint_capability(control.supports_software_breakpoint_events())?;
         self.control = Some(control);
         Ok(skipped)
     }
@@ -619,6 +626,31 @@ impl Session {
         // in `wait_for_stop`; carrying this one across guest execution would spend that budget
         // while the target is running and could make the next stop impossible to service.
         self.pause_window = None;
+        Ok(LiveTransition {
+            phase: control.phase(),
+            epoch,
+        })
+    }
+
+    pub(crate) fn continue_to_software_breakpoints(
+        &mut self,
+        engine: &DebugEngine,
+        epoch: &crate::skcontrol::StopEpoch,
+        instructions: Vec<crate::sklive::InstructionGuard>,
+    ) -> Result<LiveTransition> {
+        let deadline = self.stopped_service_deadline()?;
+        self.ensure_preparation_succeeded()?;
+        let control = self
+            .control
+            .as_mut()
+            .context("live Secure Kernel control has not completed target discovery")?;
+        let mut dispatcher = self.dispatcher.bind(engine);
+        let epoch = control.continue_to_software_breakpoints_until(
+            &mut dispatcher,
+            epoch,
+            instructions,
+            deadline,
+        )?;
         Ok(LiveTransition {
             phase: control.phase(),
             epoch,
@@ -1139,6 +1171,12 @@ struct RetainedEvent {
     release_eligible: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HandlerRegistration {
+    vector: u8,
+    context: u64,
+}
+
 pub(crate) struct VmwpDispatcherState {
     profile: DispatcherProfile,
     vmwp_pid: u32,
@@ -1149,12 +1187,22 @@ pub(crate) struct VmwpDispatcherState {
     live_transport: Option<String>,
     allow_transition_cr3: bool,
     allow_memory_writes: bool,
+    /// Derived from startup mutation policy and the selected provider topology/capabilities.
+    /// Merely authorizing guarded writes must not install a guest-visible vector-3 intercept.
+    software_breakpoint_events_enabled: bool,
     targets: Vec<TargetIdentity>,
     memory: Option<LiveGuestMemory>,
     /// Applied in stopped order and restored in reverse before guest execution is released.
     memory_writes: Vec<PreparedMemoryWrite>,
+    /// One-shot `INT3` patches which alone may survive an execution release. They are restored
+    /// under the retained sole-VP event before the resulting stop is exposed.
+    software_breakpoints: Vec<PreparedMemoryWrite>,
+    /// Read from Hyper-V before target discovery can pause or debugger-stop `vmwp`. The exact
+    /// worker PID binds this boot-stable configuration to the live-control session.
+    vm_processor_count: Option<u32>,
     vmwp_base: Option<u64>,
-    handler_context: Option<u64>,
+    handler_contexts: Vec<HandlerRegistration>,
+    last_registered_context: Option<u64>,
     scratch_allocated: bool,
     breakpoint: Option<OwnedBreakpoint>,
     phase: DispatcherPhase,
@@ -1208,11 +1256,15 @@ impl VmwpDispatcherState {
             live_transport: None,
             allow_transition_cr3: false,
             allow_memory_writes: false,
+            software_breakpoint_events_enabled: false,
             targets: Vec::new(),
             memory: None,
             memory_writes: Vec::new(),
+            software_breakpoints: Vec::new(),
+            vm_processor_count: None,
             vmwp_base: None,
-            handler_context: None,
+            handler_contexts: Vec::new(),
+            last_registered_context: None,
             scratch_allocated: false,
             breakpoint: None,
             phase: DispatcherPhase::Fresh,
@@ -1233,6 +1285,25 @@ impl VmwpDispatcherState {
             engine,
             state: self,
             retention_notice: None,
+        }
+    }
+
+    fn cache_vm_processor_count(&mut self) -> Result<()> {
+        if self.vm_processor_count.is_none() {
+            self.vm_processor_count = Some(resolve_vm_processor_count(&self.vm_id)?);
+        }
+        Ok(())
+    }
+
+    fn require_single_processor_software_breakpoint_scope(&self) -> Result<()> {
+        match self.vm_processor_count {
+            Some(1) => Ok(()),
+            Some(processor_count) => bail!(
+                "software breakpoints currently require a Hyper-V VM with exactly one virtual processor; found {processor_count}"
+            ),
+            None => bail!(
+                "software breakpoint mutation lacks a processor count cached during target preparation"
+            ),
         }
     }
 
@@ -1270,6 +1341,14 @@ impl VmwpDispatcherState {
         self.live_transport = Some(live_transport);
         self.allow_transition_cr3 = allow_transition_cr3;
         self.allow_memory_writes = allow_memory_writes;
+        Ok(())
+    }
+
+    fn bind_software_breakpoint_capability(&mut self, supported: bool) -> Result<()> {
+        if !matches!(self.phase, DispatcherPhase::Fresh) || !self.handler_contexts.is_empty() {
+            bail!("software-breakpoint capability must be bound before handler registration");
+        }
+        self.software_breakpoint_events_enabled = self.allow_memory_writes && supported;
         Ok(())
     }
 
@@ -1381,15 +1460,154 @@ impl VmwpDispatcherState {
         Ok(())
     }
 
-    fn record_handler_context(&mut self, context: u64) -> Result<()> {
+    fn arm_software_breakpoints_until(
+        &mut self,
+        instructions: &[InstructionGuard],
+        deadline: Instant,
+    ) -> Result<()> {
+        if !self.allow_memory_writes {
+            bail!("Secure Kernel software breakpoints are disabled by startup policy");
+        }
+        if !self.vm_paused || !self.provider_writes_quiesced {
+            bail!("software breakpoint mutation requires a proved VM-wide pause");
+        }
+        self.require_single_processor_software_breakpoint_scope()?;
+        if !self.memory_writes.is_empty() {
+            bail!("generic guarded writes must be rolled back before software breakpoints run");
+        }
+        if !self.software_breakpoints.is_empty() {
+            bail!("software breakpoints are already armed");
+        }
+        if instructions.is_empty() || instructions.len() > crate::sklive::MAX_SOFTWARE_BREAKPOINTS {
+            bail!(
+                "software breakpoint arming requires 1..={} guarded instructions",
+                crate::sklive::MAX_SOFTWARE_BREAKPOINTS
+            );
+        }
+
+        let mut prepared = Vec::with_capacity(instructions.len());
+        for instruction in instructions {
+            instruction.validate()?;
+            let write = GuardedMemoryWrite {
+                address: instruction.address,
+                expected: vec![instruction.bytes[0]],
+                replacement: vec![0xcc],
+            };
+            write.validate()?;
+            let patch = self.prepare_guarded_write_until(&write, deadline)?;
+            if prepared
+                .iter()
+                .any(|earlier: &PreparedMemoryWrite| earlier.address == patch.address)
+            {
+                bail!("software breakpoint addresses must be distinct");
+            }
+            prepared.push(patch);
+        }
+
+        for patch in prepared {
+            // Retain restoration ownership before the first ambiguous provider write.
+            self.software_breakpoints.push(patch.clone());
+            let memory = self
+                .memory
+                .as_ref()
+                .context("the live VTL1 memory source is absent")?;
+            memory.write_physical_until(patch.gpa, &patch.replacement, deadline)?;
+            memory.verify_virtual_until(
+                patch.address,
+                &patch.replacement,
+                "software breakpoint patch read-back",
+                deadline,
+            )?;
+        }
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            count = self.software_breakpoints.len(),
+            "live Secure Kernel control armed one-shot software breakpoints"
+        );
+        Ok(())
+    }
+
+    fn restore_software_breakpoints_until(&mut self, deadline: Instant) -> Result<()> {
+        let sole_vp_event_barrier = self.vm_processor_count == Some(1)
+            && self.provider_writes_quiesced
+            && self
+                .retained_event
+                .as_ref()
+                .is_some_and(|retained| retained.event.vector == BREAKPOINT_VECTOR);
+        if !(self.vm_paused && self.provider_writes_quiesced) && !sole_vp_event_barrier {
+            bail!(
+                "software breakpoint restoration requires a proved VM-wide pause or sole-VP event"
+            );
+        }
+        while let Some(patch) = self.software_breakpoints.last().cloned() {
+            require_completion_deadline(Some(deadline))?;
+            let memory = self
+                .memory
+                .as_ref()
+                .context("the live VTL1 memory source is absent during breakpoint restoration")?;
+            let current = memory.read_span_until(
+                sk::Gva(patch.address.0),
+                patch.original.len(),
+                "owned software breakpoint before restoration",
+                Some(deadline),
+            )?;
+            if current == patch.original {
+                // A failed write reply is ambiguous. Proving the original is already present is a
+                // complete rollback; do not demand that the replacement must have landed.
+                self.software_breakpoints.pop();
+                continue;
+            }
+            if current != patch.replacement {
+                bail!(
+                    "owned software breakpoint at {:#x} contains neither its patch nor original",
+                    patch.address.0
+                );
+            }
+            memory.write_physical_until(patch.gpa, &patch.original, deadline)?;
+            memory.verify_virtual_until(
+                patch.address,
+                &patch.original,
+                "software breakpoint restoration read-back",
+                deadline,
+            )?;
+            self.software_breakpoints.pop();
+        }
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            "live Secure Kernel control restored all one-shot software breakpoints"
+        );
+        Ok(())
+    }
+
+    fn record_handler_context(&mut self, vector: u8, context: u64) -> Result<()> {
+        if !matches!(vector, DEBUG_VECTOR | BREAKPOINT_VECTOR) {
+            bail!("unsupported owned exception vector {vector}");
+        }
         if context == 0 {
             bail!("handler registration returned a zero context");
         }
-        if self.handler_context.is_some() {
-            bail!("the dispatcher already owns a registered handler context");
+        if self
+            .handler_contexts
+            .iter()
+            .any(|registered| registered.vector == vector || registered.context == context)
+        {
+            bail!("the dispatcher already owns that handler vector or context");
         }
-        self.handler_context = Some(context);
+        self.handler_contexts
+            .push(HandlerRegistration { vector, context });
+        self.last_registered_context = Some(context);
         Ok(())
+    }
+
+    fn handler_context(&self, vector: u8) -> Option<u64> {
+        self.handler_contexts
+            .iter()
+            .find(|registered| registered.vector == vector)
+            .map(|registered| registered.context)
+    }
+
+    fn current_unregister_handler(&self) -> Option<HandlerRegistration> {
+        self.handler_contexts.last().copied()
     }
 
     fn freeze_other_threads(&mut self, mut execute: impl FnMut(&str) -> Result<()>) -> Result<()> {
@@ -1601,7 +1819,7 @@ impl VmwpDispatcherState {
     fn retry_unregister_scratch_free(&mut self) -> Result<()> {
         if !matches!(self.unregister, Some(UnregisterProgress::FreeingScratch))
             || !self.scratch_allocated
-            || self.handler_context.is_none()
+            || self.handler_contexts.is_empty()
         {
             bail!("scratch-free retry was requested outside its owned unregister state");
         }
@@ -2021,8 +2239,9 @@ impl DispatcherPhase {
         }
     }
 
-    fn running_disarm_preparation(&self) -> Option<RunningDisarmPreparation> {
+    fn running_disarm_preparation(&self, vm_paused: bool) -> Option<RunningDisarmPreparation> {
         match self {
+            Self::ReadyForStop if vm_paused => Some(RunningDisarmPreparation::AlreadyInterrupted),
             Self::ReadyForStop => Some(RunningDisarmPreparation::SettleNativeExecution),
             Self::ReadyForStopInterrupted => Some(RunningDisarmPreparation::AlreadyInterrupted),
             _ => None,
@@ -2625,7 +2844,10 @@ impl VmwpDispatcher<'_> {
         targets
             .first()
             .context("running disarm requires at least one selected VP")?;
-        let preparation = self.state.phase.running_disarm_preparation();
+        let preparation = self
+            .state
+            .phase
+            .running_disarm_preparation(self.state.vm_paused);
         if self.state.targets != targets
             || preparation.is_none()
             || self.state.retained_event.is_some()
@@ -2682,11 +2904,19 @@ impl EventDispatcher for VmwpDispatcher<'_> {
             }
             ArmPreparation::Reattach => self.reattach_registered_handler(targets, breakpoints)?,
         }
-        Ok(HexU64(
-            self.state
-                .handler_context
-                .context("the registered handler returned no context")?,
-        ))
+        Ok(HexU64(self.state.handler_context(DEBUG_VECTOR).context(
+            "the registered vector-1 handler returned no context",
+        )?))
+    }
+
+    fn software_breakpoint_context(&self) -> Option<HexU64> {
+        self.state.handler_context(BREAKPOINT_VECTOR).map(HexU64)
+    }
+
+    fn verify_software_breakpoint_scope_until(&mut self, deadline: Instant) -> Result<()> {
+        require_completion_deadline(Some(deadline))?;
+        self.state
+            .require_single_processor_software_breakpoint_scope()
     }
 
     fn begin_disarm(&mut self, targets: &[TargetIdentity]) -> Result<()> {
@@ -2709,6 +2939,10 @@ impl EventDispatcher for VmwpDispatcher<'_> {
 
     fn provider_writes_quiesced(&self) -> bool {
         self.state.provider_writes_quiesced
+    }
+
+    fn has_pending_guarded_writes(&self) -> bool {
+        !self.state.memory_writes.is_empty()
     }
 
     fn establish_recovery_pause(&mut self, targets: &[TargetIdentity]) -> Result<()> {
@@ -2769,6 +3003,19 @@ impl EventDispatcher for VmwpDispatcher<'_> {
         deadline: Instant,
     ) -> Result<AppliedMemoryWrite> {
         self.state.apply_guarded_write_until(write, deadline)
+    }
+
+    fn arm_software_breakpoints_until(
+        &mut self,
+        instructions: &[InstructionGuard],
+        deadline: Instant,
+    ) -> Result<()> {
+        self.state
+            .arm_software_breakpoints_until(instructions, deadline)
+    }
+
+    fn restore_software_breakpoints_until(&mut self, deadline: Instant) -> Result<()> {
+        self.state.restore_software_breakpoints_until(deadline)
     }
 
     fn retained_pause_deadline(&self) -> Option<Instant> {
@@ -2931,6 +3178,34 @@ impl EventDispatcher for VmwpDispatcher<'_> {
         self.release_paused_inner(Some(deadline))
     }
 
+    fn retain_pause_for_software_breakpoint_wait_until(&mut self, deadline: Instant) -> Result<()> {
+        require_completion_deadline(Some(deadline))?;
+        if self.state.retained_event.is_some()
+            || !self.state.vm_paused
+            || !self.state.provider_writes_quiesced
+            || !matches!(self.state.phase, DispatcherPhase::ReadyForStop)
+            || !self.state.attached
+            || self.state.threads_frozen
+        {
+            bail!("software-breakpoint wait requires a proved attached VM pause");
+        }
+        if self.state.software_breakpoints.is_empty() {
+            bail!("software-breakpoint wait has no owned patches");
+        }
+        if !self.state.memory_writes.is_empty() {
+            bail!("software-breakpoint wait found generic guarded writes still applied");
+        }
+        if self.state.breakpoint.is_none() {
+            let site = self.state.profile.event_held.clone();
+            self.set_site_breakpoint(&site)?;
+        }
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            "live Secure Kernel control retained its pause for the software-breakpoint wait"
+        );
+        Ok(())
+    }
+
     fn recover(&mut self, safe_to_resume: bool, event: Option<&HeldEvent>) -> Result<()> {
         self.recover_inner(safe_to_resume, event, None)
     }
@@ -2985,6 +3260,9 @@ impl VmwpDispatcher<'_> {
             bail!("release_paused requires a proved post-event VM pause");
         }
         self.state.restore_memory_writes_until(deadline)?;
+        if !self.state.software_breakpoints.is_empty() {
+            bail!("refusing to resume while software breakpoint patches remain applied");
+        }
         require_completion_deadline(deadline)?;
         if self.state.breakpoint.is_some() {
             self.remove_owned_breakpoint()?;
@@ -3063,6 +3341,14 @@ impl VmwpDispatcher<'_> {
         }
 
         self.state.restore_memory_writes_until(deadline)?;
+        if !self.state.software_breakpoints.is_empty() {
+            if !self.state.vm_paused || !self.state.provider_writes_quiesced {
+                bail!("teardown cannot restore software breakpoints without a proved VM pause");
+            }
+            self.state.restore_software_breakpoints_until(
+                deadline.unwrap_or_else(|| Instant::now() + LIVE_MEMORY_WAIT),
+            )?;
+        }
 
         // A successful native unregister is irreversible. If its later deferred-cleanup sequence
         // failed, resume that recorded sequence before any generic breakpoint removal or detach;
@@ -3086,7 +3372,7 @@ impl VmwpDispatcher<'_> {
         }
         self.state.finish_completion_kick_until(deadline)?;
         require_completion_deadline(deadline)?;
-        if self.state.handler_context.is_some() {
+        if !self.state.handler_contexts.is_empty() {
             self.unregister_handler_inner(deadline)?;
         } else if self.state.scratch_allocated {
             self.free_unregistered_scratch_inner(deadline)?;
@@ -3165,6 +3451,29 @@ impl VmwpDispatcher<'_> {
                 .release_eligible = true;
         }
         self.state.refuse_unsafe_recovery()?;
+        if !self.state.software_breakpoints.is_empty() {
+            if let Some(held) = self
+                .state
+                .retained_event
+                .as_ref()
+                .map(|retained| retained.event.clone())
+            {
+                if let Some(expected) = event
+                    && expected != &held
+                {
+                    bail!("recovery event does not match the event held by the dispatcher");
+                }
+            } else if !self.state.vm_paused || !self.state.provider_writes_quiesced {
+                let targets = self.state.targets.clone();
+                self.pause_for_provider_writes_inner(&targets, deadline)?;
+            }
+            // A retained vector-3 event on the Hyper-V-proved sole VP is itself a complete
+            // execution barrier. Restore the bytes before that event can ever be completed; doing
+            // it afterward would let the rewound VP immediately execute the still-present INT3.
+            self.state.restore_software_breakpoints_until(
+                deadline.unwrap_or_else(|| Instant::now() + LIVE_MEMORY_WAIT),
+            )?;
+        }
         if !safe_to_resume {
             let why = if self.state.vm_paused {
                 "VTL1 restoration was not proved; the VM remains paused"
@@ -3212,8 +3521,8 @@ impl VmwpDispatcher<'_> {
     }
 
     fn finish_teardown(&mut self, deadline: Option<Instant>) -> Result<()> {
-        if !self.state.memory_writes.is_empty() {
-            bail!("refusing to finish teardown with guarded memory writes still applied");
+        if !self.state.memory_writes.is_empty() || !self.state.software_breakpoints.is_empty() {
+            bail!("refusing to finish teardown with live-memory mutations still applied");
         }
         require_completion_deadline(deadline)?;
         if self.state.vm_paused {
@@ -3262,21 +3571,31 @@ impl VmwpDispatcher<'_> {
                     .checked_add(u64::from(self.state.profile.layout.event_vp))
                     .context("event VP address overflowed")?,
             )?;
-            if message_type == EVENT_TYPE_VECTOR_1
-                && context == self.state.handler_context.context("no handler context")?
+            let vector = self
+                .state
+                .handler_contexts
+                .iter()
+                .find(|registered| registered.context == context)
+                .map(|registered| registered.vector);
+            if message_type == EVENT_TYPE_VECTOR
+                && let Some(vector @ (DEBUG_VECTOR | BREAKPOINT_VECTOR)) = vector
                 && let Some(target) = targets.iter().find(|target| target.vp == vp)
             {
                 return Ok((
                     event_pointer,
                     HeldEvent {
-                        message_type: HexU64(EVENT_TYPE_VECTOR_1),
-                        vector: 1,
+                        message_type: HexU64(EVENT_TYPE_VECTOR),
+                        vector,
                         vp: target.vp,
                         vtl: target.vtl,
                         cpl: 0,
                         dispatcher_context: HexU64(context),
                         advance_instruction_pointer: false,
-                        reason: StopReason::DebugException,
+                        reason: if vector == DEBUG_VECTOR {
+                            StopReason::DebugException
+                        } else {
+                            StopReason::BreakpointException
+                        },
                     },
                 ));
             }
@@ -3287,7 +3606,7 @@ impl VmwpDispatcher<'_> {
                 .map(|activity| activity.remaining_idle().is_zero())
                 .unwrap_or_else(|| Instant::now() >= deadline);
             if deadline_expired {
-                bail!("too many unrelated dispatcher events before the owned vector-1 event");
+                bail!("too many unrelated dispatcher events before an owned exception event");
             }
         }
     }
@@ -3441,10 +3760,32 @@ impl VmwpDispatcher<'_> {
         self.verify_vmwp_build()?;
         self.verify_all_sites()?;
         self.allocate_scratch()?;
-        self.register_handler()?;
+        self.register_handler(DEBUG_VECTOR)?;
+        if self.state.software_breakpoint_events_enabled {
+            // SetThreadContext restores the OS thread exactly, but DbgEng retains the event's old
+            // register cache until a new attach. A second injected call in this attach would read
+            // the post-return RSP and mistake a non-code stack word for its return boundary.
+            self.reattach_after_registration_context_restore()?;
+            self.register_handler(BREAKPOINT_VECTOR)?;
+        }
         let site = self.state.profile.event_held.clone();
         self.set_site_breakpoint(&site)?;
         self.state.phase = DispatcherPhase::ReadyForStop;
+        Ok(())
+    }
+
+    fn reattach_after_registration_context_restore(&mut self) -> Result<()> {
+        self.detach_handled()?;
+        verify_vmwp_pid(&self.state.vm_id, self.state.vmwp_pid)?;
+        let pending = self
+            .engine
+            .attach_process_begin(self.state.vmwp_pid)
+            .map_err(debugger)?;
+        self.claim_attach();
+        pending.wait().map_err(debugger)?;
+        self.set_exception_policy()?;
+        self.verify_vmwp_build()?;
+        self.verify_all_sites()?;
         Ok(())
     }
 
@@ -3725,7 +4066,7 @@ impl VmwpDispatcher<'_> {
         breakpoints: &[BreakpointGuard],
     ) -> Result<()> {
         let target = targets.first().context("no live-control VP targets")?;
-        if self.state.handler_context.is_none() || !self.state.scratch_allocated {
+        if self.state.handler_context(DEBUG_VECTOR).is_none() || !self.state.scratch_allocated {
             bail!("the detached dispatcher no longer owns a registered handler");
         }
         self.pause_for_provider_writes(targets)?;
@@ -3879,7 +4220,14 @@ impl VmwpDispatcher<'_> {
         Ok(())
     }
 
-    fn register_handler(&mut self) -> Result<()> {
+    fn register_handler(&mut self, vector: u8) -> Result<()> {
+        if !matches!(vector, DEBUG_VECTOR | BREAKPOINT_VECTOR) {
+            bail!("unsupported owned exception vector {vector}");
+        }
+        // Each registration is a complete guarded call. In particular, restore RSP before a
+        // second vector is registered: the native return pops its synthetic return address, and
+        // treating the next stack word as another return boundary can resume into non-code data.
+        let saved = HijackContext::capture(self)?;
         let rsp = self.register("rsp")?;
         let return_address = self.read_u64(rsp)?;
         let stack_handler = rsp
@@ -3899,9 +4247,10 @@ impl VmwpDispatcher<'_> {
                 .map_err(debugger)
         })?;
         self.set_dynamic_breakpoint(return_address)?;
-        // From the first guest-memory mutation until the return boundary and original stack are
-        // proved, recovery must keep vmwp attached and the VM paused. Detaching would let a
-        // partially injected registration finish without a context this adapter can unregister.
+        // From the first guest-memory mutation until the return boundary, original stack and full
+        // thread context are proved, recovery must keep vmwp attached and the VM paused. Detaching
+        // would let a partially injected registration finish without a context this adapter can
+        // unregister.
         self.state.phase = DispatcherPhase::Registering;
         self.write_u64(
             stack_handler,
@@ -3917,7 +4266,7 @@ impl VmwpDispatcher<'_> {
                 .dispatcher_vnd
                 .context("the dispatcher VND has not been discovered")?,
         )?;
-        self.write_register("rdx", 1)?;
+        self.write_register("rdx", u64::from(vector))?;
         self.write_register("r8", 0)?;
         self.write_register("r9", self.state.profile.registration_tag.0)?;
         self.write_register(
@@ -3937,14 +4286,16 @@ impl VmwpDispatcher<'_> {
         let context = self.read_u64(self.scratch(self.state.profile.layout.returned_context)?)?;
         // Registration is already live in vmwp. Record its context before any fallible local
         // restoration so teardown must unregister it rather than free callback scratch directly.
-        self.state.record_handler_context(context)?;
+        self.state.record_handler_context(vector, context)?;
         tracing::info!(
             target: "windbg_mcp::secure_kernel_mutation",
             context = format_args!("{context:#x}"),
+            vector,
             "dispatcher registered its temporary vmwp exception handler"
         );
         self.write_u64(stack_handler, saved_handler)?;
         self.write_u64(stack_context, saved_context)?;
+        saved.restore()?;
         self.thaw_threads()?;
         self.state.phase = DispatcherPhase::Fresh;
         Ok(())
@@ -3953,6 +4304,9 @@ impl VmwpDispatcher<'_> {
     fn complete_event(&mut self, mode: ReleaseMode, deadline: Option<Instant>) -> Result<()> {
         require_completion_deadline(deadline)?;
         self.state.restore_memory_writes_until(deadline)?;
+        if !self.state.software_breakpoints.is_empty() {
+            bail!("software breakpoint patches must be restored before an event can be released");
+        }
         inject_live_debugger_loss_after_restore()?;
         let event = self
             .state
@@ -4159,12 +4513,19 @@ impl VmwpDispatcher<'_> {
 
     fn unregister_handler_inner(&mut self, deadline: Option<Instant>) -> Result<()> {
         require_completion_deadline(deadline)?;
-        let context = self.state.handler_context.context("no handler context")?;
-        if self.state.unregister.is_none() {
-            self.begin_unregister_call(context, deadline)?;
-        }
         loop {
             require_completion_deadline(deadline)?;
+            if self.state.unregister.is_none() && self.state.handler_contexts.is_empty() {
+                return Ok(());
+            }
+            let registered = self
+                .state
+                .current_unregister_handler()
+                .context("no handler context")?;
+            let context = registered.context;
+            if self.state.unregister.is_none() {
+                self.begin_unregister_call(context, deadline)?;
+            }
             match self.state.unregister.clone() {
                 Some(UnregisterProgress::Calling) => {
                     bail!("handler unregister return was not proved")
@@ -4184,7 +4545,7 @@ impl VmwpDispatcher<'_> {
                 Some(UnregisterProgress::FreeingScratch) => {
                     self.verify_unregister_scratch_free()?;
                 }
-                None => return Ok(()),
+                None => continue,
             }
         }
     }
@@ -4337,7 +4698,22 @@ impl VmwpDispatcher<'_> {
         if callback != self.scratch(self.state.profile.layout.handler_descriptor)? || flags == 0 {
             bail!("old callback record changed before scratch release");
         }
-        self.state.unregister = Some(UnregisterProgress::ReadyToFreeScratch);
+        if self.state.handler_contexts.len() > 1 {
+            let removed = self
+                .state
+                .handler_contexts
+                .pop()
+                .context("the unregistering handler context disappeared")?;
+            if removed.context != context {
+                bail!("the unregistering handler context changed during cleanup");
+            }
+            self.state.unregister = None;
+            if self.state.attached {
+                self.detach_handled()?;
+            }
+        } else {
+            self.state.unregister = Some(UnregisterProgress::ReadyToFreeScratch);
+        }
         Ok(())
     }
 
@@ -4360,13 +4736,17 @@ impl VmwpDispatcher<'_> {
         Ok(())
     }
 
-    fn verify_owned_scratch(&self, context: u64) -> Result<()> {
+    fn verify_owned_scratch(&self, _context: u64) -> Result<()> {
         let callback = self.scratch(self.state.profile.layout.callback_descriptor)?;
         let callback_stub = self.image(self.state.profile.callback_stub_rva.0)?;
         let mirror = callback
             .checked_add(u64::from(self.state.profile.layout.callback_mirror))
             .context("callback mirror address overflowed")?;
-        if self.read_u64(self.scratch(self.state.profile.layout.returned_context)?)? != context
+        if self.read_u64(self.scratch(self.state.profile.layout.returned_context)?)?
+            != self
+                .state
+                .last_registered_context
+                .context("the callback scratch has no recorded registration result")?
             || self.read_u64(self.scratch(self.state.profile.layout.handler_descriptor)?)?
                 != callback
             || self.read_u64(callback)? != callback_stub
@@ -4380,7 +4760,11 @@ impl VmwpDispatcher<'_> {
     fn verify_unregister_scratch_free(&mut self) -> Result<()> {
         let scratch = self.state.profile.scratch_base.0;
         if self.engine.read_memory(scratch, 1).is_ok() {
-            let context = self.state.handler_context.context("no handler context")?;
+            let context = self
+                .state
+                .current_unregister_handler()
+                .context("no handler context")?
+                .context;
             self.verify_owned_scratch(context)?;
             self.state.retry_unregister_scratch_free()?;
             bail!(
@@ -4388,13 +4772,13 @@ impl VmwpDispatcher<'_> {
                  this controller, so retry end_session to issue the free again"
             );
         }
-        let context = self.state.handler_context;
+        let contexts = std::mem::take(&mut self.state.handler_contexts);
         self.state.scratch_allocated = false;
-        self.state.handler_context = None;
+        self.state.last_registered_context = None;
         self.state.unregister = None;
         tracing::info!(
             target: "windbg_mcp::secure_kernel_mutation",
-            context = ?context.map(HexU64),
+            contexts = ?contexts,
             address = format_args!("{scratch:#x}"),
             "dispatcher verified handler unregistration and callback scratch release"
         );
@@ -4957,6 +5341,7 @@ fn pe_u32(bytes: &[u8], offset: usize) -> Result<u32> {
 #[derive(Clone, Copy, Debug)]
 enum VmAction {
     ResolvePid,
+    ResolveProcessorCount,
     VerifyPid(u32),
     Pause,
     Resume,
@@ -5000,6 +5385,31 @@ fn parse_vmwp_pid(output: &str) -> Result<u32> {
 
 fn verify_vmwp_pid(vm_id: &str, pid: u32) -> Result<()> {
     run_vm_action(vm_id, VmAction::VerifyPid(pid), POWERSHELL_WAIT)
+}
+
+fn resolve_vm_processor_count(vm_id: &str) -> Result<u32> {
+    let output = run_vm_query(vm_id, VmAction::ResolveProcessorCount, POWERSHELL_WAIT)?;
+    parse_vm_processor_count(&output)
+}
+
+fn parse_vm_processor_count(output: &str) -> Result<u32> {
+    let mut lines = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let value = lines
+        .next()
+        .context("Hyper-V lookup returned no virtual processor count")?;
+    if lines.next().is_some() {
+        bail!("Hyper-V lookup returned more than one virtual processor count");
+    }
+    let count = value
+        .parse::<u32>()
+        .context("Hyper-V lookup returned a non-decimal virtual processor count")?;
+    if count == 0 {
+        bail!("Hyper-V lookup returned zero virtual processors");
+    }
+    Ok(count)
 }
 
 fn run_vm_action(vm_id: &str, action: VmAction, timeout: Duration) -> Result<()> {
@@ -5049,6 +5459,12 @@ fn run_vm_query_inner(
                 Where-Object {$_.CommandLine -match [regex]::Escape($id)}); \
              if($p.Count -ne 1){throw ('expected exactly one vmwp for the selected VM; found '+$p.Count)}; \
              [Console]::Out.WriteLine([string]$p[0].ProcessId)"
+        }
+        VmAction::ResolveProcessorCount => {
+            "$ErrorActionPreference='Stop'; \
+             $vm=Get-VM -Id ([guid]$env:WINDBG_MCP_SK_VM_ID) -ErrorAction Stop; \
+             $processor=Get-VMProcessor -VM $vm -ErrorAction Stop; \
+             [Console]::Out.WriteLine([string]$processor.Count)"
         }
         VmAction::VerifyPid(_) => {
             "$ErrorActionPreference='Stop'; $id=$env:WINDBG_MCP_SK_VM_ID; \
@@ -5374,6 +5790,98 @@ mod tests {
     }
 
     #[test]
+    fn vm_processor_lookup_accepts_exactly_one_nonzero_decimal_count() {
+        assert_eq!(parse_vm_processor_count("1\r\n").unwrap(), 1);
+        assert_eq!(parse_vm_processor_count("16\n").unwrap(), 16);
+        assert!(parse_vm_processor_count("").is_err());
+        assert!(parse_vm_processor_count("0\n").is_err());
+        assert!(parse_vm_processor_count("0x1\n").is_err());
+        assert!(parse_vm_processor_count("1\n2\n").is_err());
+    }
+
+    #[test]
+    fn software_breakpoint_scope_requires_a_cached_single_processor() {
+        let mut state = VmwpDispatcherState::new(
+            profile(),
+            4242,
+            Some(0x2000_0000_1000),
+            "11111111-2222-3333-4444-555555555555".into(),
+        )
+        .unwrap();
+
+        assert!(
+            state
+                .require_single_processor_software_breakpoint_scope()
+                .unwrap_err()
+                .to_string()
+                .contains("cached during target preparation")
+        );
+        state.vm_processor_count = Some(16);
+        assert!(
+            state
+                .require_single_processor_software_breakpoint_scope()
+                .unwrap_err()
+                .to_string()
+                .contains("found 16")
+        );
+        state.vm_processor_count = Some(1);
+        state
+            .require_single_processor_software_breakpoint_scope()
+            .unwrap();
+    }
+
+    #[test]
+    fn vector_three_handler_requires_both_mutation_policy_and_provider_capability() {
+        let mut state = VmwpDispatcherState::new(
+            profile(),
+            4242,
+            Some(0x2000_0000_1000),
+            "11111111-2222-3333-4444-555555555555".into(),
+        )
+        .unwrap();
+
+        state.bind_software_breakpoint_capability(true).unwrap();
+        assert!(!state.software_breakpoint_events_enabled);
+
+        state.allow_memory_writes = true;
+        state.bind_software_breakpoint_capability(false).unwrap();
+        assert!(!state.software_breakpoint_events_enabled);
+
+        state.bind_software_breakpoint_capability(true).unwrap();
+        assert!(state.software_breakpoint_events_enabled);
+    }
+
+    #[test]
+    fn write_enabled_preparation_caches_processor_count_before_discovery() {
+        let source = include_str!("skdispatch.rs").replace("\r\n", "\n");
+        let preparation = source
+            .split_once("    fn prepare_pending(\n")
+            .expect("pending preparation exists")
+            .1
+            .split_once("    fn ensure_preparation_succeeded(")
+            .expect("pending preparation ends before its result guard")
+            .0;
+        let cache = preparation
+            .find("self.dispatcher.cache_vm_processor_count()?;")
+            .expect("write-enabled preparation caches the processor count");
+        let discovery = preparation
+            .find("dispatcher.prepare_identity(")
+            .expect("pending preparation discovers the dispatcher identity");
+        assert!(cache < discovery);
+
+        let transition_gate = source
+            .split_once("    fn verify_software_breakpoint_scope_until(")
+            .expect("software-breakpoint transition gate exists")
+            .1
+            .split_once("    fn begin_disarm(")
+            .expect("transition gate ends before disarm")
+            .0;
+        assert!(transition_gate.contains("require_single_processor_software_breakpoint_scope"));
+        assert!(!transition_gate.contains("ResolveProcessorCount"));
+        assert!(!transition_gate.contains("run_vm_query"));
+    }
+
+    #[test]
     fn interruptible_wait_activity_exposes_only_its_owned_interval() {
         let activity = WaitActivity::new(Duration::from_secs(1));
         assert_eq!(activity.phase(), WaitActivityPhase::Armed);
@@ -5444,7 +5952,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_step_reuses_and_both_continue_paths_end_the_pause_window() {
+    fn step_and_software_rearm_reuse_the_pause_window_until_a_true_continue() {
         let source = include_str!("skdispatch.rs").replace("\r\n", "\n");
         let wait = source
             .split_once("pub(crate) fn wait_for_stop(\n")
@@ -5463,6 +5971,13 @@ mod tests {
         let rearmed = source
             .split_once("pub(crate) fn continue_to_breakpoints(\n")
             .expect("continue-to-breakpoints exists")
+            .1
+            .split_once("pub(crate) fn continue_to_software_breakpoints(\n")
+            .expect("continue-to-software-breakpoints follows it")
+            .0;
+        let software = source
+            .split_once("pub(crate) fn continue_to_software_breakpoints(\n")
+            .expect("continue-to-software-breakpoints exists")
             .1
             .split_once("pub(crate) fn continue_from(\n")
             .expect("continue follows it")
@@ -5487,6 +6002,10 @@ mod tests {
         assert!(
             rearmed.contains("self.pause_window = None"),
             "continue-to-breakpoints must end the retained event's pause window: {rearmed}"
+        );
+        assert!(
+            !software.contains("self.pause_window = None"),
+            "software re-arm must retain the absolute pause window until its wait: {software}"
         );
         assert!(
             continued.contains("self.pause_window = None"),
@@ -5732,20 +6251,27 @@ mod tests {
     #[test]
     fn running_disarm_preserves_a_request_owned_debugger_stop() {
         assert_eq!(
-            DispatcherPhase::ReadyForStop.running_disarm_preparation(),
+            DispatcherPhase::ReadyForStop.running_disarm_preparation(false),
             Some(RunningDisarmPreparation::SettleNativeExecution)
         );
         assert_eq!(
-            DispatcherPhase::ReadyForStopInterrupted.running_disarm_preparation(),
+            DispatcherPhase::ReadyForStop.running_disarm_preparation(true),
             Some(RunningDisarmPreparation::AlreadyInterrupted)
         );
-        assert_eq!(DispatcherPhase::Detached.running_disarm_preparation(), None);
+        assert_eq!(
+            DispatcherPhase::ReadyForStopInterrupted.running_disarm_preparation(false),
+            Some(RunningDisarmPreparation::AlreadyInterrupted)
+        );
+        assert_eq!(
+            DispatcherPhase::Detached.running_disarm_preparation(true),
+            None
+        );
     }
 
     #[test]
     fn a_matched_event_remains_owned_for_recovery_before_validation_finishes() {
         let event = HeldEvent {
-            message_type: HexU64(EVENT_TYPE_VECTOR_1),
+            message_type: HexU64(EVENT_TYPE_VECTOR),
             vector: 1,
             vp: 0,
             vtl: 1,
@@ -5777,7 +6303,7 @@ mod tests {
     #[test]
     fn provider_stop_requires_the_selected_vp_event() {
         let event = HeldEvent {
-            message_type: HexU64(EVENT_TYPE_VECTOR_1),
+            message_type: HexU64(EVENT_TYPE_VECTOR),
             vector: 1,
             vp: 1,
             vtl: 1,
@@ -5817,7 +6343,7 @@ mod tests {
     #[test]
     fn the_cleanup_deadline_outlives_the_consumed_event_record() {
         let event = HeldEvent {
-            message_type: HexU64(EVENT_TYPE_VECTOR_1),
+            message_type: HexU64(EVENT_TYPE_VECTOR),
             vector: 1,
             vp: 0,
             vtl: 1,
@@ -5851,7 +6377,7 @@ mod tests {
     #[test]
     fn an_unvalidated_retained_event_is_contained_before_recovery_can_release_it() {
         let event = HeldEvent {
-            message_type: HexU64(EVENT_TYPE_VECTOR_1),
+            message_type: HexU64(EVENT_TYPE_VECTOR),
             vector: 1,
             vp: 0,
             vtl: 1,
@@ -5893,10 +6419,24 @@ mod tests {
         )
         .unwrap();
 
-        assert!(state.record_handler_context(0).is_err());
-        state.record_handler_context(0x2000_0000_2000).unwrap();
-        assert_eq!(state.handler_context, Some(0x2000_0000_2000));
-        assert!(state.record_handler_context(0x2000_0000_3000).is_err());
+        assert!(state.record_handler_context(DEBUG_VECTOR, 0).is_err());
+        state
+            .record_handler_context(DEBUG_VECTOR, 0x2000_0000_2000)
+            .unwrap();
+        assert_eq!(state.handler_context(DEBUG_VECTOR), Some(0x2000_0000_2000));
+        assert!(
+            state
+                .record_handler_context(DEBUG_VECTOR, 0x2000_0000_3000)
+                .is_err()
+        );
+        state
+            .record_handler_context(BREAKPOINT_VECTOR, 0x2000_0000_3000)
+            .unwrap();
+        assert_eq!(
+            state.handler_context(BREAKPOINT_VECTOR),
+            Some(0x2000_0000_3000)
+        );
+        assert!(state.record_handler_context(4, 0x2000_0000_4000).is_err());
     }
 
     #[test]
@@ -6148,6 +6688,73 @@ mod tests {
     }
 
     #[test]
+    fn every_handler_registration_restores_its_hijacked_thread_context() {
+        let source = include_str!("skdispatch.rs").replace("\r\n", "\n");
+        let registration = source
+            .split_once("    fn register_handler(&mut self, vector: u8) -> Result<()> {\n")
+            .expect("handler registration exists")
+            .1
+            .split_once("    fn complete_event(")
+            .expect("handler registration ends before event completion")
+            .0;
+
+        let capture = registration
+            .find("let saved = HijackContext::capture(self)?;")
+            .expect("registration captures the selected thread context");
+        let call = registration
+            .find("self.run_to_current_breakpoint(")
+            .expect("registration runs the guarded native call");
+        let restore = registration
+            .find("saved.restore()?;")
+            .expect("registration restores the selected thread context");
+        let thaw = registration
+            .find("self.thaw_threads()?;")
+            .expect("registration thaws the other vmwp threads");
+        assert!(capture < call && call < restore && restore < thaw);
+    }
+
+    #[test]
+    fn vector_three_registration_starts_in_a_fresh_dbgeng_attach() {
+        let source = include_str!("skdispatch.rs").replace("\r\n", "\n");
+        let opening = source
+            .split_once("    fn open_and_register(\n")
+            .expect("open-and-register exists")
+            .1
+            .split_once("    fn reattach_after_registration_context_restore(")
+            .expect("context-refresh helper follows open-and-register")
+            .0;
+
+        let debug = opening
+            .find("self.register_handler(DEBUG_VECTOR)?;")
+            .expect("vector one is registered");
+        let capability_gate = opening
+            .find("if self.state.software_breakpoint_events_enabled {")
+            .expect("vector three is gated by policy and provider capability");
+        let refresh = opening
+            .find("self.reattach_after_registration_context_restore()?;")
+            .expect("DbgEng is reattached after the first context restoration");
+        let breakpoint = opening
+            .find("self.register_handler(BREAKPOINT_VECTOR)?;")
+            .expect("vector three is registered");
+        assert!(debug < capability_gate && capability_gate < refresh && refresh < breakpoint);
+
+        let helper = source
+            .split_once("    fn reattach_after_registration_context_restore(")
+            .expect("context-refresh helper exists")
+            .1
+            .split_once("    fn prepare_identity(")
+            .expect("context-refresh helper ends before identity preparation")
+            .0;
+        let detach = helper
+            .find("self.detach_handled()?;")
+            .expect("context refresh detaches the stale debugger view");
+        let attach = helper
+            .find(".attach_process_begin(self.state.vmwp_pid)")
+            .expect("context refresh starts a new attach");
+        assert!(detach < attach);
+    }
+
+    #[test]
     fn unproved_unregister_contains_but_proved_cleanup_remains_retryable() {
         let mut state = VmwpDispatcherState::new(
             profile(),
@@ -6184,7 +6791,11 @@ mod tests {
             "11111111-2222-3333-4444-555555555555".into(),
         )
         .unwrap();
-        state.handler_context = Some(0x2000_0000_2000);
+        state.handler_contexts.push(HandlerRegistration {
+            vector: DEBUG_VECTOR,
+            context: 0x2000_0000_2000,
+        });
+        state.last_registered_context = Some(0x2000_0000_2000);
         state.scratch_allocated = true;
         state.unregister = Some(UnregisterProgress::FreeingScratch);
 
@@ -6194,7 +6805,7 @@ mod tests {
             state.unregister,
             Some(UnregisterProgress::ReadyToFreeScratch)
         );
-        assert_eq!(state.handler_context, Some(0x2000_0000_2000));
+        assert_eq!(state.handler_context(DEBUG_VECTOR), Some(0x2000_0000_2000));
         assert!(state.scratch_allocated);
         assert!(state.retry_unregister_scratch_free().is_err());
     }

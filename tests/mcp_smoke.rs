@@ -2187,6 +2187,10 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// **M3 guarded writes stay under 129,000** (2026-10-20). `sk_live_write_memory` adds 1,361 B and
 /// moves the surface to 127,299 B across 81 tools. The ceiling remains fixed with 1,701 B (1.3%)
 /// available; this is a deliberately small mutation surface rather than a general write API.
+///
+/// **M3 one-shot software breakpoints stay under 129,000** (2026-10-21). The vector-3 transition
+/// adds 1,487 B and moves the surface to 128,786 B across 82 tools. The fixed ceiling deliberately
+/// remains tight: 214 B are left, so any further surface growth needs a conscious redesign or bump.
 const MODEL_VISIBLE_CEILING: usize = 129_000;
 
 /// Ceiling on the whole `tools/list` payload — the serialized result, not the sum of its tools, so
@@ -3543,6 +3547,15 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
             "error",
         ),
         (
+            "sk_live_continue_to_software_breakpoints",
+            json!({
+                "epoch": "0123456789abcdef",
+                "address": "0xfffff80000001000",
+                "bytes": "90"
+            }),
+            "error",
+        ),
+        (
             "sk_live_continue",
             json!({ "epoch": "fedcba9876543210" }),
             "error",
@@ -4677,7 +4690,7 @@ fn a_listener_serves_the_narrowed_surface_it_was_started_with() {
     // was typed — `session` is added whatever it said.
     let log = listener.stderr();
     assert!(
-        log.contains("serving 13 of 81 tools (session, crash)"),
+        log.contains("serving 13 of 82 tools (session, crash)"),
         "the listener does not report the surface it ended up with: {log}"
     );
 }
@@ -4709,7 +4722,7 @@ fn two_clients_on_one_listener_are_served_two_surfaces() {
     let local_token = server.token.clone();
     assert!(
         server.wait_for_stderr(
-            "serving 20 of 81 tools (session, inspect) — except bench serves 13 of 81 tools \
+            "serving 20 of 82 tools (session, inspect) — except bench serves 13 of 82 tools \
              (session, crash)",
             Duration::from_secs(30)
         ),
