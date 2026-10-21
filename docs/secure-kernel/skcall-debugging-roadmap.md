@@ -256,6 +256,31 @@ Use the existing ordinary kernel worker to instrument the exact-build entry to
 `VslpEnterIumSecureMode`, capture calling context and decode the secure-service arguments. Add a
 small deterministic guest harness that issues known calls and labels each invocation.
 
+Status: complete, including the administrator-run K3 live gate on 2026-10-21.
+
+`sk_call_trace` and `sk_call_trace_read` use the ordinary kernel worker's one breakpoint-callback
+slot and are mutually exclusive with `pool_trace`. The arm resolves exactly
+`nt!VslpEnterIumSecureMode`, binds it to one `nt` image identity, and validates the measured
+10.0.26100.9457 prefix through the instructions that consume CL, DX, R8D and R9. This makes the
+private calling convention fail closed on a different build. Each bounded event retains the
+service registers, 0x68-byte raw argument block, caller, symbol-checked
+`_ETHREAD.Cid.UniqueProcess`/KTHREAD/processor, exact
+image/RVA provenance, a host-wide monotonic timestamp and named typed-read failures. The optional
+label is copied from the arm into the report; the guest harness emits the same label and an ordinal
+for every supported `CreateEnclave`/`LoadEnclaveImage`/`InitializeEnclave`/
+`TerminateEnclave`/`DeleteEnclave` invocation.
+
+Offline qualification covers ownership by id plus marker, fill/stop/drop bounds, exact register
+widths, typed callback reads, structured-result coverage and the complete MCP wire golden. The
+machine-local live driver and elevation wrapper are under `target/codex-m4/`. The passing record is
+`target/codex-m4/live-qualification/20261021T202417/report.json`: the guarded one-byte processor
+execution breakpoint retained 256 calls, 199 from the labelled workload PID, with no dropped or
+unreadable hit. Those calls covered ten service numbers and callers including `VslCreateEnclave`,
+`VslLoadEnclaveModule`, `VslInitializeEnclave`, `VslCallEnclave` and `PsTerminateVsmEnclave`.
+All three guest invocations completed create/load/initialize/terminate/delete, `stop: true`
+removed the owned breakpoint, detach terminated the worker, guest boot identity and `vmwp` PID
+were unchanged, heartbeat stayed healthy, and no process was retained.
+
 ### M5 — hypervisor transition tracer
 
 Use a separate hypervisor KD session to capture `HvCallVtlCall` (and the measured return path), VP,

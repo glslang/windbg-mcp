@@ -3600,6 +3600,108 @@ pub struct TracedAllocation {
     pub address: Option<String>,
 }
 
+/// What `sk_call_trace` armed in an ordinary live-kernel worker.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SkCallTraceArmed {
+    pub schema: String,
+    /// Unique within this worker process and copied into later reads.
+    pub trace_id: String,
+    /// Optional workload label supplied by the caller.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// The exact resolved entry, as a boot-local address and persistent module-relative
+    /// coordinate.
+    pub entry: CodeLocation,
+    /// The exact image identity behind `entry`, including its PDB identity when available.
+    pub images: Vec<ImageRef>,
+    /// Exact validated entry prefix through the instructions that consume the four arguments.
+    pub entry_bytes: String,
+    pub machine: String,
+    pub source_vtl: u8,
+    pub argument_block_bytes: usize,
+    pub limit: usize,
+    pub replaced: bool,
+    /// Correlation identities an ordinary KD target does not expose through this operation.
+    pub identity_gaps: Vec<String>,
+}
+
+/// A bounded snapshot of the VTL0 calls retained so far.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SkCallTrace {
+    pub schema: String,
+    pub trace_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub entry: CodeLocation,
+    pub images: Vec<ImageRef>,
+    pub entry_bytes: String,
+    pub machine: String,
+    pub source_vtl: u8,
+    pub calls: Vec<TracedSkCall>,
+    pub limit: usize,
+    pub full: bool,
+    pub dropped: u64,
+    pub unreadable_hits: u64,
+    pub missing_breakpoint: bool,
+    pub armed: bool,
+    pub identity_gaps: Vec<String>,
+}
+
+/// One entry to `nt!VslpEnterIumSecureMode` on x64.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TracedSkCall {
+    pub sequence: u64,
+    /// Host uptime at the hit, in microseconds. Unlike `host_elapsed_us`, this is comparable
+    /// across worker processes on the same host and boot.
+    pub host_monotonic_us: u64,
+    /// Monotonic host time since the trace was armed.
+    pub host_elapsed_us: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_rip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stack_pointer: Option<String>,
+    /// Low byte of RCX at entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transition_kind: Option<u8>,
+    /// Low word of RDX at entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service: Option<u16>,
+    /// Low dword of R8 at entry. Its service-specific meaning is deliberately not guessed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call_context: Option<u32>,
+    /// R9 at entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub argument_block_pointer: Option<String>,
+    /// The bounded raw block read from R9, in memory order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub argument_block: Option<String>,
+    /// The return address on the entry stack, attributed to the exact image where possible.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller: Option<CodeLocation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_symbol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_displacement: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<u32>,
+    /// The kernel thread object, not a debugger thread index.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub processor: Option<u32>,
+    pub provenance: SkCallProvenance,
+}
+
+/// Where the fields of one secure-call event came from.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SkCallProvenance {
+    pub measured: Vec<String>,
+    pub symbol_derived: Vec<String>,
+    pub inferred: Vec<String>,
+    /// Stable field names, retained instead of silently omitting failed reads.
+    pub read_failures: Vec<String>,
+}
+
 /// Which half of a hazard scan came up short, since the two are read from different things.
 ///
 /// **A value rather than a sentence**, because the sentence is the part that was wrong: one shared

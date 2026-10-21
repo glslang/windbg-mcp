@@ -591,6 +591,21 @@ pub enum EngineOp {
     PoolTraceRead {
         stop: bool,
     },
+    /// Arm one exact-build breakpoint at `nt!VslpEnterIumSecureMode` and record its x64 calling
+    /// context as VTL0 enters VTL1. The target is not resumed by this operation.
+    SkCallTraceArm {
+        /// A bounded caller label copied into every report so a guest workload can carry the same
+        /// identifier without the debugger inferring one from timing.
+        label: Option<String>,
+        /// How many calls to retain before stopping the target.
+        limit: usize,
+        /// Bounds the symbol resolve that places the breakpoint.
+        patience_ms: u32,
+    },
+    /// Read the VTL0 Secure Kernel calls retained by this session and optionally disarm the trace.
+    SkCallTraceRead {
+        stop: bool,
+    },
     /// A user-mode Segment Heap query, with the same queue-aware deadline and interrupt
     /// semantics as [`Self::Pool`].
     Heap {
@@ -739,6 +754,7 @@ impl EngineOp {
             | Self::Reachability(ReachabilityOp { patience_ms, .. })
             | Self::DriverHazards { patience_ms, .. }
             | Self::PoolTraceArm { patience_ms, .. }
+            | Self::SkCallTraceArm { patience_ms, .. }
             | Self::Xrefs { patience_ms, .. }
             | Self::IoctlMap { patience_ms, .. }
             | Self::IrpStack { patience_ms, .. }
@@ -1189,6 +1205,11 @@ mod tests {
             EngineOp::CrashTriage {
                 frames: 16,
                 analyze: true,
+                patience_ms: 0,
+            },
+            EngineOp::SkCallTraceArm {
+                label: Some("known-call-1".into()),
+                limit: 4,
                 patience_ms: 0,
             },
             EngineOp::Walk(

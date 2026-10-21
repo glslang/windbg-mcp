@@ -48,8 +48,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use dbgscope::dbgeng::{
-    BreakpointAt, BreakpointSpec, CommandRun, DbgEngError, DebugEngine, DebuggeeType, Disassembly,
-    FunctionExtent, Instruction, InterruptHandle, Interruption, RunToOutcome, WaitOutcome,
+    BreakpointAt, BreakpointSpec, CommandRun, DataAccess, DataWatch, DbgEngError, DebugEngine,
+    DebuggeeType, Disassembly, FunctionExtent, Instruction, InterruptHandle, Interruption,
+    RunToOutcome, WaitOutcome,
 };
 use dbgscope::heap::{self as heap_query, HeapAllocation, HeapBackend, HeapState, HeapWalk};
 use dbgscope::pool::query::{self, PoolPageFilter, PoolWalk};
@@ -3154,6 +3155,9 @@ struct HeldBetweenOps {
     /// The pool trace this session has armed, if any: its recorder is shared with a breakpoint
     /// callback the engine calls on this thread.
     pool_trace: Option<PoolTrace>,
+    /// The exact-build VTL0 Secure Kernel call trace, mutually exclusive with `pool_trace`
+    /// because DbgEng exposes one breakpoint-callback slot per engine.
+    sk_call_trace: Option<SkCallTrace>,
 }
 
 /// Live Secure Kernel state owned together because the KD facade borrows the same controller.
@@ -3177,6 +3181,7 @@ fn execute(
         sk,
         sk_live,
         pool_trace,
+        sk_call_trace,
     } = held;
     // **How much of the caller's patience is gone by the time a bound is armed** — the queue wait
     // *plus* whatever this op has already spent getting to the point of arming one. Every budget
@@ -3891,9 +3896,14 @@ fn execute(
             // nothing and say so as if the driver allocated nowhere.
             let patience = Duration::from_millis(u64::from(patience_ms));
             match walk_budget(patience, spent()) {
-                Some(budget) => {
-                    arm_pool_trace(e, &module, limit, Instant::now() + budget, pool_trace)
-                }
+                Some(budget) => arm_pool_trace(
+                    e,
+                    &module,
+                    limit,
+                    Instant::now() + budget,
+                    pool_trace,
+                    sk_call_trace.is_some(),
+                ),
                 None => Err(Failed::categorised(
                     structured::ErrorCategory::NotRun,
                     format!(
@@ -3909,6 +3919,36 @@ fn execute(
             }
         }
         EngineOp::PoolTraceRead { stop } => read_pool_trace(e, stop, pool_trace),
+        EngineOp::SkCallTraceArm {
+            label,
+            limit,
+            patience_ms,
+        } => {
+            let patience = Duration::from_millis(u64::from(patience_ms));
+            let remaining = patience.saturating_sub(spent());
+            if remaining.is_zero() {
+                Err(Failed::categorised(
+                    structured::ErrorCategory::NotRun,
+                    format!(
+                        "This Secure Kernel call trace was not armed: it reached the engine with \
+                         no caller time left for the symbol resolve. Nothing was armed. It waited \
+                         {}s behind other work on this session; issue it when the session is idle, \
+                         or raise the server's call timeout (WINDBG_MCP_CALL_TIMEOUT_SECS).",
+                        queued.as_secs(),
+                    ),
+                ))
+            } else {
+                arm_sk_call_trace(
+                    e,
+                    label,
+                    limit,
+                    remaining,
+                    sk_call_trace,
+                    pool_trace.is_some(),
+                )
+            }
+        }
+        EngineOp::SkCallTraceRead { stop } => read_sk_call_trace(e, stop, sk_call_trace),
         EngineOp::DriverHazards {
             module,
             patience_ms,
@@ -10133,7 +10173,17 @@ fn arm_pool_trace(
     limit: usize,
     deadline: Instant,
     slot: &mut Option<PoolTrace>,
+    other_trace_armed: bool,
 ) -> Result<Output, Failed> {
+    if other_trace_armed {
+        return Err(Failed::categorised(
+            structured::ErrorCategory::InvalidArgument,
+            "this session already holds a Secure Kernel call trace. DbgEng has one breakpoint \
+             callback slot, so two callback traces cannot be armed together; disarm the existing \
+             trace first."
+                .to_string(),
+        ));
+    }
     if !matches!(e.debuggee_type(), Ok(kind) if kind.is_live_kernel()) {
         return Err(Failed::categorised(
             structured::ErrorCategory::InvalidArgument,
@@ -10652,6 +10702,687 @@ fn render_pool_trace(report: &structured::PoolTrace) -> String {
         "  The trace is still armed.\n"
     } else {
         "  The trace is disarmed: its breakpoints are removed.\n"
+    });
+    out
+}
+
+/// One VTL0 Secure Kernel call trace held by an ordinary live-kernel worker.
+pub(crate) struct SkCallTrace {
+    trace_id: String,
+    label: Option<String>,
+    entry: structured::CodeLocation,
+    images: Vec<structured::ImageRef>,
+    entry_bytes: String,
+    machine: String,
+    source_vtl: u8,
+    nt_base: u64,
+    nt_end: u64,
+    /// Shared only with the engine's breakpoint callback, which runs on this same thread.
+    recorder: std::rc::Rc<std::cell::RefCell<crate::skcall::Recorder>>,
+}
+
+#[derive(Clone, Copy)]
+struct SkCallProcessLayout {
+    /// Offset of `_ETHREAD.Cid.UniqueProcess` from the thread address DbgEng reports.
+    process_id: u64,
+    process_id_size: usize,
+}
+
+static SK_CALL_TRACE_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+const SK_CALL_SCHEMA: &str = "windbg-mcp.sk-call-trace.v1";
+
+fn sk_call_identity_gaps() -> Vec<String> {
+    [
+        "session_id",
+        "target_boot_id",
+        "vm_id",
+        "partition_id",
+        "vp",
+        "stop_epoch",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn validate_sk_call_label(label: Option<String>) -> Result<Option<String>, Failed> {
+    let Some(label) = label else {
+        return Ok(None);
+    };
+    if label.is_empty() || label.len() > 128 || label.chars().any(char::is_control) {
+        return Err(Failed::categorised(
+            structured::ErrorCategory::InvalidArgument,
+            "a Secure Kernel call trace label must be 1-128 bytes and contain no control \
+             characters. Nothing was armed."
+                .to_string(),
+        ));
+    }
+    Ok(Some(label))
+}
+
+/// Arms the exact symbol entry and registers a bounded callback. It never resumes the target.
+fn arm_sk_call_trace(
+    e: &DebugEngine,
+    label: Option<String>,
+    limit: usize,
+    remaining: Duration,
+    slot: &mut Option<SkCallTrace>,
+    other_trace_armed: bool,
+) -> Result<Output, Failed> {
+    if other_trace_armed {
+        return Err(Failed::categorised(
+            structured::ErrorCategory::InvalidArgument,
+            "this session already holds a pool trace. DbgEng has one breakpoint callback slot, \
+             so two callback traces cannot be armed together; disarm the existing trace first."
+                .to_string(),
+        ));
+    }
+    if !matches!(e.debuggee_type(), Ok(kind) if kind.is_live_kernel()) {
+        return Err(Failed::categorised(
+            structured::ErrorCategory::InvalidArgument,
+            "a Secure Kernel call trace needs an ordinary live Windows kernel target. A dump \
+             cannot run, and a user-mode or hypervisor target does not contain the NT VTL0 entry."
+                .to_string(),
+        ));
+    }
+    let set = e.instruction_set();
+    if !matches!(set, dbgscope::dbgeng::InstructionSet::Amd64) {
+        return Err(Failed::categorised(
+            structured::ErrorCategory::InvalidArgument,
+            format!(
+                "this trace decodes the measured x64 entry convention (CL, DX, R8D and R9), but \
+                 the target is machine {}. Nothing was armed.",
+                machine_label(set)
+            ),
+        ));
+    }
+    let label = validate_sk_call_label(label)?;
+    let (nt_base, nt_size) = loaded_module_named(e, "nt")?;
+    let nt_end = nt_base.saturating_add(u64::from(nt_size));
+    let generation = SK_CALL_TRACE_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+    let trace_id = format!("skcall-{generation}");
+    let marker = format!("$$ sk_call_trace {generation}");
+    // This entry runs on the VTL-transition path. Do not patch its protected instruction bytes:
+    // a processor execution breakpoint observes the same exact address without planting `int 3`.
+    let spec = BreakpointSpec::data(
+        BreakpointAt::Expression("nt!VslpEnterIumSecureMode".to_string()),
+        DataWatch {
+            access: DataAccess::Execute,
+            size: 1,
+        },
+    )
+    .with_command(marker.clone());
+    let timeout_ms = remaining.as_millis().clamp(1, u128::from(u32::MAX)) as u32;
+    let armed = e
+        .set_breakpoint_bounded(&spec, timeout_ms)
+        .map_err(failed)?;
+    let id = armed.breakpoint.id;
+    let remove_new = || {
+        if e.remove_breakpoint(id).is_ok() {
+            " The breakpoint it created was removed."
+        } else {
+            " Its breakpoint could not be removed and remains set as an ordinary breakpoint; \
+             clear it before resuming."
+        }
+    };
+    if let Some(cut_short) = armed.cut_short {
+        let category = match cut_short {
+            Interruption::OnRequest => structured::ErrorCategory::Interrupted,
+            Interruption::Deadline { .. } => structured::ErrorCategory::Timeout,
+        };
+        return Err(Failed::categorised(
+            category,
+            format!(
+                "resolving `nt!VslpEnterIumSecureMode` was interrupted, so no trace was armed.{}",
+                remove_new()
+            ),
+        ));
+    }
+    let Some(address) = armed.breakpoint.address.filter(|address| *address != 0) else {
+        return Err(Failed::categorised(
+            structured::ErrorCategory::InvalidArgument,
+            format!(
+                "`nt!VslpEnterIumSecureMode` did not resolve in the current target, so no trace \
+                 was armed.{}",
+                remove_new()
+            ),
+        ));
+    };
+    if !(nt_base..nt_end).contains(&address) {
+        return Err(Failed::categorised(
+            structured::ErrorCategory::InvalidArgument,
+            format!(
+                "`nt!VslpEnterIumSecureMode` resolved to {address:#x}, outside the current nt \
+                 image [{nt_base:#x}, {nt_end:#x}), so no trace was armed.{}",
+                remove_new()
+            ),
+        ));
+    }
+    let exact_symbol = e.symbol_for(address).is_some_and(|(name, displacement)| {
+        displacement == 0 && name.eq_ignore_ascii_case("nt!VslpEnterIumSecureMode")
+    });
+    if !exact_symbol {
+        return Err(Failed::categorised(
+            structured::ErrorCategory::InvalidArgument,
+            format!(
+                "the resolved entry at {address:#x} was not exactly \
+                 `nt!VslpEnterIumSecureMode+0`, so no trace was armed.{}",
+                remove_new()
+            ),
+        ));
+    }
+    let _instruction = match e
+        .decode_range(address, 16)
+        .ok()
+        .and_then(|decoded| decoded.into_iter().next())
+        .filter(|instruction| instruction.address == address && !instruction.bytes.is_empty())
+    {
+        Some(instruction) => instruction,
+        None => {
+            return Err(Failed::categorised(
+                structured::ErrorCategory::InvalidArgument,
+                format!(
+                    "the exact entry at {address:#x} did not decode to an instruction, so no \
+                     trace was armed.{}",
+                    remove_new()
+                ),
+            ));
+        }
+    };
+    let entry_bytes = match e.read_memory(address, crate::skcall::ENTRY_GUARD.len()) {
+        Ok(bytes) if bytes == crate::skcall::ENTRY_GUARD => {
+            bytes.iter().map(|byte| format!("{byte:02X}")).collect()
+        }
+        Ok(_) | Err(_) => {
+            return Err(Failed::categorised(
+                structured::ErrorCategory::InvalidArgument,
+                format!(
+                    "the exact entry at {address:#x} does not match the measured Windows \
+                     10.0.26100.9457 prefix through its CL, DX, R8D and R9 consumers. Its \
+                     internal calling convention is not assumed on another build, so no trace \
+                     was armed.{}",
+                    remove_new()
+                ),
+            ));
+        }
+    };
+    let mut attributor = Attributor::default();
+    let entry = attributor.locate(e, address);
+    let images = attributor.images();
+    if entry.module.as_deref() != Some("nt") || entry.rva.is_none() || images.len() != 1 {
+        return Err(Failed::categorised(
+            structured::ErrorCategory::InvalidArgument,
+            format!(
+                "the resolved entry could not be bound to one exact `nt` image identity, so no \
+                 trace was armed.{}",
+                remove_new()
+            ),
+        ));
+    }
+    let process_layout = match sk_call_process_layout(e, nt_base) {
+        Ok(layout) => layout,
+        Err(why) => {
+            return Err(Failed::categorised(
+                structured::ErrorCategory::InvalidArgument,
+                format!(
+                    "the matching nt symbols do not expose the stopped thread's typed process-id \
+                     layout ({why}), so no trace was armed.{}",
+                    remove_new()
+                ),
+            ));
+        }
+    };
+
+    // The new breakpoint is fully resolved before the old trace is touched. If removing the old
+    // one fails, remove this one and leave the old callback owning the only callback slot.
+    let replaced = slot.is_some();
+    if let Some(previous) = slot.as_ref() {
+        if let Err(error) = disarm_sk_call_trace(e, previous) {
+            let _ = e.remove_breakpoint(id);
+            return Err(error);
+        }
+        *slot = None;
+    }
+
+    let mut recorder = crate::skcall::Recorder::new(limit, marker);
+    recorder.arm(id);
+    let recorder = std::rc::Rc::new(std::cell::RefCell::new(recorder));
+    let started = Instant::now();
+    let shared = std::rc::Rc::clone(&recorder);
+    let callback: dbgscope::dbgeng::BreakpointCallback = Box::new(move |hit| {
+        use dbgscope::dbgeng::BreakpointAction;
+
+        let Ok(id) = hit.id() else {
+            return BreakpointAction::Default;
+        };
+        let engine = hit.engine();
+        let command = engine
+            .breakpoints()
+            .ok()
+            .and_then(|held| held.into_iter().find(|breakpoint| breakpoint.id == id))
+            .and_then(|breakpoint| breakpoint.command);
+        let Ok(mut recorder) = shared.try_borrow_mut() else {
+            return BreakpointAction::Default;
+        };
+        if !recorder.owns(id, command.as_deref()) {
+            return BreakpointAction::Default;
+        }
+
+        let mut failures = Vec::new();
+        let mut register = |name: &'static str| match engine.integer_register(name) {
+            Ok(value) => Some(value),
+            Err(_) => {
+                failures.push(name.to_string());
+                None
+            }
+        };
+        let rip = register("rip");
+        let rsp = register("rsp");
+        let rcx = register("rcx");
+        let rdx = register("rdx");
+        let r8 = register("r8");
+        let r9 = register("r9");
+
+        let caller = rsp.and_then(|stack| match engine.read_memory(stack, 8) {
+            Ok(bytes) => <[u8; 8]>::try_from(bytes.as_slice())
+                .ok()
+                .map(u64::from_le_bytes)
+                .or_else(|| {
+                    failures.push("caller".to_string());
+                    None
+                }),
+            Err(_) => {
+                failures.push("caller".to_string());
+                None
+            }
+        });
+        let argument_block = r9.and_then(|pointer| {
+            match engine.read_memory(pointer, crate::skcall::ARGUMENT_BLOCK_BYTES) {
+                Ok(bytes) if bytes.len() == crate::skcall::ARGUMENT_BLOCK_BYTES => Some(bytes),
+                Ok(_) | Err(_) => {
+                    failures.push("argument_block".to_string());
+                    None
+                }
+            }
+        });
+        let thread = match engine.current_thread_data_offset() {
+            Ok(value) => Some(value),
+            Err(_) => {
+                failures.push("thread".to_string());
+                None
+            }
+        };
+        let process_id = thread.and_then(|thread| {
+            let address = thread.checked_add(process_layout.process_id)?;
+            engine
+                .read_memory(address, process_layout.process_id_size)
+                .ok()
+                .and_then(|bytes| crate::skcall::decode_process_id(&bytes))
+        });
+        if process_id.is_none() {
+            failures.push("process_id".to_string());
+        }
+        let processor = match engine.current_processor() {
+            Ok(Some(value)) => Some(value),
+            Ok(None) | Err(_) => {
+                failures.push("processor".to_string());
+                None
+            }
+        };
+        let (transition_kind, service, call_context) = match (rcx, rdx, r8) {
+            (Some(rcx), Some(rdx), Some(r8)) => {
+                let (kind, service, context) = crate::skcall::entry_arguments(rcx, rdx, r8);
+                (Some(kind), Some(service), Some(context))
+            }
+            _ => (
+                rcx.map(|value| value as u8),
+                rdx.map(|value| value as u16),
+                r8.map(|value| value as u32),
+            ),
+        };
+        let elapsed_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        recorder.hit(crate::skcall::Hit {
+            // GetTickCount64 is host-boot scoped, monotonic and shared by every worker process,
+            // which makes this coordinate useful to M7 where independent traces are joined.
+            host_monotonic_us: unsafe {
+                windows_sys::Win32::System::SystemInformation::GetTickCount64()
+                    .saturating_mul(1_000)
+            },
+            elapsed_us,
+            rip,
+            rsp,
+            transition_kind,
+            service,
+            call_context,
+            argument_block_pointer: r9,
+            argument_block,
+            caller,
+            process_id,
+            thread,
+            processor,
+            read_failures: failures,
+        })
+    });
+    if let Err(why) = e.set_breakpoint_callback(callback) {
+        let left = remove_new();
+        return Err(Failed::from(format!(
+            "the breakpoint callback could not be registered ({why}), so no trace was armed.{left}"
+        )));
+    }
+
+    let trace = SkCallTrace {
+        trace_id,
+        label,
+        entry,
+        images,
+        entry_bytes,
+        machine: machine_label(set),
+        source_vtl: 0,
+        nt_base,
+        nt_end,
+        recorder,
+    };
+    let report = sk_call_armed_report(&trace, replaced);
+    *slot = Some(trace);
+    Ok(Output::typed(render_sk_call_armed(&report), report))
+}
+
+fn sk_call_process_layout(e: &DebugEngine, nt_base: u64) -> Result<SkCallProcessLayout, String> {
+    let ethread = e
+        .type_id(nt_base, "_ETHREAD")
+        .map_err(|why| why.to_string())?;
+    // GetCurrentThreadDataOffset names the kernel thread. `_ETHREAD` embeds that `_KTHREAD` at
+    // byte zero on the admitted build; prove that before treating the address as an ETHREAD.
+    let tcb = e
+        .field_offset(nt_base, ethread, "Tcb")
+        .map_err(|why| why.to_string())?;
+    if tcb != 0 {
+        return Err(format!("_ETHREAD.Tcb is at {tcb:#x}, not byte zero"));
+    }
+    let (client_id, cid) = e
+        .field_type_and_offset(nt_base, ethread, "Cid")
+        .map_err(|why| why.to_string())?;
+    let (handle, unique_process) = e
+        .field_type_and_offset(nt_base, client_id, "UniqueProcess")
+        .map_err(|why| why.to_string())?;
+    let process_id_size = e
+        .type_size(nt_base, handle)
+        .map_err(|why| why.to_string())? as usize;
+    if !matches!(process_id_size, 4 | 8) {
+        return Err(format!(
+            "_CLIENT_ID.UniqueProcess is {process_id_size} bytes, not a pointer width"
+        ));
+    }
+    Ok(SkCallProcessLayout {
+        process_id: u64::from(cid) + u64::from(unique_process),
+        process_id_size,
+    })
+}
+
+fn disarm_sk_call_trace(e: &DebugEngine, trace: &SkCallTrace) -> Result<(), Failed> {
+    let marker = trace.recorder.borrow().marker().to_string();
+    let held = e.breakpoints().map_err(|why| {
+        Failed::from(format!(
+            "the session's breakpoints could not be listed ({why}), so Secure Kernel call trace \
+             {} is still armed: none of its breakpoints were removed.",
+            trace.trace_id
+        ))
+    })?;
+    let stuck: Vec<u32> = held
+        .iter()
+        .filter(|breakpoint| breakpoint.command.as_deref() == Some(marker.as_str()))
+        .map(|breakpoint| breakpoint.id)
+        .filter(|&id| e.remove_breakpoint(id).is_err())
+        .collect();
+    if !stuck.is_empty() {
+        return Err(Failed::from(format!(
+            "breakpoint(s) {stuck:?} of Secure Kernel call trace {} could not be removed, so the \
+             trace is still armed.",
+            trace.trace_id
+        )));
+    }
+    e.clear_breakpoint_callback().map_err(|why| {
+        Failed::from(format!(
+            "Secure Kernel call trace {} has no breakpoint left, but its callback could not be \
+             unregistered ({why}), so the trace is still held.",
+            trace.trace_id
+        ))
+    })
+}
+
+fn sk_call_armed_report(trace: &SkCallTrace, replaced: bool) -> structured::SkCallTraceArmed {
+    structured::SkCallTraceArmed {
+        schema: SK_CALL_SCHEMA.to_string(),
+        trace_id: trace.trace_id.clone(),
+        label: trace.label.clone(),
+        entry: trace.entry.clone(),
+        images: trace.images.clone(),
+        entry_bytes: trace.entry_bytes.clone(),
+        machine: trace.machine.clone(),
+        source_vtl: trace.source_vtl,
+        argument_block_bytes: crate::skcall::ARGUMENT_BLOCK_BYTES,
+        limit: trace.recorder.borrow().limit(),
+        replaced,
+        identity_gaps: sk_call_identity_gaps(),
+    }
+}
+
+fn read_sk_call_trace(
+    e: &DebugEngine,
+    stop: bool,
+    slot: &mut Option<SkCallTrace>,
+) -> Result<Output, Failed> {
+    let Some(trace) = slot.as_ref() else {
+        return Err(Failed::categorised(
+            structured::ErrorCategory::InvalidArgument,
+            "this session holds no VTL0 Secure Kernel call trace to read.".to_string(),
+        ));
+    };
+    let held = e.breakpoints().map_err(failed)?;
+    let report = {
+        let recorder = trace.recorder.borrow();
+        let missing_breakpoint = recorder.breakpoint().is_none_or(|id| {
+            !held.iter().any(|breakpoint| {
+                breakpoint.id == id && breakpoint.command.as_deref() == Some(recorder.marker())
+            })
+        });
+        structured::SkCallTrace {
+            schema: SK_CALL_SCHEMA.to_string(),
+            trace_id: trace.trace_id.clone(),
+            label: trace.label.clone(),
+            entry: trace.entry.clone(),
+            images: trace.images.clone(),
+            entry_bytes: trace.entry_bytes.clone(),
+            machine: trace.machine.clone(),
+            source_vtl: trace.source_vtl,
+            calls: recorder
+                .calls()
+                .iter()
+                .map(|call| {
+                    let caller_symbol = call.hit.caller.and_then(|address| e.symbol_for(address));
+                    traced_sk_call(trace, call, caller_symbol)
+                })
+                .collect(),
+            limit: recorder.limit(),
+            full: recorder.full(),
+            dropped: recorder.dropped(),
+            unreadable_hits: recorder.unreadable_hits(),
+            missing_breakpoint,
+            armed: !stop,
+            identity_gaps: sk_call_identity_gaps(),
+        }
+    };
+    if stop {
+        disarm_sk_call_trace(e, trace)?;
+        *slot = None;
+    }
+    Ok(Output::typed(render_sk_call_trace(&report), report))
+}
+
+fn traced_sk_call(
+    trace: &SkCallTrace,
+    call: &crate::skcall::Call,
+    caller_symbol: Option<(String, u64)>,
+) -> structured::TracedSkCall {
+    let hit = &call.hit;
+    let caller = hit.caller.map(|address| structured::CodeLocation {
+        address: structured::addr(address),
+        module: (trace.nt_base..trace.nt_end)
+            .contains(&address)
+            .then(|| "nt".to_string()),
+        rva: (trace.nt_base..trace.nt_end)
+            .contains(&address)
+            .then(|| format!("{:#x}", address - trace.nt_base)),
+        attribution_failed: false,
+    });
+    let mut measured = vec![
+        "host_monotonic_us".to_string(),
+        "host_elapsed_us".to_string(),
+    ];
+    for (name, present) in [
+        ("target_rip", hit.rip.is_some()),
+        ("stack_pointer", hit.rsp.is_some()),
+        ("transition_kind", hit.transition_kind.is_some()),
+        ("service", hit.service.is_some()),
+        ("call_context", hit.call_context.is_some()),
+        (
+            "argument_block_pointer",
+            hit.argument_block_pointer.is_some(),
+        ),
+        ("argument_block", hit.argument_block.is_some()),
+        ("caller", hit.caller.is_some()),
+        ("process_id", hit.process_id.is_some()),
+        ("thread", hit.thread.is_some()),
+        ("processor", hit.processor.is_some()),
+    ] {
+        if present {
+            measured.push(name.to_string());
+        }
+    }
+    let mut symbol_derived = vec!["entry".to_string(), "images".to_string()];
+    if caller_symbol.is_some() {
+        symbol_derived.push("caller_symbol".to_string());
+    }
+    let (caller_symbol, caller_displacement) = caller_symbol
+        .map_or((None, None), |(symbol, displacement)| {
+            (Some(symbol), Some(displacement))
+        });
+    structured::TracedSkCall {
+        sequence: call.sequence,
+        host_monotonic_us: hit.host_monotonic_us,
+        host_elapsed_us: hit.elapsed_us,
+        target_rip: hit.rip.map(structured::addr),
+        stack_pointer: hit.rsp.map(structured::addr),
+        transition_kind: hit.transition_kind,
+        service: hit.service,
+        call_context: hit.call_context,
+        argument_block_pointer: hit.argument_block_pointer.map(structured::addr),
+        argument_block: hit
+            .argument_block
+            .as_ref()
+            .map(|bytes| bytes.iter().map(|byte| format!("{byte:02X}")).collect()),
+        caller,
+        caller_symbol,
+        caller_displacement: caller_displacement.map(|displacement| format!("{displacement:#x}")),
+        process_id: hit.process_id,
+        thread: hit.thread.map(structured::addr),
+        processor: hit.processor,
+        provenance: structured::SkCallProvenance {
+            measured,
+            symbol_derived,
+            inferred: vec!["source_vtl".to_string()],
+            read_failures: hit.read_failures.clone(),
+        },
+    }
+}
+
+fn render_sk_call_armed(report: &structured::SkCallTraceArmed) -> String {
+    let label = report
+        .label
+        .as_deref()
+        .map(|label| format!(" for `{}`", structured::renderable(label)))
+        .unwrap_or_default();
+    let shown = &report.entry_bytes[..report.entry_bytes.len().min(32)];
+    format!(
+        "Secure Kernel call trace {}{label} armed at {} ({}+{}, guarded prefix {}{}), recording up to {} \
+         call(s).{} Nothing is recorded until the target runs.\n",
+        report.trace_id,
+        report.entry.address,
+        report.entry.module.as_deref().unwrap_or("?"),
+        report.entry.rva.as_deref().unwrap_or("?"),
+        shown,
+        if shown.len() < report.entry_bytes.len() {
+            "…"
+        } else {
+            ""
+        },
+        report.limit,
+        if report.replaced {
+            " It replaced and disarmed this session's previous Secure Kernel call trace."
+        } else {
+            ""
+        }
+    )
+}
+
+fn render_sk_call_trace(report: &structured::SkCallTrace) -> String {
+    let mut out = format!(
+        "Secure Kernel call trace {}: {} call(s) of up to {}{}.\n",
+        report.trace_id,
+        report.calls.len(),
+        report.limit,
+        if report.full { ", FULL" } else { "" }
+    );
+    if report.dropped > 0 {
+        out.push_str(&format!(
+            "  {} later call(s) were not retained after the trace filled.\n",
+            report.dropped
+        ));
+    }
+    if report.unreadable_hits > 0 {
+        out.push_str(&format!(
+            "  {} hit(s) retain one or more named read failures.\n",
+            report.unreadable_hits
+        ));
+    }
+    if report.missing_breakpoint {
+        out.push_str("  Its breakpoint is no longer held, so it has recorded nothing since.\n");
+    }
+    if !report.calls.is_empty() {
+        let mut rows = String::from("seq  us          pid    cpu  kind  service  caller\n");
+        for call in &report.calls {
+            rows.push_str(&format!(
+                "{:<4} {:<11} {:<6} {:<4} {:<5} {:<8} {}\n",
+                call.sequence,
+                call.host_elapsed_us,
+                call.process_id
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                call.processor
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                call.transition_kind
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "-".to_string()),
+                call.service
+                    .map(|value| format!("{value:#06x}"))
+                    .unwrap_or_else(|| "-".to_string()),
+                call.caller_symbol
+                    .as_deref()
+                    .map(structured::renderable)
+                    .map(std::borrow::Cow::into_owned)
+                    .or_else(|| call.caller.as_ref().map(|caller| caller.address.clone()))
+                    .unwrap_or_else(|| "-".to_string()),
+            ));
+        }
+        out.push_str(&fenced(&rows));
+    }
+    out.push_str(if report.armed {
+        "  The trace is still armed.\n"
+    } else {
+        "  The trace is disarmed: its breakpoint is removed.\n"
     });
     out
 }
@@ -15111,6 +15842,54 @@ mod tests {
             armed.contains("phase_of(id, command.as_deref())"),
             "the trace's callback no longer asks with the hit breakpoint's own command, so an id \
              the engine reused for somebody else's breakpoint is taken for the trace's"
+        );
+    }
+
+    /// The Secure Kernel call trace has the same id-reuse boundary as the pool trace: its callback
+    /// must prove both the breakpoint id and the private command marker before it auto-continues a
+    /// hit. The registers are read through typed DbgEng access in that same callback; debugger
+    /// command text would make the event contract depend on localized rendering.
+    #[test]
+    fn a_secure_call_trace_owns_its_marked_breakpoint_and_uses_typed_reads() {
+        let armed = bodies_of(&["arm_sk_call_trace"], 12_000);
+        assert!(
+            armed.contains(".with_command(marker.clone())"),
+            "the trace no longer marks the breakpoint it owns"
+        );
+        assert!(
+            armed.contains("access: DataAccess::Execute") && armed.contains("size: 1"),
+            "the VTL-transition entry must use a one-byte processor execution breakpoint rather \
+             than patching its protected instruction bytes"
+        );
+        assert!(
+            armed.contains("recorder.owns(id, command.as_deref())"),
+            "the callback no longer proves the hit id and marker together"
+        );
+        for register in ["rip", "rsp", "rcx", "rdx", "r8", "r9"] {
+            assert!(
+                armed.contains(&format!("register(\"{register}\")")),
+                "the callback no longer reads `{register}` through the typed register API"
+            );
+        }
+        assert!(
+            !armed.contains("execute("),
+            "the callback must not parse debugger command text"
+        );
+        assert!(
+            armed.contains("current_thread_data_offset()")
+                && armed.contains("sk_call_process_layout(e, nt_base)")
+                && !armed.contains("current_process_system_id()"),
+            "a kernel target has no current process system id; the callback must read the \
+             symbol-checked client id belonging to its stopped KTHREAD"
+        );
+        assert!(
+            !armed.contains("caller.and_then(|address| engine.symbol_for(address))"),
+            "caller symbol loading must happen after the event callback returns"
+        );
+        let read = bodies_of(&["read_sk_call_trace"], 1_800);
+        assert!(
+            read.contains("call.hit.caller.and_then(|address| e.symbol_for(address))"),
+            "the stopped trace read must resolve the captured caller address"
         );
     }
 

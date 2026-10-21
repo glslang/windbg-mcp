@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`sk_call_trace` records the VTL0 half of a Secure Kernel service transition.** In an ordinary
+  live x64 kernel worker it resolves exactly `nt!VslpEnterIumSecureMode`, proves the address belongs
+  to one identified `nt` image, and refuses unless the 10.0.26100.9457 prefix still contains the
+  measured CL, DX, R8D and R9 consumers. Its same-thread typed breakpoint callback retains the
+  transition kind, service, context, raw argument block, caller, the KTHREAD's symbol-checked
+  `_ETHREAD.Cid.UniqueProcess`, KTHREAD/processor,
+  host-wide monotonic time and named read failures. `sk_call_trace_read` snapshots or cleanly
+  disarms it; the trace is bounded, stops on the filling hit, owns its breakpoint by id plus a
+  private marker, and cannot coexist with a pool trace because DbgEng has one callback slot. The
+  supported-API guest harness in `tools/skcall_guest_harness.c` labels each VBS-enclave
+  create/load/initialize/terminate/delete invocation for later cross-layer correlation; an empty
+  enclave reservation alone was measured not to cross the traced entry. The exact entry uses a
+  one-byte processor execution breakpoint instead of patching the protected transition code. The
+  runbook is `docs/secure-kernel/vtl0-call-trace.md`; this is M4 of the Secure Kernel call-debugging
+  roadmap.
+  Its exact-build K3 gate retained 256 complete calls with no read failure, including 199 from the
+  single PID emitted by three successful labelled lifecycle invocations, then disarmed, detached
+  and left the same guest boot and `vmwp` healthy with no retained worker.
+
 - **The WinDbg pane is installable from this marketplace, beside the server.** `mods/windbg-pane/`
   — the Claude Code mod that draws a WinDbg-style pane from the server's tool calls as they happen
   — is now the marketplace's second plugin, so `/plugin install windbg-pane@windbg-mcp` puts it in

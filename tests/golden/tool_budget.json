@@ -523,6 +523,24 @@
       "wire": 2384
     },
     {
+      "annotations": 130,
+      "description": 873,
+      "inputSchema": 764,
+      "modelVisible": 1691,
+      "name": "sk_call_trace",
+      "outputSchema": 2768,
+      "wire": 4620
+    },
+    {
+      "annotations": 129,
+      "description": 374,
+      "inputSchema": 503,
+      "modelVisible": 936,
+      "name": "sk_call_trace_read",
+      "outputSchema": 4458,
+      "wire": 5554
+    },
+    {
       "annotations": 127,
       "description": 271,
       "inputSchema": 2089,
@@ -740,15 +758,15 @@
     }
   ],
   "totals": {
-    "annotations": 9124,
-    "description": 47982,
-    "inputSchema": 76405,
+    "annotations": 9383,
+    "description": 49229,
+    "inputSchema": 77672,
     "instructions": 2022,
-    "modelVisible": 128786,
-    "outputSchema": 226639,
-    "payload": 366944,
-    "tools": 82,
-    "wire": 366851,
+    "modelVisible": 131413,
+    "outputSchema": 233865,
+    "payload": 377120,
+    "tools": 84,
+    "wire": 377025,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10296
   }

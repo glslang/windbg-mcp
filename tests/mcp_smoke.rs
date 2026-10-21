@@ -2191,7 +2191,12 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// **M3 one-shot software breakpoints stay under 129,000** (2026-10-21). The vector-3 transition
 /// adds 1,487 B and moves the surface to 128,786 B across 82 tools. The fixed ceiling deliberately
 /// remains tight: 214 B are left, so any further surface growth needs a conscious redesign or bump.
-const MODEL_VISIBLE_CEILING: usize = 129_000;
+///
+/// **129,000 -> 135,000 for the M4 VTL0 Secure Kernel call trace** (2026-10-21). The two tools
+/// move the surface to 131,413 B across 84 tools. Their 2,627 B carry the exact-symbol/image guard,
+/// bounded x64 entry contract, explicit callback ownership and the separate arm/read lifecycle.
+/// The new ceiling leaves 3,587 B (2.7%).
+const MODEL_VISIBLE_CEILING: usize = 135_000;
 
 /// Ceiling on the whole `tools/list` payload — the serialized result, not the sum of its tools, so
 /// the array's own punctuation and every result-level field are inside it. 216,839 bytes as of
@@ -2363,7 +2368,13 @@ const MODEL_VISIBLE_CEILING: usize = 129_000;
 /// **360,000 -> 370,000 for M3 guarded writes** (2026-10-20). The payload moves 359,927 ->
 /// 362,953 B. The new tool accounts for the 3,025 B row and the remaining byte is the array comma;
 /// no shared output shape grew. The ceiling leaves 7,047 B (1.9%).
-const WIRE_CEILING: usize = 370_000;
+///
+/// **370,000 -> 385,000 for the M4 VTL0 Secure Kernel call trace** (2026-10-21). The payload moves
+/// 366,944 -> 377,120 B. The two new closures own that growth: the read result carries one exact
+/// image identity and a bounded sequence of typed calls, including cross-worker monotonic time,
+/// raw argument bytes and named failures. No existing output closure grew. The new ceiling leaves
+/// 7,880 B (2.1%).
+const WIRE_CEILING: usize = 385_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,296
 /// bytes (2026-10-14), because its `inputSchema` pulls the whole `StepAction`/`Check` vocabulary
@@ -3572,6 +3583,10 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
         // `a_pool_trace_is_refused_on_a_dump`'s.
         ("pool_trace", json!({ "module": "mydriver" }), "error"),
         ("pool_trace_read", json!({}), "error"),
+        // Both are well formed and take the ordinary no-session refusal. Exact-symbol and
+        // live-kernel validation happen only after routing to an ordinary worker.
+        ("sk_call_trace", json!({ "label": "smoke" }), "error"),
+        ("sk_call_trace_read", json!({}), "error"),
         ("heap_list", json!({}), "error"),
         ("heap_allocations", json!({}), "error"),
         (
@@ -4690,7 +4705,7 @@ fn a_listener_serves_the_narrowed_surface_it_was_started_with() {
     // was typed — `session` is added whatever it said.
     let log = listener.stderr();
     assert!(
-        log.contains("serving 13 of 82 tools (session, crash)"),
+        log.contains("serving 13 of 84 tools (session, crash)"),
         "the listener does not report the surface it ended up with: {log}"
     );
 }
@@ -4722,7 +4737,7 @@ fn two_clients_on_one_listener_are_served_two_surfaces() {
     let local_token = server.token.clone();
     assert!(
         server.wait_for_stderr(
-            "serving 20 of 82 tools (session, inspect) — except bench serves 13 of 82 tools \
+            "serving 20 of 84 tools (session, inspect) — except bench serves 13 of 84 tools \
              (session, crash)",
             Duration::from_secs(30)
         ),
