@@ -143,6 +143,12 @@ pub enum EngineOp {
         epoch: crate::skcontrol::StopEpoch,
         breakpoints: Vec<crate::sklive::BreakpointGuard>,
     },
+    /// Consume the current stop and plant up to 64 one-shot `INT3` patches under a VM-wide pause.
+    /// The immediately following wait resumes until the owned vector-3 handler catches one.
+    SkLiveContinueToSoftwareBreakpoints {
+        epoch: crate::skcontrol::StopEpoch,
+        instructions: Vec<crate::sklive::InstructionGuard>,
+    },
     /// Consume the current stop epoch, restore the complete baseline and resume.
     SkLiveContinue {
         epoch: crate::skcontrol::StopEpoch,

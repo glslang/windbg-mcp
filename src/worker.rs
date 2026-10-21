@@ -1006,6 +1006,7 @@ fn sealed_as(op: &EngineOp) -> Option<Cleanup> {
         | EngineOp::SkLiveWrite { .. }
         | EngineOp::SkLiveStep { .. }
         | EngineOp::SkLiveContinueToBreakpoints { .. }
+        | EngineOp::SkLiveContinueToSoftwareBreakpoints { .. }
         | EngineOp::SkLiveContinue { .. }
         | EngineOp::OpenSecureKernelKd(_) => Some(Cleanup::NotInterruptible),
         _ => None,
@@ -2319,6 +2320,7 @@ fn refuse_when_the_target_is_gone(e: &DebugEngine, op: &EngineOp) -> Option<Fail
             | EngineOp::SkLiveWrite { .. }
             | EngineOp::SkLiveStep { .. }
             | EngineOp::SkLiveContinueToBreakpoints { .. }
+            | EngineOp::SkLiveContinueToSoftwareBreakpoints { .. }
             | EngineOp::SkLiveContinue { .. }
             | EngineOp::SkKdServe
         )
@@ -2761,6 +2763,7 @@ fn watch_for(op: &EngineOp) -> Watch {
         | EngineOp::SkLiveWrite { .. }
         | EngineOp::SkLiveStep { .. }
         | EngineOp::SkLiveContinueToBreakpoints { .. }
+        | EngineOp::SkLiveContinueToSoftwareBreakpoints { .. }
         | EngineOp::SkLiveContinue { .. }
         | EngineOp::SkKdServe => Watch::Ignore,
         _ => Watch::Compare,
@@ -3534,6 +3537,19 @@ fn execute(
                 .continue_to_breakpoints(e, &epoch, breakpoints)
                 .map_err(failed)?;
             emit(&WorkerMessage::SecureKernelPauseEnded);
+            Ok(Output::typed(
+                crate::skdispatch::render_transition(&transition),
+                transition,
+            ))
+        }
+
+        EngineOp::SkLiveContinueToSoftwareBreakpoints {
+            epoch,
+            instructions,
+        } => {
+            let transition = held_live_control(&mut sk_live.session)?
+                .continue_to_software_breakpoints(e, &epoch, instructions)
+                .map_err(failed)?;
             Ok(Output::typed(
                 crate::skdispatch::render_transition(&transition),
                 transition,
@@ -13476,23 +13492,34 @@ mod tests {
     }
 
     #[test]
-    fn a_live_step_keeps_the_pause_timer_and_both_continue_paths_end_it() {
+    fn live_step_and_software_rearm_keep_the_pause_timer_until_a_true_continue() {
         let source = include_str!("worker.rs");
-        let step = source
+        let dispatch = source
+            .split_once("fn execute(")
+            .expect("the worker dispatch function exists")
+            .1;
+        let step = dispatch
             .split_once("EngineOp::SkLiveStep { epoch, guard } =>")
             .expect("the live-step dispatch arm exists")
             .1
             .split_once("EngineOp::SkLiveContinueToBreakpoints { epoch, breakpoints } =>")
             .expect("the replacement-breakpoint dispatch arm follows it")
             .0;
-        let rearmed = source
+        let rearmed = dispatch
             .split_once("EngineOp::SkLiveContinueToBreakpoints { epoch, breakpoints } =>")
             .expect("the replacement-breakpoint dispatch arm exists")
+            .1
+            .split_once("EngineOp::SkLiveContinueToSoftwareBreakpoints {")
+            .expect("the software-breakpoint dispatch arm follows it")
+            .0;
+        let software = dispatch
+            .split_once("EngineOp::SkLiveContinueToSoftwareBreakpoints {")
+            .expect("the software-breakpoint dispatch arm exists")
             .1
             .split_once("EngineOp::SkLiveContinue { epoch } =>")
             .expect("the live-continue dispatch arm follows it")
             .0;
-        let continued = source
+        let continued = dispatch
             .split_once("EngineOp::SkLiveContinue { epoch } =>")
             .expect("the live-continue dispatch arm exists")
             .1
@@ -13505,6 +13532,10 @@ mod tests {
             "single-step keeps vmwp under debugger control and must preserve the absolute pause timer: {step}"
         );
         assert_eq!(rearmed.matches("SecureKernelPauseEnded").count(), 1);
+        assert!(
+            !software.contains("SecureKernelPauseEnded"),
+            "software re-arm keeps a VM-wide pause until its wait begins: {software}"
+        );
         assert_eq!(continued.matches("SecureKernelPauseEnded").count(), 1);
     }
 
@@ -17999,6 +18030,14 @@ mod tests {
                         address: crate::skcontrol::HexU64(0xfffff80000001000),
                         bytes: vec![0x90],
                     },
+                }],
+            },
+            EngineOp::SkLiveContinueToSoftwareBreakpoints {
+                epoch: crate::skcontrol::StopEpoch::new("0123456789abcdef")
+                    .expect("the fixture epoch is valid"),
+                instructions: vec![crate::sklive::InstructionGuard {
+                    address: crate::skcontrol::HexU64(0xfffff80000001000),
+                    bytes: vec![0x90],
                 }],
             },
             EngineOp::SkLiveContinue {

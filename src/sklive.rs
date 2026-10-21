@@ -18,8 +18,8 @@ use std::fmt;
 use std::time::Instant;
 
 use crate::skcontrol::{
-    Capabilities, ControlProcess, ControlSession, HeldEvent, HexU64, RegisterName, RegisterValue,
-    RegisterWrite, StopEpoch, StopReason, TargetIdentity,
+    Capabilities, Capability, ControlProcess, ControlSession, HeldEvent, HexU64, RegisterName,
+    RegisterValue, RegisterWrite, StopEpoch, StopReason, TargetIdentity,
 };
 
 const TF: u64 = 1 << 8;
@@ -29,6 +29,7 @@ const DR7_ENABLE_MASK: u64 = 0xff;
 const MAX_INSTRUCTION_BYTES: usize = 15;
 const MAX_HARDWARE_BREAKPOINTS: usize = 4;
 const MAX_GUARDED_WRITE_BYTES: usize = 64;
+pub(crate) const MAX_SOFTWARE_BREAKPOINTS: usize = 64;
 pub(crate) const MAX_LIVE_CONTROL_VPS: usize = 16;
 const MAX_STEP_DESTINATIONS: usize = 4;
 const PROFILE_SCHEMA: &str = "windbg-mcp.sk-live-dispatcher-profile.v1";
@@ -212,6 +213,15 @@ pub(crate) trait EventDispatcher {
         targets: &[TargetIdentity],
         breakpoints: &[BreakpointGuard],
     ) -> Result<HexU64>;
+    /// Optional vector-3 context independently registered for owned software breakpoints.
+    fn software_breakpoint_context(&self) -> Option<HexU64> {
+        None
+    }
+    /// Prove that every VP which can execute an owned `INT3` is represented by this controller.
+    /// The first software-breakpoint slice supports only a Hyper-V VM proved to have one vCPU.
+    fn verify_software_breakpoint_scope_until(&mut self, _deadline: Instant) -> Result<()> {
+        bail!("this dispatcher cannot prove software-breakpoint VP coverage")
+    }
     /// Detach before pausing an armed target that produced no event, then reattach while paused so
     /// provider state and the registered handler can be removed without deadlocking Hyper-V.
     fn begin_disarm(&mut self, targets: &[TargetIdentity]) -> Result<()>;
@@ -221,6 +231,10 @@ pub(crate) trait EventDispatcher {
     fn finish_arm(&mut self) -> Result<()>;
     /// Whether every provider whose registers may be accessed is currently quiesced.
     fn provider_writes_quiesced(&self) -> bool;
+    /// Whether a generic guarded write is still rollback-owned at the retained stop.
+    fn has_pending_guarded_writes(&self) -> bool {
+        false
+    }
     /// Finish any pending transition and prove provider-write quiescence for fault recovery.
     fn establish_recovery_pause(&mut self, targets: &[TargetIdentity]) -> Result<()>;
     fn establish_recovery_pause_until(
@@ -264,6 +278,20 @@ pub(crate) trait EventDispatcher {
         _deadline: Instant,
     ) -> Result<AppliedMemoryWrite> {
         bail!("this dispatcher does not support guarded live-memory writes")
+    }
+    /// Install one-byte `INT3` patches under a proved VM-wide pause. Unlike generic writes these
+    /// remain owned across exactly one execution interval.
+    fn arm_software_breakpoints_until(
+        &mut self,
+        _instructions: &[InstructionGuard],
+        _deadline: Instant,
+    ) -> Result<()> {
+        bail!("this dispatcher does not support software breakpoints")
+    }
+    /// Restore and prove every execution-time patch under either a VM pause or the retained event
+    /// on a Hyper-V-proved sole VP.
+    fn restore_software_breakpoints_until(&mut self, _deadline: Instant) -> Result<()> {
+        bail!("this dispatcher does not support software breakpoints")
     }
     fn retained_pause_deadline(&self) -> Option<Instant> {
         None
@@ -311,6 +339,14 @@ pub(crate) trait EventDispatcher {
     fn release_paused(&mut self) -> Result<()>;
     fn release_paused_until(&mut self, _deadline: Instant) -> Result<()> {
         self.release_paused()
+    }
+    /// Retain a proved VM-wide pause with only owned one-shot `INT3` patches applied. The next
+    /// wait installs its event-site breakpoint before it starts Resume-VM and pumps DbgEng.
+    fn retain_pause_for_software_breakpoint_wait_until(
+        &mut self,
+        _deadline: Instant,
+    ) -> Result<()> {
+        bail!("this dispatcher does not support executing software breakpoints")
     }
     fn recover(&mut self, safe_to_resume: bool, event: Option<&HeldEvent>) -> Result<()>;
     fn recover_until(
@@ -1049,7 +1085,10 @@ impl RegisterSnapshot {
         let observed_cr3 = snapshot.low(RegisterName::Cr3)?;
         match expected_cr3 {
             Some(expected) if observed_cr3 != expected => {
-                bail!("the stopped CR3 does not match the required address space");
+                bail!(
+                    "the stopped CR3 {observed_cr3:#x} does not match the required address space \
+                     {expected:#x}"
+                );
             }
             None if !allow_transition_cr3 => {
                 bail!("a transition CR3 was not enabled for this session");
@@ -1129,6 +1168,11 @@ enum ExpectedStop {
         destination: HexU64,
         slot: u8,
     },
+    Software {
+        instructions: Vec<InstructionGuard>,
+        /// The exact address space in which the guarded instructions were verified and patched.
+        cr3: HexU64,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -1148,6 +1192,7 @@ struct VpControl<P> {
     provider_phase: ProviderPhase,
     baseline: Option<RegisterSnapshot>,
     observed_cr3: Option<u64>,
+    supports_breakpoint_events: bool,
 }
 
 /// One-VM coordinator for selected VPs and up to four execution breakpoints per VP. The dispatcher
@@ -1163,8 +1208,12 @@ pub(crate) struct LiveControl<P> {
     breakpoints: Vec<BreakpointGuard>,
     arm_mode: Option<ArmMode>,
     dispatcher_context: Option<HexU64>,
+    software_breakpoint_context: Option<HexU64>,
     dispatcher_event: Option<HeldEvent>,
     expected_stop: Option<ExpectedStop>,
+    /// An owned vector-3 event cannot be released until its restart RIP is verified. An ambiguous
+    /// register-write reply deliberately leaves the dispatcher contained on that event.
+    software_restart_rip_unproved: bool,
     allow_transition_cr3: bool,
     fault: Option<FaultRecord>,
 }
@@ -1226,6 +1275,9 @@ impl<P: ControlProvider> LiveControl<P> {
                 provider_phase: ProviderPhase::Running,
                 baseline: None,
                 observed_cr3: None,
+                supports_breakpoint_events: capabilities
+                    .capabilities
+                    .contains(&Capability::BreakpointEvents),
             });
         }
         Ok(Self {
@@ -1240,11 +1292,22 @@ impl<P: ControlProvider> LiveControl<P> {
             breakpoints: Vec::new(),
             arm_mode: None,
             dispatcher_context: None,
+            software_breakpoint_context: None,
             dispatcher_event: None,
             expected_stop: None,
+            software_restart_rip_unproved: false,
             allow_transition_cr3,
             fault: None,
         })
+    }
+
+    /// Whether this controller can own vector-3 events for the bounded one-shot transition.
+    ///
+    /// A software breakpoint can execute on any selected VP, so the first implementation is
+    /// available only when the controller has exactly one provider and that provider explicitly
+    /// advertised the optional event kind during its capabilities handshake.
+    pub(crate) fn supports_software_breakpoint_events(&self) -> bool {
+        self.providers.len() == 1 && self.providers[0].supports_breakpoint_events
     }
 
     pub(crate) fn phase(&self) -> LivePhase {
@@ -1587,9 +1650,14 @@ impl<P: ControlProvider> LiveControl<P> {
             // it here would use the old root; the stop is instead proved by DR6, RIP and the
             // temporary debug register after the new root has been accepted.
             ExpectedStop::StepOver { .. } => Vec::new(),
+            // The first byte is intentionally `INT3` while the guest runs. Its full original is
+            // verified under the owned event on the proved sole VP before that event is released.
+            ExpectedStop::Software { .. } => Vec::new(),
         };
         let targets = match &expected_stop {
-            ExpectedStop::Hardware | ExpectedStop::BreakRequest { .. } => self.targets(),
+            ExpectedStop::Hardware
+            | ExpectedStop::BreakRequest { .. }
+            | ExpectedStop::Software { .. } => self.targets(),
             ExpectedStop::SingleStep { .. } | ExpectedStop::StepOver { .. } => {
                 let Some(active) = self.active_provider else {
                     return Err(self.enter_fault(
@@ -1621,6 +1689,12 @@ impl<P: ControlProvider> LiveControl<P> {
         if let Err(error) = self.validate_observation(active, &observed, &expected_stop) {
             return Err(self.enter_fault(dispatcher, error, Some(observed.event)));
         }
+        let software_stop = matches!(&expected_stop, ExpectedStop::Software { .. });
+        if software_stop {
+            // From this point the owned vector-3 event must not be completed until every patch is
+            // restored and the architectural restart RIP has been verified.
+            self.software_restart_rip_unproved = true;
+        }
         let pause_deadline = dispatcher.retained_pause_deadline();
         for provider in &mut self.providers {
             provider.provider.set_outer_deadline(pause_deadline);
@@ -1650,6 +1724,7 @@ impl<P: ControlProvider> LiveControl<P> {
                 // A CR3 write supplies its own reason to accept a new root. This is narrower than
                 // allowing an arbitrary natural hardware stop to arrive in another address space.
                 ExpectedStop::StepOver { .. } => self.read_allowed_transition_snapshot(active)?,
+                ExpectedStop::Software { cr3, .. } => self.read_snapshot(active, cr3.0)?,
             };
             let stop_cr3 = first.low(RegisterName::Cr3)?;
             self.providers[active].observed_cr3 = Some(stop_cr3);
@@ -1676,13 +1751,38 @@ impl<P: ControlProvider> LiveControl<P> {
             if let ExpectedStop::StepOver { slot, .. } = expected_stop {
                 self.release_step_over_slot(active, &first, slot)?;
             }
+            let mut stop_registers = first.clone();
+            if matches!(&expected_stop, ExpectedStop::Software { .. }) {
+                let deadline = pause_deadline
+                    .context("software breakpoint restoration lacks a pause deadline")?;
+                dispatcher.restore_software_breakpoints_until(deadline)?;
+                if let ExpectedStop::Software { instructions, .. } = &expected_stop {
+                    for instruction in instructions {
+                        dispatcher.verify_instruction_until(instruction, deadline)?;
+                    }
+                }
+                let observed_rip = first.low(RegisterName::Rip)?;
+                self.write_one(
+                    active,
+                    RegisterName::Rip,
+                    observed_rip,
+                    instruction.address.0,
+                )?;
+                let rip = stop_registers
+                    .values
+                    .iter_mut()
+                    .find(|value| value.name == RegisterName::Rip)
+                    .context("the accepted snapshot omitted RIP")?;
+                rip.low = instruction.address;
+                self.software_restart_rip_unproved = false;
+            }
             let mut event = observed.event.clone();
             event.reason = reason;
             let stop = StopRecord {
                 epoch: next_epoch.1.clone(),
                 target: self.providers[active].target.clone(),
                 event,
-                registers: first,
+                registers: stop_registers,
                 instruction,
                 expected_rips,
                 arm_mode: self.arm_mode.context("the armed session has no arm mode")?,
@@ -1693,7 +1793,7 @@ impl<P: ControlProvider> LiveControl<P> {
                 .filter(|provider| provider.baseline.is_some())
                 .count()
                 > 1;
-            if multi_provider_stop {
+            if multi_provider_stop || software_stop {
                 // The retained event is a barrier for the winner only. Return that provider to
                 // running before native completion, complete the callback, and prove a VM-wide
                 // pause before beginning any transition on a losing provider.
@@ -1713,9 +1813,11 @@ impl<P: ControlProvider> LiveControl<P> {
                 }
                 self.providers[active].provider.begin_arm()?;
                 self.providers[active].provider_phase = ProviderPhase::Arming;
-                self.restore_inactive_providers(active)?;
+                if !software_stop {
+                    self.restore_inactive_providers(active)?;
+                }
             }
-            Ok((stop, multi_provider_stop))
+            Ok((stop, multi_provider_stop || software_stop))
         })();
         for provider in &mut self.providers {
             provider.provider.set_outer_deadline(None);
@@ -1925,7 +2027,8 @@ impl<P: ControlProvider> LiveControl<P> {
                         .context("the stepping session has no hardware-breakpoint slot to borrow")?
                         .slot
                 }
-                StopReason::DebugException => {
+                StopReason::SoftwareBreakpoint { .. } => 0,
+                StopReason::DebugException | StopReason::BreakpointException => {
                     bail!("the stopped event has no validated reason")
                 }
             })
@@ -2292,6 +2395,128 @@ impl<P: ControlProvider> LiveControl<P> {
         Ok(self.commit_epoch(next_epoch))
     }
 
+    /// Replace the stopped hardware arm with one-shot software breakpoints. The dispatcher owns
+    /// every `INT3` byte across this single execution interval and restores all of them before a
+    /// resulting stop can become visible.
+    pub(crate) fn continue_to_software_breakpoints_until(
+        &mut self,
+        dispatcher: &mut impl EventDispatcher,
+        epoch: &StopEpoch,
+        instructions: Vec<InstructionGuard>,
+        deadline: Instant,
+    ) -> Result<StopEpoch> {
+        self.require_stop_epoch(epoch)?;
+        if instructions.is_empty() || instructions.len() > MAX_SOFTWARE_BREAKPOINTS {
+            bail!(
+                "software breakpoint arming requires 1..={MAX_SOFTWARE_BREAKPOINTS} guarded instructions"
+            );
+        }
+        if self.providers.len() != 1 {
+            bail!("software breakpoints currently require exactly one selected VP");
+        }
+        if !self.providers[0].supports_breakpoint_events {
+            bail!("the register provider does not advertise vector-3 breakpoint events");
+        }
+        if self.software_breakpoint_context.is_none() {
+            bail!("the dispatcher did not register an owned vector-3 handler");
+        }
+        if dispatcher.has_pending_guarded_writes() {
+            bail!(
+                "software breakpoints cannot run while generic guarded writes remain rollback-owned"
+            );
+        }
+        dispatcher.verify_software_breakpoint_scope_until(deadline)?;
+        for (index, instruction) in instructions.iter().enumerate() {
+            instruction.validate()?;
+            if instruction.bytes[0] == 0xcc {
+                bail!("software breakpoint guards may not begin with an existing INT3 byte");
+            }
+            if instructions[..index]
+                .iter()
+                .any(|earlier| earlier.address.0.abs_diff(instruction.address.0) <= 1)
+            {
+                bail!(
+                    "software breakpoint addresses may not be equal or adjacent because a \
+                     vector-3 RIP may name the patched byte or its successor"
+                );
+            }
+            dispatcher.verify_instruction_until(instruction, deadline)?;
+        }
+
+        let next_epoch = self.next_epoch("running")?;
+        let dispatcher_event = self.dispatcher_event.clone();
+        let active = self
+            .active_provider
+            .context("the stopped session has no active VP provider")?;
+        // A natural hardware stop may be accepted in an explicitly allowed transition CR3. The
+        // INT3 bytes are verified and installed in that stopped address space, so the resulting
+        // vector-3 event must return in exactly the same one rather than the session's startup CR3.
+        let software_cr3 = HexU64(
+            self.providers[active]
+                .observed_cr3
+                .context("the stopped provider has no accepted CR3 for software breakpoints")?,
+        );
+        let recovery_deadline = dispatcher.retained_recovery_deadline().or(Some(deadline));
+        self.providers[active]
+            .provider
+            .set_outer_deadline(Some(deadline));
+        self.state = State::Releasing;
+        let result = (|| {
+            self.restore_owned_state(active)?;
+            match self.providers[active].provider_phase {
+                ProviderPhase::Stopped => {
+                    self.providers[active].provider.release()?;
+                    self.providers[active].provider_phase = ProviderPhase::Running;
+                    let event = dispatcher_event
+                        .as_ref()
+                        .context("a provider-held stop has no retained dispatcher event")?;
+                    let targets = self.targets();
+                    dispatcher.release_event_and_pause_until(event, &targets, deadline)?;
+                    self.providers[active].provider.begin_arm()?;
+                    self.providers[active].provider_phase = ProviderPhase::Arming;
+                }
+                ProviderPhase::Arming => {
+                    if !dispatcher.provider_writes_quiesced() {
+                        bail!("software breakpoint arming lacks a proved VM-wide pause");
+                    }
+                }
+                ProviderPhase::Running => bail!("the active provider is already running"),
+            }
+            dispatcher.arm_software_breakpoints_until(&instructions, deadline)?;
+            self.providers[active].provider.finish_arm()?;
+            self.providers[active].provider_phase = ProviderPhase::Running;
+            dispatcher.retain_pause_for_software_breakpoint_wait_until(deadline)?;
+            Ok(())
+        })();
+        self.providers[active].provider.set_outer_deadline(None);
+        if let Err(error) = result {
+            return Err(self.enter_fault_inner(
+                dispatcher,
+                error,
+                dispatcher_event,
+                recovery_deadline,
+            ));
+        }
+        self.active_provider = None;
+        self.breakpoints.clear();
+        self.arm_mode = Some(ArmMode::Natural);
+        self.dispatcher_event = None;
+        self.expected_stop = Some(ExpectedStop::Software {
+            instructions: instructions.clone(),
+            cr3: software_cr3,
+        });
+        self.software_restart_rip_unproved = false;
+        self.state = State::Running;
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            vm_id = %self.providers[active].target.vm_id,
+            vp = self.providers[active].target.vp,
+            breakpoint_count = instructions.len(),
+            "live Secure Kernel control resumed to one-shot software breakpoints"
+        );
+        Ok(self.commit_epoch(next_epoch))
+    }
+
     /// Restore or release anything this session still owns, then remove the handler and detach.
     pub(crate) fn close(&mut self, dispatcher: &mut impl EventDispatcher) -> Result<()> {
         self.close_inner(dispatcher, None)
@@ -2346,7 +2571,9 @@ impl<P: ControlProvider> LiveControl<P> {
                     provider.provider.set_outer_deadline(deadline);
                 }
                 let result = (|| {
-                    if self.breakpoints.is_empty() {
+                    if self.breakpoints.is_empty()
+                        && !matches!(self.expected_stop, Some(ExpectedStop::Software { .. }))
+                    {
                         bail!("the armed session has no breakpoint guards");
                     }
                     match deadline {
@@ -2488,8 +2715,12 @@ impl<P: ControlProvider> LiveControl<P> {
         expected_stop: &ExpectedStop,
     ) -> Result<()> {
         observed.event.validate(&self.providers[provider].target)?;
-        if Some(observed.event.dispatcher_context) != self.dispatcher_context {
-            bail!("the dispatcher event context does not match the registered handler");
+        let expected_context = match expected_stop {
+            ExpectedStop::Software { .. } => self.software_breakpoint_context,
+            _ => self.dispatcher_context,
+        };
+        if Some(observed.event.dispatcher_context) != expected_context {
+            bail!("the dispatcher event context does not match the registered exception handler");
         }
         let expected_instructions = match expected_stop {
             ExpectedStop::Hardware | ExpectedStop::BreakRequest { .. } => self
@@ -2499,12 +2730,17 @@ impl<P: ControlProvider> LiveControl<P> {
                 .collect::<Vec<_>>(),
             ExpectedStop::SingleStep { instruction, .. } => vec![instruction.clone()],
             ExpectedStop::StepOver { .. } => Vec::new(),
+            ExpectedStop::Software { .. } => Vec::new(),
         };
         if observed.instructions != expected_instructions {
             bail!("a guarded instruction changed before the stop was accepted");
         }
-        if observed.event.reason != StopReason::DebugException {
-            bail!("the dispatcher classified a vector-1 event before register validation");
+        let expected_raw_reason = match expected_stop {
+            ExpectedStop::Software { .. } => StopReason::BreakpointException,
+            _ => StopReason::DebugException,
+        };
+        if observed.event.reason != expected_raw_reason {
+            bail!("the dispatcher event vector does not match the expected stop class");
         }
         Ok(())
     }
@@ -2518,11 +2754,11 @@ impl<P: ControlProvider> LiveControl<P> {
         if registers.low(RegisterName::Cs)? & 3 != u64::from(event.cpl) {
             bail!("the held event CPL does not match the provider's CS register");
         }
-        if event.reason != StopReason::DebugException {
-            bail!("the held dispatcher event is not an unclassified debug exception");
-        }
         match expected_stop {
             ExpectedStop::Hardware | ExpectedStop::BreakRequest { .. } => {
+                if event.reason != StopReason::DebugException {
+                    bail!("the held dispatcher event is not an unclassified debug exception");
+                }
                 let causes = registers.low(RegisterName::Dr6)? & 0xf;
                 if causes.count_ones() != 1 {
                     bail!("hardware-stop DR6 must name exactly one breakpoint slot");
@@ -2558,6 +2794,9 @@ impl<P: ControlProvider> LiveControl<P> {
                 expected_rips,
                 ..
             } => {
+                if event.reason != StopReason::DebugException {
+                    bail!("the held dispatcher event is not an unclassified debug exception");
+                }
                 if !expected_rips.contains(&HexU64(registers.low(RegisterName::Rip)?))
                     || registers.low(RegisterName::Dr6)? & (1 << 14) == 0
                     || registers.low(RegisterName::Dr6)? & 0xf != 0
@@ -2579,6 +2818,9 @@ impl<P: ControlProvider> LiveControl<P> {
                 destination,
                 slot,
             } => {
+                if event.reason != StopReason::DebugException {
+                    bail!("the held dispatcher event is not an unclassified debug exception");
+                }
                 let register = breakpoint_register(*slot);
                 let enable_mask = breakpoint_enable_mask(*slot);
                 let causes = registers.low(RegisterName::Dr6)? & 0xf;
@@ -2599,6 +2841,36 @@ impl<P: ControlProvider> LiveControl<P> {
                     },
                     instruction.clone(),
                     vec![*destination],
+                ))
+            }
+            ExpectedStop::Software { instructions, .. } => {
+                if event.reason != StopReason::BreakpointException || event.vector != 3 {
+                    bail!("the held dispatcher event is not an unclassified breakpoint exception");
+                }
+                let rip = registers.low(RegisterName::Rip)?;
+                let instruction = instructions
+                    .iter()
+                    .find(|instruction| {
+                        rip == instruction.address.0
+                            || instruction.address.0.checked_add(1) == Some(rip)
+                    })
+                    .with_context(|| {
+                        let owned = instructions
+                            .iter()
+                            .map(|instruction| format!("{:#x}", instruction.address.0))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!(
+                            "vector-3 RIP {rip:#x} does not name an owned software breakpoint; \
+                             expected one of [{owned}] or one byte past it"
+                        )
+                    })?;
+                Ok((
+                    StopReason::SoftwareBreakpoint {
+                        address: instruction.address,
+                    },
+                    instruction.clone(),
+                    vec![instruction.address],
                 ))
             }
         }
@@ -2697,6 +2969,13 @@ impl<P: ControlProvider> LiveControl<P> {
             bail!("the debugger adapter changed its registered handler context");
         }
         self.dispatcher_context = Some(context);
+        let software = dispatcher.software_breakpoint_context();
+        if let Some(expected) = self.software_breakpoint_context
+            && software != Some(expected)
+        {
+            bail!("the debugger adapter changed its registered vector-3 handler context");
+        }
+        self.software_breakpoint_context = software;
         Ok(())
     }
 
@@ -2949,8 +3228,10 @@ impl<P: ControlProvider> LiveControl<P> {
         )
         .then_some(self.active_provider)
         .flatten();
-        let mut safe_to_resume = !owns_provider_state || dispatcher.provider_writes_quiesced();
-        if owns_provider_state && !safe_to_resume {
+        let restart_rip_unproved = self.software_restart_rip_unproved;
+        let mut safe_to_resume = (!owns_provider_state || dispatcher.provider_writes_quiesced())
+            && !restart_rip_unproved;
+        if owns_provider_state && !dispatcher.provider_writes_quiesced() {
             let recovery_targets = self
                 .providers
                 .iter()
@@ -2968,7 +3249,13 @@ impl<P: ControlProvider> LiveControl<P> {
                     "establish provider-write quiescence for VTL1 recovery: {error:#}"
                 ));
             }
-            safe_to_resume = dispatcher.provider_writes_quiesced();
+            safe_to_resume = dispatcher.provider_writes_quiesced() && !restart_rip_unproved;
+        }
+        if restart_rip_unproved {
+            recovery_errors.push(
+                "software-breakpoint restart RIP was not proved; the owned vector-3 event cannot be released"
+                    .to_string(),
+            );
         }
         if owns_provider_state && !safe_to_resume {
             recovery_errors.push(
@@ -3050,9 +3337,14 @@ impl<P: ControlProvider> LiveControl<P> {
         }
 
         let owned_event = event.as_ref().filter(|event| {
+            let expected_context = if event.vector == 3 {
+                self.software_breakpoint_context
+            } else {
+                self.dispatcher_context
+            };
             self.providers.iter().any(|provider| {
                 event.validate(&provider.target).is_ok()
-                    && Some(event.dispatcher_context) == self.dispatcher_context
+                    && Some(event.dispatcher_context) == expected_context
             })
         });
         let dispatcher_safe = safe_to_resume && (event.is_none() || owned_event.is_some());
@@ -3130,6 +3422,22 @@ mod tests {
     fn natural_guest_execution_is_the_default_arm_mode() {
         assert_eq!(ArmMode::default(), ArmMode::Natural);
     }
+
+    #[test]
+    fn register_snapshot_cr3_mismatch_names_both_roots() {
+        let observed = 0x220_1000;
+        let required = 0x120_1000;
+        let mut values = register_values(BASE_RIP, 0xffff_0ff0, 0x400, 0x46);
+        set_low(&mut values, RegisterName::Cr3, observed);
+
+        let error = RegisterSnapshot::from_values(values, Some(required), true).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "the stopped CR3 0x2201000 does not match the required address space 0x1201000"
+        );
+    }
+
     use crate::skcontrol::Capability;
 
     const BASE_RIP: u64 = 0xffff_f803_60ab_0035;
@@ -3151,6 +3459,7 @@ mod tests {
         held: Option<HeldEvent>,
         registers: Vec<RegisterValue>,
         hardware_rip: u64,
+        software_rip_at_instruction: bool,
         hardware_slot: Option<u8>,
         single_step_rips: VecDeque<u64>,
         stopped_cr3s: VecDeque<u64>,
@@ -3175,6 +3484,7 @@ mod tests {
                 held: None,
                 registers: register_values(BASE_RIP, 0xffff_0ff0, 0x400, 0x46),
                 hardware_rip: TARGET_RIP,
+                software_rip_at_instruction: false,
                 hardware_slot: None,
                 single_step_rips: VecDeque::new(),
                 stopped_cr3s: VecDeque::new(),
@@ -3191,6 +3501,11 @@ mod tests {
 
         fn with_hardware_rip(mut self, rip: u64) -> Self {
             self.hardware_rip = rip;
+            self
+        }
+
+        fn with_pre_advance_software_rip(mut self) -> Self {
+            self.software_rip_at_instruction = true;
             self
         }
 
@@ -3334,7 +3649,17 @@ mod tests {
             if self.phase != FakePhase::Running {
                 bail!("not running");
             }
-            self.set_stop();
+            if event.vector == 3 {
+                let advance = u64::from(!self.software_rip_at_instruction);
+                set_low(
+                    &mut self.registers,
+                    RegisterName::Rip,
+                    self.hardware_rip + advance,
+                );
+                set_low(&mut self.registers, RegisterName::Dr6, 0xffff_0ff0);
+            } else {
+                self.set_stop();
+            }
             self.held = Some(event);
             self.phase = FakePhase::Stopped;
             self.rotate("stopped");
@@ -3422,15 +3747,19 @@ mod tests {
         BeginArm,
         BeginDisarm,
         FinishArm,
+        VerifySoftwareScope,
         Verify(InstructionGuard),
         Capture(u64),
         PrepareWrite(u64),
         ApplyWrite(u64),
+        ArmSoftware(Vec<u64>),
+        RestoreSoftware,
         Wait,
         EstablishRecoveryPause,
         Release(ReleaseMode),
         ReleaseAndPause,
         ReleasePaused,
+        RetainPausedForSoftware,
         Recover { safe: bool, owned_event: bool },
         Teardown,
     }
@@ -3449,7 +3778,9 @@ mod tests {
         break_wake: bool,
         fail_wait_quiesced: bool,
         fail_recovery_pause: Option<&'static str>,
+        fail_software_scope: Option<&'static str>,
         provider_writes_quiesced: bool,
+        pending_guarded_writes: bool,
         fail_recover: Option<&'static str>,
         fail_teardown: Option<&'static str>,
         fail_verify: Option<&'static str>,
@@ -3476,7 +3807,9 @@ mod tests {
                 break_wake: false,
                 fail_wait_quiesced: true,
                 fail_recovery_pause: None,
+                fail_software_scope: None,
                 provider_writes_quiesced: false,
+                pending_guarded_writes: false,
                 fail_recover: None,
                 fail_teardown: None,
                 fail_verify: None,
@@ -3501,6 +3834,18 @@ mod tests {
                 bail!("{reason}");
             }
             Ok(HexU64(0x2000_0000_1000))
+        }
+
+        fn software_breakpoint_context(&self) -> Option<HexU64> {
+            Some(HexU64(0x2000_0000_3000))
+        }
+
+        fn verify_software_breakpoint_scope_until(&mut self, _deadline: Instant) -> Result<()> {
+            self.actions.push(Action::VerifySoftwareScope);
+            if let Some(reason) = self.fail_software_scope {
+                bail!("{reason}");
+            }
+            Ok(())
         }
 
         fn begin_disarm(&mut self, _targets: &[TargetIdentity]) -> Result<()> {
@@ -3534,6 +3879,10 @@ mod tests {
 
         fn provider_writes_quiesced(&self) -> bool {
             self.provider_writes_quiesced
+        }
+
+        fn has_pending_guarded_writes(&self) -> bool {
+            self.pending_guarded_writes
         }
 
         fn establish_recovery_pause(&mut self, _targets: &[TargetIdentity]) -> Result<()> {
@@ -3583,12 +3932,36 @@ mod tests {
             _deadline: Instant,
         ) -> Result<AppliedMemoryWrite> {
             self.actions.push(Action::ApplyWrite(write.address.0));
+            self.pending_guarded_writes = true;
             Ok(AppliedMemoryWrite {
                 address: write.address,
                 gpa: write.gpa,
                 original: write.original,
                 replacement: write.replacement,
             })
+        }
+
+        fn arm_software_breakpoints_until(
+            &mut self,
+            instructions: &[InstructionGuard],
+            _deadline: Instant,
+        ) -> Result<()> {
+            self.actions.push(Action::ArmSoftware(
+                instructions
+                    .iter()
+                    .map(|instruction| instruction.address.0)
+                    .collect(),
+            ));
+            Ok(())
+        }
+
+        fn restore_software_breakpoints_until(&mut self, _deadline: Instant) -> Result<()> {
+            self.actions.push(Action::RestoreSoftware);
+            Ok(())
+        }
+
+        fn retained_pause_deadline(&self) -> Option<Instant> {
+            self.retained_recovery_deadline
         }
 
         fn retained_recovery_deadline(&self) -> Option<Instant> {
@@ -3684,6 +4057,15 @@ mod tests {
         fn release_paused_until(&mut self, deadline: Instant) -> Result<()> {
             self.release_deadlines.push(Some(deadline));
             self.release_paused()
+        }
+
+        fn retain_pause_for_software_breakpoint_wait_until(
+            &mut self,
+            deadline: Instant,
+        ) -> Result<()> {
+            self.release_deadlines.push(Some(deadline));
+            self.actions.push(Action::RetainPausedForSoftware);
+            Ok(())
         }
 
         fn recover(&mut self, safe_to_resume: bool, event: Option<&HeldEvent>) -> Result<()> {
@@ -3788,6 +4170,368 @@ mod tests {
                 Action::Wait,
                 Action::Release(ReleaseMode::Resume),
             ]
+        );
+    }
+
+    #[test]
+    fn software_breakpoint_is_one_shot_restored_and_normalizes_post_advance_rip() {
+        let mut dispatcher = FakeDispatcher::new([
+            observed(StopReason::HardwareBreakpoint { slot: 0 }),
+            observed_software(),
+        ]);
+        let mut control = LiveControl::open(FakeProvider::new()).unwrap();
+        assert!(control.supports_software_breakpoint_events());
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Redirect)
+            .unwrap();
+        let first = control.wait_for_stop(&mut dispatcher).unwrap();
+        let guarded = instruction();
+
+        let running = control
+            .continue_to_software_breakpoints_until(
+                &mut dispatcher,
+                &first.epoch,
+                vec![guarded.clone()],
+                Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(control.phase(), LivePhase::Running);
+        assert!(running.to_string().contains("running"));
+        assert!(
+            dispatcher
+                .actions
+                .contains(&Action::ArmSoftware(vec![TARGET_RIP]))
+        );
+        assert!(
+            dispatcher
+                .actions
+                .contains(&Action::RetainPausedForSoftware)
+        );
+
+        dispatcher.retained_recovery_deadline =
+            Some(Instant::now() + std::time::Duration::from_secs(1));
+        let stopped = control.wait_for_stop(&mut dispatcher).unwrap();
+        assert_eq!(
+            stopped.event.reason,
+            StopReason::SoftwareBreakpoint {
+                address: HexU64(TARGET_RIP)
+            }
+        );
+        assert_eq!(
+            stopped.registers.low(RegisterName::Rip).unwrap(),
+            TARGET_RIP
+        );
+        assert_eq!(stopped.instruction, guarded);
+        assert_eq!(stopped.expected_rips, vec![HexU64(TARGET_RIP)]);
+        assert!(dispatcher.actions.contains(&Action::RestoreSoftware));
+        assert!(dispatcher.wait_instructions.last().unwrap().is_empty());
+        let restored = dispatcher
+            .actions
+            .iter()
+            .position(|action| *action == Action::RestoreSoftware)
+            .unwrap();
+        let released = dispatcher
+            .actions
+            .iter()
+            .rposition(|action| *action == Action::ReleaseAndPause)
+            .unwrap();
+        assert!(restored < released, "{:?}", dispatcher.actions);
+
+        control
+            .continue_from(&mut dispatcher, &stopped.epoch)
+            .unwrap();
+        assert_eq!(control.phase(), LivePhase::Running);
+    }
+
+    #[test]
+    fn software_breakpoint_accepts_vid_pre_advance_rip_and_preserves_restart() {
+        let mut dispatcher = FakeDispatcher::new([
+            observed(StopReason::HardwareBreakpoint { slot: 0 }),
+            observed_software(),
+        ]);
+        let provider = FakeProvider::new().with_pre_advance_software_rip();
+        let mut control = LiveControl::open(provider).unwrap();
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Redirect)
+            .unwrap();
+        let hardware = control.wait_for_stop(&mut dispatcher).unwrap();
+        control
+            .continue_to_software_breakpoints_until(
+                &mut dispatcher,
+                &hardware.epoch,
+                vec![instruction()],
+                Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+        dispatcher.retained_recovery_deadline =
+            Some(Instant::now() + std::time::Duration::from_secs(1));
+
+        let software = control.wait_for_stop(&mut dispatcher).unwrap();
+
+        assert_eq!(
+            software.event.reason,
+            StopReason::SoftwareBreakpoint {
+                address: HexU64(TARGET_RIP)
+            }
+        );
+        assert_eq!(
+            software.registers.low(RegisterName::Rip).unwrap(),
+            TARGET_RIP
+        );
+        assert!(dispatcher.actions.contains(&Action::RestoreSoftware));
+    }
+
+    #[test]
+    fn software_breakpoint_addresses_may_not_be_adjacent() {
+        let mut dispatcher =
+            FakeDispatcher::new([observed(StopReason::HardwareBreakpoint { slot: 0 })]);
+        let mut control = LiveControl::open(FakeProvider::new()).unwrap();
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Redirect)
+            .unwrap();
+        let stopped = control.wait_for_stop(&mut dispatcher).unwrap();
+
+        let error = control
+            .continue_to_software_breakpoints_until(
+                &mut dispatcher,
+                &stopped.epoch,
+                vec![
+                    instruction(),
+                    InstructionGuard {
+                        address: HexU64(TARGET_RIP + 1),
+                        bytes: vec![0x90],
+                    },
+                ],
+                Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("may not be equal or adjacent"));
+        assert_eq!(control.phase(), LivePhase::Stopped);
+        assert!(
+            !dispatcher
+                .actions
+                .iter()
+                .any(|action| matches!(action, Action::ArmSoftware(_)))
+        );
+    }
+
+    #[test]
+    fn software_breakpoint_requires_the_address_space_where_it_was_armed() {
+        const TRANSITION_CR3: u64 = 0x4567_8000;
+        let mut dispatcher = FakeDispatcher::new([
+            observed(StopReason::HardwareBreakpoint { slot: 0 }),
+            observed_software(),
+        ]);
+        let provider = FakeProvider::new().with_stopped_cr3s([TRANSITION_CR3]);
+        let mut control = LiveControl::open_with_transition(provider, true).unwrap();
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Natural)
+            .unwrap();
+        let hardware = control.wait_for_stop(&mut dispatcher).unwrap();
+        assert_eq!(
+            hardware.registers.low(RegisterName::Cr3).unwrap(),
+            TRANSITION_CR3
+        );
+
+        control
+            .continue_to_software_breakpoints_until(
+                &mut dispatcher,
+                &hardware.epoch,
+                vec![instruction()],
+                Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+        dispatcher.retained_recovery_deadline =
+            Some(Instant::now() + std::time::Duration::from_secs(1));
+
+        let software = control.wait_for_stop(&mut dispatcher).unwrap();
+        assert_eq!(
+            software.registers.low(RegisterName::Cr3).unwrap(),
+            TRANSITION_CR3
+        );
+        assert_eq!(
+            software.event.reason,
+            StopReason::SoftwareBreakpoint {
+                address: HexU64(TARGET_RIP)
+            }
+        );
+    }
+
+    #[test]
+    fn software_breakpoint_scope_is_proved_before_any_patch_or_epoch_change() {
+        let mut dispatcher =
+            FakeDispatcher::new([observed(StopReason::HardwareBreakpoint { slot: 0 })]);
+        let mut control = LiveControl::open(FakeProvider::new()).unwrap();
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Redirect)
+            .unwrap();
+        let stopped = control.wait_for_stop(&mut dispatcher).unwrap();
+        dispatcher.fail_software_scope = Some("the VM has two virtual processors");
+
+        let error = control
+            .continue_to_software_breakpoints_until(
+                &mut dispatcher,
+                &stopped.epoch,
+                vec![instruction()],
+                Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("two virtual processors"));
+        assert_eq!(control.phase(), LivePhase::Stopped);
+        assert_eq!(control.stopped().unwrap().epoch, stopped.epoch);
+        assert!(
+            !dispatcher
+                .actions
+                .iter()
+                .any(|action| matches!(action, Action::ArmSoftware(_)))
+        );
+    }
+
+    #[test]
+    fn software_breakpoints_require_the_optional_vector_three_capability() {
+        let mut provider = FakeProvider::new();
+        provider
+            .capabilities
+            .capabilities
+            .retain(|capability| *capability != Capability::BreakpointEvents);
+        let mut dispatcher =
+            FakeDispatcher::new([observed(StopReason::HardwareBreakpoint { slot: 0 })]);
+        let mut control = LiveControl::open(provider).unwrap();
+        assert!(!control.supports_software_breakpoint_events());
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Redirect)
+            .unwrap();
+        let stopped = control.wait_for_stop(&mut dispatcher).unwrap();
+
+        let error = control
+            .continue_to_software_breakpoints_until(
+                &mut dispatcher,
+                &stopped.epoch,
+                vec![instruction()],
+                Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("does not advertise vector-3"));
+        assert_eq!(control.phase(), LivePhase::Stopped);
+        assert!(!dispatcher.actions.contains(&Action::VerifySoftwareScope));
+    }
+
+    #[test]
+    fn software_breakpoints_refuse_a_pending_generic_write_without_consuming_the_stop() {
+        let mut dispatcher =
+            FakeDispatcher::new([observed(StopReason::HardwareBreakpoint { slot: 0 })]);
+        let mut control = LiveControl::open(FakeProvider::new()).unwrap();
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Redirect)
+            .unwrap();
+        let stopped = control.wait_for_stop(&mut dispatcher).unwrap();
+        control
+            .guarded_write_until(
+                &mut dispatcher,
+                &stopped.epoch,
+                GuardedMemoryWrite {
+                    address: HexU64(TARGET_RIP),
+                    expected: vec![0x90],
+                    replacement: vec![0xcc],
+                },
+                Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+
+        let error = control
+            .continue_to_software_breakpoints_until(
+                &mut dispatcher,
+                &stopped.epoch,
+                vec![instruction()],
+                Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("remain rollback-owned"));
+        assert_eq!(control.phase(), LivePhase::Stopped);
+        assert_eq!(control.stopped().unwrap().epoch, stopped.epoch);
+        assert!(!dispatcher.actions.contains(&Action::VerifySoftwareScope));
+        assert!(
+            !dispatcher
+                .actions
+                .iter()
+                .any(|action| matches!(action, Action::ArmSoftware(_)))
+        );
+    }
+
+    #[test]
+    fn closing_before_the_software_wait_disarms_the_patch_only_running_state() {
+        let mut dispatcher =
+            FakeDispatcher::new([observed(StopReason::HardwareBreakpoint { slot: 0 })]);
+        let mut control = LiveControl::open(FakeProvider::new()).unwrap();
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Redirect)
+            .unwrap();
+        let stopped = control.wait_for_stop(&mut dispatcher).unwrap();
+        control
+            .continue_to_software_breakpoints_until(
+                &mut dispatcher,
+                &stopped.epoch,
+                vec![instruction()],
+                Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+
+        control.close(&mut dispatcher).unwrap();
+
+        assert_eq!(control.phase(), LivePhase::Closed);
+        assert!(dispatcher.actions.contains(&Action::BeginDisarm));
+        assert!(dispatcher.actions.contains(&Action::Teardown));
+    }
+
+    #[test]
+    fn vector_three_away_from_an_owned_patch_faults_closed() {
+        let mut dispatcher = FakeDispatcher::new([
+            observed(StopReason::HardwareBreakpoint { slot: 0 }),
+            observed_software(),
+        ]);
+        let mut control = LiveControl::open(FakeProvider::new()).unwrap();
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Redirect)
+            .unwrap();
+        let first = control.wait_for_stop(&mut dispatcher).unwrap();
+        control
+            .continue_to_software_breakpoints_until(
+                &mut dispatcher,
+                &first.epoch,
+                vec![InstructionGuard {
+                    address: HexU64(TARGET_RIP + 0x100),
+                    bytes: vec![0x90],
+                }],
+                Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+        dispatcher.retained_recovery_deadline =
+            Some(Instant::now() + std::time::Duration::from_secs(1));
+
+        let error = control.wait_for_stop(&mut dispatcher).unwrap_err();
+        assert!(
+            error.to_string().contains(&format!(
+                "vector-3 RIP {:#x} does not name an owned software breakpoint; expected one of [{:#x}] or one byte past it",
+                TARGET_RIP + 1,
+                TARGET_RIP + 0x100
+            )),
+            "{error:#}"
+        );
+        assert_eq!(control.phase(), LivePhase::Faulted);
+        assert!(
+            dispatcher.actions.iter().any(|action| matches!(
+                action,
+                Action::Recover {
+                    safe: false,
+                    owned_event: false
+                }
+            )),
+            "{:?}",
+            dispatcher.actions
         );
     }
 
@@ -4644,6 +5388,11 @@ mod tests {
 
     #[test]
     fn provider_set_rejects_duplicate_vps_and_mismatched_vm_identity() {
+        let multi =
+            LiveControl::open_many(vec![FakeProvider::new(), FakeProvider::new().with_vp(1)])
+                .unwrap();
+        assert!(!multi.supports_software_breakpoint_events());
+
         let duplicate = LiveControl::open_many(vec![FakeProvider::new(), FakeProvider::new()])
             .err()
             .unwrap();
@@ -6027,6 +6776,16 @@ mod tests {
         }
     }
 
+    fn observed_software() -> ObservedStop {
+        let mut event = event(StopReason::BreakpointException);
+        event.vector = 3;
+        event.dispatcher_context = HexU64(0x2000_0000_3000);
+        ObservedStop {
+            event,
+            instructions: Vec::new(),
+        }
+    }
+
     fn capabilities() -> Capabilities {
         Capabilities {
             capabilities: vec![
@@ -6037,6 +6796,7 @@ mod tests {
                 Capability::ReadRegisters,
                 Capability::WriteRegisters,
                 Capability::Release,
+                Capability::BreakpointEvents,
             ],
             readable_registers: SNAPSHOT_REGISTERS.to_vec(),
             writable_registers: WRITTEN_REGISTERS.to_vec(),

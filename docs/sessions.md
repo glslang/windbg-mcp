@@ -136,7 +136,7 @@ first `sk_live_arm` pauses the VM,
 validates the VM-to-`vmwp` binding, live-memory CR3, guarded instructions and local `vmwp.exe`
 build, and proceeds to register or breakpoint mutation only after those checks pass.
 
-Nine tools drive that session after the open:
+Ten tools drive that session after the open:
 
 - `sk_live_arm` saves every selected VP's baseline and installs one to four guarded execution
   breakpoints on each. Each address carries the exact live instruction bytes expected there.
@@ -160,6 +160,17 @@ Nine tools drive that session after the open:
   destinations, and arms the next trap. Collect that stop with `sk_live_wait`.
 - `sk_live_continue_to_breakpoints` atomically replaces the guarded breakpoint set while consuming
   the held epoch, then resumes for another `sk_live_wait`.
+- `sk_live_continue_to_software_breakpoints` verifies up to 64 exact instruction guards, patches
+  their first bytes with one-shot `INT3`s under a VM-wide pause, and arms the owned event wait.
+  The pause and its original absolute deadline remain in force until the immediately following
+  `sk_live_wait` installs its `vmwp` breakpoint and starts Resume-VM. This first slice requires
+  the processor count cached from Hyper-V during write-enabled target preparation to prove that
+  the VM has exactly one virtual processor, preventing an unselected VP from consuming a patch.
+  No Hyper-V management query runs while `vmwp` is debugger-stopped. The next vector-3 stop must
+  name an owned patch or its exact successor and use the CR3 where that patch was guarded and
+  installed. Adjacent patch addresses are refused so those two VID forms cannot be ambiguous.
+  Before returning it, the controller treats that sole-VP event as an execution barrier, restores
+  and verifies every patch, normalizes RIP to the patch, and converts the event to a VM-wide pause.
 - `sk_live_continue` consumes the current epoch, restores the complete saved baseline, clears the
   execution breakpoints and resumes. The session stays open for another arm.
 

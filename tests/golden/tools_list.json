@@ -2,7 +2,7 @@
   "schemaDialects": [
     "https://json-schema.org/draft/2020-12/schema"
   ],
-  "toolCount": 81,
+  "toolCount": 82,
   "tools": [
     {
       "hints": {
@@ -2124,6 +2124,50 @@
         "epoch"
       ],
       "title": "Continue to live Secure Kernel breakpoints"
+    },
+    {
+      "hints": {
+        "destructive": true,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "sk_live_continue_to_software_breakpoints",
+      "output": {
+        "branches": [
+          {
+            "payload": null,
+            "required": [
+              "epoch",
+              "phase",
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
+      "params": [
+        "additional_breakpoints: array<ref(#/$defs/SkLiveSoftwareBreakpointArgs)>",
+        "address: string",
+        "bytes: string",
+        "epoch: string",
+        "session_id: string|null"
+      ],
+      "required": [
+        "address",
+        "bytes",
+        "epoch"
+      ],
+      "title": "Continue to live Secure Kernel software breakpoints"
     },
     {
       "hints": {

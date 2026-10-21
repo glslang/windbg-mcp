@@ -256,6 +256,8 @@ pub(crate) enum Capability {
     ReadRegisters,
     WriteRegisters,
     Release,
+    /// The provider can retain and echo raw vector-3 events produced by owned `INT3` patches.
+    BreakpointEvents,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -321,6 +323,10 @@ pub(crate) enum StopReason {
     /// Raw vector-1 event as observed by the dispatcher. The worker replaces this with the exact
     /// architectural cause after it has published the held event and can read the VP's DR6.
     DebugException,
+    /// Raw vector-3 event. The worker replaces this with the exact owned software-breakpoint
+    /// address after validating and normalizing RIP and restoring every patch under a VM-wide
+    /// pause.
+    BreakpointException,
     HardwareBreakpoint {
         slot: u8,
     },
@@ -333,6 +339,9 @@ pub(crate) enum StopReason {
     StepOver {
         slot: u8,
         new_cr3: HexU64,
+    },
+    SoftwareBreakpoint {
+        address: HexU64,
     },
 }
 
@@ -357,8 +366,16 @@ impl HeldEvent {
                 self.message_type.0
             );
         }
-        if self.vector != 1 {
-            bail!("held event is vector {}, expected vector 1", self.vector);
+        match (self.vector, &self.reason) {
+            (1, StopReason::DebugException) | (3, StopReason::BreakpointException) => {}
+            (1 | 3, _) => bail!(
+                "held vector-{} event has a reason that does not match its raw exception class",
+                self.vector
+            ),
+            _ => bail!(
+                "held event is vector {}, expected vector 1 or 3",
+                self.vector
+            ),
         }
         if self.vp != target.vp || self.vtl != target.vtl || self.cpl != 0 {
             bail!("held event is not the bound VTL1 CPL0 VP");
@@ -626,6 +643,9 @@ impl<R: BufRead, W: Write> ControlSession<R, W> {
 
     pub(crate) fn publish_stop(&mut self, event: HeldEvent) -> Result<()> {
         self.require_capability(Capability::PublishStop)?;
+        if event.vector == 3 {
+            self.require_capability(Capability::BreakpointEvents)?;
+        }
         if self.phase != Phase::Running {
             bail!("cannot publish a second event while one is held");
         }
@@ -658,6 +678,9 @@ impl<R: BufRead, W: Write> ControlSession<R, W> {
         let ReplyValue::HeldEvent { event } = response else {
             bail!("provider returned the wrong reply to held_event")
         };
+        if event.vector == 3 {
+            self.require_capability(Capability::BreakpointEvents)?;
+        }
         event.validate(&self.target)?;
         if Some(&event) != self.held() {
             self.poisoned = true;
@@ -2016,6 +2039,31 @@ mod tests {
         identity = target();
         identity.expected_cr3 = HexU64(0x120_1001);
         assert!(format!("{}", identity.validate().unwrap_err()).contains("page-aligned"));
+    }
+
+    #[test]
+    fn held_event_validation_binds_each_raw_reason_to_its_vector() {
+        let mut breakpoint = event();
+        breakpoint.vector = 3;
+        breakpoint.reason = StopReason::BreakpointException;
+        breakpoint.validate(&target()).unwrap();
+
+        breakpoint.reason = StopReason::DebugException;
+        assert!(
+            breakpoint
+                .validate(&target())
+                .unwrap_err()
+                .to_string()
+                .contains("does not match")
+        );
+        breakpoint.vector = 2;
+        assert!(
+            breakpoint
+                .validate(&target())
+                .unwrap_err()
+                .to_string()
+                .contains("expected vector 1 or 3")
+        );
     }
 
     #[test]

@@ -1285,6 +1285,32 @@ pub struct SkLiveContinueToBreakpointsArgs {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct SkLiveSoftwareBreakpointArgs {
+    /// Exact VTL1 virtual address whose first byte will be replaced by `INT3`.
+    pub address: String,
+    /// Exact 1..=15-byte instruction currently at `address`.
+    pub bytes: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SkLiveContinueToSoftwareBreakpointsArgs {
+    /// The opaque epoch from the current stopped record. It is consumed exactly once.
+    pub epoch: String,
+    /// Primary guarded instruction to patch for one execution interval.
+    pub address: String,
+    /// Exact 1..=15-byte instruction currently at `address`.
+    pub bytes: String,
+    /// Further guarded instructions, up to 64 distinct addresses total.
+    #[serde(default)]
+    pub additional_breakpoints: Vec<SkLiveSoftwareBreakpointArgs>,
+    /// Which live Secure Kernel session owns the stopped epoch. Omit for the current one.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SkLiveEpochArgs {
     /// The opaque epoch from the current stopped record. It is consumed exactly once.
     pub epoch: String,
@@ -4979,6 +5005,92 @@ impl WindbgServer {
             .run(
                 args.session_id.as_deref(),
                 EngineOp::SkLiveContinueToBreakpoints { epoch, breakpoints },
+            )
+            .await;
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
+    /// Plant up to 64 guarded one-shot `INT3` bytes under a VM-wide pause. The next wait resumes and
+    /// accepts vector-3 RIP only at a patch or its successor, restores every patch, and normalizes
+    /// RIP to its address. Unproved restoration fails closed.
+    #[rmcp::tool(
+        annotations(
+            title = "Continue to live Secure Kernel software breakpoints",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<Outcome<crate::sklive::LiveTransition>>()
+    )]
+    async fn sk_live_continue_to_software_breakpoints(
+        &self,
+        Parameters(args): Parameters<SkLiveContinueToSoftwareBreakpointsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let epoch = match crate::skcontrol::StopEpoch::new(args.epoch) {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                return typed_error(
+                    ErrorCategory::InvalidArgument,
+                    error.to_string(),
+                    args.session_id,
+                );
+            }
+        };
+        let mut specs = Vec::with_capacity(1 + args.additional_breakpoints.len());
+        specs.push(SkLiveSoftwareBreakpointArgs {
+            address: args.address,
+            bytes: args.bytes,
+        });
+        specs.extend(args.additional_breakpoints);
+        if specs.len() > crate::sklive::MAX_SOFTWARE_BREAKPOINTS {
+            return typed_error(
+                ErrorCategory::InvalidArgument,
+                format!(
+                    "at most {} software breakpoints may be armed",
+                    crate::sklive::MAX_SOFTWARE_BREAKPOINTS
+                ),
+                args.session_id,
+            );
+        }
+        let mut instructions = Vec::with_capacity(specs.len());
+        for spec in specs {
+            let address = match parse_u64(&spec.address) {
+                Ok(value) => value,
+                Err(why) => {
+                    return typed_error(ErrorCategory::InvalidArgument, why, args.session_id);
+                }
+            };
+            let bytes = match crate::skdispatch::parse_hex_bytes(&spec.bytes) {
+                Ok(value) => value,
+                Err(error) => {
+                    return typed_error(
+                        ErrorCategory::InvalidArgument,
+                        error.to_string(),
+                        args.session_id,
+                    );
+                }
+            };
+            let instruction = crate::sklive::InstructionGuard {
+                address: crate::skcontrol::HexU64(address),
+                bytes,
+            };
+            if let Err(error) = instruction.validate() {
+                return typed_error(
+                    ErrorCategory::InvalidArgument,
+                    error.to_string(),
+                    args.session_id,
+                );
+            }
+            instructions.push(instruction);
+        }
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::SkLiveContinueToSoftwareBreakpoints {
+                    epoch,
+                    instructions,
+                },
             )
             .await;
         engine_result_for(args.session_id.as_deref(), out)
