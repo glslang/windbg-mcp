@@ -2,7 +2,7 @@
   "schemaDialects": [
     "https://json-schema.org/draft/2020-12/schema"
   ],
-  "toolCount": 82,
+  "toolCount": 84,
   "tools": [
     {
       "hints": {
@@ -1955,6 +1955,77 @@
         "path"
       ],
       "title": "Set symbol search path"
+    },
+    {
+      "hints": {
+        "destructive": true,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "sk_call_trace",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/SkCallTraceArmed",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
+      "params": [
+        "label: string|null",
+        "max_calls: integer|null/uint32",
+        "session_id: string|null"
+      ],
+      "required": [],
+      "title": "Trace VTL0 Secure Kernel calls"
+    },
+    {
+      "hints": {
+        "destructive": true,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "sk_call_trace_read",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/SkCallTrace",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
+      "params": [
+        "session_id: string|null",
+        "stop: boolean|null"
+      ],
+      "required": [],
+      "title": "Read VTL0 Secure Kernel calls"
     },
     {
       "hints": {

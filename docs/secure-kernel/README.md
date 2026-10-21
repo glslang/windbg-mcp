@@ -43,7 +43,10 @@ dedicated worker session: `open_sk_live_control`, `sk_live_arm`, `sk_live_wait`,
 `sk_live_registers`, `sk_live_read_memory`, optional policy-gated `sk_live_write_memory`, `sk_live_step`,
 `sk_live_continue_to_breakpoints`, `sk_live_continue_to_software_breakpoints` and
 `sk_live_continue`. The current run/break/correlation work is
-tracked in the [Secure Kernel call-debugging roadmap](skcall-debugging-roadmap.md).
+tracked in the [Secure Kernel call-debugging roadmap](skcall-debugging-roadmap.md). M4's separate
+ordinary-kernel worker records the VTL0 half through `sk_call_trace` and `sk_call_trace_read`; its
+exact-build guard, event contract and deterministic guest workload are in the
+[VTL0 call-trace runbook](vtl0-call-trace.md).
 
 **And since 0.22.0 an installed WinDbg can sit in front of that controller.**
 `open_sk_kd` owns the controller as an MCP session, returns a generated local named pipe, and

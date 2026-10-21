@@ -53,6 +53,7 @@ mod sd;
 mod server;
 mod service;
 mod sk;
+mod skcall;
 mod skcontrol;
 mod skdispatch;
 mod skinspect;

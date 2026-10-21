@@ -2023,6 +2023,35 @@ pub struct PoolTraceReadArgs {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct SkCallTraceArgs {
+    /// Workload label copied into the trace. Use the same label in the guest harness to make the
+    /// later cross-layer join explicit instead of inferred from timing (1-128 bytes).
+    #[serde(default)]
+    pub label: Option<String>,
+    /// How many entries to retain before the target is stopped (default 64, at most 1024).
+    #[serde(default)]
+    pub max_calls: Option<u32>,
+    /// Which session to act on. Omit for the current one; pass an opener's handle to route to that
+    /// session and be refused if its target was replaced or closed.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SkCallTraceReadArgs {
+    /// Disarm the trace after reading it: remove its breakpoint and stop recording (default
+    /// false).
+    #[serde(default)]
+    pub stop: Option<bool>,
+    /// Which session to act on. Omit for the current one; pass an opener's handle to route to that
+    /// session and be refused if its target was replaced or closed.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DriverHazardsArgs {
     /// The driver to scan, by the name the module inventory lists it under, e.g. "mydriver". The
     /// image must be readable in this session: on a dump that means the engine can obtain the
@@ -3616,6 +3645,74 @@ impl WindbgServer {
             .run(
                 args.session_id.as_deref(),
                 EngineOp::PoolTraceRead {
+                    stop: args.stop.unwrap_or(false),
+                },
+            )
+            .await;
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
+    /// Trace VTL0 entries to the Secure Kernel on an ordinary live x64 Windows-kernel session.
+    /// Resolves exactly `nt!VslpEnterIumSecureMode`, proves the entry belongs to the current `nt`
+    /// image, matches the measured 10.0.26100.9457 argument-consuming prefix, and records that
+    /// image's timestamp, size and PDB identity. Each hit captures the
+    /// process, kernel thread, processor, caller, CL transition kind, DX secure-service number,
+    /// R8D call context, R9 argument-block pointer and a bounded raw copy of that block. Failed
+    /// reads remain named in each event rather than becoming zeroes. Arming does not resume the
+    /// target; the hit that reaches `max_calls` stops it. Only one callback trace (this or a pool
+    /// trace) may be armed in a session.
+    #[rmcp::tool(
+        annotations(
+            title = "Trace VTL0 Secure Kernel calls",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<Outcome<structured::SkCallTraceArmed>>()
+    )]
+    async fn sk_call_trace(
+        &self,
+        Parameters(args): Parameters<SkCallTraceArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::SkCallTraceArm {
+                    label: args.label,
+                    limit: args
+                        .max_calls
+                        .map_or(crate::skcall::DEFAULT_CALLS, |limit| limit as usize),
+                    patience_ms: 0,
+                },
+            )
+            .await;
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
+    /// Read the bounded VTL0 Secure Kernel call record held by this ordinary kernel session.
+    /// Returns exact image/RVA provenance, the optional workload label, host-wide monotonic time
+    /// and time from arm, decoded entry registers, raw argument blocks, caller symbols and every
+    /// named read failure.
+    /// Pass `stop` to remove the owned breakpoint and callback after taking the snapshot.
+    #[rmcp::tool(
+        annotations(
+            title = "Read VTL0 Secure Kernel calls",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<Outcome<structured::SkCallTrace>>()
+    )]
+    async fn sk_call_trace_read(
+        &self,
+        Parameters(args): Parameters<SkCallTraceReadArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::SkCallTraceRead {
                     stop: args.stop.unwrap_or(false),
                 },
             )
@@ -7312,6 +7409,12 @@ const SUMMARY_NOTES: &[SummaryNote] = &[
 /// here reads as a sentence about the tool and may be the only home a sentence about one of its
 /// arguments has.
 const TOOL_NOTES: &[ToolNote] = &[
+    ToolNote {
+        tool: "sk_call_trace",
+        names: &["continue_async", "sk_call_trace_read"],
+        note: "Arm it, then `continue_async` and run the labelled guest workload; \
+               `sk_call_trace_read` reads what was recorded and disarms it with `stop`.",
+    },
     ToolNote {
         tool: "pool_trace",
         names: &["continue_async", "pool_trace_read"],
