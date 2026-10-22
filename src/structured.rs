@@ -3702,6 +3702,124 @@ pub struct SkCallProvenance {
     pub read_failures: Vec<String>,
 }
 
+/// What `hv_transition_trace` armed in a separate hypervisor KD worker.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HvTransitionTraceArmed {
+    pub schema: String,
+    pub trace_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub call_site: CodeLocation,
+    pub return_site: CodeLocation,
+    pub images: Vec<ImageRef>,
+    /// PE checksum from the live module table, part of the admitted exact-build guard.
+    pub image_checksum: String,
+    /// Exact prefixes of both measured handlers, in memory order.
+    pub call_guard: String,
+    pub return_guard: String,
+    pub machine: String,
+    /// DbgEng-owned code breakpoints. The engine restores their original bytes when removed.
+    pub software_breakpoints: usize,
+    pub limit: usize,
+    pub replaced: bool,
+    /// VMCS field encodings paired with each reported VMCS physical coordinate. The raw VMCS
+    /// representation is architectural implementation state and is deliberately not decoded.
+    pub guest_rip_field: String,
+    pub guest_cr3_field: String,
+    pub identity_gaps: Vec<String>,
+}
+
+/// A bounded snapshot of authoritative VTL selections retained by a hypervisor session.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HvTransitionTrace {
+    pub schema: String,
+    pub trace_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub call_site: CodeLocation,
+    pub return_site: CodeLocation,
+    pub images: Vec<ImageRef>,
+    pub image_checksum: String,
+    pub call_guard: String,
+    pub return_guard: String,
+    pub machine: String,
+    pub transitions: Vec<HvTransition>,
+    pub limit: usize,
+    pub full: bool,
+    pub dropped: u64,
+    pub unreadable_hits: u64,
+    pub missing_breakpoints: usize,
+    pub armed: bool,
+    pub guest_rip_field: String,
+    pub guest_cr3_field: String,
+    pub identity_gaps: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HvTransitionKind {
+    VtlCall,
+    VtlReturn,
+}
+
+/// Coordinates of one VTL's saved VMCS. Consumers use the named VMCS field encodings from the
+/// trace envelope; no VTL0 register is substituted for a value held here.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HvVmcsCoordinate {
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub descriptor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub physical_address: Option<String>,
+}
+
+/// One selected hypervisor VTL transition.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HvTransition {
+    pub sequence: u64,
+    /// Host uptime at the hit, in microseconds, comparable to the ordinary-kernel M4 trace.
+    pub host_monotonic_us: u64,
+    pub host_elapsed_us: u64,
+    pub kind: HvTransitionKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_rip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stack_pointer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub processor: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vp: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vp_index: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_vtl: Option<u8>,
+    /// Selected by the hypervisor handler, never calculated as source +/- 1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_vtl: Option<u8>,
+    /// Hypercall control value: guest RAX for VTL call and the handler's retained R14 for return.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fast_return: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guest_registers: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_vmcs: Option<HvVmcsCoordinate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_vmcs: Option<HvVmcsCoordinate>,
+    pub provenance: HvTransitionProvenance,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HvTransitionProvenance {
+    pub measured: Vec<String>,
+    pub exact_build_derived: Vec<String>,
+    /// Interpretations defined by the hypervisor ABI or processor architecture.
+    pub architectural: Vec<String>,
+    pub inferred: Vec<String>,
+    pub read_failures: Vec<String>,
+}
+
 /// Which half of a hazard scan came up short, since the two are read from different things.
 ///
 /// **A value rather than a sentence**, because the sentence is the part that was wrong: one shared

@@ -271,6 +271,24 @@
       "wire": 6292
     },
     {
+      "annotations": 132,
+      "description": 851,
+      "inputSchema": 656,
+      "modelVisible": 1567,
+      "name": "hv_transition_trace",
+      "outputSchema": 2966,
+      "wire": 4696
+    },
+    {
+      "annotations": 131,
+      "description": 311,
+      "inputSchema": 326,
+      "modelVisible": 702,
+      "name": "hv_transition_trace_read",
+      "outputSchema": 5052,
+      "wire": 5916
+    },
+    {
       "annotations": 120,
       "description": 858,
       "inputSchema": 343,
@@ -758,15 +776,15 @@
     }
   ],
   "totals": {
-    "annotations": 9383,
-    "description": 49229,
-    "inputSchema": 77672,
+    "annotations": 9646,
+    "description": 50391,
+    "inputSchema": 78654,
     "instructions": 2022,
-    "modelVisible": 131413,
-    "outputSchema": 233865,
-    "payload": 377120,
-    "tools": 84,
-    "wire": 377025,
+    "modelVisible": 133682,
+    "outputSchema": 241883,
+    "payload": 387734,
+    "tools": 86,
+    "wire": 387637,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10296
   }

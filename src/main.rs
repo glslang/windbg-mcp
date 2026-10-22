@@ -33,6 +33,7 @@ mod engine;
 mod fault;
 mod framework;
 mod hazards;
+mod hvtransition;
 mod ioctl;
 mod kdapi;
 mod kdconn;
