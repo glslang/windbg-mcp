@@ -18,6 +18,50 @@ The low-level engine bindings live in [`dbgscope`](https://github.com/glslang/db
 (`src/dbgeng.rs`); this crate adds process-per-session engine supervision and the `rmcp` tool
 surface on top.
 
+## Official sources
+
+**This repository — [`github.com/glslang/windbg-mcp`](https://github.com/glslang/windbg-mcp) — is
+the project's only official home.** If you are reading this anywhere else, you are reading a copy:
+a mirror can carry this README word for word, so the address it is served from is the check, not
+what it says.
+
+It is published through these channels and no others:
+
+- **Source**: this repository, and [`glslang/dbgscope`](https://github.com/glslang/dbgscope) for
+  the engine bindings.
+- **Binaries**: this repository's [releases](https://github.com/glslang/windbg-mcp/releases) — a
+  zip and an `.mcpb` bundle, both listed in `SHA256SUMS.txt` and both covered by a signed
+  build-provenance attestation.
+- **MCP registry**: [`io.github.glslang/windbg-mcp`](docs/mcp-clients.md#from-the-official-mcp-registry)
+  in the [official registry](https://registry.modelcontextprotocol.io), whose `io.github.glslang`
+  namespace only this GitHub account can publish to. The entry points at the `.mcpb` above.
+- **Claude Code plugin**: `/plugin marketplace add glslang/windbg-mcp` — the marketplace is this
+  repository.
+
+The [Scoop bucket](docs/install.md#install-with-scoop) is community-maintained and outside this
+project; that section says what trusting it involves.
+
+**MCP directories and marketplaces list public repositories without asking. None of them is
+affiliated with this project or acts for it**, so before using windbg-mcp from one:
+
+- **It is free, and there is no paid edition.** It is MIT-licensed, with no subscription, licence
+  key or premium tier. A listing that charges for it is not a channel of this project, and the
+  money does not reach it.
+- **There is no hosted version.** The server drives DbgEng on the Windows machine it runs on,
+  against targets that machine can reach, so it belongs on yours or on one you control — `--listen`
+  exists to serve *your* clients. An endpoint offering it as a service is running someone else's
+  code, and your agent would be sending it what you debug: dumps, memory, traces.
+- **A binary from anywhere else is a debugger you have not vetted.** This one runs elevated — a
+  kernel attach and TTD recording need Administrator, and `--install-service` runs it as
+  `LocalSystem` — and it reads and writes other processes and the kernel. A tampered build in that
+  seat owns the machine and every target it reaches. Take binaries from the releases above and
+  check them before running them: the hash against `SHA256SUMS.txt`, and the provenance with
+
+  ```pwsh
+  gh attestation verify <file> --repo glslang/windbg-mcp `
+     --signer-workflow glslang/windbg-mcp/.github/workflows/release.yml
+  ```
+
 ## Documentation
 
 This file is the map. Each topic is one document, and each document is the whole of that topic.
