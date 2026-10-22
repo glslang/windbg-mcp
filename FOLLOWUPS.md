@@ -758,6 +758,12 @@ its op is its own; this one is not, for the reason below.
   down the `timeout_ms` it already has. Done together, `resolve` leaves the allowlist in
   `worker::tests::every_unbounded_execute_in_this_worker_is_accounted_for`, which is where
   the deferral is recorded in code.
+- **The `disassemble` op's patience has a second place to go, and nothing will ask for it.** Its
+  decode is `e.disassemble(start, count)`, which renders each line and so resolves symbols, and
+  [dbgscope#200](https://github.com/glslang/dbgscope/pull/200) gave that call a bounded form,
+  `disassemble_bounded`, which the walk's `function_listing` already spends its deadline on. A
+  `patience_ms` threaded only into `resolve` would bound the address and leave the listing
+  unbounded, and the allowlist above counts `Execute` call sites, so it cannot see a typed call.
 - **Note the hazard is not fully closable by a watchdog anyway.** `backtrace` resolves a symbol per
   frame through direct engine calls, with no `Execute` for a watchdog to break, so a cold symbol
   server can block that too — see `EngineOp::Backtrace`. This item is worth doing because a

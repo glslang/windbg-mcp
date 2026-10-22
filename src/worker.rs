@@ -48,7 +48,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use dbgscope::dbgeng::{
-    BreakpointAt, BreakpointSpec, CommandRun, DbgEngError, DebugEngine, DebuggeeType,
+    BreakpointAt, BreakpointSpec, CommandRun, DbgEngError, DebugEngine, DebuggeeType, Disassembly,
     FunctionExtent, Instruction, InterruptHandle, Interruption, RunToOutcome, WaitOutcome,
 };
 use dbgscope::heap::{self as heap_query, HeapAllocation, HeapBackend, HeapState, HeapWalk};
@@ -11998,13 +11998,6 @@ fn remaining(deadline: Instant, what: &str) -> Result<u32, Failed> {
     })
 }
 
-/// Why a bounded command stopped, as the walk reports it.
-///
-/// The two are kept apart because their remedies are, which is the same reason `Halt` has two
-/// variants at all: a deadline sends the caller to the call timeout, and a caller told "the call
-/// ran out of time" about a break they asked for themselves goes and raises a setting that was
-/// never the problem. dbgscope's own watchdog files nothing through the host handle, so
-/// `OnRequest` here is somebody's `interrupt` and nothing else.
 /// The watchdog budget for one of the walk's commands: what is left of the caller's clock, in ms,
 /// or `None` when there is nothing left to spend.
 ///
@@ -12014,7 +12007,8 @@ fn remaining(deadline: Instant, what: &str) -> Result<u32, Failed> {
 /// minutes as the single *unbounded* thing in it — reachable by sub-millisecond arithmetic alone.
 /// [`resolve_budget_ms`] answers the same hazard the other way, flooring at 1ms so its command
 /// runs and is cut short at once. Here `None` is better: a walk already past its deadline has a
-/// halt to report, and reporting it costs no engine call.
+/// halt to report, and reporting it costs no engine call. The walk's decodes take their budget
+/// from here as well, because `disassemble_bounded` reads zero the same way, as no deadline.
 fn walk_budget_ms(deadline: Instant, now: Instant) -> Option<u32> {
     match u32::try_from(deadline.saturating_duration_since(now).as_millis()) {
         Ok(0) => None,
@@ -12024,6 +12018,13 @@ fn walk_budget_ms(deadline: Instant, now: Instant) -> Option<u32> {
     }
 }
 
+/// Why a bounded call stopped, as the walk reports it -- the `uf` or a decode.
+///
+/// The two are kept apart because their remedies are, which is the same reason `Halt` has two
+/// variants at all: a deadline sends the caller to the call timeout, and a caller told "the call
+/// ran out of time" about a break they asked for themselves goes and raises a setting that was
+/// never the problem. dbgscope's own watchdog files nothing through the host handle, so
+/// `OnRequest` here is somebody's `interrupt` and nothing else.
 fn halt_for(cut_short: Interruption) -> walk::Halt {
     match cut_short {
         Interruption::OnRequest => walk::Halt::Interrupted,
@@ -12100,29 +12101,50 @@ fn function_listing(
     // that becomes "could not disassemble `from`" against a symbol that was fine, and on the
     // last queued function it becomes a clean NOT REACHABLE claiming the graph was fully
     // explored. The reason goes in a cell the walk's own `halt` closure reads.
-    // **The typed decodes below carry no bound of their own, and dbgscope has none to give
-    // them.** `disassemble` renders each line, so it resolves symbols, so a module with
-    // deferred ones can send it to a symbol server mid-loop — and a poll between calls cannot
-    // run while one is inside the engine. The `uf` above is bounded because a *command* can
-    // be; a typed call needs `disassemble_bounded`, which is
-    // [dbgscope#149](https://github.com/glslang/dbgscope/issues/149) and the sibling of #95's
-    // question about `read_memory`. Until then the bound here is the number of calls rather
-    // than the time they take, which is the honest description of it.
+    // **And each decode carries the deadline itself, as the `uf` does**, because a poll between
+    // calls cannot run while one is inside the engine: `disassemble` renders each line, so it
+    // resolves symbols, and a module with deferred ones can send it to a symbol server mid-run.
+    // `disassemble_bounded` checks what is left of the clock before every line, so a cold module
+    // costs the walk one line past its deadline rather than a run's worth of them. One line is the
+    // residual, not zero: whether a watchdog's `SetInterrupt` reaches a `Disassemble` already in
+    // progress is unmeasured, which is why
+    // [dbgscope#149](https://github.com/glslang/dbgscope/issues/149) bounded the loop instead.
+    // The poll stays in front of each call because the two read different things: a break the
+    // host files while no operation is open reaches only the engine's flag, which `expired`
+    // reads, and one filed during the decode is that operation's, which only the decode reads.
+    let decode = |start: u64, count: usize| -> Result<Vec<Instruction>, walk::Halt> {
+        if let Some(why) = expired(e) {
+            return Err(why);
+        }
+        let Some(budget) = walk_budget_ms(deadline, Instant::now()) else {
+            return Err(walk::Halt::Deadline);
+        };
+        match e.disassemble_bounded(start, count, budget) {
+            Ok(Disassembly {
+                cut_short: Some(why),
+                ..
+            }) => Err(halt_for(why)),
+            Ok(run) => Ok(run.instructions),
+            // Nothing decoded is not a halt: the retry below asks for each address again, and
+            // what still will not decode becomes a barrier rather than a hole.
+            Err(_) => Ok(Vec::new()),
+        }
+    };
     let mut decoded: HashMap<u64, Instruction> = HashMap::new();
     for (start, count) in listing_runs(&listing) {
-        if let Some(why) = expired(e) {
+        match decode(start, count) {
+            Ok(run) => decoded.extend(
+                run.into_iter()
+                    .map(|instruction| (instruction.address, instruction)),
+            ),
             // Pruned rather than returned half-decoded: a function missing instructions is a
             // function missing edges. The reason is recorded first, so the walk reports a
             // halt rather than a graph it never finished.
-            halted.set(Some(why));
-            return None;
+            Err(why) => {
+                halted.set(Some(why));
+                return None;
+            }
         }
-        decoded.extend(
-            e.disassemble(start, count)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|instruction| (instruction.address, instruction)),
-        );
     }
     // **Grouping is an optimisation, and this is what keeps it from being an assumption.**
     // A run decodes forward from its first address, so any listed address the run did not
@@ -12131,15 +12153,19 @@ fn function_listing(
     // an edge or a target in the dropped part reads as NOT REACHABLE. Anything missing is
     // asked for on its own, which is the answer the ungrouped version would have given.
     for &address in &listing {
-        if let Some(why) = expired(e) {
-            halted.set(Some(why));
-            return None;
+        if decoded.contains_key(&address) {
+            continue;
         }
-        if !decoded.contains_key(&address)
-            && let Ok(mut one) = e.disassemble(address, 1)
-            && let Some(instruction) = one.pop()
-        {
-            decoded.insert(instruction.address, instruction);
+        match decode(address, 1) {
+            Ok(mut one) => {
+                if let Some(instruction) = one.pop() {
+                    decoded.insert(instruction.address, instruction);
+                }
+            }
+            Err(why) => {
+                halted.set(Some(why));
+                return None;
+            }
         }
     }
     // Emitted in the **listing's** order and with a barrier wherever an address would not
@@ -14577,6 +14603,30 @@ mod tests {
         );
     }
 
+    /// **And the walk's instruction decodes spend it too**, which the guard above cannot see: it is
+    /// about commands, and these are typed calls. `function_listing` is shared by the walk and the
+    /// IOCTL map, and until [dbgscope#149](https://github.com/glslang/dbgscope/issues/149) its
+    /// decodes were the part of both bounded by their *number* rather than their time. Backing one
+    /// out to `disassemble` compiles, passes every test with no cold module behind it, and puts
+    /// back a call that holds the session for as long as a symbol server takes.
+    #[test]
+    fn a_function_listing_decodes_nothing_unbounded() {
+        let body = bodies_of(&["function_listing"], 6_000);
+        // `.disassemble_bounded(` does not contain this, which is the whole point of the two names.
+        assert!(
+            !body.contains(".disassemble("),
+            "a function listing carries the caller's deadline and must spend it on its decodes: \
+             `disassemble` renders each line, so it resolves symbols, and a fetch there blocks the \
+             session's one thread with no poll able to run. Use `disassemble_bounded` on what \
+             `walk_budget_ms` reports."
+        );
+        assert!(
+            body.contains(".disassemble_bounded("),
+            "a function listing no longer decodes through `disassemble_bounded`, so the guard \
+             above is passing over code that decodes nothing at all"
+        );
+    }
+
     /// **The trace's ownership check is applied where it bites**, which the recorder's own tests
     /// cannot say: `phase_of` is right in `src/pooltrace.rs` whatever calls it, and the defect
     /// review found twice on #473 was a callback asking about something other than the breakpoint
@@ -15971,7 +16021,8 @@ mod tests {
         // could not: it reads `server.rs` for ops, not this file for arguments. Every site here
         // takes its budget from the caller's clock, and the two that could round down to nothing
         // deal with it by name — `resolve_budget_ms` floors at 1ms, `walk_budget_ms` refuses to
-        // run the command at all.
+        // run the command at all. The typed bounded calls read zero the same way, as no deadline,
+        // so they are held to the same spelling.
         // Comments are skipped, and both doc comments above are why: the hazard is *named* in the
         // prose that explains why each site avoids it, so a scan that read them would fail on the
         // documentation of the very rule it enforces.
@@ -15979,11 +16030,20 @@ mod tests {
             .lines()
             .map(str::trim)
             .filter(|line| !line.starts_with("//"))
-            .filter(|line| line.contains("execute_command_bounded(") && line.contains(", 0)"))
+            .filter(|line| {
+                [
+                    "execute_command_bounded(",
+                    "read_memory_bounded(",
+                    "disassemble_bounded(",
+                ]
+                .iter()
+                .any(|call| line.contains(call))
+                    && line.contains(", 0)")
+            })
             .collect();
         assert!(
             disarmed.is_empty(),
-            "a bounded command with a zero budget runs unbounded: {disarmed:?}"
+            "a bounded call with a zero budget runs unbounded: {disarmed:?}"
         );
         let mut counted: Vec<(&str, usize)> = Vec::new();
         for site in sites {

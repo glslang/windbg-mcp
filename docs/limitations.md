@@ -57,10 +57,13 @@
   aborts rather than outliving the call that asked for it and pinning the session behind it. So do
   the commands that run *before* the walk: evaluating the address expressions and reading a
   module's base are where a cold symbol server is reached, and a deadline first consulted inside
-  the walk is one the caller can outlive before it starts. The
-  typed instruction decodes underneath it are bounded by their *number* rather than by their time,
-  because the debugger bindings have no bounded form of that call yet
-  ([dbgscope#149](https://github.com/glslang/dbgscope/issues/149)).
+  the walk is one the caller can outlive before it starts. So do the typed instruction decodes
+  underneath it, which check what is left before each instruction
+  ([dbgscope#149](https://github.com/glslang/dbgscope/issues/149)). What none of them reaches is
+  one instruction already being rendered when the time runs out: rendering resolves the symbols in
+  it, and a render blocked fetching a PDB runs to completion, so a walk can end that one symbol load
+  past its deadline. The IOCTL map decodes its dispatch routine through the same path and carries
+  the same bound.
 - A `NOT REACHABLE` also says when part of the graph it explored **could not be seen**. An
   instruction whose bytes will not read, or whose encoding this build does not decode, stops the
   walk where it is; the report counts those, withholds the claim that the reachable call graph was

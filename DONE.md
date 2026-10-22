@@ -457,6 +457,15 @@ dbgscope has no bounded form of that call. Filed as
 `docs/limitations.md`, which says what the bound there actually is — the number of calls, not the
 time they take.
 
+**Closed upstream on 2026-10-22.** [dbgscope#200](https://github.com/glslang/dbgscope/pull/200)
+added `disassemble_bounded`, which checks a budget before each line rather than arming a watchdog,
+for the reason [#95](https://github.com/glslang/dbgscope/issues/95)'s read did: whether
+`SetInterrupt` reaches a direct engine call already in progress is unmeasured, and a loop can be
+bounded without that answer. `function_listing` spends the walk's remaining clock on every decode
+now, the IOCTL map included, and `worker::tests::a_function_listing_decodes_nothing_unbounded`
+fails if one is backed out to `disassemble`. What is left is one instruction: a render blocked on a
+symbol load runs to completion.
+
 - **Where it landed:** `src/driver.rs` (the walk and its rendering), `src/worker.rs` (`reachable`,
   `walk_budget_ms`, `halt_for`), `src/server.rs` (`walk_bound` and the two ceilings),
   `src/proto.rs` (`ReachabilityOp::patience_ms`).
