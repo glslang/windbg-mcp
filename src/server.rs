@@ -2052,6 +2052,32 @@ pub struct SkCallTraceReadArgs {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct HvTransitionTraceArgs {
+    /// Workload label shared with the ordinary-kernel call trace and guest harness (1-128 bytes).
+    #[serde(default)]
+    pub label: Option<String>,
+    /// How many VTL call/return selections to retain before the target stops (default 64, at most
+    /// 1024).
+    #[serde(default)]
+    pub max_transitions: Option<u32>,
+    /// A session opened with a distinct hypervisor KD profile. An ordinary Windows-kernel session
+    /// is refused.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HvTransitionTraceReadArgs {
+    /// Disarm the trace after reading it: remove both processor breakpoints and the callback.
+    #[serde(default)]
+    pub stop: Option<bool>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DriverHazardsArgs {
     /// The driver to scan, by the name the module inventory lists it under, e.g. "mydriver". The
     /// image must be readable in this session: on a dump that means the engine can obtain the
@@ -3713,6 +3739,74 @@ impl WindbgServer {
             .run(
                 args.session_id.as_deref(),
                 EngineOp::SkCallTraceRead {
+                    stop: args.stop.unwrap_or(false),
+                },
+            )
+            .await;
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
+    /// Trace the hypervisor's authoritative VTL-call and VTL-return selections in a distinct
+    /// live x64 hypervisor KD session. This exact-build path accepts only the measured K3 Intel
+    /// `hvix64.exe` identity and validates both handler prefixes plus their relocated hypercall
+    /// descriptors before arming two DbgEng-owned software breakpoints. Each event records
+    /// the VP and processor, source and handler-selected target VTL, control value, and both
+    /// per-VTL saved-state/VMCS coordinates. It reports the architectural guest-RIP and guest-CR3
+    /// VMCS field encodings but never substitutes VTL0 registers or decodes opaque VMCS memory.
+    /// Arming does not resume the target; the event that reaches `max_transitions` stops it.
+    #[rmcp::tool(
+        annotations(
+            title = "Trace hypervisor VTL transitions",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<Outcome<structured::HvTransitionTraceArmed>>()
+    )]
+    async fn hv_transition_trace(
+        &self,
+        Parameters(args): Parameters<HvTransitionTraceArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::HvTransitionTraceArm {
+                    label: args.label,
+                    limit: args
+                        .max_transitions
+                        .map_or(crate::hvtransition::DEFAULT_TRANSITIONS, |limit| {
+                            limit as usize
+                        }),
+                    patience_ms: 0,
+                },
+            )
+            .await;
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
+    /// Read the bounded VTL transitions retained by this hypervisor session. Values selected by
+    /// the two handlers are distinguished from exact-build-derived structure coordinates, and
+    /// every failed register or memory read stays named. Pass `stop` to disarm both owned software
+    /// breakpoints after taking the snapshot.
+    #[rmcp::tool(
+        annotations(
+            title = "Read hypervisor VTL transitions",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<Outcome<structured::HvTransitionTrace>>()
+    )]
+    async fn hv_transition_trace_read(
+        &self,
+        Parameters(args): Parameters<HvTransitionTraceReadArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::HvTransitionTraceRead {
                     stop: args.stop.unwrap_or(false),
                 },
             )
@@ -7409,6 +7503,12 @@ const SUMMARY_NOTES: &[SummaryNote] = &[
 /// here reads as a sentence about the tool and may be the only home a sentence about one of its
 /// arguments has.
 const TOOL_NOTES: &[ToolNote] = &[
+    ToolNote {
+        tool: "hv_transition_trace",
+        names: &["continue_async", "hv_transition_trace_read"],
+        note: "Arm it in the separate hypervisor session, then `continue_async`; \
+               `hv_transition_trace_read` reads the selected VTLs and disarms with `stop`.",
+    },
     ToolNote {
         tool: "sk_call_trace",
         names: &["continue_async", "sk_call_trace_read"],

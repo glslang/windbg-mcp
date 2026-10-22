@@ -3158,6 +3158,9 @@ struct HeldBetweenOps {
     /// The exact-build VTL0 Secure Kernel call trace, mutually exclusive with `pool_trace`
     /// because DbgEng exposes one breakpoint-callback slot per engine.
     sk_call_trace: Option<SkCallTrace>,
+    /// The two exact-build hypervisor transition breakpoints. This lives only in the distinct
+    /// hypervisor KD worker; it can never share an engine with the ordinary-kernel M4 trace.
+    hv_transition_trace: Option<HvTransitionTrace>,
 }
 
 /// Live Secure Kernel state owned together because the KD facade borrows the same controller.
@@ -3182,6 +3185,7 @@ fn execute(
         sk_live,
         pool_trace,
         sk_call_trace,
+        hv_transition_trace,
     } = held;
     // **How much of the caller's patience is gone by the time a bound is armed** — the queue wait
     // *plus* whatever this op has already spent getting to the point of arming one. Every budget
@@ -3902,7 +3906,7 @@ fn execute(
                     limit,
                     Instant::now() + budget,
                     pool_trace,
-                    sk_call_trace.is_some(),
+                    sk_call_trace.is_some() || hv_transition_trace.is_some(),
                 ),
                 None => Err(Failed::categorised(
                     structured::ErrorCategory::NotRun,
@@ -3944,11 +3948,43 @@ fn execute(
                     limit,
                     remaining,
                     sk_call_trace,
-                    pool_trace.is_some(),
+                    pool_trace.is_some() || hv_transition_trace.is_some(),
                 )
             }
         }
         EngineOp::SkCallTraceRead { stop } => read_sk_call_trace(e, stop, sk_call_trace),
+        EngineOp::HvTransitionTraceArm {
+            label,
+            limit,
+            patience_ms,
+        } => {
+            let patience = Duration::from_millis(u64::from(patience_ms));
+            let remaining = patience.saturating_sub(spent());
+            if remaining.is_zero() {
+                Err(Failed::categorised(
+                    structured::ErrorCategory::NotRun,
+                    format!(
+                        "This hypervisor transition trace was not armed: it reached the engine \
+                         with no caller time left. Nothing was armed. It waited {}s behind other \
+                         work on this session; issue it when the session is idle, or raise the \
+                         server's call timeout (WINDBG_MCP_CALL_TIMEOUT_SECS).",
+                        queued.as_secs(),
+                    ),
+                ))
+            } else {
+                arm_hv_transition_trace(
+                    e,
+                    label,
+                    limit,
+                    remaining,
+                    hv_transition_trace,
+                    pool_trace.is_some() || sk_call_trace.is_some(),
+                )
+            }
+        }
+        EngineOp::HvTransitionTraceRead { stop } => {
+            read_hv_transition_trace(e, stop, hv_transition_trace)
+        }
         EngineOp::DriverHazards {
             module,
             patience_ms,
@@ -11387,6 +11423,833 @@ fn render_sk_call_trace(report: &structured::SkCallTrace) -> String {
     out
 }
 
+/// One exact-build VTL transition trace held by a distinct hypervisor KD worker.
+pub(crate) struct HvTransitionTrace {
+    trace_id: String,
+    label: Option<String>,
+    call_site: structured::CodeLocation,
+    return_site: structured::CodeLocation,
+    images: Vec<structured::ImageRef>,
+    image_checksum: String,
+    call_guard: String,
+    return_guard: String,
+    machine: String,
+    recorder: std::rc::Rc<std::cell::RefCell<crate::hvtransition::Recorder>>,
+}
+
+static HV_TRANSITION_TRACE_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+const HV_TRANSITION_SCHEMA: &str = "windbg-mcp.hv-transition-trace.v1";
+
+fn hv_transition_identity_gaps() -> Vec<String> {
+    [
+        "session_id",
+        "target_boot_id",
+        "vm_id",
+        "partition_id",
+        "stop_epoch",
+        "total_vp_count",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn validate_hv_transition_label(label: Option<String>) -> Result<Option<String>, Failed> {
+    let Some(label) = label else {
+        return Ok(None);
+    };
+    if label.is_empty() || label.len() > 128 || label.chars().any(char::is_control) {
+        return Err(Failed::categorised(
+            structured::ErrorCategory::InvalidArgument,
+            "a hypervisor transition trace label must be 1-128 bytes and contain no control \
+             characters. Nothing was armed."
+                .to_string(),
+        ));
+    }
+    Ok(Some(label))
+}
+
+fn exact_bytes(e: &DebugEngine, address: u64, expected: &[u8]) -> Result<(), String> {
+    let read = e
+        .read_memory_bounded(address, expected.len(), 5_000)
+        .map_err(es)?;
+    if let Some(reason) = read.cut_short {
+        return Err(format!("read was cut short ({reason:?})"));
+    }
+    if read.bytes != expected {
+        let differences: Vec<String> = read
+            .bytes
+            .iter()
+            .zip(expected)
+            .enumerate()
+            .filter(|(_, (actual, expected))| actual != expected)
+            .map(|(offset, (actual, expected))| format!("{offset:#x}:{expected:02x}->{actual:02x}"))
+            .collect();
+        let difference_count = differences.len() + read.bytes.len().abs_diff(expected.len());
+        return Err(format!(
+            "{difference_count} of {} guarded bytes were different (expected->actual {})",
+            expected.len(),
+            differences.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+fn exact_hv_descriptor(
+    e: &DebugEngine,
+    address: u64,
+    handler: u64,
+    tail: &[u8],
+) -> Result<(), String> {
+    let read = e
+        .read_memory_bounded(address, 8 + tail.len(), 5_000)
+        .map_err(es)?;
+    if let Some(reason) = read.cut_short {
+        return Err(format!("read was cut short ({reason:?})"));
+    }
+    let relocated = read
+        .bytes
+        .get(..8)
+        .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+        .map(u64::from_le_bytes);
+    if relocated != Some(handler) {
+        return Err("relocated handler pointer differs".to_string());
+    }
+    if read.bytes.get(8..) != Some(tail) {
+        return Err("descriptor tail differs".to_string());
+    }
+    Ok(())
+}
+
+fn arm_hv_transition_trace(
+    e: &DebugEngine,
+    label: Option<String>,
+    limit: usize,
+    _remaining: Duration,
+    slot: &mut Option<HvTransitionTrace>,
+    other_trace_armed: bool,
+) -> Result<Output, Failed> {
+    if other_trace_armed {
+        return Err(Failed::categorised(
+            structured::ErrorCategory::InvalidArgument,
+            "this session already holds another callback trace. DbgEng has one breakpoint \
+             callback slot per engine; disarm the existing trace first."
+                .to_string(),
+        ));
+    }
+    if !matches!(e.debuggee_type(), Ok(kind) if kind.is_live_kernel())
+        || target_summary(e).kernel_target != Some(structured::KernelTarget::Hypervisor)
+    {
+        return Err(Failed::categorised(
+            structured::ErrorCategory::InvalidArgument,
+            "a hypervisor transition trace needs a separate live hypervisor KD target. It is \
+             refused on an ordinary Windows-kernel worker, a dump, and user mode."
+                .to_string(),
+        ));
+    }
+    let set = e.instruction_set();
+    if !matches!(set, dbgscope::dbgeng::InstructionSet::Amd64) {
+        return Err(Failed::categorised(
+            structured::ErrorCategory::InvalidArgument,
+            format!(
+                "this trace decodes the measured Intel x64 hypervisor handlers, but the target \
+                 is machine {}. Nothing was armed.",
+                machine_label(set)
+            ),
+        ));
+    }
+    let label = validate_hv_transition_label(label)?;
+    let modules = e.modules().map_err(failed)?;
+    let mut matching = modules
+        .iter()
+        .filter(|module| module.name.eq_ignore_ascii_case("hv"));
+    let Some(hv) = matching.next() else {
+        return Err(Failed::categorised(
+            structured::ErrorCategory::InvalidArgument,
+            "the hypervisor target has no loaded `hv` image. Nothing was armed.".to_string(),
+        ));
+    };
+    if matching.next().is_some()
+        || hv.size != crate::hvtransition::IMAGE_SIZE
+        || hv.timestamp != crate::hvtransition::IMAGE_TIMESTAMP
+        || hv.checksum != crate::hvtransition::IMAGE_CHECKSUM
+    {
+        return Err(Failed::categorised(
+            structured::ErrorCategory::InvalidArgument,
+            format!(
+                "the live `hv` image is not the measured K3 hvix64.exe identity \
+                 (timestamp {:#010x}, size {:#x}, checksum {:#010x}). Found timestamp {:#010x}, \
+                 size {:#x}, checksum {:#010x}; nothing was armed.",
+                crate::hvtransition::IMAGE_TIMESTAMP,
+                crate::hvtransition::IMAGE_SIZE,
+                crate::hvtransition::IMAGE_CHECKSUM,
+                hv.timestamp,
+                hv.size,
+                hv.checksum,
+            ),
+        ));
+    }
+    let base = hv.base;
+    let address = |rva: u64| base.checked_add(rva);
+    let Some(call_handler) = address(crate::hvtransition::CALL_HANDLER_RVA) else {
+        return Err(Failed::from(
+            "the live hv base overflows its call handler RVA",
+        ));
+    };
+    let Some(call_address) = address(crate::hvtransition::CALL_BREAK_RVA) else {
+        return Err(Failed::from(
+            "the live hv base overflows its call breakpoint RVA",
+        ));
+    };
+    let Some(return_handler) = address(crate::hvtransition::RETURN_HANDLER_RVA) else {
+        return Err(Failed::from(
+            "the live hv base overflows its return handler RVA",
+        ));
+    };
+    let Some(return_address) = address(crate::hvtransition::RETURN_BREAK_RVA) else {
+        return Err(Failed::from(
+            "the live hv base overflows its return breakpoint RVA",
+        ));
+    };
+    let Some(call_descriptor) = address(crate::hvtransition::CALL_DESCRIPTOR_RVA) else {
+        return Err(Failed::from(
+            "the live hv base overflows its call descriptor RVA",
+        ));
+    };
+    let Some(return_descriptor) = address(crate::hvtransition::RETURN_DESCRIPTOR_RVA) else {
+        return Err(Failed::from(
+            "the live hv base overflows its return descriptor RVA",
+        ));
+    };
+    let guard_failures: Vec<String> = [
+        (
+            "call handler",
+            exact_bytes(e, call_handler, crate::hvtransition::CALL_GUARD),
+        ),
+        (
+            "return handler",
+            exact_bytes(e, return_handler, crate::hvtransition::RETURN_GUARD),
+        ),
+        (
+            "call descriptor",
+            exact_hv_descriptor(
+                e,
+                call_descriptor,
+                call_handler,
+                crate::hvtransition::CALL_DESCRIPTOR_TAIL,
+            ),
+        ),
+        (
+            "return descriptor",
+            exact_hv_descriptor(
+                e,
+                return_descriptor,
+                return_handler,
+                crate::hvtransition::RETURN_DESCRIPTOR_TAIL,
+            ),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(name, result)| result.err().map(|why| format!("{name}: {why}")))
+    .collect();
+    if !guard_failures.is_empty() {
+        return Err(Failed::categorised(
+            structured::ErrorCategory::InvalidArgument,
+            format!(
+                "the live hypervisor's handler bytes or relocated hypercall descriptors do not \
+                 match the measured K3 profile ({}). Internal registers and offsets are not \
+                 assumed on a different image; nothing was armed.",
+                guard_failures.join("; ")
+            ),
+        ));
+    }
+
+    let mut attributor = Attributor::default();
+    let call_site = attributor.locate(e, call_address);
+    let return_site = attributor.locate(e, return_address);
+    let images = attributor.images();
+    if call_site.module.as_deref() != Some("hv")
+        || return_site.module.as_deref() != Some("hv")
+        || images.len() != 1
+    {
+        return Err(Failed::categorised(
+            structured::ErrorCategory::InvalidArgument,
+            "the two transition sites could not be bound to one exact `hv` image identity. \
+             Nothing was armed."
+                .to_string(),
+        ));
+    }
+
+    let generation = HV_TRANSITION_TRACE_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+    let trace_id = format!("hvtransition-{generation}");
+    let marker = format!("$$ hv_transition_trace {generation}");
+    // Processor execution breakpoints are accepted by DbgEng on the K3 hypervisor target but do
+    // not fire there: a 120-second run crossed both handlers repeatedly and retained zero hits.
+    // A DbgEng-owned code breakpoint at this exact call site fired in 161 ms on the same boot;
+    // removal restored the guarded byte and the independent same-boot health check passed. The
+    // engine's multiprocessor detach drain covers stops another processor can already owe when a
+    // shared code breakpoint is removed (DONE.md item 93).
+    let spec = |at| BreakpointSpec::code(BreakpointAt::Address(at)).with_command(marker.clone());
+    let call = e.set_breakpoint(&spec(call_address)).map_err(failed)?;
+    let call_id = call.breakpoint.id;
+    if call.breakpoint.address != Some(call_address) {
+        let _ = e.remove_breakpoint(call_id);
+        return Err(Failed::from(
+            "the call breakpoint did not resolve to its guarded address; it was removed",
+        ));
+    }
+    let ret = match e.set_breakpoint(&spec(return_address)) {
+        Ok(ret) => ret,
+        Err(why) => {
+            let _ = e.remove_breakpoint(call_id);
+            return Err(failed(why));
+        }
+    };
+    let return_id = ret.breakpoint.id;
+    if ret.breakpoint.address != Some(return_address) {
+        let _ = e.remove_breakpoint(call_id);
+        let _ = e.remove_breakpoint(return_id);
+        return Err(Failed::from(
+            "the return breakpoint did not resolve to its guarded address; both were removed",
+        ));
+    }
+
+    let replaced = slot.is_some();
+    if let Some(previous) = slot.as_ref() {
+        if let Err(error) = disarm_hv_transition_trace(e, previous) {
+            let _ = e.remove_breakpoint(call_id);
+            let _ = e.remove_breakpoint(return_id);
+            return Err(error);
+        }
+        *slot = None;
+    }
+
+    let mut recorder = crate::hvtransition::Recorder::new(limit, marker);
+    recorder.arm(call_id, return_id);
+    let recorder = std::rc::Rc::new(std::cell::RefCell::new(recorder));
+    let shared = std::rc::Rc::clone(&recorder);
+    let started = Instant::now();
+    let callback: dbgscope::dbgeng::BreakpointCallback = Box::new(move |hit| {
+        use dbgscope::dbgeng::BreakpointAction;
+
+        let Ok(id) = hit.id() else {
+            return BreakpointAction::Default;
+        };
+        let engine = hit.engine();
+        let command = engine
+            .breakpoints()
+            .ok()
+            .and_then(|held| held.into_iter().find(|breakpoint| breakpoint.id == id))
+            .and_then(|breakpoint| breakpoint.command);
+        let Ok(mut recorder) = shared.try_borrow_mut() else {
+            return BreakpointAction::Default;
+        };
+        let Some(kind) = recorder.owns(id, command.as_deref()) else {
+            return BreakpointAction::Default;
+        };
+        let mut failures = Vec::new();
+        let rip = hv_register(engine, "rip", &mut failures);
+        let rsp = hv_register(engine, "rsp", &mut failures);
+        let processor = match engine.current_processor() {
+            Ok(Some(value)) => Some(value),
+            Ok(None) | Err(_) => {
+                failures.push("processor".to_string());
+                None
+            }
+        };
+        let (vp, source_vtl, target_vtl, control, guest_registers) = match kind {
+            crate::hvtransition::Kind::Call => {
+                let vp = hv_register(engine, "rdi", &mut failures);
+                let target = hv_register(engine, "rsi", &mut failures)
+                    .and_then(|value| hv_vtl(value, "target_vtl", &mut failures));
+                let source = vp
+                    .and_then(|vp| {
+                        hv_offset(
+                            vp,
+                            crate::hvtransition::CURRENT_VTL_STATE_OFFSET,
+                            "current_vtl_state",
+                            &mut failures,
+                        )
+                    })
+                    .and_then(|vp| hv_read_u64(engine, vp, "current_vtl_state", &mut failures))
+                    .and_then(|state| {
+                        hv_offset(
+                            state,
+                            crate::hvtransition::ACTIVE_VTL_OFFSET,
+                            "source_vtl",
+                            &mut failures,
+                        )
+                    })
+                    .and_then(|state| hv_read_u8(engine, state, "source_vtl", &mut failures))
+                    .and_then(|value| hv_vtl(u64::from(value), "source_vtl", &mut failures));
+                let registers = vp
+                    .and_then(|vp| {
+                        hv_offset(
+                            vp,
+                            crate::hvtransition::GUEST_REGISTERS_OFFSET,
+                            "guest_registers",
+                            &mut failures,
+                        )
+                    })
+                    .and_then(|address| {
+                        hv_read_u64(engine, address, "guest_registers", &mut failures)
+                    });
+                let control = registers
+                    .and_then(|registers| hv_read_u64(engine, registers, "control", &mut failures));
+                (vp, source, target, control, registers)
+            }
+            crate::hvtransition::Kind::Return => {
+                let vp = hv_register(engine, "rbx", &mut failures);
+                let source = hv_register(engine, "r15", &mut failures)
+                    .and_then(|value| hv_vtl(value, "source_vtl", &mut failures));
+                let target = hv_register(engine, "rcx", &mut failures)
+                    .and_then(|value| hv_vtl(value, "target_vtl", &mut failures));
+                let control = hv_register(engine, "r14", &mut failures);
+                let registers = vp
+                    .and_then(|vp| {
+                        hv_offset(
+                            vp,
+                            crate::hvtransition::GUEST_REGISTERS_OFFSET,
+                            "guest_registers",
+                            &mut failures,
+                        )
+                    })
+                    .and_then(|address| {
+                        hv_read_u64(engine, address, "guest_registers", &mut failures)
+                    });
+                (vp, source, target, control, registers)
+            }
+        };
+        let vp_index = vp
+            .and_then(|vp| {
+                hv_offset(
+                    vp,
+                    crate::hvtransition::VP_INDEX_OFFSET,
+                    "vp_index",
+                    &mut failures,
+                )
+            })
+            .and_then(|address| hv_read_u8(engine, address, "vp_index", &mut failures));
+        let source_vmcs = hv_vmcs_for_vtl(engine, vp, source_vtl, "source_vmcs", &mut failures);
+        let target_vmcs = hv_vmcs_for_vtl(engine, vp, target_vtl, "target_vmcs", &mut failures);
+        let elapsed_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        recorder.hit(crate::hvtransition::Hit {
+            host_monotonic_us: unsafe {
+                windows_sys::Win32::System::SystemInformation::GetTickCount64()
+                    .saturating_mul(1_000)
+            },
+            elapsed_us,
+            kind,
+            rip,
+            rsp,
+            processor,
+            vp,
+            vp_index,
+            source_vtl,
+            target_vtl,
+            control,
+            guest_registers,
+            source_vmcs,
+            target_vmcs,
+            read_failures: failures,
+        })
+    });
+    if let Err(why) = e.set_breakpoint_callback(callback) {
+        let _ = e.remove_breakpoint(call_id);
+        let _ = e.remove_breakpoint(return_id);
+        return Err(Failed::from(format!(
+            "the hypervisor breakpoint callback could not be registered ({why}); both \
+             breakpoints were removed"
+        )));
+    }
+
+    let trace = HvTransitionTrace {
+        trace_id,
+        label,
+        call_site,
+        return_site,
+        images,
+        image_checksum: format!("{:#010x}", hv.checksum),
+        call_guard: hex_bytes(crate::hvtransition::CALL_GUARD),
+        return_guard: hex_bytes(crate::hvtransition::RETURN_GUARD),
+        machine: machine_label(set),
+        recorder,
+    };
+    let report = hv_transition_armed_report(&trace, replaced);
+    *slot = Some(trace);
+    Ok(Output::typed(render_hv_transition_armed(&report), report))
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02X}")).collect()
+}
+
+fn hv_register(e: &DebugEngine, name: &'static str, failures: &mut Vec<String>) -> Option<u64> {
+    match e.integer_register(name) {
+        Ok(value) => Some(value),
+        Err(_) => {
+            failures.push(name.to_string());
+            None
+        }
+    }
+}
+
+fn hv_offset(
+    base: u64,
+    offset: u64,
+    name: &'static str,
+    failures: &mut Vec<String>,
+) -> Option<u64> {
+    base.checked_add(offset).or_else(|| {
+        failures.push(name.to_string());
+        None
+    })
+}
+
+fn hv_read_u64(
+    e: &DebugEngine,
+    address: u64,
+    name: &'static str,
+    failures: &mut Vec<String>,
+) -> Option<u64> {
+    match e.read_memory(address, 8) {
+        Ok(bytes) => <[u8; 8]>::try_from(bytes.as_slice())
+            .ok()
+            .map(u64::from_le_bytes)
+            .or_else(|| {
+                failures.push(name.to_string());
+                None
+            }),
+        Err(_) => {
+            failures.push(name.to_string());
+            None
+        }
+    }
+}
+
+fn hv_read_u8(
+    e: &DebugEngine,
+    address: u64,
+    name: &'static str,
+    failures: &mut Vec<String>,
+) -> Option<u8> {
+    match e.read_memory(address, 1) {
+        Ok(bytes) if bytes.len() == 1 => Some(bytes[0]),
+        Ok(_) | Err(_) => {
+            failures.push(name.to_string());
+            None
+        }
+    }
+}
+
+fn hv_vtl(value: u64, name: &'static str, failures: &mut Vec<String>) -> Option<u8> {
+    match u8::try_from(value).ok().filter(|value| *value <= 2) {
+        Some(value) => Some(value),
+        None => {
+            failures.push(name.to_string());
+            None
+        }
+    }
+}
+
+fn hv_vmcs_for_vtl(
+    e: &DebugEngine,
+    vp: Option<u64>,
+    vtl: Option<u8>,
+    name: &'static str,
+    failures: &mut Vec<String>,
+) -> Option<crate::hvtransition::VmcsCoordinate> {
+    let (vp, vtl) = (vp?, vtl?);
+    let Some(slot) = vp
+        .checked_add(crate::hvtransition::VTL_STATE_ARRAY_OFFSET)
+        .and_then(|array| array.checked_add(u64::from(vtl) * 8))
+    else {
+        failures.push(name.to_string());
+        return None;
+    };
+    let state = hv_read_u64(e, slot, name, failures)?;
+    if state == 0 {
+        failures.push(name.to_string());
+        return None;
+    }
+    let descriptor = state.checked_add(crate::hvtransition::VMCS_DESCRIPTOR_OFFSET);
+    if descriptor.is_none() {
+        failures.push(name.to_string());
+    }
+    let physical_address = descriptor.and_then(|descriptor| {
+        let Some(address) = descriptor.checked_add(crate::hvtransition::VMCS_PHYSICAL_OFFSET)
+        else {
+            failures.push(name.to_string());
+            return None;
+        };
+        hv_read_u64(e, address, name, failures)
+    });
+    Some(crate::hvtransition::VmcsCoordinate {
+        state,
+        descriptor,
+        physical_address,
+    })
+}
+
+fn disarm_hv_transition_trace(e: &DebugEngine, trace: &HvTransitionTrace) -> Result<(), Failed> {
+    let marker = trace.recorder.borrow().marker().to_string();
+    let held = e.breakpoints().map_err(|why| {
+        Failed::from(format!(
+            "the session's breakpoints could not be listed ({why}), so hypervisor transition \
+             trace {} remains armed",
+            trace.trace_id
+        ))
+    })?;
+    let stuck: Vec<u32> = held
+        .iter()
+        .filter(|breakpoint| breakpoint.command.as_deref() == Some(marker.as_str()))
+        .map(|breakpoint| breakpoint.id)
+        .filter(|&id| e.remove_breakpoint(id).is_err())
+        .collect();
+    if !stuck.is_empty() {
+        return Err(Failed::from(format!(
+            "breakpoint(s) {stuck:?} of hypervisor transition trace {} could not be removed, so \
+             the trace remains armed",
+            trace.trace_id
+        )));
+    }
+    e.clear_breakpoint_callback().map_err(|why| {
+        Failed::from(format!(
+            "hypervisor transition trace {} has no breakpoint left, but its callback could not \
+             be unregistered ({why}), so the trace is still held",
+            trace.trace_id
+        ))
+    })
+}
+
+fn hv_transition_armed_report(
+    trace: &HvTransitionTrace,
+    replaced: bool,
+) -> structured::HvTransitionTraceArmed {
+    structured::HvTransitionTraceArmed {
+        schema: HV_TRANSITION_SCHEMA.to_string(),
+        trace_id: trace.trace_id.clone(),
+        label: trace.label.clone(),
+        call_site: trace.call_site.clone(),
+        return_site: trace.return_site.clone(),
+        images: trace.images.clone(),
+        image_checksum: trace.image_checksum.clone(),
+        call_guard: trace.call_guard.clone(),
+        return_guard: trace.return_guard.clone(),
+        machine: trace.machine.clone(),
+        software_breakpoints: 2,
+        limit: trace.recorder.borrow().limit(),
+        replaced,
+        guest_rip_field: format!("{:#x}", crate::hvtransition::GUEST_RIP_FIELD),
+        guest_cr3_field: format!("{:#x}", crate::hvtransition::GUEST_CR3_FIELD),
+        identity_gaps: hv_transition_identity_gaps(),
+    }
+}
+
+fn read_hv_transition_trace(
+    e: &DebugEngine,
+    stop: bool,
+    slot: &mut Option<HvTransitionTrace>,
+) -> Result<Output, Failed> {
+    let Some(trace) = slot.as_ref() else {
+        return Err(Failed::categorised(
+            structured::ErrorCategory::InvalidArgument,
+            "this session holds no hypervisor transition trace to read.".to_string(),
+        ));
+    };
+    let held = e.breakpoints().map_err(failed)?;
+    let report = {
+        let recorder = trace.recorder.borrow();
+        let missing_breakpoints = recorder
+            .breakpoints()
+            .into_iter()
+            .filter(|id| {
+                id.is_none_or(|id| {
+                    !held.iter().any(|breakpoint| {
+                        breakpoint.id == id
+                            && breakpoint.command.as_deref() == Some(recorder.marker())
+                    })
+                })
+            })
+            .count();
+        structured::HvTransitionTrace {
+            schema: HV_TRANSITION_SCHEMA.to_string(),
+            trace_id: trace.trace_id.clone(),
+            label: trace.label.clone(),
+            call_site: trace.call_site.clone(),
+            return_site: trace.return_site.clone(),
+            images: trace.images.clone(),
+            image_checksum: trace.image_checksum.clone(),
+            call_guard: trace.call_guard.clone(),
+            return_guard: trace.return_guard.clone(),
+            machine: trace.machine.clone(),
+            transitions: recorder
+                .transitions()
+                .iter()
+                .map(structured_hv_transition)
+                .collect(),
+            limit: recorder.limit(),
+            full: recorder.full(),
+            dropped: recorder.dropped(),
+            unreadable_hits: recorder.unreadable_hits(),
+            missing_breakpoints,
+            armed: !stop,
+            guest_rip_field: format!("{:#x}", crate::hvtransition::GUEST_RIP_FIELD),
+            guest_cr3_field: format!("{:#x}", crate::hvtransition::GUEST_CR3_FIELD),
+            identity_gaps: hv_transition_identity_gaps(),
+        }
+    };
+    if stop {
+        disarm_hv_transition_trace(e, trace)?;
+        *slot = None;
+    }
+    Ok(Output::typed(render_hv_transition_trace(&report), report))
+}
+
+fn structured_hv_transition(
+    transition: &crate::hvtransition::Transition,
+) -> structured::HvTransition {
+    let hit = &transition.hit;
+    let measured = [
+        ("target_rip", hit.rip.is_some()),
+        ("stack_pointer", hit.rsp.is_some()),
+        ("processor", hit.processor.is_some()),
+        ("vp", hit.vp.is_some()),
+        ("vp_index", hit.vp_index.is_some()),
+        ("source_vtl", hit.source_vtl.is_some()),
+        ("target_vtl", hit.target_vtl.is_some()),
+        ("control", hit.control.is_some()),
+        ("guest_registers", hit.guest_registers.is_some()),
+        ("source_vmcs", hit.source_vmcs.is_some()),
+        ("target_vmcs", hit.target_vmcs.is_some()),
+    ]
+    .into_iter()
+    .filter(|(_, present)| *present)
+    .map(|(name, _)| name.to_string())
+    .chain([
+        "host_monotonic_us".to_string(),
+        "host_elapsed_us".to_string(),
+    ])
+    .collect();
+    structured::HvTransition {
+        sequence: transition.sequence,
+        host_monotonic_us: hit.host_monotonic_us,
+        host_elapsed_us: hit.elapsed_us,
+        kind: match hit.kind {
+            crate::hvtransition::Kind::Call => structured::HvTransitionKind::VtlCall,
+            crate::hvtransition::Kind::Return => structured::HvTransitionKind::VtlReturn,
+        },
+        target_rip: hit.rip.map(structured::addr),
+        stack_pointer: hit.rsp.map(structured::addr),
+        processor: hit.processor,
+        vp: hit.vp.map(structured::addr),
+        vp_index: hit.vp_index,
+        source_vtl: hit.source_vtl,
+        target_vtl: hit.target_vtl,
+        control: hit.control.map(|value| format!("{value:#x}")),
+        fast_return: match hit.kind {
+            crate::hvtransition::Kind::Call => None,
+            crate::hvtransition::Kind::Return => hit.control.map(|control| control & 1 != 0),
+        },
+        guest_registers: hit.guest_registers.map(structured::addr),
+        source_vmcs: hit.source_vmcs.as_ref().map(structured_hv_vmcs),
+        target_vmcs: hit.target_vmcs.as_ref().map(structured_hv_vmcs),
+        provenance: structured::HvTransitionProvenance {
+            measured,
+            exact_build_derived: vec![
+                "handler_sites".to_string(),
+                "vp_index_offset".to_string(),
+                "vtl_state_array_offset".to_string(),
+                "vmcs_descriptor_offset".to_string(),
+                "vmcs_physical_offset".to_string(),
+            ],
+            architectural: vec![
+                "fast_return".to_string(),
+                "guest_rip_field".to_string(),
+                "guest_cr3_field".to_string(),
+            ],
+            inferred: Vec::new(),
+            read_failures: hit.read_failures.clone(),
+        },
+    }
+}
+
+fn structured_hv_vmcs(value: &crate::hvtransition::VmcsCoordinate) -> structured::HvVmcsCoordinate {
+    structured::HvVmcsCoordinate {
+        state: structured::addr(value.state),
+        descriptor: value.descriptor.map(structured::addr),
+        physical_address: value.physical_address.map(structured::addr),
+    }
+}
+
+fn render_hv_transition_armed(report: &structured::HvTransitionTraceArmed) -> String {
+    format!(
+        "Hypervisor transition trace {} armed at hv+{} and hv+{}, recording up to {} selected \
+         VTL transition(s) with two software breakpoints. Nothing is recorded until \
+         the hypervisor target runs.{}\n",
+        report.trace_id,
+        report.call_site.rva.as_deref().unwrap_or("?"),
+        report.return_site.rva.as_deref().unwrap_or("?"),
+        report.limit,
+        if report.replaced {
+            " It replaced and disarmed this session's previous transition trace."
+        } else {
+            ""
+        }
+    )
+}
+
+fn render_hv_transition_trace(report: &structured::HvTransitionTrace) -> String {
+    let mut out = format!(
+        "Hypervisor transition trace {}: {} transition(s) of up to {}{}.\n",
+        report.trace_id,
+        report.transitions.len(),
+        report.limit,
+        if report.full { ", FULL" } else { "" }
+    );
+    if !report.transitions.is_empty() {
+        let mut rows = String::from("seq  us          cpu  vp   kind        source target\n");
+        for transition in &report.transitions {
+            rows.push_str(&format!(
+                "{:<4} {:<11} {:<4} {:<4} {:<11} {:<6} {}\n",
+                transition.sequence,
+                transition.host_elapsed_us,
+                transition
+                    .processor
+                    .map_or_else(|| "-".into(), |value| value.to_string()),
+                transition
+                    .vp_index
+                    .map_or_else(|| "-".into(), |value| value.to_string()),
+                match transition.kind {
+                    structured::HvTransitionKind::VtlCall => "vtl_call",
+                    structured::HvTransitionKind::VtlReturn => "vtl_return",
+                },
+                transition
+                    .source_vtl
+                    .map_or_else(|| "-".into(), |value| value.to_string()),
+                transition
+                    .target_vtl
+                    .map_or_else(|| "-".into(), |value| value.to_string()),
+            ));
+        }
+        out.push_str(&fenced(&rows));
+    }
+    if report.missing_breakpoints > 0 {
+        out.push_str(&format!(
+            "  {} owned breakpoint(s) are missing.\n",
+            report.missing_breakpoints
+        ));
+    }
+    out.push_str(if report.armed {
+        "  The trace is still armed.\n"
+    } else {
+        "  The trace is disarmed: both breakpoints are removed.\n"
+    });
+    out
+}
+
 /// The image's own unwind table, asked one address at a time
 /// ([#303](https://github.com/glslang/windbg-mcp/issues/303)).
 ///
@@ -15890,6 +16753,45 @@ mod tests {
         assert!(
             read.contains("call.hit.caller.and_then(|address| e.symbol_for(address))"),
             "the stopped trace read must resolve the captured caller address"
+        );
+    }
+
+    /// M5 has the same callback-ownership boundary, but owns two processor breakpoints in a
+    /// separate hypervisor worker. Its exact-build handler contract must remain typed: parsing
+    /// debugger text here would make a high-frequency callback locale- and rendering-dependent.
+    #[test]
+    fn a_hypervisor_trace_owns_both_marked_breakpoints_and_uses_typed_reads() {
+        let armed = bodies_of(&["arm_hv_transition_trace"], 12_000);
+        assert!(
+            armed.contains(".with_command(marker.clone())"),
+            "the hypervisor trace no longer marks both breakpoints it owns"
+        );
+        assert!(
+            armed.contains("BreakpointSpec::code(BreakpointAt::Address(at))")
+                && !armed.contains("BreakpointSpec::data("),
+            "both hypervisor sites must use DbgEng-owned code breakpoints; processor execution \
+             breakpoints are accepted but do not fire on the measured hypervisor target"
+        );
+        assert!(
+            armed.contains("recorder.owns(id, command.as_deref())"),
+            "the callback no longer proves each hit id and marker together"
+        );
+        for register in ["rip", "rsp", "rdi", "rsi", "rbx", "r15", "rcx", "r14"] {
+            assert!(
+                armed.contains(&format!("hv_register(engine, \"{register}\"")),
+                "the callback no longer reads `{register}` through typed DbgEng access"
+            );
+        }
+        assert!(
+            armed.contains("exact_bytes(e, call_handler, crate::hvtransition::CALL_GUARD)")
+                && armed
+                    .contains("exact_bytes(e, return_handler, crate::hvtransition::RETURN_GUARD)")
+                && armed.contains("exact_hv_descriptor("),
+            "the exact image identity alone is insufficient; handler and descriptor guards must remain"
+        );
+        assert!(
+            !armed.contains("execute("),
+            "the hypervisor callback must not parse debugger command text"
         );
     }
 

@@ -606,6 +606,17 @@ pub enum EngineOp {
     SkCallTraceRead {
         stop: bool,
     },
+    /// Arm exact-build software breakpoints on `HvCallVtlCall` and `HvCallVtlReturn` in a
+    /// separate hypervisor KD worker. The target is not resumed by this operation.
+    HvTransitionTraceArm {
+        label: Option<String>,
+        limit: usize,
+        patience_ms: u32,
+    },
+    /// Read authoritative VTL selections and saved-state coordinates retained by this worker.
+    HvTransitionTraceRead {
+        stop: bool,
+    },
     /// A user-mode Segment Heap query, with the same queue-aware deadline and interrupt
     /// semantics as [`Self::Pool`].
     Heap {
@@ -755,6 +766,7 @@ impl EngineOp {
             | Self::DriverHazards { patience_ms, .. }
             | Self::PoolTraceArm { patience_ms, .. }
             | Self::SkCallTraceArm { patience_ms, .. }
+            | Self::HvTransitionTraceArm { patience_ms, .. }
             | Self::Xrefs { patience_ms, .. }
             | Self::IoctlMap { patience_ms, .. }
             | Self::IrpStack { patience_ms, .. }

@@ -2196,6 +2196,11 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// move the surface to 131,413 B across 84 tools. Their 2,627 B carry the exact-symbol/image guard,
 /// bounded x64 entry contract, explicit callback ownership and the separate arm/read lifecycle.
 /// The new ceiling leaves 3,587 B (2.7%).
+///
+/// **M5 stays under the 135,000 model ceiling** (2026-10-22). The two hypervisor-transition
+/// tools move the surface to 133,682 B across 86 tools. Their 2,269 B carry the exact-build image
+/// and instruction guards, two owned software-breakpoint sites, typed VTL/VMCS coordinates and a
+/// separate arm/read lifecycle. The fixed ceiling leaves 1,318 B (1.0%).
 const MODEL_VISIBLE_CEILING: usize = 135_000;
 
 /// Ceiling on the whole `tools/list` payload — the serialized result, not the sum of its tools, so
@@ -2374,7 +2379,12 @@ const MODEL_VISIBLE_CEILING: usize = 135_000;
 /// image identity and a bounded sequence of typed calls, including cross-worker monotonic time,
 /// raw argument bytes and named failures. No existing output closure grew. The new ceiling leaves
 /// 7,880 B (2.1%).
-const WIRE_CEILING: usize = 385_000;
+///
+/// **385,000 -> 395,000 for the M5 hypervisor transition trace** (2026-10-22). The payload moves
+/// 377,120 -> 387,637 B. The two new closures carry the guarded exact-build identity and typed,
+/// bounded transition/VMCS-coordinate result; no existing output closure grew. The new ceiling
+/// leaves 7,363 B (1.9%).
+const WIRE_CEILING: usize = 395_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,296
 /// bytes (2026-10-14), because its `inputSchema` pulls the whole `StepAction`/`Check` vocabulary
@@ -3587,6 +3597,10 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
         // live-kernel validation happen only after routing to an ordinary worker.
         ("sk_call_trace", json!({ "label": "smoke" }), "error"),
         ("sk_call_trace_read", json!({}), "error"),
+        // The M5 pair is well formed and reaches the same no-session refusal. Exact-image and
+        // hypervisor-target validation happen only after routing to its distinct worker.
+        ("hv_transition_trace", json!({ "label": "smoke" }), "error"),
+        ("hv_transition_trace_read", json!({}), "error"),
         ("heap_list", json!({}), "error"),
         ("heap_allocations", json!({}), "error"),
         (
@@ -4705,7 +4719,7 @@ fn a_listener_serves_the_narrowed_surface_it_was_started_with() {
     // was typed — `session` is added whatever it said.
     let log = listener.stderr();
     assert!(
-        log.contains("serving 13 of 84 tools (session, crash)"),
+        log.contains("serving 13 of 86 tools (session, crash)"),
         "the listener does not report the surface it ended up with: {log}"
     );
 }
@@ -4737,7 +4751,7 @@ fn two_clients_on_one_listener_are_served_two_surfaces() {
     let local_token = server.token.clone();
     assert!(
         server.wait_for_stderr(
-            "serving 20 of 84 tools (session, inspect) — except bench serves 13 of 84 tools \
+            "serving 20 of 86 tools (session, inspect) — except bench serves 13 of 86 tools \
              (session, crash)",
             Duration::from_secs(30)
         ),

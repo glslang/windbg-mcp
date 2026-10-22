@@ -342,25 +342,25 @@ None of these is a bug. They are recorded because they were invisible, and
    and, since item 41, for the sentences the tools it keeps used to spend on pointing at them.
    Where the bytes sit, and what each profile costs:
 
-   Both tables are measurements of **2026-10-21** and move with any edit to a description. The
+   Both tables are measurements of **2026-10-22** and move with any edit to a description. The
    `securekernel` row is an extra group: the absent spec omits it, while `all` includes it.
 
    | group | tools | bytes | share |
    |---|---:|---:|---:|
-   | `allocator` | 12 | 19,807 | 15.1% |
-   | `ioctl` | 11 | 16,088 | 12.2% |
-   | `securekernel` | 18 | 27,879 | 21.2% |
-   | `exec` | 10 | 15,087 | 11.5% |
-   | `session` | 10 | 14,208 | 10.8% |
-   | `inspect` | 10 | 13,485 | 10.3% |
-   | `batch` | 1 | 10,296 | 7.8% |
-   | `crash` | 3 | 7,473 | 5.7% |
-   | `ttd` | 9 | 7,090 | 5.4% |
+   | `allocator` | 12 | 19,807 | 14.8% |
+   | `ioctl` | 11 | 16,088 | 12.0% |
+   | `securekernel` | 20 | 30,148 | 22.6% |
+   | `exec` | 10 | 15,087 | 11.3% |
+   | `session` | 10 | 14,208 | 10.6% |
+   | `inspect` | 10 | 13,485 | 10.1% |
+   | `batch` | 1 | 10,296 | 7.7% |
+   | `crash` | 3 | 7,473 | 5.6% |
+   | `ttd` | 9 | 7,090 | 5.3% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
    | *(absent)* | 66 | 103,534 |
-   | `all` | 84 | 131,413 |
+   | `all` | 86 | 133,682 |
    | `session,inspect,exec,crash` | 33 | 49,332 |
    | `session,inspect,crash` | 23 | 34,092 |
    | `crash` | 13 | 20,515 |
@@ -389,6 +389,13 @@ None of these is a bug. They are recorded because they were invisible, and
    exact image/RVA provenance, a host-wide monotonic timestamp, raw argument bytes and named read
    failures. The ceilings deliberately move to 135,000 B and 385,000 B, leaving 3,587 B (2.7%)
    and 7,880 B (2.1%) respectively.
+
+   M5's distinct hypervisor-worker transition trace adds `hv_transition_trace` and
+   `hv_transition_trace_read`, moving the complete surface to **86 tools and 133,682 B**. Their
+   2,269 model-visible bytes describe the exact-build image and instruction guards, the two owned
+   software-breakpoint sites and typed saved-state/VMCS coordinates. The wire payload reaches
+   **387,637 B**. The model ceiling stays at 135,000 B, leaving 1,318 B (1.0%); the wire ceiling
+   deliberately moves to 395,000 B, leaving 7,363 B (1.9%).
 
    **The two tables do not reconcile, and that is the point of item 41.** The first is each group's
    share of the whole surface; the second is what a spec actually serves, which is less — `crash`

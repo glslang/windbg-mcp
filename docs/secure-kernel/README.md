@@ -46,7 +46,10 @@ dedicated worker session: `open_sk_live_control`, `sk_live_arm`, `sk_live_wait`,
 tracked in the [Secure Kernel call-debugging roadmap](skcall-debugging-roadmap.md). M4's separate
 ordinary-kernel worker records the VTL0 half through `sk_call_trace` and `sk_call_trace_read`; its
 exact-build guard, event contract and deterministic guest workload are in the
-[VTL0 call-trace runbook](vtl0-call-trace.md).
+[VTL0 call-trace runbook](vtl0-call-trace.md). M5's independent hypervisor KD worker records the
+authoritative transition selection through `hv_transition_trace` and
+`hv_transition_trace_read`; its symbol-free exact-image gate and saved-state coordinates are in
+the [hypervisor transition runbook](hypervisor-transition-trace.md).
 
 **And since 0.22.0 an installed WinDbg can sit in front of that controller.**
 `open_sk_kd` owns the controller as an MCP session, returns a generated local named pipe, and

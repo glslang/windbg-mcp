@@ -287,6 +287,47 @@ Use a separate hypervisor KD session to capture `HvCallVtlCall` (and the measure
 target VTL and saved-state coordinates. Do not infer VTL1 state from VTL0 registers when the
 hypervisor provides the authoritative frame.
 
+Status: complete on the measured K3 profile.
+
+`hv_transition_trace` and `hv_transition_trace_read` run only in a distinct hypervisor KD worker.
+The first profile admits the collected K3 Intel `hvix64.exe` 10.0.26100.9444 by timestamp, image
+size and checksum, then independently matches the two handler prefixes and relocated descriptors
+for hypercall codes 0x11 and 0x12. Two DbgEng-owned software breakpoints retain the VP,
+processor, source VTL and the target VTL already selected by each handler. Per-VTL state pointers
+lead to the inline VMCS descriptor and its physical address; the report pairs those coordinates
+with guest-RIP field 0x681e and guest-CR3 field 0x6802, but deliberately does not parse raw VMCS
+memory or substitute VTL0 registers. The event provenance separates measured values,
+exact-build-derived layout and architectural decoding, with named read failures and no inferred
+target VTL.
+
+Processor execution breakpoints were rejected by the live evidence rather than by their setter:
+DbgEng accepted and retained both for a full 120-second run containing three successful enclave
+lifecycles, but neither fired. A one-shot code breakpoint at the identical call site fired in
+161 ms, restored its original byte exactly, detached cleanly and passed same-boot heartbeat and
+process audits. M5 therefore uses owned software breakpoints and makes byte restoration part of
+the live exit gate; the multiprocessor stop drain is the already-qualified `DONE.md` item 93 path.
+
+The K3 collection record is under ignored `target/codex-m5/`: it copied the exact Intel/AMD images,
+proved the guest currently had no hypervisor KD endpoint, and found no existing K3 hypervisor
+profile. `prepare-m5-hypervisor.ps1` creates a separate port-50021 `k3-hypervisor` endpoint and
+profile while preserving `k3-nt` on 50020, then reboots and verifies VBS plus the complete redacted
+configuration.
+
+Because K3 is nested, the outer VM also has virtualization extensions exposed. BCD
+`hypervisorlaunchtype Auto` and VBS status did not prove that condition: without the host processor
+setting, the guest logged Hyper-V event 41 (VMX unavailable) and emitted no hypervisor KDNET
+traffic. The preparation gate now distinguishes launch intent from a running nested hypervisor.
+
+The passing live record is
+`target/codex-m5/live-qualification/20261022T203416/report.json`. Its labelled workload began
+strictly inside the trace window and completed three create/load/initialize/terminate/delete
+lifecycles. The bounded trace retained 1,024 transitions: 512 calls and 512 returns, covering
+authoritative VTL0-to-VTL1 and VTL1-to-VTL0 selections on VP index 3, with no dropped event,
+unreadable hit or inferred value. `stop: true` removed both owned breakpoints; immediate rereads
+matched both complete handler guards and both relocated descriptors. Detach released the target
+and terminated the worker, boot identity and `vmwp` PID were unchanged, heartbeat stayed healthy,
+and no debugger process remained.
+
 ### M6 — VTL1 semantic tracer
 
 Resolve and break on `IumInvokeSecureService` and selected dispatch targets. Decode SSCN/service

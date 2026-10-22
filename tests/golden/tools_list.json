@@ -2,7 +2,7 @@
   "schemaDialects": [
     "https://json-schema.org/draft/2020-12/schema"
   ],
-  "toolCount": 84,
+  "toolCount": 86,
   "tools": [
     {
       "hints": {
@@ -977,6 +977,77 @@
       ],
       "required": [],
       "title": "List user-mode heaps"
+    },
+    {
+      "hints": {
+        "destructive": true,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "hv_transition_trace",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/HvTransitionTraceArmed",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
+      "params": [
+        "label: string|null",
+        "max_transitions: integer|null/uint32",
+        "session_id: string|null"
+      ],
+      "required": [],
+      "title": "Trace hypervisor VTL transitions"
+    },
+    {
+      "hints": {
+        "destructive": true,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "hv_transition_trace_read",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/HvTransitionTrace",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
+      "params": [
+        "session_id: string|null",
+        "stop: boolean|null"
+      ],
+      "required": [],
+      "title": "Read hypervisor VTL transitions"
     },
     {
       "hints": {
