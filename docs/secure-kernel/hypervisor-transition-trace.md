@@ -100,11 +100,14 @@ was retained.
 - The admitted build and offsets are K3-specific. Supporting another image requires a new measured
   profile; similar bytes are not accepted as compatibility.
 - The event reports the processor and VP it actually observed, but M5 does not yet prove total-VP
-  coverage; `total_vp_count` stays an explicit identity gap.
+  coverage; `total_vp_count` stays an explicit identity gap. M7 therefore refuses a multi-VP
+  correlation instead of treating this trace as complete coverage.
 - These are software breakpoints in hypervisor code. A failed removal is an error and leaves the
   trace held; callers must not force-kill its worker. The live gate audits the restored bytes,
   explicit detach, same boot, heartbeat and retained processes.
 - The optional label is correlation authority supplied by the caller, not something the
-  hypervisor can observe in the guest workload.
+  hypervisor can observe in the guest workload. M7 uses it to select a capture, never as proof that
+  two events are the same call.
 - The first implementation reports saved-state coordinates. Reading the named VMCS fields through
-  an architectural debugger API is a later extension; raw VMCS memory parsing is not one.
+  an architectural debugger API is assigned to M7's admission phase; `coordinate_only` remains a
+  valid explicit result if that API is unavailable. Raw VMCS memory parsing is not a fallback.

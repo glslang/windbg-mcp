@@ -29,15 +29,16 @@ controller or the investigation.
   guarded `vmwp` dispatcher hook.
 - A live controller session owns one disposable VM and one worker. DbgEng stays on that worker's
   engine thread; the supervisor never touches it.
-- Hardware execution breakpoints are the first mutation primitive. Software breakpoint and code
-  writes remain out of scope until restoration and instruction-cache behavior have their own live
-  proof.
+- Hardware execution breakpoints remain the primary VTL1 mutation primitive. M3 proved guarded,
+  one-shot software breakpoints for the single-vCPU Secure Kernel controller, and M5 separately
+  proved DbgEng-owned software breakpoints in the hypervisor. Neither result authorizes general KD
+  memory writes, multiprocessor patching or reuse of one layer's restoration proof in another.
 - Every stop and transition is tied to an opaque epoch, exact instruction bytes, VM identity,
   partition, VP, VTL and CR3. Stale coordinates are refusals, not best-effort operations.
-- The 2026-10-18 `g` qualification is a failed gate: after WinDbg armed
+- The 2026-10-18 `g` qualification is a failed facade gate: after WinDbg armed
   `securekernel!KiTimerInterrupt`, the next VTL1 stop was not observed and K3 reset. The KD facade
-  must continue to refuse non-trace continue requests until the direct controller passes the
-  repeatability and recovery gates below.
+  continues to refuse non-trace requests. M1 and M2 subsequently passed on the direct controller;
+  routing WinDbg onto those proved paths is M8 and requires its own packet-race and recovery gate.
 - Break-on-demand cannot be emulated by an arbitrary cross-thread DbgEng call. `SetInterrupt` is
   used only during the worker's explicitly scoped owned-event wait; target-side interruption needs
   a separate controller primitive.
@@ -74,7 +75,9 @@ initial schema is:
 - position: monotonic host timestamp, target RIP, symbol plus displacement and stop epoch;
 - VTL0 call: process/thread, secure-service number and argument pointers captured at
   `VslpEnterIumSecureMode` (or the exact build's equivalent);
-- hypervisor transition: hypercall code, intercepted VP/VTL state and saved guest RIP/CR3;
+- hypervisor transition: hypercall code, intercepted VP/VTL state and, where a supported
+  architectural debugger API can read them, saved guest RIP/CR3 values; otherwise the exact VMCS
+  fields and physical coordinates plus an explicit `coordinate_only` availability state;
 - VTL1 dispatch: service number, SSCN/dispatch target, arguments, return status and selected
   memory snapshots;
 - provenance: which fields were measured, symbol-derived or inferred, with read failures retained
@@ -87,10 +90,12 @@ resolved to a VA only after that boot's module base is proved.
 
 ### M0 — freeze the safety and evidence contract
 
-Status: complete enough to begin M1.
+Status: complete. These constraints remain invariants for every later milestone.
 
 - Preserve the worker/process/thread ownership rules above.
-- Keep KD `g`, software breakpoints and arbitrary register writes refused.
+- Keep KD `g`, KD-originated software breakpoints and arbitrary register writes refused until their
+  own later gates. M3's direct-controller software-breakpoint path is a separate, policy-gated
+  capability.
 - Treat K3 as disposable, but require a post-run health and debug-register audit.
 - Use deterministic guest workloads; timer interrupts are not an acceptance workload.
 
@@ -126,7 +131,9 @@ Live qualification uses a build-guarded site reached by a deterministic guest ac
 - final DR0–DR3/DR6/DR7/RFLAGS equality with the saved baseline;
 - K3 uptime/identity unchanged, no unexpected reset, and no retained `vmwp` debugger attachment.
 
-Only after those checks may the KD facade translate WinDbg `g` into this path.
+Those checks authorize M8 to translate WinDbg `g` into this path; they do not make that packet
+translation safe by implication. M8 separately tests KD packet ordering, running break-in,
+disconnect and teardown races before the facade's refusal is removed.
 
 Qualification record (machine-local raw evidence under ignored `target/` paths):
 
@@ -330,34 +337,275 @@ and no debugger process remained.
 
 ### M6 — VTL1 semantic tracer
 
-Resolve and break on `IumInvokeSecureService` and selected dispatch targets. Decode SSCN/service
-number, input/output buffers and status using exact-build symbols plus checked structure layouts.
-Start with one known service before generalizing.
+Status: planned; this is the next implementation milestone.
+
+Resolve and stop at `IumInvokeSecureService`, one selected dispatch target and its measured return
+site(s). Decode the SSCN/service number, bounded input/output buffers and status using exact-build
+symbols plus checked structure layouts. M6 remains a selected-VP, single-vCPU qualification: it
+must refuse a VM with more than one runnable VP before arming anything. It uses guarded hardware
+execution breakpoints first; a need for code patches is a new gate, not a fallback hidden inside
+the tracer.
+
+#### M6.0 — choose and prove the first service
+
+The first service is an output of this phase, not a number guessed from M4 frequency. Extend the
+guest harness with cumulative stages (baseline, create, load, initialize, terminate and delete),
+each with a label, ordinal and before/after guest tick. Compare repeated M4 traces and the exact
+Secure Kernel dispatch walk to select one service whose entry and return cardinality are stable.
+Record a repository-tracked, machine-readable manifest consumed by both the implementation and its
+tests; prose must not carry a second copy of its constants. The manifest contains:
+
+- Secure Kernel PE identity and PDB identity, entry/dispatch/return RVAs and complete instruction
+  guards;
+- the service number and the register or checked structure field from which it is read;
+- every layout offset, width, alignment and bound used for arguments, output and status;
+- the expected number of selected-service calls per positive workload ordinal; and
+- the maximum number of hardware slots required, which must not exceed four.
+
+Pass: three positive and three negative workload runs in one unchanged boot reproduce the manifest
+exactly. Control: a workload stage before the selected operation produces no selected-service
+record, and an offline fixture or submitted guard with one changed image byte, RVA or layout offset
+is refused before a debug register changes. Stop: ambiguous service mapping, more than four simultaneous sites, a public
+symbol with no independently checked layout, or any path that can return without a guarded return
+site sends the design back to a narrower service.
+
+#### M6.1 — versioned event and recorder
+
+Add a bounded `sk_service_trace` / `sk_service_trace_read` lifecycle to the existing
+`secure_kernel_live` worker. The arm starts one worker-owned asynchronous job and returns a trace id
+only after every guard and hardware slot is acknowledged. A read without `stop` may copy only the
+immutable completed prefix and recorder counters; it touches no engine or provider. A read with
+`stop: true` binds to that exact job, uses only the approved scoped interrupt to wake its wait, and
+returns only after engine-thread restoration. One record carries the trace id, capture label, exact
+target and image identity, selected VP/VTL/CR3 and three ordered semantic phases:
+
+1. dispatcher entry — service/SSCN, caller coordinate and raw register arguments;
+2. selected dispatch — checked handler coordinate plus bounded input/output coordinates and bytes;
+3. return — status, bounded post-call bytes and the site that supplied the result.
+
+Every value is tagged as measured, exact-build/layout-derived or unavailable; inference is an
+explicit empty list for the first service. Reads are whole-or-named-failure. A caller chooses a
+per-buffer limit from 0 through 4,096 bytes, and the recorder also enforces a total byte and event
+limit so a target cannot expand an MCP result without bound. A missing entry, dispatch or return is
+an incomplete record with its last observed phase, never a completed call assembled from adjacent
+hits.
+
+Offline tests must cover schema round trips, exact register widths, all layout guards, page-boundary
+reads, unreadable and short buffers, zero/max limits, fill/drop accounting, nested or repeated
+entries, an unexpected return, stale epoch/CR3/image identity and rendering of every incomplete
+state. Mutation tests must fail if a guard or typed read is removed.
+
+The tool-surface tests must also pin both schemas, `securekernel` group membership, model-visible
+and wire budgets, and the `tools/list` golden before either name is considered public. The current
+complete surface leaves only 1,318 model-visible bytes, so the schema is drafted and measured
+before implementation: either both tools fit, or the ceiling moves in one explicit, attributed
+budget change. Silently weakening descriptions or omitting output fields to satisfy the old number
+is not a pass.
+
+#### M6.2 — guarded run/stop loop
+
+Arming starts from a retained epoch. It verifies the manifest and complete baseline before writing
+DR0–DR3/DR6/DR7, owns every installed slot, releases through the M1 transition, and re-arms only
+after the next owned VTL1 stop has been converted back to a retained epoch. No tool call may expose
+a half-mutated debug-register set. Capacity completion seals the recorder before restoration;
+`stop: true`, timeout, no-hit, client loss and `end_session` do the same. Every path restores and
+verifies the complete baseline before execution is released; an unproved restoration contains the
+VM and reports the recovery action.
+
+The fake provider/dispatcher tier must exercise entry→dispatch→return, a non-selected service,
+re-entry, out-of-order stops, capacity on each phase, no-hit, interrupt, teardown-before-arm,
+teardown-while-waiting and a restoration failure. Each race has one linearization point and tests
+that the same epoch cannot be consumed twice.
+
+#### M6.3 — live qualification
+
+Run only after M6.0 has emitted the checked manifest. On each of three clean boots, collect 100
+complete selected-service records from the deterministic workload plus its negative control. The
+clean records must have the manifest's exact cardinality, no drop, no unreadable required field and
+no inferred value; decoded status and bounded output must agree with the guest's supported-API
+result. Separately run stale-image, stale-byte, stale-layout, no-hit, capacity, forced-teardown and
+provider-death controls.
+
+Exit: every boot ends with exact DR0–DR3/DR6/DR7/RFLAGS equality, unchanged Secure Kernel text,
+released ownership, the same guest boot and `vmwp`, healthy heartbeat and no retained debugger or
+provider process. The qualification record names the manifest, raw run directories and every
+negative control. Only then may M7 treat an M6 record as a semantic endpoint.
 
 ### M7 — cross-layer correlation and investigations
 
-Join M4–M6 events by deterministic workload id, VP, ordering and bounded time windows. Produce
-structured JSON plus a concise table/timeline. Explicitly mark ambiguous matches and dropped
-events. Add repeatable investigations for service dispatch, argument mutation and return status.
+Status: planned; depends on M6's live exit gate.
+
+Join M4–M6 without putting two targets in one DbgEng process. The coordinator owns session ids and
+lifecycles, not engines: each layer remains in its existing worker and contributes an immutable
+trace. The first accepted configuration is the same one-vCPU K3 VM used by M3–M6. A VM reporting
+more than one runnable VP is refused before any layer is armed; total-VP coverage and mapping are a
+separate future gate, not an optimistic extension of this result.
+
+The first coordinator is a repository-owned live driver over the public MCP surface plus a pure
+Rust join module. It holds only session/trace ids and serialized records. It is not a new DbgEng
+role and does not run in a worker. Promoting the transaction itself to an MCP tool is a later
+tool-surface decision with its own schema and token-budget gate; M7 does not hide that expansion in
+the correlation implementation.
+
+#### M7.0 — common identity, clock and availability contract
+
+Mint one `capture_id` before opening the three sessions and bind it to the allowlisted VM id, guest
+boot identity, `vmwp` PID, profile names, workload label, processor count and each layer's image
+identity. Worker session ids remain separate. Values observed only by the coordinator are carried
+in a coordinator envelope and are never presented as target-measured fields.
+
+The existing millisecond-derived `host_monotonic_us` can collide at M5's event rate. Have the three
+workers and coordinator sample one common high-resolution Windows counter, record its raw tick and
+frequency, and bracket every arm/read RPC with coordinator ticks. Use point timestamps only if all
+four processes report one frequency and ordered samples stay within a recorded skew bound;
+otherwise retain only the measured RPC intervals. Stop if those intervals overlap where a causal
+decision is required rather than inventing microsecond precision. Preserve the old field for wire
+compatibility until a schema revision explicitly retires it.
+
+M7.0 also owns M5's VMCS-value question. Probe a supported architectural debugger API for guest RIP
+and CR3. A successful value records its API and field; an unsupported API leaves the exact field
+encoding and physical coordinate with `availability: coordinate_only`. Raw VMCS memory parsing is
+forbidden, and the value is not a correlation key, so coordinate-only is an admitted result rather
+than an inferred value.
+
+Pass: two independent processes produce ordered/collision test vectors with a stated resolution
+and skew; the coordinator rejects a changed boot, `vmwp`, image, profile or processor count between
+preflight and arm. Controls deliberately collide old timestamps and mutate each identity field.
+Any new clock fields are optional for old records, required for a new complete M7 capture, and move
+the schema goldens and both surface budgets by an explicitly measured delta.
+
+#### M7.1 — three-worker capture transaction
+
+Implement an explicit transaction with `preflight`, `opening`, `armed`, `workload`, `draining`,
+`restoring` and `closed` states. First prove that all three sessions can coexist, arm and disarm on
+an idle VM without a workload. Then choose and record one arm order; workload launch is forbidden
+until all three workers have acknowledged `armed`. Cleanup runs for every session that reached
+opening, in reverse successful-arm order, and never force-kills a worker that still owns a patch or
+retained VTL1 event.
+
+Offline transaction tests inject failure and timeout at every state and for every worker. They
+assert that unopened layers are untouched, opened layers are ended once, all restoration results
+are retained, and the top-level result cannot be `pass` while a child is running, held, dropped or
+unreadable. The live coexistence control arms and removes all instruments without starting the
+guest harness, then proves the same boot, heartbeat, breakpoint bytes, debug-register baseline and
+zero retained processes.
+
+#### M7.2 — deterministic join
+
+The workload label and `capture_id` select a capture; neither proves that two events are one call.
+Within the admitted one-VP capture, assign a `call_id` only when the observed order is:
+
+```text
+M4 VTL0 entry -> M5 vtl_call -> M6 entry -> M6 selected dispatch -> M6 return -> M5 vtl_return
+```
+
+Use per-layer sequence numbers, direction, the selected service, VTLs and non-overlapping clock
+intervals. Pair nesting with a stack, not nearest-timestamp matching. If zero or more than one
+candidate survives, retain the candidate ids and reason as `unmatched` or `ambiguous`; never pick
+the nearest silently. A layer's dropped counter or incomplete call marks the affected interval and
+prevents a complete verdict across it.
+
+Publish versioned JSON containing the capture envelope, original events, correlation decisions,
+unmatched/ambiguous sets, drops and restoration audit. Render a bounded table/timeline from that
+JSON; the table is not an independent source. Property tests generate nested calls, equal
+timestamps, reordered arrivals, missing phases, unmatched returns and drops, and assert that input
+permutation does not change a decision once layer sequence numbers are fixed.
+
+#### M7.3 — correlated live gate and investigations
+
+Across three clean boots, run at least 25 positive workload ordinals and five negative controls per
+boot. Every invocation of M6's selected service must produce the manifest's exact number of
+complete six-stage chains, with no ambiguity, unmatched required event, drop, unreadable required
+field or inferred value. Guest result/status must agree with M4 arguments and M6 return data.
+
+Fault arms deliberately cap each layer in turn, drop a coordinator connection at a state where the
+worker owns no mutation, collide legacy timestamps and fail one cleanup call. Each must yield the
+named incomplete/ambiguous result and still complete all reachable restoration. Add three
+repeatable investigations only after the clean gate passes: selected-service dispatch, bounded
+guest-originated input variation observed without a debugger write, and return-status propagation.
+
+Exit: structured JSON and its table reproduce the same decisions, all three layers prove their own
+restoration, the VM remains on the same boot with a healthy heartbeat, and no worker/provider is
+retained. The qualification record includes preflight identity, clock evidence, raw child reports,
+the joined result and negative controls.
 
 ### M8 — debugger front ends
 
-After M1 and M2 pass, enable normal WinDbg `bp`/`g`/break behavior in the managed KD facade and add
-PowerShell helpers that launch WinDbgX from any working directory. Evaluate EXDI last: it is useful
-only if it improves compatibility without weakening process isolation or requiring unsafe host
-registration/in-process loading.
+Status: planned. M1 and M2 authorize implementation, but the facade keeps refusing ordinary `g`
+and running break-in until this milestone's own gate passes. M8 is independent of M6/M7's trace
+schema; it is scheduled after them so controller behavior is not changed underneath their live
+qualification.
 
-## M1 implementation slices
+#### M8.0 — packet-to-controller contract
 
-1. **Transition surface:** promote the already unit-tested replacement-breakpoint transition into
-   the live worker/MCP protocol; preserve the KD refusal.
-2. **Failure harness:** extend the fake provider/dispatcher tests through replacement, no-hit
+Write the translation table before changing the facade:
+
+- KD `WriteBreakpoint` reads and retains the complete instruction guard and reserves one of at most
+  four hardware slots; `RestoreBreakpoint` removes only that handle.
+- legacy Continue and non-trace Continue2 (`g`) with breakpoints call the proved M1 guarded
+  continue-to-breakpoints path and enter one owned wait.
+- `g` with no breakpoint enters a distinct bounded running wait that can be stopped only by M2
+  break-on-demand, teardown or its recovery deadline; it is not implemented as an infinite resume.
+- running Ctrl+Break binds to that exact wait and invokes the M2 rendezvous. A natural breakpoint
+  winning the race remains a natural breakpoint. Ctrl+Break while already stopped preserves and
+  resends the retained stop.
+- trace Continue2 (`t`, and only packet forms proved equivalent) keeps the existing guarded
+  fall-through step. Unsupported branch/call/return steps remain refusals.
+- reset, disconnect, idle expiry and MCP teardown recover the currently owned run before any
+  reconnect; memory/register writes and a fifth breakpoint remain refused.
+
+The request-reader thread may use only the already approved scoped `SetInterrupt` wake. Every
+controller mutation remains on the engine thread. Unit tests feed raw KD packets through all table
+rows, malformed lengths, duplicate handles and all pairwise stop/break/disconnect/teardown races.
+The response must name whether execution moved, which epoch stopped and whether recovery is owed.
+
+#### M8.1 — facade integration and launchers
+
+Route the two continue forms through the direct controller without creating a second engine or a
+second session registry. Preserve one absolute pause/run deadline across packet handling, controller
+transition and wait. A rejected guard or stale epoch resends the old stop; a failure after release
+must recover or contain the VM and terminate the KD connection with the exact disposition.
+
+Add PowerShell launchers for classic WinDbg and WinDbgX that resolve the executable and generated
+pipe from any working directory, keep credentials/keys off command lines and logs, and always end
+the MCP session after the debugger exits. Script tests use paths containing spaces, missing
+debuggers, early debugger exit and a fake client so they need neither elevation nor a live VM.
+
+#### M8.2 — live compatibility and safety gate
+
+Qualify classic WinDbg and WinDbgX separately on each of three clean boots. Each client must pass:
+
+- 100 `bp` → `g` → owned-stop cycles at the deterministic M1 site, including set/list/remove;
+- 25 `g`-without-breakpoint → Ctrl+Break cycles using the M2 request;
+- natural-stop-wins, Ctrl+Break-wins, already-stopped, no-hit/timeout, reset, disconnect,
+  reconnect and MCP-teardown races; and
+- `r`, bounded memory reads, `lm`, symbols, stack, one fall-through `t`, refused writes and a
+  refused fifth breakpoint before and after the run tests.
+
+Every arm audits exact DR0–DR3/DR6/DR7/RFLAGS restoration, unchanged Secure Kernel text, one
+selected VP, same boot/`vmwp`, heartbeat and retained processes. A reset, hang, ambiguous stop or
+unproved restoration fails the gate and leaves ordinary `g` disabled.
+
+Exit: both front ends perform `bp`/`g`/Ctrl+Break repeatedly through the managed session, all race
+controls have unique results, launchers work outside the repository, and the refusal is removed
+only for the qualified single-VP shape. EXDI is evaluated after this exit and is not a prerequisite;
+it is accepted only if it adds compatibility without host registration, in-process vendor loading
+or weaker worker isolation.
+
+## M1 implementation record
+
+All five slices are complete; this list records what passed rather than work still queued:
+
+1. **Transition surface — complete:** the replacement-breakpoint transition is in the live
+   worker/MCP protocol while the KD facade refusal remains explicit.
+2. **Failure harness — complete:** fake provider/dispatcher tests cover replacement, no-hit
    recovery, stale guards, deadline propagation and one-shot epoch consumption.
-3. **Opt-in live smoke:** extend `WINDBG_MCP_SMOKE_SK_LIVE` with guarded replacement breakpoint
-   cases and always run teardown plus baseline/VM health checks.
-4. **Deterministic trigger:** add the guest workload and exact symbol/RVA resolution record.
-5. **Qualification:** execute the 100-cycle/three-boot matrix and record raw run directories and
-   the result here before changing KD behavior.
+3. **Opt-in live smoke — complete:** `WINDBG_MCP_SMOKE_SK_LIVE` covers guarded replacement and
+   always runs teardown plus baseline/VM health checks.
+4. **Deterministic trigger — complete:** the guest workload and exact symbol/RVA record select the
+   live site.
+5. **Qualification — complete:** the 100-cycle/three-boot matrix and raw evidence are recorded in
+   M1 above. Changing KD behavior remains M8 work.
 
 ## Verification commands
 
