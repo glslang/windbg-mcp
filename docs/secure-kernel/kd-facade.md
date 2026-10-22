@@ -222,18 +222,22 @@ which single steps are refused, and what every other request is answered with:
   `mov cr3,r64` is carried to that successor with a temporary hardware breakpoint rather than TF;
   the controller binds the resulting root and removes the slot before reporting the stop. `g` is
   refused before the retained event is released, even when WinDbg has installed a hardware
-  breakpoint. A refusal resends the held stop, so the session survives it. The facade recognizes
-  both the legacy continue request and `Continue2`; only `Continue2` with its trace flag set may
-  resume the target. Whatever WinDbg sends for `p` is handled by that same trace arm.
+  breakpoint. A refusal resends the held stop, so the session survives it. The direct controller's
+  M1 run-to-breakpoint and M2 break-on-demand paths now pass independently; the call-debugging
+  roadmap's M8 gate owns their KD packet translation and race qualification. Until that passes,
+  the facade recognizes both the legacy continue request and `Continue2` but only `Continue2` with
+  its trace flag set may resume the target. Whatever WinDbg sends for `p` is handled by that same
+  trace arm.
 - **The proven redirected step is one five-byte NOP.** On that bench the next instruction used the
   interrupted context's RBX, so the acceptance takes one step and quits.
 - **`SetContext` succeeds only for WinDbg's unchanged compatibility write**; a changed byte is
   refused, as are all control-space writes. No guest memory is written and no general-purpose register is: the only writes are the
   controller's own — debug registers for a breakpoint, TF for a step — and the baseline restores
   them at release.
-- **Break-in is not implemented as a new stop.** While stopped it is logged as unsupported and the
-  retained stop remains usable. While running it cancels the bounded wait into fail-closed recovery;
-  it is not reported as a stop that did not occur.
+- **Break-in is not yet routed to M2.** While stopped it is logged as unsupported and the retained
+  stop remains usable. While running it cancels the bounded wait into fail-closed recovery; it is
+  not reported as a stop that did not occur. M8 keeps that refusal until running, natural-stop and
+  teardown races pass through the packet facade itself.
 - **Everything else answers `0xC0000001`**: `WriteVirtual`, `ReadPhysical`, `SearchMemory`, MSR
   reads and writes, `SwitchProcessor`, `QueryMemory`, `SetContextEx`, `Reboot`, `CauseBugCheck`,
   control-space writes and control-space selectors other than the bounded AMD64 special-register
@@ -325,6 +329,7 @@ produced `Continue2` with the trace flag.
 The [item 119 capability record](../../DONE.md#119-windbg-mcp-what-a-vtl1-debugger-still-cannot-do--done-2026-10-07)
 holds the ordered ladder. The version record now names validated live debugger and module
 lists; module enumeration, PDB symbol resolution and one bounded natural stack walk have passed.
-Debugger display/write diagnostics, forced-disconnect behavior, break-in,
-stepping over anything but a fall-through, repeated run-break-run, more than one VP and writes are
-left, each behind a guard or an explicit refusal in `src/sklive.rs` and `src/kdtarget.rs`.
+Debugger display/write diagnostics, forced-disconnect behavior, facade-routed break-in,
+stepping over anything but a fall-through, facade-routed repeated run-break-run, more than one VP
+and writes are left, each behind a guard or an explicit refusal in `src/sklive.rs` and
+`src/kdtarget.rs`. The direct M1/M2 paths are qualified; M8 is the missing facade-specific proof.

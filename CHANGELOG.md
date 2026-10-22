@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`hv_transition_trace` records the hypervisor half of a Secure Kernel service transition.** A
+  distinct hypervisor KD worker admits the measured K3 Intel `hvix64.exe` only by exact image
+  identity, validates the complete call/return handler prefixes and relocated descriptors, and
+  owns two software breakpoints independently of the ordinary-kernel and VTL1 workers. Typed
+  events report call/return direction, processor, VP, authoritative source/target VTL, control
+  state and saved-state/VMCS coordinates with measured/derived provenance and named read failures;
+  `hv_transition_trace_read` snapshots or disarms the bounded recorder. The live M5 gate retained
+  1,024 transitions — 512 calls and 512 returns — during three successful labelled enclave
+  lifecycles with no drop, unreadable hit or inferred value, then proved both handler guards and
+  descriptors restored, detached and left the same boot and `vmwp` healthy with no retained
+  processes. The exact-build contract, nested-virtualization preflight and limits are in
+  `docs/secure-kernel/hypervisor-transition-trace.md`.
+
 - **`sk_call_trace` records the VTL0 half of a Secure Kernel service transition.** In an ordinary
   live x64 kernel worker it resolves exactly `nt!VslpEnterIumSecureMode`, proves the address belongs
   to one identified `nt` image, and refuses unless the 10.0.26100.9457 prefix still contains the

@@ -58,10 +58,12 @@ standalone `windbg-mcp --sk-kd-target` role remains for compatibility and diagno
 translates the requests it understands — context, virtual reads, hardware-breakpoint bookkeeping,
 a fall-through single step and quit — into the same guarded controller operations
 ([#463](https://github.com/glslang/windbg-mcp/pull/463)). Non-trace continue remains refused after
-the 2026-10-18 live qualification reset K3; the roadmap's M1 gate decides when it can return. It is
-a facade for the debugger over the root-driven controller, not a KD transport inside the guest: Secure Kernel still
-ships none, which is gate S5a below. What it can do, what WinDbg is told that the guest never held,
-and the one live run it rests on are in [`kd-facade.md`](kd-facade.md).
+the 2026-10-18 live qualification reset K3. The direct M1/M2 controller gates now pass; the
+roadmap's packet-race and recovery qualification in M8 decides when the facade refusal can be
+removed. It is a facade for the debugger over the root-driven controller, not a KD transport inside
+the guest: Secure Kernel still ships none, which is gate S5a below. What it can do, what WinDbg is
+told that the guest never held, and the one live run it rests on are in
+[`kd-facade.md`](kd-facade.md).
 
 ## The answer so far
 
