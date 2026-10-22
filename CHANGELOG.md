@@ -81,6 +81,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A reachability walk or IOCTL map held up by a cold module now stops at its deadline, give or
+  take one instruction** ([dbgscope#149](https://github.com/glslang/dbgscope/issues/149)). Each
+  function's `uf` already carried what was left of the caller's timeout, but the decodes under it
+  did not: each instruction is rendered, rendering resolves symbols, and a module with deferred ones
+  could send every line of a run to a symbol server with nothing able to stop it between calls. The
+  decodes now go through dbgscope's `disassemble_bounded`, which checks the remaining time before
+  each instruction, and a walk cut short there reports the halt rather than a function it never
+  finished. One instruction is still unbounded: a render blocked loading a symbol runs to
+  completion, because whether a break reaches one in progress is unmeasured. The `dbgscope` pin
+  moves to 0.3.0 for it.
+
 - **A kernel attach refused before it claimed anything no longer leaves a controller reserved when
   the caller's deadline got there first** (issue #462). The deadline answers `target: unknown` and
   preserves the session, which is right while the outcome is unknown. A KDNET port another process
