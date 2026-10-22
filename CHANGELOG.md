@@ -190,6 +190,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- **The README names the project's official sources, and warns about the rest.** Third-party MCP
+  directories list the repository unasked, and one invited the maintainer to "claim" and monetise a
+  listing. The new *Official sources* section lists the four channels this project publishes
+  through, and says what a copy from anywhere else means: there is no paid edition and no hosted
+  one, and a binary this elevated is worth checking against `SHA256SUMS.txt` and its attestation.
 - **The `debug_batch` `command` step's example of a failure that returns success was one that
   fails.** It said a command printing `Couldn't resolve error at 'nt!Nope'` is a step that
   succeeded; an unresolvable argument fails `Execute` with `0x80040205` on both engine builds
