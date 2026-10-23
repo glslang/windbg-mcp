@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **M6 now has a proved first VTL1 service and an exact-build gate.** The supported-API guest
+  harness accepts cumulative `baseline`, `create`, `load`, `initialize`, `terminate` and `delete`
+  stages while preserving M4's original arguments and output schema. Staged records bracket the
+  requested work with guest tick/QPC values and report later resource release separately. Three
+  baseline and three create discovery arms passed on one unchanged boot: the selected service was
+  absent from every control and appeared exactly once per positive ordinal, with no drop,
+  unreadable hit or retained process. The checked JSON manifest is the sole source for the exact
+  image/PDB identity, service number, guarded RVAs and bytes, request layout, cardinality and
+  hardware-slot count; `src/skservice.rs` validates and consumes it, including stale-byte, RVA,
+  layout, identity and fifth-slot refusal tests. This completes M6.0.
+
+  M6.1 now has its non-public, engine-free record contract and bounded recorder. A record carries
+  exact target/image identity and ordered entry, dispatch and return evidence; mutable partial work
+  is never exposed by a snapshot. Whole page-split captures are bounded per buffer and in total,
+  failed or short reads become named unavailability, inferred values are refused, and event/byte
+  capacity accounts for every dropped record. The state machine refuses stale epochs, CR3s and
+  layout values and keeps nested, repeated or missing phases incomplete instead of joining
+  adjacent hits. Draft schemas for the future `sk_service_trace` pair are pinned at 2,930
+  model-visible and 15,098 total estimated bytes. The tools remain unregistered until M6.2 can
+  satisfy their worker-owned run, scoped stop and proved restoration contract.
+
 - **`hv_transition_trace` records the hypervisor half of a Secure Kernel service transition.** A
   distinct hypervisor KD worker admits the measured K3 Intel `hvix64.exe` only by exact image
   identity, validates the complete call/return handler prefixes and relocated descriptors, and
@@ -32,11 +53,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disarms it; the trace is bounded, stops on the filling hit, owns its breakpoint by id plus a
   private marker, and cannot coexist with a pool trace because DbgEng has one callback slot. The
   supported-API guest harness in `tools/skcall_guest_harness.c` labels each VBS-enclave
-  create/load/initialize/terminate/delete invocation for later cross-layer correlation; an empty
-  enclave reservation alone was measured not to cross the traced entry. The exact entry uses a
-  one-byte processor execution breakpoint instead of patching the protected transition code. The
-  runbook is `docs/secure-kernel/vtl0-call-trace.md`; this is M4 of the Secure Kernel call-debugging
-  roadmap.
+  create/load/initialize/terminate/delete invocation for later cross-layer correlation. The exact
+  entry uses a one-byte processor execution breakpoint instead of patching the protected transition
+  code. The runbook is `docs/secure-kernel/vtl0-call-trace.md`; this is M4 of the Secure Kernel
+  call-debugging roadmap.
   Its exact-build K3 gate retained 256 complete calls with no read failure, including 199 from the
   single PID emitted by three successful labelled lifecycle invocations, then disarmed, detached
   and left the same guest boot and `vmwp` healthy with no retained worker.

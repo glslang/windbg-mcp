@@ -73,11 +73,18 @@ callback trace.
 
 [`tools/skcall_guest_harness.c`](../../tools/skcall_guest_harness.c) uses supported Windows APIs
 only. Each invocation creates a debug VBS enclave, loads and initializes a valid enclave image,
-then terminates and deletes it. Reserving and deleting an *empty* enclave is not sufficient on this
-build: live qualification measured no entry from that process until `LoadEnclaveImage` and
-`InitializeEnclave` were added. The harness emits one JSON line carrying the supplied label,
-actual process id, ordinal and each supported API result. It neither calls a private kernel address
-nor embeds the private service ABI.
+then terminates and deletes it. The harness emits one JSON line carrying the supplied label, actual
+process id, ordinal and each supported API result. It neither calls a private kernel address nor
+embeds the private service ABI.
+
+M6 service discovery adds an explicit cumulative stage after the enclave-image argument:
+`baseline`, `create`, `load`, `initialize`, `terminate` or `delete`. `baseline` makes no enclave
+life-cycle call after the common support check. Each later value runs the named operation and all
+of its prerequisites. A stage that
+stops before `terminate` or `delete` still releases what it created, but reports that work in
+separate `cleanup_*` fields outside the stage's before/after guest-tick and QPC interval. Explicit
+stage mode emits `windbg-mcp.skcall-guest-workload-stage.v1`; omitting it preserves the original
+full-lifecycle arguments and `windbg-mcp.skcall-guest-workload.v1` output used by M4.
 
 Build it on the host with Visual Studio's x64 C++ tools:
 
@@ -88,20 +95,29 @@ powershell -NoProfile -ExecutionPolicy Bypass `
 ```
 
 Place a valid, debuggable VBS enclave image named `spin_enclave.dll` beside the harness (or pass an
-explicit image path as the sixth optional argument). The image must satisfy the guest's ordinary
+explicit image path). The image must satisfy the guest's ordinary
 enclave signing policy. After copying both to the disposable guest:
 
 ```pwsh
 C:\encl\skcall_guest_harness.exe create-enclave-01 3 5000
 ```
 
+For example, three M6 create-stage records with owned output files are:
+
+```pwsh
+C:\encl\skcall_guest_harness.exe m6-create 3 5000 `
+  C:\encl\m6-create.jsonl C:\encl\m6-create.err `
+  C:\encl\spin_enclave.dll create
+```
+
 Use the same label when arming the trace. The guest record identifies each supported API
 invocation; the trace identifies every private entry it caused. M4 deliberately does not claim a
 one-to-one relationship between them—M7 joins layers by label, ordered host timestamps and bounded
-windows. The third optional argument delays the first VBS operation, which lets a scheduled
-launcher finish before the kernel trace can stop the guest. Fourth and fifth arguments can name
-stdout and stderr files; the harness opens them before that delay so no remoting pipe owns its
-lifetime. The sixth names the enclave image.
+windows. After the label, `count` is positional argument 2 and `startup-delay-ms` is argument 3;
+the delay lets a scheduled launcher finish before the kernel trace can stop the guest. Arguments 4
+and 5 can name stdout and stderr files; the harness opens them before that delay so no remoting
+pipe owns its lifetime. Argument 6 names the enclave image, and argument 7 selects the cumulative
+M6 stage.
 
 The 2026-10-21 exact-build live gate retained 256 complete calls before the bound stopped the
 target. Of those, 199 carried the single PID emitted by the three labelled harness records; every

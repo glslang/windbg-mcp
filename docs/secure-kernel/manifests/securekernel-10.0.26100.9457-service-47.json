@@ -1,0 +1,143 @@
+{
+  "schema": "windbg-mcp.sk-service-manifest.v1",
+  "manifest_id": "securekernel-10.0.26100.9457-service-47",
+  "image": {
+    "module": "securekernel",
+    "original_filename": "securekernel.exe",
+    "file_version": "10.0.26100.9457",
+    "file_size": 1385944,
+    "sha256": "a9cde82e39794fb2910bd53a7dda3df750c443222f898c49092d5e51f8b2095e",
+    "pe": {
+      "machine": 34404,
+      "sections": 18,
+      "timestamp": 2497630847,
+      "size_of_image": 1527808,
+      "checksum": 1431106
+    },
+    "pdb": {
+      "guid": "C2C0D1A62E3269F40C69EA44FDB230C4",
+      "age": 1,
+      "key": "C2C0D1A62E3269F40C69EA44FDB230C41"
+    }
+  },
+  "service": {
+    "number": 47,
+    "caller_symbol": "nt!VslCreateEnclave",
+    "handler_symbol": "securekernel!SkmmCreateEnclave",
+    "handler_rva": 366992,
+    "handler_call_rva": 85003,
+    "number_source": {
+      "phase": "dispatch",
+      "base_register": "r14",
+      "offset": 2,
+      "width": 2,
+      "byte_order": "little"
+    },
+    "status_source": {
+      "phase": "return",
+      "register": "eax",
+      "width": 4,
+      "encoding": "ntstatus"
+    }
+  },
+  "sites": [
+    {
+      "phase": "entry",
+      "symbol": "securekernel!IumInvokeSecureService",
+      "rva": 79856,
+      "slot": 0,
+      "guard": "405553415441564157488dac2450f9ffff4881ecb0070000488b05f13f110048"
+    },
+    {
+      "phase": "dispatch",
+      "symbol": "securekernel!IumInvokeSecureService+0x13e8",
+      "rva": 84952,
+      "slot": 1,
+      "guard": "410fb64638498d56104d8b4e204d8b4618498b4e084889542438488b1288442430498b46304889442428498b46284889442420e8804d0400"
+    },
+    {
+      "phase": "return",
+      "symbol": "securekernel!IumInvokeSecureService+0x1420",
+      "rva": 85008,
+      "slot": 2,
+      "guard": "e94b500000"
+    }
+  ],
+  "static_guards": [
+    {
+      "name": "service-number-load",
+      "rva": 80629,
+      "guard": "410fb77e02897d188d8721ffffff83f8027739391d5674"
+    },
+    {
+      "name": "bounded-jump-router",
+      "rva": 80862,
+      "guard": "8d47ff3d160100000f879b6000004c8d150dc4feff410fb68402a3531000418b8c82335110004903caffe1"
+    },
+    {
+      "name": "service-47-selector",
+      "rva": 1070033,
+      "guard": "2d"
+    },
+    {
+      "name": "service-47-target-rva",
+      "rva": 1069543,
+      "guard": "d84b0100"
+    }
+  ],
+  "request_layout": {
+    "size": 64,
+    "alignment": 8,
+    "fields": [
+      { "name": "dispatch_mode", "offset": 0, "width": 1, "alignment": 1 },
+      { "name": "completion", "offset": 1, "width": 1, "alignment": 1 },
+      { "name": "service_number", "offset": 2, "width": 2, "alignment": 2 },
+      { "name": "argument_0", "offset": 8, "width": 8, "alignment": 8 },
+      { "name": "argument_1_in_out", "offset": 16, "width": 8, "alignment": 8 },
+      { "name": "argument_2", "offset": 24, "width": 8, "alignment": 8 },
+      { "name": "argument_3", "offset": 32, "width": 8, "alignment": 8 },
+      { "name": "argument_4", "offset": 40, "width": 8, "alignment": 8 },
+      { "name": "argument_5", "offset": 48, "width": 8, "alignment": 8 },
+      { "name": "argument_6", "offset": 56, "width": 1, "alignment": 1 }
+    ]
+  },
+  "capture": {
+    "per_buffer_limit_max": 4096,
+    "regions": [
+      {
+        "name": "request",
+        "entry_base_register": "rcx",
+        "dispatch_base_register": "r14",
+        "offset": 0,
+        "length": 64,
+        "alignment": 8,
+        "before": true,
+        "after": true
+      }
+    ]
+  },
+  "cardinality": {
+    "positive_stage": "create",
+    "selected_calls_per_positive_ordinal": 1,
+    "negative_stage": "baseline",
+    "selected_calls_per_negative_ordinal": 0
+  },
+  "hardware_slots_required": 3,
+  "qualification": {
+    "status": "passed",
+    "date": "2026-10-22",
+    "positive_runs": [
+      "target/codex-m6/discovery/20261022T212300/report.json",
+      "target/codex-m6/discovery/20261022T212524/report.json",
+      "target/codex-m6/discovery/20261022T212740/report.json"
+    ],
+    "negative_runs": [
+      "target/codex-m6/discovery/20261022T212144/report.json",
+      "target/codex-m6/discovery/20261022T212420/report.json",
+      "target/codex-m6/discovery/20261022T212632/report.json"
+    ],
+    "dropped": 0,
+    "unreadable": 0,
+    "retained_processes": 0
+  }
+}

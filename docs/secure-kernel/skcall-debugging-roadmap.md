@@ -337,7 +337,7 @@ and no debugger process remained.
 
 ### M6 — VTL1 semantic tracer
 
-Status: planned; this is the next implementation milestone.
+Status: in progress; M6.0 passed on 2026-10-22 and the offline M6.1 recorder contract is complete.
 
 Resolve and stop at `IumInvokeSecureService`, one selected dispatch target and its measured return
 site(s). Decode the SSCN/service number, bounded input/output buffers and status using exact-build
@@ -368,6 +368,22 @@ record, and an offline fixture or submitted guard with one changed image byte, R
 is refused before a debug register changes. Stop: ambiguous service mapping, more than four simultaneous sites, a public
 symbol with no independently checked layout, or any path that can return without a guarded return
 site sends the design back to a narrower service.
+
+**M6.0 result, 2026-10-22: passed.** The cumulative harness mode separated a life-cycle-free baseline
+from the supported create operation and reported all later resource release as cleanup. Three
+independent baseline arms and three independent create arms ran on one unchanged guest boot and
+`vmwp`; every arm passed with zero trace drop, unreadable hit or retained process. The baseline
+never emitted the selected service and every positive ordinal emitted it exactly once. Offline
+symbol/disassembly work tied that service to `SkmmCreateEnclave`, one guarded call and one guarded
+return path.
+
+The [checked machine-readable manifest](manifests/securekernel-10.0.26100.9457-service-47.json) is
+the only copy of the exact image/PDB identity, service number, RVAs, instruction bytes, request
+layout, cardinality and hardware-slot count. `src/skservice.rs` consumes it, rejects internal
+inconsistency, and checks observed identity plus all target bytes before mutation. Its negative
+tests alter an image byte, RVA, layout offset, image identity and slot count independently. The
+six local raw reports named by the manifest remain under `target/codex-m6/discovery/`; generated
+reports are intentionally not versioned.
 
 #### M6.1 — versioned event and recorder
 
@@ -401,6 +417,32 @@ complete surface leaves only 1,318 model-visible bytes, so the schema is drafted
 before implementation: either both tools fit, or the ceiling moves in one explicit, attributed
 budget change. Silently weakening descriptions or omitting output fields to satisfy the old number
 is not a pass.
+
+**M6.1 implementation checkpoint, 2026-10-22:** `src/skservicetrace.rs` now defines the versioned
+armed, trace and per-call records plus an engine-free bounded recorder. Its public-facing snapshot
+copies only terminal records and counters; an entry or dispatch being filled remains private and is
+represented only by `pending_phase`. Every retained call repeats its trace/capture identity, exact
+target and manifest image identity, selected CR3 and typed phases. Captures split at page
+boundaries, retain bytes only after the complete bounded read succeeds, and otherwise carry one
+named failure. Event capacity drops whole records, byte capacity counts the whole dropped capture,
+and a zero-byte budget still permits metadata-only records.
+
+Sixteen offline tests pin schema round trips and integer widths, the 0/4,096-byte endpoints,
+page-boundary, short and unreadable reads, immutable-prefix behavior, non-selected traffic,
+nested/repeated/out-of-order phases, stale epoch and CR3 refusal, both capacity dimensions,
+provenance and every incomplete rendering. The two input-schema drafts and stripped output schemas
+measure **2,930 model-visible bytes and 15,098 estimated wire bytes** together. They exceed the
+current model headroom by 1,612 bytes, so M6.2 must make one explicit ceiling change when the real
+registered `tools/list` measurement replaces this estimate; no description or result field was
+weakened to fit. Neither tool is registered yet: exposing a recorder without the asynchronous
+engine-thread restoration lifecycle below would claim a safety property it does not have.
+
+The staged M6.2 arm gate is also present but unexposed. From one exact retained epoch it requires
+one selected VP, reads and verifies the live mapped PE identity, CodeView/PDB identity and every
+manifest guard, derives all hardware breakpoints only from that proved manifest, and only then
+enters the existing atomic replacement transition. Unit tests reject truncated PE declarations
+and ratchet that proof-before-mutation ordering. The gate stays private until the worker-owned
+run/stop loop below can guarantee restoration on every exit.
 
 #### M6.2 — guarded run/stop loop
 

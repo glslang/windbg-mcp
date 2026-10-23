@@ -60,6 +60,8 @@ mod skdispatch;
 mod skinspect;
 mod sklive;
 mod skpolicy;
+mod skservice;
+mod skservicetrace;
 mod sksession;
 mod sksym;
 mod structured;

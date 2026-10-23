@@ -397,6 +397,15 @@ None of these is a bug. They are recorded because they were invisible, and
    **387,637 B**. The model ceiling stays at 135,000 B, leaving 1,318 B (1.0%); the wire ceiling
    deliberately moves to 395,000 B, leaving 7,363 B (1.9%).
 
+   M6.1 drafts `sk_service_trace` and `sk_service_trace_read` before registering either tool. The
+   same compact-JSON accounting used by the surface test measures their names, descriptions,
+   annotations and input schemas at **2,930 model-visible bytes**, and those fields plus stripped
+   output schemas at **15,098 bytes**. The model figure exceeds the complete surface's remaining
+   1,318 bytes by 1,612, so these tools do not fit the existing 135,000 B ceiling. The recorder is
+   intentionally still private; M6.2 will replace the estimate with the actual `tools/list`
+   golden and make one attributed ceiling change when the worker-owned stop/restoration lifecycle
+   makes the tools honest enough to expose.
+
    **The two tables do not reconcile, and that is the point of item 41.** The first is each group's
    share of the whole surface; the second is what a spec actually serves, which is less — `crash`
    is 20,515 rather than the 21,681 its two rows sum to, because the cross-references leave with
