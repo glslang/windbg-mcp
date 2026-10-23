@@ -276,6 +276,59 @@ impl Session {
             .and_then(|memory| memory.source.kernel_base())
     }
 
+    /// Admit and arm the M6 exact-build service trace from one retained stop. Every image and
+    /// instruction read completes before `continue_to_breakpoints` starts the existing atomic
+    /// debug-register replacement transition.
+    #[allow(dead_code)] // M6.2 wires the pre-mutation gate into the worker-owned trace job.
+    pub(crate) fn arm_service_trace(
+        &mut self,
+        engine: &DebugEngine,
+        epoch: &crate::skcontrol::StopEpoch,
+        manifest: &crate::skservice::ServiceManifest,
+    ) -> Result<ServiceTraceArm> {
+        self.ensure_preparation_succeeded()?;
+        let stop = self
+            .control()?
+            .stopped()
+            .cloned()
+            .context("service tracing requires one retained VTL1 stop")?;
+        if &stop.epoch != epoch {
+            bail!("service trace arm supplied a stale stop epoch");
+        }
+        if self.control()?.provider_count() != 1 {
+            bail!(
+                "service tracing requires exactly one selected VP; multi-VP ordering is not proved"
+            );
+        }
+        let image_base = self
+            .kernel_base()
+            .context("the live-memory provider did not report a Secure Kernel image base")?;
+        let deadline = self.stopped_service_deadline()?;
+        let proof = manifest
+            .verify_live_image(|rva, size| {
+                let address = image_base
+                    .checked_add(u64::from(rva))
+                    .ok_or_else(|| "live image RVA wraps its address".to_string())?;
+                let size =
+                    u32::try_from(size).map_err(|_| "live image read is too large".to_string())?;
+                let read = self
+                    .read_memory_until(address, size, deadline)
+                    .map_err(|error| format!("{error:#}"))?;
+                decode_live_hex(&read.data)
+            })
+            .map_err(anyhow::Error::msg)?;
+        let breakpoints = manifest
+            .breakpoints(image_base)
+            .map_err(anyhow::Error::msg)?;
+        let transition = self.continue_to_breakpoints(engine, epoch, breakpoints)?;
+        Ok(ServiceTraceArm {
+            transition,
+            target: stop.target,
+            image_base: HexU64(image_base),
+            proof,
+        })
+    }
+
     pub(crate) fn secure_kernel_kd(&self) -> Option<crate::sklive::SecureKernelKdProfile> {
         self.dispatcher.profile.secure_kernel_kd.clone()
     }
@@ -931,6 +984,34 @@ pub(crate) struct LiveMemoryRead {
     pub(crate) read_size: u32,
     /// Uppercase hexadecimal bytes with no separators.
     pub(crate) data: String,
+}
+
+#[allow(dead_code)] // Returned by the M6.2 worker arm once that operation is exposed.
+pub(crate) struct ServiceTraceArm {
+    pub(crate) transition: LiveTransition,
+    pub(crate) target: TargetIdentity,
+    pub(crate) image_base: HexU64,
+    pub(crate) proof: crate::skservice::LiveImageProof,
+}
+
+#[allow(dead_code)] // Used by the adjacent M6.2 pre-mutation gate.
+fn decode_live_hex(encoded: &str) -> Result<Vec<u8>, String> {
+    if !encoded.len().is_multiple_of(2) {
+        return Err("live-memory provider returned odd-length hexadecimal data".into());
+    }
+    encoded
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| {
+            let text = std::str::from_utf8(pair).map_err(|_| {
+                "live-memory provider returned non-ASCII hexadecimal data".to_string()
+            })?;
+            u8::from_str_radix(text, 16)
+                .map_err(|_| "live-memory provider returned non-hexadecimal data".to_string())
+        })
+        .collect()
 }
 
 pub(crate) fn render_transition(transition: &LiveTransition) -> String {
@@ -5879,6 +5960,35 @@ mod tests {
         assert!(transition_gate.contains("require_single_processor_software_breakpoint_scope"));
         assert!(!transition_gate.contains("ResolveProcessorCount"));
         assert!(!transition_gate.contains("run_vm_query"));
+    }
+
+    #[test]
+    fn service_trace_proves_the_live_image_before_breakpoint_mutation() {
+        let source = include_str!("skdispatch.rs").replace("\r\n", "\n");
+        let body = source
+            .split_once("    pub(crate) fn arm_service_trace(\n")
+            .expect("the service-trace arm gate exists")
+            .1
+            .split_once("    pub(crate) fn secure_kernel_kd(")
+            .expect("the service-trace arm gate ends before the KD accessor")
+            .0;
+        let single_vp = body
+            .find("provider_count() != 1")
+            .expect("the arm gate requires exactly one selected VP");
+        let live_proof = body
+            .find(".verify_live_image(")
+            .expect("the arm gate proves the complete live image");
+        let breakpoint_derivation = body
+            .find(".breakpoints(image_base)")
+            .expect("breakpoints are derived from the proved manifest");
+        let mutation = body
+            .find("self.continue_to_breakpoints(")
+            .expect("the existing atomic breakpoint transition is used");
+
+        assert!(single_vp < live_proof);
+        assert!(live_proof < breakpoint_derivation);
+        assert!(breakpoint_derivation < mutation);
+        assert_eq!(body.matches("self.continue_to_breakpoints(").count(), 1);
     }
 
     #[test]

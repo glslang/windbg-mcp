@@ -1310,6 +1310,11 @@ impl<P: ControlProvider> LiveControl<P> {
         self.providers.len() == 1 && self.providers[0].supports_breakpoint_events
     }
 
+    #[allow(dead_code)] // M6.2 refuses multi-VP service tracing before its first register write.
+    pub(crate) fn provider_count(&self) -> usize {
+        self.providers.len()
+    }
+
     pub(crate) fn phase(&self) -> LivePhase {
         match self.state {
             State::Running => LivePhase::Running,
