@@ -575,9 +575,10 @@ negative control. Only then may M7 treat an M6 record as a semantic endpoint.
 
 Status: in progress. M6's live exit gate and M7.0 are complete. M7.1's offline transaction,
 line-protocol and live-topology admission gates are complete, its provider-choice gate selected a
-nested L2 workload under K3, and the nested-parent provider's first read-only control passed. Its
-write/event/restoration controls are not yet qualified, so the live coexistence exit gate and M7.2
-remain closed.
+nested L2 workload under K3, and the nested-parent provider is qualified: the read-only, no-op
+write, arm/restore and natural held-event controls, the provider-death control and the complete
+positive sequence on three clean child boots all passed. The live coexistence exit gate remains,
+and it needs an admitted-topology driver that does not exist yet, so M7.2 remains closed.
 
 Join M4–M6 without putting two targets in one DbgEng process. The coordinator owns session ids and
 lifecycles, not engines: each layer remains in its existing worker and contributes an immutable
@@ -739,22 +740,124 @@ the temporary H3/hvmm services and runtime staging, and left both heartbeats `OK
 `target/codex-m7/m7-provider-readonly.json`. This passes only the read-only subgate; it is not the
 arm/event/restoration qualification.
 
+**The first nested-parent write/event/restoration controls passed on 2026-10-24.** The no-op
+debug-register round trip wrote and read back DR0-DR3, DR6 and DR7, then proved the complete before
+and after snapshots equal. Its record is `target/codex-m7/m7-provider-roundtrip.json`. The separate
+arm/restore control installed DR0 and DR7, restored DR0-DR3, DR6, DR7 and RFLAGS in its `finally`
+path, and again proved exact final-state equality. Its record is
+`target/codex-m7/m7-provider-arm-restore.json`. Both controls resumed the child, removed the
+temporary H3/hvmm services and staging, and left its heartbeat `OK`.
+
+The first natural held-event control then passed on parent boot
+`2026-10-24T14:01:53.5683807Z` and child boot `2026-10-24T14:17:57.5748892Z`. It rebound the exact
+child to nested `vmwp` PID 5860, source VID handle `0x2c4` and partition `0x6`; matched the image,
+mapped text and manifest guards; armed a hardware breakpoint; and retained a vector-1 slot-0 event
+at the guarded instruction `0xfffff8060d394900` without redirecting execution. Teardown released
+the event, proved the entire saved register snapshot equal, removed the worker, listener, services
+and staging, and left both VMs running with heartbeat `OK`. The result reports
+`released=true`, `target_left_running=true`, `worker_terminated=true`,
+`recovery_required=false`, no error and no reported secret. Its record is
+`target/codex-m7/m7-provider-event.json`. This is one successful natural-event run, not the
+three-clean-boot qualification and not the provider-death control.
+
+**The nested-parent provider-death control passed on 2026-10-24.** On the same parent boot
+`2026-10-24T14:01:53.5683807Z` and child boot `2026-10-24T14:17:57.5748892Z`, the control
+provider ran with `--exit-before-response publish_stop`, the acknowledgement boundary the earlier
+live provider-death injection used, over the exact chain nested `vmwp` PID 5860, VID handle
+`0x2c4` and partition `0x6`. The natural slot-0 event at `0xfffff8060d394900` arrived, the
+provider exited before acknowledging it, and `sk_live_wait` returned the terminal fault
+`provider closed its stdout` with `target_left_paused=true` and the recovery error `control
+protocol desynchronised`. `end_session` reported `recovery_required=true`, `released=false` and
+`worker_terminated=false`, naming retained worker PID 4192. The independent read taken while that
+worker was retained found DR0 still armed at the guarded address, DR7 `0x401`, DR6 `0xffff0ff1`,
+RIP on the guarded instruction, every manifest guard matching and the mapped text hash unchanged;
+the control-provider child was gone with its injected exit in the listener log and the live-memory
+child remained. A bounded `Get-VM` of the child did not answer within 30 seconds, and the first
+recovery attempt's `Get-VM` failed after six minutes with `object not found`, so no Hyper-V health
+reading of the contained child exists and continued guest health is not claimed. That evidence was
+sealed to `target/codex-m7/m7-provider-death-evidence.json` before recovery.
+
+The first harness attempt's evidence block and the first recovery attempt both failed on exactly
+that VMMS query; the recovery attempt took no action and its record is kept as
+`m7-provider-death-recovery-attempt1.json`. The standalone collector and the corrected recovery
+read only the `vmwp` process until the debugger is gone. The dedicated recovery then issued a
+bounded power-off request, which timed out while the debugger held `vmwp`, terminated the exact
+worker tree, which ended the contained `vmwp`, turned off the replacement boot Hyper-V started on
+its own, and restarted the child deliberately: new child boot `2026-10-24T15:39:51.5768400Z`,
+`vmwp` 5812, heartbeat `OK`, VBS status 2, zero retained processes, the listener, drivers, firewall
+rule and staging removed, and the parent on its original boot with heartbeat `OK`.
+`finalize-m7-provider-death.ps1` re-checked every field from the raw records and the live lab and
+wrote `target/codex-m7/m7-provider-death-control.json` with result `pass`. This proves containment
+and recovery, not restoration by the dead provider.
+
+**The three-clean-boot provider qualification passed on 2026-10-24.**
+`run-m7-provider-qualification.ps1` recreated the child from its pinned parent before each run and
+then drove the complete positive sequence through the K3-hosted listener: baseline read-only probe,
+`open_sk_live_control`, natural slot-0 arm at base plus `0xEA900`, guest-triggered VTL1 event,
+`end_session`, independent restoration audit and cleanup. The runs are
+`target/codex-m7/live-qualification/20261024T154937/`, `20261024T155332/` and `20261024T155743/`,
+each holding its reset record and its event record. Their child boots
+(`2026-10-24T15:50:52.5847177Z`, `15:54:46.5753379Z` and `15:58:58.5915607Z`), nested `vmwp`
+PIDs (1920, 1468 and 2324), H3 partition ids (`0xb`, `0xc` and `0xd`) and randomized Secure
+Kernel bases were all distinct; the parent stayed on boot `2026-10-24T14:01:53.5683807Z`
+throughout, and the staged server, image and profile hashes were identical across runs. Every run
+froze its VID handle, partition id, CR3 `0x1201000`, image and every manifest guard at the
+baseline, retained one owned vector-1 slot-0 VTL1 event at the guarded instruction, released with
+`released=true`, `worker_terminated=true`, `target_left_running=true` and
+`recovery_required=false`, and audited DR0-DR3/DR6/DR7 and TF/RF equal to the baseline with the
+mapped text hash unchanged within the run, zero engine workers, zero retained processes, no
+residual services or staging, and both heartbeats `OK`. The mapped `.text` hash differs between
+runs because the image is relocated to a different base on every boot; within a run it is the
+invariant. Two earlier driver launches aborted on PowerShell 5.1 script faults after a reset and
+before any session opened; their reset-only directories `20261024T154328/` and `20261024T154623/`
+are not part of the qualification. `finalize-m7-provider-qualification.ps1` re-checked every field
+of the three reset and event records against each other, the provider-death control and the live
+lab, and wrote `target/codex-m7/m7-provider-qualification.json` with result `pass`.
+
 Refinement proceeds as three separately gated phases:
 
 1. **Provider choice: passed.** Use the nested L2 workload and run M6's provider in its K3 parent.
    The parent/child ids, both boots, nested `vmwp`, identity-bound VID handle and H3 partition id
    are one required chain. The external-L0 design remains an unqualified fallback, not a second
    active path. Cross-boot joins and raw VMCS parsing remain forbidden.
-2. **Provider qualification: in progress.** The read-only L2 RIP/CR3, exact-image and manifest-
-   guard control passed. Next reproduce M6's no-op debug-register round trip, then its arm,
-   held-event, reverse restoration, provider-death and three-clean-boot controls through the
-   nested-parent boundary. Access denied, unavailable state, identity ambiguity or incomplete
-   restoration fails the phase; none may be converted to coordinate-only for semantic tracing.
-3. **Idle coexistence.** Only after phase 2 may the transaction open M5 -> M4 -> M6 in one live
-   parent/child topology, arm all three without a workload, drain in reverse order and prove
-   byte/register baselines, both heartbeats, unchanged boots/`vmwp` processes and zero retained
-   processes. Failure/timeout injection remains part of this gate. M7.2 stays closed until this
-   exact live control passes.
+2. **Provider qualification: passed.** The read-only L2 RIP/CR3, exact-image and manifest-guard
+   control, the no-op debug-register round trip, arm/reverse restoration, one natural held-event
+   control, the nested-parent provider-death control and the complete positive sequence on three
+   clean child boots through the nested-parent boundary all passed, as recorded above. Access
+   denied, unavailable state, identity ambiguity or incomplete restoration would have failed the
+   phase; none was converted to coordinate-only for semantic tracing.
+3. **Idle coexistence: open, unrun.** Phase 2 is satisfied, so the transaction may open
+   M5 -> M4 -> M6 in one live parent/child topology, arm all three without a workload, drain in
+   reverse order and prove byte/register baselines, both heartbeats, unchanged boots/`vmwp`
+   processes and zero retained processes. Failure/timeout injection remains part of this gate.
+   M7.2 stays closed until this exact live control passes.
+
+Continuation order from this checkpoint:
+
+1. Build the admitted-topology coexistence driver. `run-m7-coexistence.py` still targets the
+   K3-root shape, with M4 on `k3-nt`, M5 on `k3-hypervisor` and M6 on the host-side dispatcher
+   profile, which the admission gate refuses. The selected topology needs two things it does not
+   have: an NT KDNET profile for the L2 child that is routable from the host (the host's catalog
+   on 2026-10-24 holds `ctf-vm`, `k3-hypervisor`, `k3-nt`, `lab-hypervisor` and `lab-nt`, none of
+   them reaching the child), measured in the child with `bcdedit /dbgsettings` and from the host
+   as the UDP path, and a coordinator that
+   drives the M6 layer through the K3-hosted listener while M4 and M5 run on the host server,
+   holding the two endpoints' session ids separately. Preflight must bind the child boot and the
+   parent boot that owns its `vmwp`, exactly as the provider runs above do.
+2. Run M7.1's idle live transaction in that topology: open and arm M5 -> M4 -> M6, launch no
+   workload, drain M6 -> M4 -> M5, then repeat the relevant failure and timeout injections. The
+   gate requires unchanged identities and byte/register baselines, healthy parent and child, and
+   no retained process. Any Hyper-V management query of the child while a layer holds its `vmwp`
+   must be bounded, for the reason the provider-death control measured.
+3. Only after that live coexistence result is recorded may M7.2 implement and qualify the
+   deterministic join below.
+
+The event, provider-death and qualification harnesses depend on the `src/listen.rs` change that
+adds the explicitly bound non-loopback IP to rmcp's Host-header allowlist while retaining the
+loopback defaults; its matching `CHANGELOG.md` entry is beside it, and both land in the same commit
+as this checkpoint. The staged server identity in every record above,
+`0.23.0+ga7a37906-dirty.f64e9801`, is the build that carried them before that commit. The lab
+harness and raw reports remain intentionally ignored under `target/codex-m7/`.
 
 #### M7.2 — deterministic join
 

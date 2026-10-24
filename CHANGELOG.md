@@ -206,6 +206,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   completion, because whether a break reaches one in progress is unmeasured. The `dbgscope` pin
   moves to 0.3.0 for it.
 
+- **A listener bound to an explicit non-loopback IP accepts that exact address in the HTTP `Host`
+  header again.** `rmcp` 3.5.1 added a loopback-only DNS-rebinding allowlist, so the documented
+  host-only-adapter deployment bound successfully but rejected every remote request with `403`.
+  The configured bind IP now joins rmcp's loopback defaults; arbitrary host names remain refused.
+
 - **A kernel attach refused before it claimed anything no longer leaves a controller reserved when
   the caller's deadline got there first** (issue #462). The deadline answers `target: unknown` and
   preserves the session, which is right while the outcome is unknown. A KDNET port another process
