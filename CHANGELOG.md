@@ -9,16 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **M7.1 now has a typed one-boot topology gate.** The capture identity freezes nested-
-  virtualization state, guest-hypervisor launch, outer-partition VTL1 availability and the M6
-  provider boundary. The transaction enumerates unavailable layers and refuses before opening a
-  worker: non-nested K3 exposes M4+M6 but no M5 hypervisor, while nested K3 exposes M4+M5 but the
-  existing outer-`vmwp` M6 provider cannot reach its Secure Kernel VTL1. A live refusal preserved
-  the boot, `vmwp`, heartbeat and zero-process baseline. A bounded guest-root feasibility probe
-  then proved that SELF/VTL0 register access works and VTL1 is enabled, but SELF/VTL1 CR3 and RIP
-  are both access-denied, rejecting that raw-hypercall provider path. The roadmap now gates M7.2
-  on qualifying either a supported nested-root M6 provider or an externally hosted L0 M5
-  provider, followed by the original idle three-worker coexistence control.
+- **M7.1 now selects and types a live nested-child topology.** The capture identity freezes both
+  the L2 workload and its L1 parent VM/boot/`vmwp`, workload placement, guest-hypervisor launch,
+  outer and child VTL1 availability, and the independently selected M5 and M6 provider boundaries.
+  The transaction enumerates unavailable layers and refuses before opening a worker: non-nested
+  K3 exposes M4+M6 but no guest M5 hypervisor, while a nested K3-root workload exposes M4+M5 but
+  not VTL1 through its outer `vmwp`. A bounded SELF probe then measured VTL1 register access as
+  denied, rejecting that provider design. The selected replacement is one child L2 under K3: H3
+  in K3 read the child's VTL0 and VTL1 CR3 plus VSM status, and an identity-bound VID handle in the
+  exact nested `vmwp` resolved in-process to the same partition `0x2`; the debugger detached with
+  its return breakpoint restored and both VMs healthy. The first nested-parent qualification
+  control then matched the exact Secure Kernel PE and all seven manifest guards, with identical
+  before/after register snapshots, zero writes, successful L2 resume and complete driver/staging
+  cleanup. Phase 1 and the read-only part of phase 2 are complete. M7.2 remains gated on the
+  write/event/restoration controls and then idle three-worker coexistence.
 
 - **M7.1 adds an engine-free three-worker transaction coordinator without adding an MCP tool.** A
   typed line protocol keeps the live adapter on the public MCP surface while the pure Rust runner
@@ -27,8 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unsafe running, held, dropped, unreadable or unrestored child state cannot pass. Failed opens
   retain and clean up a public recovery handle when one is available, and no coordinator path can
   force-kill a worker that may still own debugger state. The offline and real-binary protocol gates
-  pass; the live three-layer gate remains incomplete at the one-boot provider-compatibility gate
-  and M7.2 remains gated on it.
+  pass; the live three-layer gate remains incomplete at nested-parent provider qualification and
+  M7.2 remains gated on it.
 
 - **M7.0 adds the cross-layer identity and clock admission contract without adding a debugger
   role or MCP tool.** M4, M5 and M6 arm/read envelopes and events now retain optional raw Windows

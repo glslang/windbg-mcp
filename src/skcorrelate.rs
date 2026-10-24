@@ -37,31 +37,53 @@ pub(crate) struct LayerBindings {
     pub(crate) m6_vtl1: LayerBinding,
 }
 
-/// The VTL1 boundary reached by M6. The existing provider runs beside the outer `vmwp`; a future
-/// nested-root provider would have to run inside the L1 root and prove access independently.
+/// Where the M4 workload and M6 Secure Kernel execute relative to the hypervisor observed by M5.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WorkloadPlacement {
+    HypervisorRoot,
+    ChildPartition,
+}
+
+/// The boundary from which M5 observes the hypervisor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum M5HypervisorProvider {
+    GuestNested,
+    ExternalL0,
+}
+
+/// The boundary from which M6 controls the workload's VTL1 state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum M6Vtl1Provider {
     OuterVmwp,
-    NestedRoot,
+    NestedParent,
 }
 
-/// Measured target shape that determines whether all three M7 layers refer to one boot.
+/// Measured target shape that determines whether all three M7 layers refer to one live topology.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TargetShape {
     pub(crate) nested_virtualization: bool,
     pub(crate) guest_hypervisor_started: bool,
+    pub(crate) workload_placement: WorkloadPlacement,
     pub(crate) outer_partition_vtl1: bool,
+    pub(crate) nested_child_vtl1: bool,
+    pub(crate) m5_provider: M5HypervisorProvider,
     pub(crate) m6_provider: M6Vtl1Provider,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LayerUnavailableReason {
-    M5NeedsNestedHypervisor,
-    M6OuterProviderCannotReachNestedVtl1,
+    M5GuestProviderNeedsNestedHypervisor,
+    M5ExternalProviderNeedsRootWorkload,
+    M5ExternalProviderCannotObserveNestedHypervisor,
+    M6OuterProviderNeedsRootWorkload,
     M6OuterPartitionHasNoVtl1,
     M6NestedProviderNeedsNestedHypervisor,
+    M6NestedProviderNeedsChildWorkload,
+    M6NestedChildHasNoVtl1,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,21 +93,42 @@ pub(crate) struct LayerUnavailability {
 }
 
 impl TargetShape {
-    /// Return every layer unavailable in this exact boot shape. M4's ordinary kernel remains at
-    /// the guest-root boundary in both shapes, so only M5 and M6 need topology admission here.
+    /// Return every layer unavailable in this exact live topology. M4 remains available at either
+    /// workload placement, so only M5 and M6 need provider-boundary admission here.
     pub(crate) fn unavailable_layers(&self) -> Vec<LayerUnavailability> {
         let mut unavailable = Vec::new();
-        if !self.nested_virtualization || !self.guest_hypervisor_started {
-            unavailable.push(LayerUnavailability {
-                layer: Layer::M5Hypervisor,
-                reason: LayerUnavailableReason::M5NeedsNestedHypervisor,
-            });
+        match self.m5_provider {
+            M5HypervisorProvider::GuestNested
+                if !self.nested_virtualization || !self.guest_hypervisor_started =>
+            {
+                unavailable.push(LayerUnavailability {
+                    layer: Layer::M5Hypervisor,
+                    reason: LayerUnavailableReason::M5GuestProviderNeedsNestedHypervisor,
+                });
+            }
+            M5HypervisorProvider::ExternalL0
+                if self.workload_placement != WorkloadPlacement::HypervisorRoot =>
+            {
+                unavailable.push(LayerUnavailability {
+                    layer: Layer::M5Hypervisor,
+                    reason: LayerUnavailableReason::M5ExternalProviderNeedsRootWorkload,
+                });
+            }
+            M5HypervisorProvider::ExternalL0 if self.nested_virtualization => {
+                unavailable.push(LayerUnavailability {
+                    layer: Layer::M5Hypervisor,
+                    reason: LayerUnavailableReason::M5ExternalProviderCannotObserveNestedHypervisor,
+                });
+            }
+            M5HypervisorProvider::GuestNested | M5HypervisorProvider::ExternalL0 => {}
         }
         match self.m6_provider {
-            M6Vtl1Provider::OuterVmwp if self.nested_virtualization => {
+            M6Vtl1Provider::OuterVmwp
+                if self.workload_placement != WorkloadPlacement::HypervisorRoot =>
+            {
                 unavailable.push(LayerUnavailability {
                     layer: Layer::M6Vtl1,
-                    reason: LayerUnavailableReason::M6OuterProviderCannotReachNestedVtl1,
+                    reason: LayerUnavailableReason::M6OuterProviderNeedsRootWorkload,
                 });
             }
             M6Vtl1Provider::OuterVmwp if !self.outer_partition_vtl1 => {
@@ -94,7 +137,7 @@ impl TargetShape {
                     reason: LayerUnavailableReason::M6OuterPartitionHasNoVtl1,
                 });
             }
-            M6Vtl1Provider::NestedRoot
+            M6Vtl1Provider::NestedParent
                 if !self.nested_virtualization || !self.guest_hypervisor_started =>
             {
                 unavailable.push(LayerUnavailability {
@@ -102,10 +145,33 @@ impl TargetShape {
                     reason: LayerUnavailableReason::M6NestedProviderNeedsNestedHypervisor,
                 });
             }
-            M6Vtl1Provider::OuterVmwp | M6Vtl1Provider::NestedRoot => {}
+            M6Vtl1Provider::NestedParent
+                if self.workload_placement != WorkloadPlacement::ChildPartition =>
+            {
+                unavailable.push(LayerUnavailability {
+                    layer: Layer::M6Vtl1,
+                    reason: LayerUnavailableReason::M6NestedProviderNeedsChildWorkload,
+                });
+            }
+            M6Vtl1Provider::NestedParent if !self.nested_child_vtl1 => {
+                unavailable.push(LayerUnavailability {
+                    layer: Layer::M6Vtl1,
+                    reason: LayerUnavailableReason::M6NestedChildHasNoVtl1,
+                });
+            }
+            M6Vtl1Provider::OuterVmwp | M6Vtl1Provider::NestedParent => {}
         }
         unavailable
     }
+}
+
+/// Identity of the L1 parent that owns a child workload's `vmwp` and provider boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ParentIdentity {
+    pub(crate) vm_id: String,
+    pub(crate) guest_boot_identity: String,
+    pub(crate) vmwp_pid: u32,
 }
 
 /// Coordinator-owned capture identity. None of these fields is presented as target-measured by
@@ -118,6 +184,7 @@ pub(crate) struct CaptureIdentity {
     pub(crate) vm_id: String,
     pub(crate) guest_boot_identity: String,
     pub(crate) vmwp_pid: u32,
+    pub(crate) parent: Option<ParentIdentity>,
     pub(crate) workload_label: String,
     pub(crate) processor_count: u32,
     pub(crate) target_shape: TargetShape,
@@ -142,6 +209,35 @@ impl CaptureIdentity {
         if self.vmwp_pid == 0 {
             return Err("vmwp_pid must be nonzero".into());
         }
+        match (&self.target_shape.workload_placement, &self.parent) {
+            (WorkloadPlacement::ChildPartition, Some(parent)) => {
+                for (name, value) in [
+                    ("parent.vm_id", parent.vm_id.as_str()),
+                    (
+                        "parent.guest_boot_identity",
+                        parent.guest_boot_identity.as_str(),
+                    ),
+                ] {
+                    if value.is_empty() || value.len() > 128 || value.chars().any(char::is_control)
+                    {
+                        return Err(format!("{name} must contain 1 through 128 printable bytes"));
+                    }
+                }
+                if parent.vmwp_pid == 0 {
+                    return Err("parent.vmwp_pid must be nonzero".into());
+                }
+                if parent.vm_id == self.vm_id {
+                    return Err("parent.vm_id must differ from the child workload vm_id".into());
+                }
+            }
+            (WorkloadPlacement::ChildPartition, None) => {
+                return Err("a child-partition workload requires its parent identity".into());
+            }
+            (WorkloadPlacement::HypervisorRoot, Some(_)) => {
+                return Err("a hypervisor-root workload must not carry a parent identity".into());
+            }
+            (WorkloadPlacement::HypervisorRoot, None) => {}
+        }
         if self.processor_count != 1 {
             return Err(format!(
                 "M7 admits exactly one runnable processor, observed {}",
@@ -151,7 +247,7 @@ impl CaptureIdentity {
         let unavailable = self.target_shape.unavailable_layers();
         if !unavailable.is_empty() {
             return Err(format!(
-                "M7 target shape does not expose all three layers in one boot: {unavailable:?}"
+                "M7 target shape does not expose all three layers in one live topology: {unavailable:?}"
             ));
         }
         for (name, layer) in [
@@ -217,6 +313,31 @@ pub(crate) fn admit_identity(
         armed.guest_boot_identity
     );
     changed!("vmwp_pid", preflight.vmwp_pid, armed.vmwp_pid);
+    if preflight.parent.is_some() != armed.parent.is_some() {
+        fields.push("parent".to_string());
+    } else {
+        changed!(
+            "parent.vm_id",
+            preflight.parent.as_ref().map(|parent| &parent.vm_id),
+            armed.parent.as_ref().map(|parent| &parent.vm_id)
+        );
+        changed!(
+            "parent.guest_boot_identity",
+            preflight
+                .parent
+                .as_ref()
+                .map(|parent| &parent.guest_boot_identity),
+            armed
+                .parent
+                .as_ref()
+                .map(|parent| &parent.guest_boot_identity)
+        );
+        changed!(
+            "parent.vmwp_pid",
+            preflight.parent.as_ref().map(|parent| parent.vmwp_pid),
+            armed.parent.as_ref().map(|parent| parent.vmwp_pid)
+        );
+    }
     changed!(
         "workload_label",
         preflight.workload_label,
@@ -238,9 +359,24 @@ pub(crate) fn admit_identity(
         armed.target_shape.guest_hypervisor_started
     );
     changed!(
+        "target_shape.workload_placement",
+        preflight.target_shape.workload_placement,
+        armed.target_shape.workload_placement
+    );
+    changed!(
         "target_shape.outer_partition_vtl1",
         preflight.target_shape.outer_partition_vtl1,
         armed.target_shape.outer_partition_vtl1
+    );
+    changed!(
+        "target_shape.nested_child_vtl1",
+        preflight.target_shape.nested_child_vtl1,
+        armed.target_shape.nested_child_vtl1
+    );
+    changed!(
+        "target_shape.m5_provider",
+        preflight.target_shape.m5_provider,
+        armed.target_shape.m5_provider
     );
     changed!(
         "target_shape.m6_provider",
@@ -1191,16 +1327,24 @@ mod tests {
         CaptureIdentity {
             schema: CAPTURE_SCHEMA.into(),
             capture_id: "capture-00000001".into(),
-            vm_id: "6b1ed0f6-137e-469f-aeab-a3f4cfee398d".into(),
-            guest_boot_identity: "2026-10-24T08:00:00.0000000Z".into(),
-            vmwp_pid: 4242,
+            vm_id: "e35248f3-d779-44c1-8f69-8a8cc27bc11b".into(),
+            guest_boot_identity: "2026-10-24T09:32:31.5773667Z".into(),
+            vmwp_pid: 4124,
+            parent: Some(ParentIdentity {
+                vm_id: "6b1ed0f6-137e-469f-aeab-a3f4cfee398d".into(),
+                guest_boot_identity: "2026-10-24T09:08:18.5667664Z".into(),
+                vmwp_pid: 4242,
+            }),
             workload_label: "m7-create-0001".into(),
             processor_count: 1,
             target_shape: TargetShape {
                 nested_virtualization: true,
                 guest_hypervisor_started: true,
+                workload_placement: WorkloadPlacement::ChildPartition,
                 outer_partition_vtl1: false,
-                m6_provider: M6Vtl1Provider::NestedRoot,
+                nested_child_vtl1: true,
+                m5_provider: M5HypervisorProvider::GuestNested,
+                m6_provider: M6Vtl1Provider::NestedParent,
             },
             layers: LayerBindings {
                 m4_vtl0: binding("k3-nt", 'a'),
@@ -1226,43 +1370,178 @@ mod tests {
         let mut many = identity();
         many.processor_count = 2;
         assert!(many.validate().unwrap_err().contains("exactly one"));
+
+        let mut missing_parent = identity();
+        missing_parent.parent = None;
+        assert!(
+            missing_parent
+                .validate()
+                .unwrap_err()
+                .contains("requires its parent identity")
+        );
+
+        let mut same_vm = identity();
+        same_vm.parent.as_mut().unwrap().vm_id = same_vm.vm_id.clone();
+        assert!(same_vm.validate().unwrap_err().contains("must differ"));
+
+        let mut root_with_parent = identity();
+        root_with_parent.target_shape.workload_placement = WorkloadPlacement::HypervisorRoot;
+        assert!(
+            root_with_parent
+                .validate()
+                .unwrap_err()
+                .contains("must not carry a parent")
+        );
     }
 
     #[test]
-    fn target_shape_matrix_refuses_the_two_measured_partial_shapes() {
+    fn target_shape_matrix_selects_the_nested_child_topology() {
         let non_nested = TargetShape {
             nested_virtualization: false,
             guest_hypervisor_started: false,
+            workload_placement: WorkloadPlacement::HypervisorRoot,
             outer_partition_vtl1: true,
+            nested_child_vtl1: false,
+            m5_provider: M5HypervisorProvider::GuestNested,
             m6_provider: M6Vtl1Provider::OuterVmwp,
         };
         assert_eq!(
             non_nested.unavailable_layers(),
             [LayerUnavailability {
                 layer: Layer::M5Hypervisor,
-                reason: LayerUnavailableReason::M5NeedsNestedHypervisor,
+                reason: LayerUnavailableReason::M5GuestProviderNeedsNestedHypervisor,
             }]
         );
 
-        let nested_with_outer_provider = TargetShape {
+        let nested_root_with_outer_provider = TargetShape {
             nested_virtualization: true,
             guest_hypervisor_started: true,
+            workload_placement: WorkloadPlacement::HypervisorRoot,
             outer_partition_vtl1: false,
+            nested_child_vtl1: false,
+            m5_provider: M5HypervisorProvider::GuestNested,
             m6_provider: M6Vtl1Provider::OuterVmwp,
         };
         assert_eq!(
-            nested_with_outer_provider.unavailable_layers(),
+            nested_root_with_outer_provider.unavailable_layers(),
             [LayerUnavailability {
                 layer: Layer::M6Vtl1,
-                reason: LayerUnavailableReason::M6OuterProviderCannotReachNestedVtl1,
+                reason: LayerUnavailableReason::M6OuterPartitionHasNoVtl1,
             }]
         );
 
-        let nested_root_provider = TargetShape {
-            m6_provider: M6Vtl1Provider::NestedRoot,
-            ..nested_with_outer_provider
+        let rejected_self_provider = TargetShape {
+            m6_provider: M6Vtl1Provider::NestedParent,
+            ..nested_root_with_outer_provider
         };
-        assert!(nested_root_provider.unavailable_layers().is_empty());
+        assert_eq!(
+            rejected_self_provider.unavailable_layers(),
+            [LayerUnavailability {
+                layer: Layer::M6Vtl1,
+                reason: LayerUnavailableReason::M6NestedProviderNeedsChildWorkload,
+            }]
+        );
+
+        let selected_nested_child = TargetShape {
+            workload_placement: WorkloadPlacement::ChildPartition,
+            nested_child_vtl1: true,
+            ..rejected_self_provider
+        };
+        assert!(selected_nested_child.unavailable_layers().is_empty());
+
+        let external_l0_fallback = TargetShape {
+            m5_provider: M5HypervisorProvider::ExternalL0,
+            ..non_nested
+        };
+        assert!(external_l0_fallback.unavailable_layers().is_empty());
+    }
+
+    #[test]
+    fn every_provider_boundary_has_a_typed_refusal() {
+        let selected = identity().target_shape;
+        let has = |shape: &TargetShape, layer, reason| {
+            shape
+                .unavailable_layers()
+                .contains(&LayerUnavailability { layer, reason })
+        };
+
+        let guest_without_nested = TargetShape {
+            nested_virtualization: false,
+            guest_hypervisor_started: false,
+            ..selected.clone()
+        };
+        assert!(has(
+            &guest_without_nested,
+            Layer::M5Hypervisor,
+            LayerUnavailableReason::M5GuestProviderNeedsNestedHypervisor
+        ));
+        assert!(has(
+            &guest_without_nested,
+            Layer::M6Vtl1,
+            LayerUnavailableReason::M6NestedProviderNeedsNestedHypervisor
+        ));
+
+        let external_for_child = TargetShape {
+            m5_provider: M5HypervisorProvider::ExternalL0,
+            ..selected.clone()
+        };
+        assert!(has(
+            &external_for_child,
+            Layer::M5Hypervisor,
+            LayerUnavailableReason::M5ExternalProviderNeedsRootWorkload
+        ));
+
+        let external_for_nested_root = TargetShape {
+            workload_placement: WorkloadPlacement::HypervisorRoot,
+            m5_provider: M5HypervisorProvider::ExternalL0,
+            ..selected.clone()
+        };
+        assert!(has(
+            &external_for_nested_root,
+            Layer::M5Hypervisor,
+            LayerUnavailableReason::M5ExternalProviderCannotObserveNestedHypervisor
+        ));
+
+        let outer_for_child = TargetShape {
+            m6_provider: M6Vtl1Provider::OuterVmwp,
+            ..selected.clone()
+        };
+        assert!(has(
+            &outer_for_child,
+            Layer::M6Vtl1,
+            LayerUnavailableReason::M6OuterProviderNeedsRootWorkload
+        ));
+
+        let outer_without_vtl1 = TargetShape {
+            workload_placement: WorkloadPlacement::HypervisorRoot,
+            m6_provider: M6Vtl1Provider::OuterVmwp,
+            ..selected.clone()
+        };
+        assert!(has(
+            &outer_without_vtl1,
+            Layer::M6Vtl1,
+            LayerUnavailableReason::M6OuterPartitionHasNoVtl1
+        ));
+
+        let nested_for_root = TargetShape {
+            workload_placement: WorkloadPlacement::HypervisorRoot,
+            ..selected.clone()
+        };
+        assert!(has(
+            &nested_for_root,
+            Layer::M6Vtl1,
+            LayerUnavailableReason::M6NestedProviderNeedsChildWorkload
+        ));
+
+        let child_without_vtl1 = TargetShape {
+            nested_child_vtl1: false,
+            ..selected
+        };
+        assert!(has(
+            &child_without_vtl1,
+            Layer::M6Vtl1,
+            LayerUnavailableReason::M6NestedChildHasNoVtl1
+        ));
     }
 
     #[test]
@@ -1275,9 +1554,7 @@ mod tests {
         assert!(report.issues.iter().any(|issue| {
             issue.state == TransactionState::Preflight
                 && issue.operation == "preflight"
-                && issue
-                    .message
-                    .contains("M6OuterProviderCannotReachNestedVtl1")
+                && issue.message.contains("M6OuterProviderNeedsRootWorkload")
         }));
     }
 
@@ -1296,6 +1573,25 @@ mod tests {
                 Box::new(|v| v.guest_boot_identity.push_str("-changed")),
             ),
             ("vmwp_pid", Box::new(|v| v.vmwp_pid += 1)),
+            ("parent", Box::new(|v| v.parent = None)),
+            (
+                "parent.vm_id",
+                Box::new(|v| v.parent.as_mut().unwrap().vm_id.push_str("-changed")),
+            ),
+            (
+                "parent.guest_boot_identity",
+                Box::new(|v| {
+                    v.parent
+                        .as_mut()
+                        .unwrap()
+                        .guest_boot_identity
+                        .push_str("-changed")
+                }),
+            ),
+            (
+                "parent.vmwp_pid",
+                Box::new(|v| v.parent.as_mut().unwrap().vmwp_pid += 1),
+            ),
             (
                 "workload_label",
                 Box::new(|v| v.workload_label.push_str("-changed")),
@@ -1310,8 +1606,20 @@ mod tests {
                 Box::new(|v| v.target_shape.guest_hypervisor_started = false),
             ),
             (
+                "target_shape.workload_placement",
+                Box::new(|v| v.target_shape.workload_placement = WorkloadPlacement::HypervisorRoot),
+            ),
+            (
                 "target_shape.outer_partition_vtl1",
                 Box::new(|v| v.target_shape.outer_partition_vtl1 = true),
+            ),
+            (
+                "target_shape.nested_child_vtl1",
+                Box::new(|v| v.target_shape.nested_child_vtl1 = false),
+            ),
+            (
+                "target_shape.m5_provider",
+                Box::new(|v| v.target_shape.m5_provider = M5HypervisorProvider::ExternalL0),
             ),
             (
                 "target_shape.m6_provider",

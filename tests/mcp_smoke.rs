@@ -153,16 +153,24 @@ fn m7_identity() -> Value {
     json!({
         "schema": "windbg-mcp.sk-correlation-capture.v1",
         "capture_id": "capture-smoke-0001",
-        "vm_id": "6b1ed0f6-137e-469f-aeab-a3f4cfee398d",
-        "guest_boot_identity": "2026-10-24T08:00:00.0000000Z",
-        "vmwp_pid": 4242,
+        "vm_id": "e35248f3-d779-44c1-8f69-8a8cc27bc11b",
+        "guest_boot_identity": "2026-10-24T09:32:31.5773667Z",
+        "vmwp_pid": 4124,
+        "parent": {
+            "vm_id": "6b1ed0f6-137e-469f-aeab-a3f4cfee398d",
+            "guest_boot_identity": "2026-10-24T09:08:18.5667664Z",
+            "vmwp_pid": 4242,
+        },
         "workload_label": "m7-smoke-idle",
         "processor_count": 1,
         "target_shape": {
             "nested_virtualization": true,
             "guest_hypervisor_started": true,
+            "workload_placement": "child_partition",
             "outer_partition_vtl1": false,
-            "m6_provider": "nested_root",
+            "nested_child_vtl1": true,
+            "m5_provider": "guest_nested",
+            "m6_provider": "nested_parent",
         },
         "layers": {
             "m4_vtl0": m7_binding("k3-nt", 'a'),

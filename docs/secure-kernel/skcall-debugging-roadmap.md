@@ -574,15 +574,17 @@ negative control. Only then may M7 treat an M6 record as a semantic endpoint.
 ### M7 — cross-layer correlation and investigations
 
 Status: in progress. M6's live exit gate and M7.0 are complete. M7.1's offline transaction,
-line-protocol and one-boot topology-refusal gates are complete. The live coexistence exit gate is
-blocked because the qualified M5 and M6 providers require mutually exclusive K3 processor shapes;
-M7.2 does not start until one provider is qualified in a shape that exposes all three layers.
+line-protocol and live-topology admission gates are complete, its provider-choice gate selected a
+nested L2 workload under K3, and the nested-parent provider's first read-only control passed. Its
+write/event/restoration controls are not yet qualified, so the live coexistence exit gate and M7.2
+remain closed.
 
 Join M4–M6 without putting two targets in one DbgEng process. The coordinator owns session ids and
 lifecycles, not engines: each layer remains in its existing worker and contributes an immutable
-trace. The first accepted configuration is the same one-vCPU K3 VM used by M3–M6. A VM reporting
-more than one runnable VP is refused before any layer is armed; total-VP coverage and mapping are a
-separate future gate, not an optimistic extension of this result.
+trace. The first accepted configuration is a one-vCPU L2 workload under the one-vCPU K3 root used
+by M3–M6. A workload reporting more than one runnable VP is refused before any layer is armed;
+total-VP coverage and mapping are a separate future gate, not an optimistic extension of this
+result.
 
 The first coordinator is a repository-owned live driver over the public MCP surface plus a pure
 Rust join module. It holds only session/trace ids and serialized records. It is not a new DbgEng
@@ -592,10 +594,12 @@ the correlation implementation.
 
 #### M7.0 — common identity, clock and availability contract
 
-Mint one `capture_id` before opening the three sessions and bind it to the allowlisted VM id, guest
-boot identity, `vmwp` PID, profile names, workload label, processor count and each layer's image
-identity. Worker session ids remain separate. Values observed only by the coordinator are carried
-in a coordinator envelope and are never presented as target-measured fields.
+Mint one `capture_id` before opening the three sessions and bind it to the workload VM id, boot
+identity and `vmwp` PID; for a child workload also bind its parent VM id, boot identity and outer
+`vmwp` PID. Freeze the profile names, workload label, processor count, placement, provider
+boundaries and each layer's image identity. Worker session ids remain separate. Values observed
+only by the coordinator are carried in a coordinator envelope and are never presented as
+target-measured fields.
 
 The existing millisecond-derived `host_monotonic_us` can collide at M5's event rate. Have the three
 workers and coordinator sample one common high-resolution Windows counter, record its raw tick and
@@ -625,8 +629,9 @@ collisions in the old millisecond coordinate. The pure `src/skcorrelate.rs` admi
 the QPC resolution and caller-selected skew bound, permits point order only when every worker
 sample has the common frequency and lies inside its coordinator bracket, and otherwise retains
 interval-only authority with named reasons. Touching/overlapping intervals never become a causal
-order. Mutation controls independently reject every capture, VM, boot, `vmwp`, workload,
-one-processor, layer-profile and exact-image binding between preflight and arm.
+order. Mutation controls independently reject every capture, workload or parent VM/boot/`vmwp`,
+placement, provider boundary, one-processor, layer-profile and exact-image binding between
+preflight and arm.
 
 The supported debugger API exposes no architectural VMCS guest-state read. M5 therefore adds a
 typed `coordinate_only` availability result beside each exact field/physical coordinate and a
@@ -674,25 +679,29 @@ was already bound entered Windows repair; that boot-priming path remains rejecte
 Every failed attempt withheld the workload and was recovered to heartbeat `OK` with no debugger
 process retained.
 
-#### M7.1a — one-boot topology admission and provider refinement
+#### M7.1a — live-topology admission and provider refinement
 
-The three records must describe one boot. Switching `ExposeVirtualizationExtensions` between
-layers changes the boot identity and is never a correlation mechanism. The measured matrix is:
+The three records must describe one simultaneously live topology. Switching
+`ExposeVirtualizationExtensions` between layers changes the parent boot identity and is never a
+correlation mechanism. A child workload binds both its own boot and the parent boot that owns its
+`vmwp`. The measured and selected matrix is:
 
-| K3 processor shape | M4 guest NT | M5 hypervisor | existing M6 outer-`vmwp` VTL1 |
-| --- | --- | --- | --- |
-| non-nested | available | unavailable: no guest hypervisor | available |
-| nested, guest hypervisor started | available | available | unavailable: outer partition has no K3 Secure Kernel VTL1 |
+| topology and workload placement | M4 guest NT | M5 boundary | M6 boundary | admission |
+| --- | --- | --- | --- | --- |
+| non-nested K3 root | K3 | guest nested: unavailable | outer `vmwp`: available | refuse M5 |
+| nested K3 root | K3 | guest nested: available | outer `vmwp`: no K3 VTL1 | refuse M6 |
+| nested K3 root with SELF provider | K3 | guest nested: available | SELF/VTL1: access denied | rejected design |
+| nested K3 parent plus L2 child | L2 | guest nested: available | nested parent: child VTL1 available | **selected** |
 
-The capture identity now carries the measured nesting flag, guest-hypervisor-started evidence,
-outer-partition VTL1 availability and selected M6 provider boundary. The pure gate enumerates
-unavailable layers and refuses before the first worker opens. Matrix tests cover both measured
-partial shapes and the only admissible future shape (nested plus a separately qualified
-`nested_root` M6 provider); mutation tests freeze every shape field between preflight and arm. The
-live refusal in `target/codex-m7/live-coexistence/20261024T102334/report.json` measured a running
-nested hypervisor, outer-partition VTL1 register status 21 and `m6_provider: outer_vmwp`, then
-closed with no sessions opened, no workload, unchanged boot/`vmwp`, heartbeat `OK` and no retained
-process.
+The capture identity now carries workload placement, the optional parent identity, measured
+nesting and guest-hypervisor-started evidence, outer and child VTL1 availability, and selected M5
+and M6 provider boundaries. The pure gate enumerates unavailable layers and refuses before the
+first worker opens. Matrix tests cover both measured partial shapes, the rejected SELF design, the
+selected nested child and the unselected external-L0 fallback; mutation tests freeze every field
+between preflight and arm. The live refusal in
+`target/codex-m7/live-coexistence/20261024T102334/report.json` measured a running nested
+hypervisor, outer-partition VTL1 register status 21 and `m6_provider: outer_vmwp`, then closed with
+no sessions opened, no workload, unchanged boot/`vmwp`, heartbeat `OK` and no retained process.
 
 A bounded read-only feasibility probe tested the shortest nested-root path. Inside K3, the pinned
 test-signed H3 driver issued only `HvCallGetVpRegisters` against partition `SELF`: VTL0 CR3 and
@@ -702,21 +711,50 @@ heartbeat `OK`; the local evidence is
 `target/codex-m7/m7-nested-vtl1-feasibility.json`. Therefore raw SELF/VTL1 hypercalls are a
 rejected provider design, not an implicit fallback.
 
+**Provider choice passed on 2026-10-24.** K3 now owns one exact generation-2 L2,
+`e35248f3-d779-44c1-8f69-8a8cc27bc11b`, on a pinned differencing disk. Its first bounded boot
+reached PowerShell Direct, heartbeat `OK`, VBS status 2 and boot identity
+`2026-10-24T09:31:24.6653173Z`. From K3, the pinned H3 driver enumerated exactly one child,
+partition `0x2`, and read VP0 VTL0 CR3, VTL1 CR3, `VsmVpStatus` and `VsmPartitionStatus` with
+status zero; the low partition-status bits report both VTL0 and VTL1. The raw record is
+`target/codex-m7/m7-child-vtl1-feasibility.json`. That first-start boot id is historical evidence,
+not the capture identity; the later qualification below records and freezes the current child boot.
+
+The independent identity binding also passed. WMI bound that exact L2 id to nested `vmwp` PID
+4124. A bounded handle census found one identity-bound VID candidate (`ERROR_ACCESS_DENIED` when
+duplicated, as the earlier qualified probe requires); CDB attached to that exact process, called
+`vid!VidGetHvPartitionId` in-process on source handle `0x2c0`, and received partition `0x2`.
+It restored the one-byte return breakpoint, detached, left no CDB process or staging directory,
+and both K3 and L2 retained heartbeat `OK`. The record is
+`target/codex-m7/m7-l2-binding.json`. The command-line startup handle `0x334` was tested and
+correctly rejected by VID; it is not used as a partition identity.
+
+**The first provider-qualification control passed on 2026-10-24.** On parent boot
+`2026-10-24T09:08:18.5667664Z` and child boot `2026-10-24T09:32:31.5773667Z`, the provider ran
+inside K3 against the exact nested PID/handle/partition chain above. With only L2 paused, it read
+VTL1 CR3 `0x1e381000`, RIP `0xfffff80509560035`, found the pinned Secure Kernel image at
+`0xfffff8050fb1a000`, matched its PE identity and all seven manifest byte guards, and produced
+identical complete register snapshots before and after with `writes: 0`. It resumed L2, removed
+the temporary H3/hvmm services and runtime staging, and left both heartbeats `OK`. The record is
+`target/codex-m7/m7-provider-readonly.json`. This passes only the read-only subgate; it is not the
+arm/event/restoration qualification.
+
 Refinement proceeds as three separately gated phases:
 
-1. **Provider choice.** Either prove a supported nested-root mechanism that can read and restore
-   the complete M6 register/event state, or use a separate debugger machine to observe the L0
-   hypervisor while K3 remains non-nested. A proposal must bind its observation to the exact K3
-   partition and boot before any mutation test. Cross-boot joins and raw VMCS parsing remain
-   forbidden.
-2. **Provider qualification.** A read-only RIP/CR3 positive control comes first. Then reproduce
-   M6's arm, held-event, reverse restoration, provider-death and three-clean-boot controls through
-   the chosen boundary. Access denied, unavailable state, identity ambiguity or incomplete
+1. **Provider choice: passed.** Use the nested L2 workload and run M6's provider in its K3 parent.
+   The parent/child ids, both boots, nested `vmwp`, identity-bound VID handle and H3 partition id
+   are one required chain. The external-L0 design remains an unqualified fallback, not a second
+   active path. Cross-boot joins and raw VMCS parsing remain forbidden.
+2. **Provider qualification: in progress.** The read-only L2 RIP/CR3, exact-image and manifest-
+   guard control passed. Next reproduce M6's no-op debug-register round trip, then its arm,
+   held-event, reverse restoration, provider-death and three-clean-boot controls through the
+   nested-parent boundary. Access denied, unavailable state, identity ambiguity or incomplete
    restoration fails the phase; none may be converted to coordinate-only for semantic tracing.
-3. **Idle coexistence.** Only after phase 2 may the transaction open M5 -> M4 -> M6 on one boot,
-   arm all three without a workload, drain in reverse order and prove byte/register baselines,
-   heartbeat, unchanged boot/`vmwp` and zero retained processes. Failure/timeout injection remains
-   part of this gate. M7.2 stays closed until this exact live control passes.
+3. **Idle coexistence.** Only after phase 2 may the transaction open M5 -> M4 -> M6 in one live
+   parent/child topology, arm all three without a workload, drain in reverse order and prove
+   byte/register baselines, both heartbeats, unchanged boots/`vmwp` processes and zero retained
+   processes. Failure/timeout injection remains part of this gate. M7.2 stays closed until this
+   exact live control passes.
 
 #### M7.2 — deterministic join
 
