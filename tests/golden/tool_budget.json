@@ -276,8 +276,8 @@
       "inputSchema": 656,
       "modelVisible": 1567,
       "name": "hv_transition_trace",
-      "outputSchema": 2966,
-      "wire": 4696
+      "outputSchema": 3265,
+      "wire": 4995
     },
     {
       "annotations": 131,
@@ -285,8 +285,8 @@
       "inputSchema": 326,
       "modelVisible": 702,
       "name": "hv_transition_trace_read",
-      "outputSchema": 5052,
-      "wire": 5916
+      "outputSchema": 6142,
+      "wire": 7006
     },
     {
       "annotations": 120,
@@ -546,8 +546,8 @@
       "inputSchema": 764,
       "modelVisible": 1691,
       "name": "sk_call_trace",
-      "outputSchema": 2768,
-      "wire": 4620
+      "outputSchema": 3067,
+      "wire": 4919
     },
     {
       "annotations": 129,
@@ -555,8 +555,8 @@
       "inputSchema": 503,
       "modelVisible": 936,
       "name": "sk_call_trace_read",
-      "outputSchema": 4458,
-      "wire": 5554
+      "outputSchema": 4829,
+      "wire": 5925
     },
     {
       "annotations": 127,
@@ -672,8 +672,8 @@
       "inputSchema": 1171,
       "modelVisible": 1548,
       "name": "sk_service_trace",
-      "outputSchema": 3435,
-      "wire": 5143
+      "outputSchema": 3734,
+      "wire": 5442
     },
     {
       "annotations": 134,
@@ -681,8 +681,8 @@
       "inputSchema": 540,
       "modelVisible": 893,
       "name": "sk_service_trace_read",
-      "outputSchema": 8752,
-      "wire": 9810
+      "outputSchema": 9123,
+      "wire": 10181
     },
     {
       "annotations": 129,
@@ -799,10 +799,10 @@
     "inputSchema": 80365,
     "instructions": 2022,
     "modelVisible": 136123,
-    "outputSchema": 254070,
-    "payload": 402689,
+    "outputSchema": 256799,
+    "payload": 405418,
     "tools": 88,
-    "wire": 402590,
+    "wire": 405319,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10296
   }

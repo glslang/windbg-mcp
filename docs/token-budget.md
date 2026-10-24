@@ -406,6 +406,13 @@ None of these is a bug. They are recorded because they were invisible, and
    leaving 1,877 B (1.4%), and the wire ceiling moves from 395,000 to **410,000 B**, leaving 7,311
    B (1.8%). No description or result field was removed to fit the previous ceilings.
 
+   M7.0 adds optional high-resolution QPC samples to the existing M4, M5 and M6 arm/read envelopes
+   and events, plus typed guest-state availability on M5's VMCS coordinates. It adds **0
+   model-visible bytes** because no tool description or input changed, and **2,729 payload bytes**
+   across the six existing output schemas: the surface remains **88 tools and 136,123 B** to the
+   model while the payload moves **402,689 → 405,418 B**. The existing 138,000 and 410,000
+   ceilings therefore remain fixed, with 1,877 B (1.4%) and 4,582 B (1.1%) headroom respectively.
+
    **The two tables do not reconcile, and that is the point of item 41.** The first is each group's
    share of the whole surface; the second is what a spec actually serves, which is less — `crash`
    is 20,515 rather than the 21,681 its two rows sum to, because the cross-references leave with
