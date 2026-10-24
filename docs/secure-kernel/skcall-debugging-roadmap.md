@@ -577,8 +577,11 @@ Status: in progress. M6's live exit gate and M7.0 are complete. M7.1's offline t
 line-protocol and live-topology admission gates are complete, its provider-choice gate selected a
 nested L2 workload under K3, and the nested-parent provider is qualified: the read-only, no-op
 write, arm/restore and natural held-event controls, the provider-death control and the complete
-positive sequence on three clean child boots all passed. The live coexistence exit gate remains,
-and it needs an admitted-topology driver that does not exist yet, so M7.2 remains closed.
+positive sequence on three clean child boots all passed. The admitted-topology coexistence driver
+exists and opened and armed all three layers once; the live coexistence exit gate is blocked on
+the transaction's arm order, which armed the hypervisor first and drained it last although a
+stopped hypervisor is unreachable from every layer beneath it. The order is inverted in the tree
+and the live control has not been rerun under it, so M7.2 remains closed.
 
 Join M4–M6 without putting two targets in one DbgEng process. The coordinator owns session ids and
 lifecycles, not engines: each layer remains in its existing worker and contributes an immutable
@@ -660,8 +663,10 @@ guest harness, then proves the same boot, heartbeat, breakpoint bytes, debug-reg
 zero retained processes.
 
 **M7.1 implementation result, 2026-10-24: offline passed; live incomplete.** The pure transaction
-runner now owns the seven states above, fixes the arm order as M5 hypervisor -> M4 VTL0 -> M6
-VTL1, withholds the workload until all three acknowledgements say they are ready, and drains
+runner now owns the seven states above, fixes the arm order as M4 VTL0 -> M6 VTL1 -> M5
+hypervisor (inverted the same evening from M5 first, after the live run recorded under M7.1a
+showed that a stopped hypervisor holds every layer beneath it), withholds the workload until all
+three acknowledgements say they are ready, and drains
 successful arms in reverse order before ending every reachable session. Its driver has no
 force-kill operation. Failed and timed-out opens retain a public recovery session handle when one
 was returned, so that handle is ended exactly once rather than being mistaken for an unopened
@@ -826,29 +831,66 @@ Refinement proceeds as three separately gated phases:
    clean child boots through the nested-parent boundary all passed, as recorded above. Access
    denied, unavailable state, identity ambiguity or incomplete restoration would have failed the
    phase; none was converted to coordinate-only for semantic tracing.
-3. **Idle coexistence: open, unrun.** Phase 2 is satisfied, so the transaction may open
-   M5 -> M4 -> M6 in one live parent/child topology, arm all three without a workload, drain in
-   reverse order and prove byte/register baselines, both heartbeats, unchanged boots/`vmwp`
-   processes and zero retained processes. Failure/timeout injection remains part of this gate.
-   M7.2 stays closed until this exact live control passes.
+3. **Idle coexistence: attempted, blocked.** Phase 2 is satisfied, and the transaction opened
+   and armed M5 -> M4 -> M6 in one live parent/child topology on 2026-10-24 before M5's trace cap
+   froze the parent and child (recorded below). It must still arm all three without a workload,
+   drain in reverse order and prove byte/register baselines, both heartbeats, unchanged
+   boots/`vmwp` processes and zero retained processes, with failure/timeout injection. M7.2 stays
+   closed until this exact live control passes.
+
+**The admitted-topology driver exists and ran, 2026-10-24 evening; the gate is blocked by the
+protocol's arm order, not by the topology or by the trace.** `target/codex-m7/run-m7-nested-coexistence.py` drives M5
+over `k3-hypervisor` and M4 over a new `l2-nt` profile from the host server, and M6 through the
+K3-hosted listener, under the same `--m7-transaction-protocol` process. Its wiring is recorded
+in `m7-nested-kd-wiring.json`, `m7-k3-boot-repair.json` and `m7-l2-kdnet.json`: both of K3's
+KDNET host IPs and the child's point at the host's current switch address, which moves on every
+host boot, so `configure-m7-l2-kdnet.ps1` reapplies the child's wiring after each reset. Three
+measurements along the way decide how the driver must behave:
+
+- A `continue_async` issued straight after `attach_kernel` on the nested hypervisor is
+  acknowledged and does not resume K3: heartbeat `Lost Communication`, PowerShell Direct dead,
+  guest clock unreadable, both NICs silent, with and without a child running
+  (`m7-m5-network-effect-with-l2.json`, `-without-l2.json`). A 5 s bounded run whose break-in is
+  collected at the bound, followed by the real run, leaves K3 running with heartbeat `OK` and
+  its clock advancing while the session stays open. That is the cycle the M5 qualification runner
+  used; the coordinator now performs it in `settle_hypervisor` before M5's bounded run. The
+  first nested run, taken before this was measured, parked M4's attach for its 300 s bound and
+  left the child at a KD break; a serial-pipe transport for M5 was tried on that misreading, its
+  attach parked, and the `kd.exe` probe against the pipe hung this bench. The serial path is
+  removed and rejected.
+- With M5 settled and running, `l2-nt` lands in 1.7 s and releases cleanly while the hypervisor
+  session is open (`m7-hv-coexistence-probe.json`).
+- In the full run `live-coexistence/20261024T190156/`, preflight, all three opens and the M5 and
+  M4 arms succeeded. M5's trace then retained its 1,024-transition cap in 2.09 s, 512 calls and
+  512 returns at about 490 transitions per second on an idle child, and `hv_transition_trace`
+  stops the hypervisor at the event that reaches `max_transitions`, whose largest accepted value
+  is 1,024. K3 and L2 froze about two seconds after M5 was armed and resumed: M6's arm could not
+  reach the child to register its trigger, M4's break-in never arrived inside its 60 s wait, and
+  M4 ended unresolved. The protocol closed M5 and M6 cleanly and reported the M4 child unsafe,
+  which is the specified behaviour. The child was released afterwards by a fresh attach and
+  `end_session`, and the lab audited clean. The stop itself is by design: a hypervisor held by
+  its debugger holds every partition under it, so nothing beneath M5 can be armed, drained or
+  reached while M5 is stopped. The transaction arms M5 first and drains it last, which is the
+  one order that cannot work; the trace cap is only where that stop first landed.
 
 Continuation order from this checkpoint:
 
-1. Build the admitted-topology coexistence driver. `run-m7-coexistence.py` still targets the
-   K3-root shape, with M4 on `k3-nt`, M5 on `k3-hypervisor` and M6 on the host-side dispatcher
-   profile, which the admission gate refuses. The selected topology needs two things it does not
-   have: an NT KDNET profile for the L2 child that is routable from the host (the host's catalog
-   on 2026-10-24 holds `ctf-vm`, `k3-hypervisor`, `k3-nt`, `lab-hypervisor` and `lab-nt`, none of
-   them reaching the child), measured in the child with `bcdedit /dbgsettings` and from the host
-   as the UDP path, and a coordinator that
-   drives the M6 layer through the K3-hosted listener while M4 and M5 run on the host server,
-   holding the two endpoints' session ids separately. Preflight must bind the child boot and the
-   parent boot that owns its `vmwp`, exactly as the provider runs above do.
-2. Run M7.1's idle live transaction in that topology: open and arm M5 -> M4 -> M6, launch no
-   workload, drain M6 -> M4 -> M5, then repeat the relevant failure and timeout injections. The
-   gate requires unchanged identities and byte/register baselines, healthy parent and child, and
-   no retained process. Any Hyper-V management query of the child while a layer holds its `vmwp`
-   must be bounded, for the reason the provider-death control measured.
+1. **Done, 2026-10-24 evening.** The transaction arms M4 VTL0, then M6 VTL1, then M5 hypervisor
+   immediately before the workload, and drains M5 first, reading its trace while the hypervisor
+   is stopped and then resuming it before M6 and M4 are drained and before any session is ended.
+   `ARM_ORDER` and its rationale in `src/skcorrelate.rs` moved, with the offline tests that pin
+   the order and the reverse restoration (the 14 unit controls and the two engine-free protocol
+   smoke tests pass), the M7.1 changelog entry, and the driver's recorded order and M5 drain,
+   which now resumes the hypervisor after its read. Opening follows the same order, so the
+   hypervisor is attached and settled last, beside sessions that hold nothing a brief stop can
+   disturb. The cap stays as it is: on an idle child it is reached about 2 s after
+   M5 is armed and becomes M5's drain point, and for M7.2 it is the latency budget inside which
+   the workload must land, a measurement for that gate rather than a coexistence blocker.
+2. Then rerun `run-m7-nested-coexistence.ps1`: open all three, arm M4 -> M6 -> M5, launch no
+   workload, drain M5 -> M6 -> M4, and repeat the relevant failure and timeout injections. The gate requires
+   unchanged identities and byte/register baselines, healthy parent and child, and no retained
+   process. Any Hyper-V management query of the child while a layer holds its `vmwp` must be
+   bounded, for the reason the provider-death control measured.
 3. Only after that live coexistence result is recorded may M7.2 implement and qualify the
    deterministic join below.
 

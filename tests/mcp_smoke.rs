@@ -274,18 +274,18 @@ fn m7_transaction_protocol_owns_order_and_reverse_cleanup() {
         operations,
         [
             "preflight:",
-            "open:m5_hypervisor",
             "open:m4_vtl0",
             "open:m6_vtl1",
-            "arm:m5_hypervisor",
+            "open:m5_hypervisor",
             "arm:m4_vtl0",
             "arm:m6_vtl1",
+            "arm:m5_hypervisor",
+            "drain:m5_hypervisor",
             "drain:m6_vtl1",
             "drain:m4_vtl0",
-            "drain:m5_hypervisor",
+            "end_session:m5_hypervisor",
             "end_session:m6_vtl1",
             "end_session:m4_vtl0",
-            "end_session:m5_hypervisor",
         ]
     );
 }
@@ -315,7 +315,7 @@ fn m7_transaction_protocol_ends_a_timed_out_open_when_it_has_a_handle() {
         let attempt = match operation {
             "preflight" => json!({"status": "succeeded", "value": m7_identity()}),
             "open" => {
-                assert_eq!(layer, "m5_hypervisor");
+                assert_eq!(layer, "m4_vtl0");
                 json!({
                     "status": "timed_out",
                     "timeout_ms": 300_000,
@@ -323,7 +323,7 @@ fn m7_transaction_protocol_ends_a_timed_out_open_when_it_has_a_handle() {
                 })
             }
             "end_session" => {
-                assert_eq!(layer, "m5_hypervisor");
+                assert_eq!(layer, "m4_vtl0");
                 assert_eq!(request["session"]["session_id"], "sess-recovery");
                 json!({
                     "status": "succeeded",
@@ -348,14 +348,10 @@ fn m7_transaction_protocol_ends_a_timed_out_open_when_it_has_a_handle() {
         String::from_utf8_lossy(&completed.stderr)
     );
     assert_eq!(report["verdict"], "incomplete");
-    assert_eq!(report["cleanup_order"], json!(["m5_hypervisor"]));
+    assert_eq!(report["cleanup_order"], json!(["m4_vtl0"]));
     assert_eq!(
         operations,
-        [
-            "preflight:",
-            "open:m5_hypervisor",
-            "end_session:m5_hypervisor",
-        ]
+        ["preflight:", "open:m4_vtl0", "end_session:m4_vtl0"]
     );
 }
 
