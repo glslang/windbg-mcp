@@ -169,6 +169,17 @@ fn longest_quiet_call(call_timeout: Duration) -> Duration {
 /// How often the SSE stream says it is still there while a call runs quietly.
 const SSE_KEEP_ALIVE: Duration = Duration::from_secs(15);
 
+/// rmcp defaults its DNS-rebinding allowlist to loopback. Preserve that protection while allowing
+/// the exact interface this listener was explicitly told to expose.
+fn http_config(addr: SocketAddr) -> StreamableHttpServerConfig {
+    let mut config = StreamableHttpServerConfig::default();
+    let bound_host = addr.ip().to_string();
+    if !config.allowed_hosts.contains(&bound_host) {
+        config.allowed_hosts.push(bound_host);
+    }
+    config.with_sse_keep_alive(Some(SSE_KEEP_ALIVE))
+}
+
 /// How often the sweeper looks for a lease that has run out. Fine enough that a released target is
 /// released promptly, coarse enough to cost nothing while idle.
 const SWEEP: Duration = Duration::from_secs(5);
@@ -764,7 +775,7 @@ pub async fn serve(
             manager.clone(),
             // A tool call can be quiet for minutes; without a keep-alive the stream looks idle to
             // anything between the two machines and gets collected.
-            StreamableHttpServerConfig::default().with_sse_keep_alive(Some(SSE_KEEP_ALIVE)),
+            http_config(addr),
         ))
     };
 
@@ -1223,6 +1234,24 @@ mod tests {
     }
 
     const CALL: Duration = Duration::from_secs(300);
+
+    /// rmcp 3.5 tightened its default Host-header allowlist to loopback. A host-only adapter is an
+    /// intentional supported bind here, so its exact IP joins the defaults without opening the
+    /// guard to arbitrary Host values.
+    #[test]
+    fn a_non_loopback_bind_allows_its_exact_host_and_keeps_loopback() {
+        let config = http_config("172.23.162.152:38761".parse().unwrap());
+
+        assert!(
+            config
+                .allowed_hosts
+                .iter()
+                .any(|host| host == "172.23.162.152")
+        );
+        assert!(config.allowed_hosts.iter().any(|host| host == "localhost"));
+        assert!(config.allowed_hosts.iter().any(|host| host == "127.0.0.1"));
+        assert!(config.allowed_hosts.iter().any(|host| host == "::1"));
+    }
 
     /// A grace comfortably past the opener's end-to-end bound.
     fn lease() -> For {
