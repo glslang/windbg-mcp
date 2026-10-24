@@ -588,9 +588,14 @@ impl Layer {
     }
 }
 
-/// M5 is armed first because it is the lowest layer; M6 is armed last and therefore restored
-/// first, before either lower layer it depends on is released.
-pub(crate) const ARM_ORDER: [Layer; 3] = [Layer::M5Hypervisor, Layer::M4Vtl0, Layer::M6Vtl1];
+/// The hypervisor is armed last and drained first. A hypervisor held by its debugger holds every
+/// partition beneath it, so nothing under M5 can be opened, armed, drained or ended while M5 is
+/// stopped: M4 and M6 are put in place while the hypervisor runs, M5 is armed immediately before
+/// the workload, and the reverse order drains and releases M5 first, which is what makes the
+/// hypervisor run again for the drains and ends beneath it. Measured 2026-10-24 with the order the
+/// other way round: M5's trace reached its cap two seconds after arming and froze the parent and
+/// child before M6 could register its trigger or M4 could break in.
+pub(crate) const ARM_ORDER: [Layer; 3] = [Layer::M4Vtl0, Layer::M6Vtl1, Layer::M5Hypervisor];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -1968,7 +1973,7 @@ mod tests {
         assert_eq!(report.successful_arm_order, ARM_ORDER);
         assert_eq!(
             report.cleanup_order,
-            [Layer::M6Vtl1, Layer::M4Vtl0, Layer::M5Hypervisor]
+            [Layer::M5Hypervisor, Layer::M6Vtl1, Layer::M4Vtl0]
         );
         assert_eq!(report.workload, WorkloadResult::SkippedIdle);
         assert!(!driver.calls.contains(&Operation::Workload));
@@ -2149,21 +2154,20 @@ mod tests {
 
     #[test]
     fn arm_time_identity_drift_still_restores_every_instrument_that_was_acknowledged() {
+        // Drift at the second layer: the one before it armed cleanly and the one after it must
+        // stay untouched, so both halves of "every acknowledged instrument" are exercised.
         let mut driver = MockDriver::new();
-        driver.drift_at_arm = Some(Layer::M4Vtl0);
+        driver.drift_at_arm = Some(Layer::M6Vtl1);
         let report = run_transaction(plan(true), &mut driver);
         assert_eq!(report.verdict, TransactionVerdict::Incomplete);
-        assert_eq!(
-            report.successful_arm_order,
-            [Layer::M5Hypervisor, Layer::M4Vtl0]
-        );
+        assert_eq!(report.successful_arm_order, [Layer::M4Vtl0, Layer::M6Vtl1]);
         assert_eq!(
             report.cleanup_order,
-            [Layer::M4Vtl0, Layer::M5Hypervisor, Layer::M6Vtl1]
+            [Layer::M6Vtl1, Layer::M4Vtl0, Layer::M5Hypervisor]
         );
         assert!(report.layers.m4_vtl0.restoration.is_some());
-        assert!(report.layers.m5_hypervisor.restoration.is_some());
-        assert!(report.layers.m6_vtl1.arm.is_none());
+        assert!(report.layers.m6_vtl1.restoration.is_some());
+        assert!(report.layers.m5_hypervisor.arm.is_none());
         assert!(!driver.calls.contains(&Operation::Workload));
     }
 }

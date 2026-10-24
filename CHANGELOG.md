@@ -26,7 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **M7.1 adds an engine-free three-worker transaction coordinator without adding an MCP tool.** A
   typed line protocol keeps the live adapter on the public MCP surface while the pure Rust runner
-  owns preflight, opening, fixed M5 -> M4 -> M6 arm order, workload admission, reverse drain,
+  owns preflight, opening, a fixed M4 -> M6 -> M5 arm order that arms the hypervisor last and
+  drains it first because a stopped hypervisor holds every layer beneath it, workload admission, reverse drain,
   session restoration and the final verdict. Failure/timeout injection covers every operation;
   unsafe running, held, dropped, unreadable or unrestored child state cannot pass. Failed opens
   retain and clean up a public recovery handle when one is available, and no coordinator path can
