@@ -142,6 +142,209 @@ fn two_processes_share_an_ordered_high_resolution_clock_despite_legacy_collision
     );
 }
 
+fn m7_binding(profile: &str, digit: char) -> Value {
+    json!({
+        "profile": profile,
+        "image_identity_sha256": digit.to_string().repeat(64),
+    })
+}
+
+fn m7_identity() -> Value {
+    json!({
+        "schema": "windbg-mcp.sk-correlation-capture.v1",
+        "capture_id": "capture-smoke-0001",
+        "vm_id": "6b1ed0f6-137e-469f-aeab-a3f4cfee398d",
+        "guest_boot_identity": "2026-10-24T08:00:00.0000000Z",
+        "vmwp_pid": 4242,
+        "workload_label": "m7-smoke-idle",
+        "processor_count": 1,
+        "layers": {
+            "m4_vtl0": m7_binding("k3-nt", 'a'),
+            "m5_hypervisor": m7_binding("k3-hypervisor", 'b'),
+            "m6_vtl1": m7_binding("k3-vtl1", 'c'),
+        },
+    })
+}
+
+#[test]
+fn m7_transaction_protocol_owns_order_and_reverse_cleanup() {
+    let identity = m7_identity();
+    let mut child = Command::new(EXE)
+        .args(["--m7-transaction-protocol", "--m7-max-skew-ticks=1000"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start engine-free M7 coordinator");
+    let mut input = child.stdin.take().unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap());
+    let mut operations = Vec::new();
+    let mut tick = 10_000_u64;
+    let report = loop {
+        let mut line = String::new();
+        assert_ne!(
+            output.read_line(&mut line).unwrap(),
+            0,
+            "M7 coordinator closed"
+        );
+        let request: Value = serde_json::from_str(&line).expect("M7 emits JSON lines");
+        if request["schema"] == "windbg-mcp.sk-correlation-transaction.v1" {
+            break request;
+        }
+        assert_eq!(request["schema"], "windbg-mcp.m7-transaction-protocol.v1");
+        let operation = request["operation"].as_str().unwrap();
+        let layer = request["layer"].as_str().unwrap_or("");
+        operations.push(format!("{operation}:{layer}"));
+        let value = match operation {
+            "preflight" => identity.clone(),
+            "open" => json!({"session_id": format!("sess-{layer}")}),
+            "arm" => {
+                let bracket = json!({
+                    "layer": layer,
+                    "operation": "arm",
+                    "coordinator_before": {"tick": tick, "frequency": 10_000_000},
+                    "worker": {"tick": tick + 10, "frequency": 10_000_000},
+                    "coordinator_after": {"tick": tick + 20, "frequency": 10_000_000},
+                });
+                tick += 100;
+                json!({
+                    "trace_id": format!("trace-{layer}"),
+                    "workload_ready": true,
+                    "identity": identity,
+                    "clock": bracket,
+                })
+            }
+            "drain" => {
+                let bracket = json!({
+                    "layer": layer,
+                    "operation": "drain",
+                    "coordinator_before": {"tick": tick, "frequency": 10_000_000},
+                    "worker": {"tick": tick + 10, "frequency": 10_000_000},
+                    "coordinator_after": {"tick": tick + 20, "frequency": 10_000_000},
+                });
+                tick += 100;
+                json!({
+                    "audit": {
+                        "restored": true,
+                        "running": false,
+                        "held": false,
+                        "dropped_records": 0,
+                        "dropped_bytes": 0,
+                        "unreadable_fields": 0,
+                    },
+                    "clock": bracket,
+                })
+            }
+            "end_session" => json!({"ended": true, "retained_processes": 0}),
+            other => panic!("unexpected idle M7 operation {other}"),
+        };
+        let response = json!({
+            "schema": "windbg-mcp.m7-transaction-protocol-response.v1",
+            "sequence": request["sequence"],
+            "attempt": {"status": "succeeded", "value": value},
+        });
+        writeln!(input, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+        input.flush().unwrap();
+    };
+    drop(input);
+    let completed = child.wait_with_output().unwrap();
+    assert!(
+        completed.status.success(),
+        "M7 coordinator failed: {}",
+        String::from_utf8_lossy(&completed.stderr)
+    );
+    assert_eq!(report["verdict"], "pass");
+    assert_eq!(report["state"], "closed");
+    assert_eq!(report["clock"]["value"]["mode"], "point");
+    assert_eq!(
+        operations,
+        [
+            "preflight:",
+            "open:m5_hypervisor",
+            "open:m4_vtl0",
+            "open:m6_vtl1",
+            "arm:m5_hypervisor",
+            "arm:m4_vtl0",
+            "arm:m6_vtl1",
+            "drain:m6_vtl1",
+            "drain:m4_vtl0",
+            "drain:m5_hypervisor",
+            "end_session:m6_vtl1",
+            "end_session:m4_vtl0",
+            "end_session:m5_hypervisor",
+        ]
+    );
+}
+
+#[test]
+fn m7_transaction_protocol_ends_a_timed_out_open_when_it_has_a_handle() {
+    let mut child = Command::new(EXE)
+        .args(["--m7-transaction-protocol", "--m7-max-skew-ticks=1000"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start engine-free M7 coordinator");
+    let mut input = child.stdin.take().unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap());
+    let mut operations = Vec::new();
+    let report = loop {
+        let mut line = String::new();
+        assert_ne!(output.read_line(&mut line).unwrap(), 0, "M7 closed early");
+        let request: Value = serde_json::from_str(&line).expect("M7 emits JSON lines");
+        if request["schema"] == "windbg-mcp.sk-correlation-transaction.v1" {
+            break request;
+        }
+        let operation = request["operation"].as_str().unwrap();
+        let layer = request["layer"].as_str().unwrap_or("");
+        operations.push(format!("{operation}:{layer}"));
+        let attempt = match operation {
+            "preflight" => json!({"status": "succeeded", "value": m7_identity()}),
+            "open" => {
+                assert_eq!(layer, "m5_hypervisor");
+                json!({
+                    "status": "timed_out",
+                    "timeout_ms": 300_000,
+                    "recovery": {"session_id": "sess-recovery"},
+                })
+            }
+            "end_session" => {
+                assert_eq!(layer, "m5_hypervisor");
+                assert_eq!(request["session"]["session_id"], "sess-recovery");
+                json!({
+                    "status": "succeeded",
+                    "value": {"ended": true, "retained_processes": 0},
+                })
+            }
+            other => panic!("unexpected recovery operation {other}"),
+        };
+        let response = json!({
+            "schema": "windbg-mcp.m7-transaction-protocol-response.v1",
+            "sequence": request["sequence"],
+            "attempt": attempt,
+        });
+        writeln!(input, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+        input.flush().unwrap();
+    };
+    drop(input);
+    let completed = child.wait_with_output().unwrap();
+    assert!(
+        completed.status.success(),
+        "M7 coordinator failed: {}",
+        String::from_utf8_lossy(&completed.stderr)
+    );
+    assert_eq!(report["verdict"], "incomplete");
+    assert_eq!(report["cleanup_order"], json!(["m5_hypervisor"]));
+    assert_eq!(
+        operations,
+        [
+            "preflight:",
+            "open:m5_hypervisor",
+            "end_session:m5_hypervisor",
+        ]
+    );
+}
+
 /// Per-request budget for protocol-tier calls. Generous enough that a loaded CI runner never
 /// trips it, bounded so a regression fails instead of hanging the suite.
 const STEP: Duration = Duration::from_secs(60);
