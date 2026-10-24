@@ -51,7 +51,9 @@
 //! <- (any number of lines the provider prints while starting)
 //! <- windbg-mcp-gpa/1
 //! -> SHAPE
-//! <- SHAPE cr3=0x1201000 vtl_enabled=1 paging=long cr0=0x80050033 cr4=0x350ef8 efer=0xd01 kernel_base=0xfffff8072007a000 max_read=4096
+//! <- SHAPE cr3=0x1201000 vtl_enabled=1 paging=long cr0=0x80050033 cr4=0x350ef8 efer=0xd01 kernel_base=0xfffff8072007a000 max_read=4096 read_coherency=explicit_refresh
+//! -> REFRESH
+//! <- OK 0
 //! -> READ 0xCD12DF 16
 //! <- OK 16
 //! <- <16 raw bytes>
@@ -77,6 +79,12 @@
 //! second is the provider's explicit promise that a write made while the controller owns a
 //! VM-wide pause is visible to instruction fetch after resume. Startup policy is a separate gate:
 //! transport capability cannot authorize itself.
+//!
+//! A transport that caches physical pages may advertise `read_coherency=explicit_refresh`. Before
+//! reading a newly retained stop, the live controller sends `REFRESH` and requires `OK 0`. M6
+//! refuses a source without this capability: a cache that was sound for immutable image guards
+//! returned old contents for a reused Secure Kernel request page, which made the guarded
+//! `SkmmCreateEnclave` path appear to carry a different service number.
 //!
 //! The four status words are the four [`sk::ReadFailure`] variants, and keeping them distinct is the
 //! whole point of the trait: a source that collapsed them would produce silent zeros exactly where
@@ -163,6 +171,8 @@ pub(crate) struct ShapeReply {
     pub(crate) max_read: usize,
     pub(crate) max_write: Option<usize>,
     pub(crate) instruction_writes_coherent: bool,
+    /// Reads become a fresh stop-scoped view after an acknowledged `REFRESH` exchange.
+    pub(crate) explicit_refresh: bool,
     /// Secure Kernel's live virtual image base when the provider can name it. It is transport
     /// evidence only until the caller reads and validates the PE at this address.
     pub(crate) kernel_base: Option<u64>,
@@ -446,6 +456,30 @@ impl<R: BufRead, W: Write> Transport<R, W> {
         }
     }
 
+    fn refresh_until_cancelled(&mut self, deadline: Instant, cancelled: CancelCheck) -> Result<()> {
+        self.bounded_until_cancelled(Some(deadline), Some(cancelled), Self::refresh_inner)
+    }
+
+    fn refresh_inner(&mut self) -> Result<()> {
+        self.send("REFRESH\n", &[])?;
+        let line = self.line()?;
+        let status = parse_status(&line, 0)
+            .inspect_err(|failure| {
+                if framing_fault(failure) {
+                    self.poisoned = true;
+                }
+            })
+            .map_err(|failure| anyhow::anyhow!("physical-read refresh failed: {failure:?}"))?;
+        match status {
+            Some(0) => Ok(()),
+            Some(count) => {
+                self.poisoned = true;
+                bail!("transport reported {count} bytes for a zero-byte refresh")
+            }
+            None => unreachable!("parse_status returns Err for every non-OK status"),
+        }
+    }
+
     /// One line of the transport's output, bounded.
     ///
     /// **The bound is on the line's length as well as on the number of lines**, because
@@ -631,6 +665,10 @@ pub(crate) fn parse_shape(line: &str) -> Result<ShapeReply> {
                 "instruction_coherent" => instruction_writes_coherent = true,
                 other => bail!("write_coherency must be instruction_coherent, got {other:?}"),
             },
+            "read_coherency" => match value {
+                "explicit_refresh" => reply.explicit_refresh = true,
+                other => bail!("read_coherency must be explicit_refresh, got {other:?}"),
+            },
             "vtl_enabled" => {
                 reply.shape.vtl_enabled = Some(match value {
                     "1" => true,
@@ -773,6 +811,7 @@ pub(crate) struct LiveSource {
     max_read: usize,
     max_write: Option<usize>,
     instruction_writes_coherent: bool,
+    explicit_refresh: bool,
     kernel_base: Option<u64>,
 }
 
@@ -835,6 +874,7 @@ impl LiveSource {
             max_read: 1,
             max_write: None,
             instruction_writes_coherent: false,
+            explicit_refresh: false,
             kernel_base: None,
         };
         source.handshake()?;
@@ -857,6 +897,7 @@ impl LiveSource {
         self.max_read = reply.max_read;
         self.max_write = reply.max_write;
         self.instruction_writes_coherent = reply.instruction_writes_coherent;
+        self.explicit_refresh = reply.explicit_refresh;
         self.kernel_base = reply.kernel_base;
         Ok(())
     }
@@ -870,6 +911,10 @@ impl LiveSource {
         self.instruction_writes_coherent
             .then_some(self.max_write)
             .flatten()
+    }
+
+    pub(crate) fn explicit_refresh_capability(&self) -> bool {
+        self.explicit_refresh
     }
 }
 
@@ -960,6 +1005,17 @@ impl LiveSource {
             Some(transport) => {
                 transport.write_chunk_until_cancelled(gpa, bytes, deadline, cancelled)
             }
+            None => bail!("the transport has already been closed"),
+        }
+    }
+
+    pub(crate) fn refresh_until_cancelled(
+        &self,
+        deadline: Instant,
+        cancelled: CancelCheck,
+    ) -> Result<()> {
+        match self.transport.borrow_mut().as_mut() {
+            Some(transport) => transport.refresh_until_cancelled(deadline, cancelled),
             None => bail!("the transport has already been closed"),
         }
     }
@@ -1226,12 +1282,33 @@ mod tests {
         assert_eq!(reply.max_read, 4096);
         assert_eq!(reply.max_write, None);
         assert!(!reply.instruction_writes_coherent);
+        assert!(!reply.explicit_refresh);
         assert_eq!(reply.shape.cr3, Some(0x1201000));
         assert_eq!(reply.shape.cr0, Some(0x8005_0033));
         assert_eq!(reply.shape.vtl_enabled, Some(true));
         assert_eq!(reply.shape.paging_mode, Some(PagingMode::Long));
         assert_eq!(reply.kernel_base, Some(0xffff_f807_2007_a000));
         assert!(reply.shape.unreadable.is_empty());
+    }
+
+    #[test]
+    fn explicit_refresh_is_advertised_and_acknowledged_as_a_zero_byte_exchange() {
+        let reply = parse_shape("SHAPE max_read=4096 read_coherency=explicit_refresh").unwrap();
+        assert!(reply.explicit_refresh);
+
+        let mut transport = exchange("OK 0\n");
+        transport.refresh_inner().unwrap();
+        assert_eq!(transport.writer, b"REFRESH\n");
+        assert!(!transport.poisoned);
+    }
+
+    #[test]
+    fn unknown_read_coherency_is_refused_instead_of_assumed_fresh() {
+        let error = parse_shape("SHAPE max_read=4096 read_coherency=eventual").unwrap_err();
+        assert!(
+            error.to_string().contains("must be explicit_refresh"),
+            "{error:#}"
+        );
     }
 
     #[test]

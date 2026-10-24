@@ -337,7 +337,8 @@ and no debugger process remained.
 
 ### M6 — VTL1 semantic tracer
 
-Status: in progress; M6.0 passed on 2026-10-22 and the offline M6.1 recorder contract is complete.
+Status: complete as of 2026-10-24. M6.0 through M6.3, including the three-clean-boot matrix and
+every live and offline control, have passed.
 
 Resolve and stop at `IumInvokeSecureService`, one selected dispatch target and its measured return
 site(s). Decode the SSCN/service number, bounded input/output buffers and status using exact-build
@@ -427,12 +428,12 @@ boundaries, retain bytes only after the complete bounded read succeeds, and othe
 named failure. Event capacity drops whole records, byte capacity counts the whole dropped capture,
 and a zero-byte budget still permits metadata-only records.
 
-Sixteen offline tests pin schema round trips and integer widths, the 0/4,096-byte endpoints,
+Offline tests pin schema round trips and integer widths, the 0/4,096-byte endpoints,
 page-boundary, short and unreadable reads, immutable-prefix behavior, non-selected traffic,
 nested/repeated/out-of-order phases, stale epoch and CR3 refusal, both capacity dimensions,
 provenance and every incomplete rendering. The two input-schema drafts and stripped output schemas
-measure **2,930 model-visible bytes and 15,098 estimated wire bytes** together. They exceed the
-current model headroom by 1,612 bytes, so M6.2 must make one explicit ceiling change when the real
+measure **2,937 model-visible bytes and 15,124 estimated wire bytes** together. They exceed the
+current model headroom by 1,619 bytes, so M6.2 must make one explicit ceiling change when the real
 registered `tools/list` measurement replaces this estimate; no description or result field was
 weakened to fit. Neither tool is registered yet: exposing a recorder without the asynchronous
 engine-thread restoration lifecycle below would claim a safety property it does not have.
@@ -443,6 +444,103 @@ manifest guard, derives all hardware breakpoints only from that proved manifest,
 enters the existing atomic replacement transition. Unit tests reject truncated PE declarations
 and ratchet that proof-before-mutation ordering. The gate stays private until the worker-owned
 run/stop loop below can guarantee restoration on every exit.
+
+**M6.2 core checkpoint, 2026-10-23:** the retained-stop decoder now consumes the manifest's exact
+slot, guard, register and typed request layout. Fake live stops prove a complete
+entry→dispatch→return record, caller and page-bounded before/after bytes, the caller-selected
+buffer cap, non-selected dispatch/return pairing and changed-guard refusal. The engine-free shared
+trace exposes only completed records and one stop bit; concurrent stop requests have exactly one
+winner, stale ids change nothing, and a stop linearized before an observation consumes no epoch.
+The before bytes come from entry-time `rcx`, stay private until a selected dispatch proves the same
+request at `r14`, and are never reconstructed from a later stop; changed and missing entry
+coordinates have explicit refusal/unavailability tests. Because the entry site is common to every
+service, entries remain in a bounded private request-keyed queue: a checked selected dispatch
+consumes only its matching earlier candidate, while unrelated nested entries stay private and
+cannot truncate or be spliced into that call. A return without a selected dispatch is ignored.
+Incomplete records begin only after the checked dispatch has proved service 47, so ambient Secure
+Kernel traffic cannot be mislabeled as a selected call.
+
+The engine-thread loop prepares the recorder, decoder and derived breakpoints before its
+first mutation, publishes only after the exact live arm succeeds, and seals before the existing
+`continue_from` restoration transition. Stop, capacity and observation failures all converge on
+that helper; wait/re-arm failures retain the live controller's existing fault recovery. Source
+ratchets pin proof-before-mutation and seal-before-restore ordering.
+
+**M6.2 integration checkpoint, 2026-10-23:** `sk_service_trace` and
+`sk_service_trace_read` are now registered in the `securekernel` group. The arm call waits for a
+dedicated worker milestone emitted only after proof, slot installation and resume; its final job
+reply is retained until sealing and restoration. Prefix reads are answered by the request reader
+without reaching the engine or provider. A stopping read first linearizes the exact trace id,
+wakes only that job's scoped `WaitActivity`, and queues behind it so the response cannot overtake
+restoration. Generic `break_in` and unrelated calls are refused while the trace owns the engine;
+`end_session` sets the same stop before closing new waits. Provider reads occur outside the shared
+recorder lock, so a stop arriving during one wins and discards the decoded observation. The actual
+88-tool golden measures 136,123 model-visible and 402,689 wire bytes; the explicit ceilings are
+138,000 and 410,000.
+
+**M6.2 offline exit, 2026-10-23:** the production run/stop orchestration now crosses one narrow
+fakeable controller/provider boundary. Its matrix exercises entry→dispatch→return, non-selected
+traffic, re-entry, out-of-order return, capacity reached after selection at dispatch, nested entry
+and return, no-hit,
+reader stop/interrupt, re-arm failure, teardown-before-publication, teardown while waiting,
+restoration failure and reused epochs. It caught two cleanup gaps before live use: a changed guard
+during re-arm now seals and restores the retained epoch instead of only sealing, and teardown read
+during the sealed arm transition is inherited at publication, suppresses the arm milestone and
+takes the ordinary stop/restore path. Supervisor tests separately pin arm-before-wake and exact
+failure-before-arm ordering. Terminal re-arm/restoration failure is retained beside the shared
+prefix before `Done`, so a queued or later read reports it even though the supervisor consumes the
+asynchronous job reply in the background. M6.2 is complete; M6.3 live qualification is next.
+
+**M6.3 live-integration checkpoint, 2026-10-23:** the first live probes exposed two facts that the
+offline source could not simulate. The Hyper-V GPA helper cached mutable physical pages across
+retained stops, so a later dispatch could read a stale request even though its register coordinate
+was current. The live-source protocol now requires and negotiates
+`read_coherency=explicit_refresh`; every stop-scoped root bind sends `REFRESH`, and the provider
+discards its page cache before acknowledging the new read epoch. A source without that capability
+is refused before the trace mutates debug state. The same probes showed unrelated nested common
+entries between both entry and selected dispatch and between selected dispatch and return, which
+led to the bounded request-keyed candidate queue above. The diagnostic one-record arm at
+`target/codex-m6/live-qualification/20261023T215214/report.json` completed with status zero, no
+drops or unreadable data, exact debug-state restoration, unchanged Secure Kernel text, the same
+boot and `vmwp`, healthy heartbeat and no retained process. It is a path proof, not the three-boot
+M6.3 exit record.
+
+**M6.3 qualification checkpoint, 2026-10-23:** three clean boots passed 100/100 selected calls in
+`target/codex-m6/live-qualification/20261023T223744/`, `20261023T225031/` and
+`20261023T230342/`. Their guest boot identities, `vmwp` PIDs, nested partition ids and randomized
+Secure Kernel bases were all distinct. Every record was complete, returned status zero and carried
+one measured 64-byte before/after request pair; every run had zero dropped records/bytes,
+unreadable fields, inference or pending phase. The causally gated baseline completed before the
+positive task could enter the API, and each guest emitted exactly 100 successful create/cleanup
+rows. Each arm restored DR0-DR3/DR6/DR7/RFLAGS exactly, preserved the mapped image base/RVA/size and
+text hash, stayed on its original boot and `vmwp`, released its worker without recovery, retained a
+healthy heartbeat and left no debugger/provider process.
+
+The separate one-record capacity arm is
+`target/codex-m6/live-qualification/20261023T222002/`; it sealed `full` at its exact limit and
+passed the same audits. The live no-hit and forced-teardown controls are respectively
+`20261023T231728/` and `20261023T231911/`: the former retained a clean zero-record prefix for six
+reads before explicit stop/restoration, and the latter ended an actively armed zero-record trace
+through `end_session`; both restored all state without recovery. The stale-image, stale-byte and
+stale-layout controls plus the proof-before-mutation ratchet passed in
+`target/codex-m6/offline-controls.json`.
+
+Provider death reached its intended fail-closed result in
+`target/codex-m6/live-qualification/20261023T232322/`: terminating the exact control-provider child
+made the trace report the closed pipe with `target_left_paused=true`, and `end_session` reported
+`recovery_required=true`, `released=false` while retaining the isolated worker. The exact recovery
+then removed that worker and its remaining memory-provider child and power-cycled only K3. After
+Windows recovery, the strict final audit in `target/codex-m6/provider-death-control.json` proved a
+new guest boot identity, heartbeat `OK`, active VBS and zero retained debugger/provider processes.
+The fail-closed containment and subsequent recovery therefore form one passing provider-death
+control rather than treating containment alone as success.
+
+`target/codex-m6/m6-qualification.json` is the final machine-checkable M6.3 record. Its companion
+`finalize-m6-qualification.ps1` independently re-checks and hashes all three 100-call reports, the
+one-record capacity run, no-hit and forced-teardown runs, all four offline controls and the finalized
+provider-death control. It passed with three distinct boot identities, `vmwp` PIDs, partition ids
+and randomized Secure Kernel bases. M6.3's exit gate is satisfied, so M7 may consume an M6 record as
+a semantic endpoint.
 
 #### M6.2 — guarded run/stop loop
 
@@ -475,7 +573,7 @@ negative control. Only then may M7 treat an M6 record as a semantic endpoint.
 
 ### M7 — cross-layer correlation and investigations
 
-Status: planned; depends on M6's live exit gate.
+Status: planned; M6's live exit gate is complete.
 
 Join M4–M6 without putting two targets in one DbgEng process. The coordinator owns session ids and
 lifecycles, not engines: each layer remains in its existing worker and contributes an immutable

@@ -153,6 +153,22 @@ pub enum EngineOp {
     SkLiveContinue {
         epoch: crate::skcontrol::StopEpoch,
     },
+    /// Arm the exact-build M6 service trace and keep its wait/decode/restore loop on this worker's
+    /// engine thread. The worker publishes [`WorkerMessage::ServiceTraceArmed`] only after every
+    /// guard and hardware slot has been acknowledged.
+    SkServiceTraceRun {
+        epoch: crate::skcontrol::StopEpoch,
+        trace_id: String,
+        label: Option<String>,
+        limits: crate::skservicetrace::TraceLimits,
+    },
+    /// Read the immutable completed prefix of the named service trace. The request reader answers
+    /// non-stopping reads directly; a stopping read is queued only after it sets the shared stop
+    /// bit and wakes the exact scoped wait, so its reply follows engine-thread restoration.
+    SkServiceTraceRead {
+        trace_id: String,
+        stop: bool,
+    },
 
     // ---- ordinary work ----
     /// A raw command run with **no watchdog at all** — `index_trace`'s, and nothing else's.
@@ -1445,6 +1461,13 @@ pub enum WorkerMessage {
     /// engine not running, answers `Done` with the failure and never sends this — so a supervisor
     /// that has seen this has a target that is running, rather than one that was asked to run.
     Resumed { id: u64 },
+    /// An [`EngineOp::SkServiceTraceRun`] has completed its exact-build proof, installed every
+    /// guarded hardware slot and resumed into its worker-owned loop. Its final `Done` follows only
+    /// after the recorder is sealed and the complete debug-register baseline is restored.
+    ServiceTraceArmed {
+        id: u64,
+        armed: crate::skservicetrace::ServiceTraceArmed,
+    },
     /// An [`EngineOp::EndSession`] found a batch in flight and told it to stop; it will be done —
     /// stopped, rolled back and reported — within `within_ms`. `id` is that request's, like every
     /// other message here.

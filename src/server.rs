@@ -5322,6 +5322,75 @@ impl WindbgServer {
         engine_result_for(args.session_id.as_deref(), out)
     }
 
+    /// Trace one manifest-pinned Secure Kernel service on an existing secure_kernel_live session. Verifies the exact image, complete instruction guards and all three hardware slots before starting the worker-owned bounded job. The label is copied into every record; limits bound records, each buffer and total captured bytes.
+    #[rmcp::tool(
+        annotations(
+            title = "Trace a Secure Kernel service",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<Outcome<crate::skservicetrace::ServiceTraceArmed>>()
+    )]
+    async fn sk_service_trace(
+        &self,
+        Parameters(args): Parameters<crate::skservicetrace::TraceArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let (label, limits) = match args.checked() {
+            Ok(checked) => checked,
+            Err(error) => {
+                return typed_error(ErrorCategory::InvalidArgument, error, args.session_id);
+            }
+        };
+        let session = match self.sessions.resolve(args.session_id.as_deref()) {
+            Ok(session) => session,
+            Err(error) => return engine_result(Err(error)),
+        };
+        let result = self
+            .sessions
+            .start_service_trace(
+                &session,
+                args.session_id.is_some(),
+                args.epoch,
+                label,
+                limits,
+            )
+            .await
+            .map(|armed| Output::typed(crate::skservicetrace::render_armed(&armed), armed));
+        engine_result_for(args.session_id.as_deref(), result)
+    }
+
+    /// Read an immutable completed prefix from a Secure Kernel service trace. Without stop this touches no engine or provider. With stop it binds to the exact trace job, wakes only its scoped wait, restores the complete debug-register baseline on the engine thread, and returns after restoration.
+    #[rmcp::tool(
+        annotations(
+            title = "Read a Secure Kernel service trace",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<Outcome<crate::skservicetrace::ServiceTrace>>()
+    )]
+    async fn sk_service_trace_read(
+        &self,
+        Parameters(args): Parameters<crate::skservicetrace::TraceReadArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Err(error) = args.validate() {
+            return typed_error(ErrorCategory::InvalidArgument, error, args.session_id);
+        }
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::SkServiceTraceRead {
+                    trace_id: args.trace_id,
+                    stop: args.stop.unwrap_or(false),
+                },
+            )
+            .await;
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
     /// List the debug sessions this server holds — what each one is, how long it has been in
     /// its current state, and which one a call that names no session is routed to. Pass a
     /// `session_id` to ask about one in particular.

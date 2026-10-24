@@ -38,7 +38,7 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::sk;
 use crate::sk::RawSource;
-use crate::skcontrol::{HeldEvent, HexU64, StopReason, TargetIdentity};
+use crate::skcontrol::{HeldEvent, HexU64, RegisterName, StopReason, TargetIdentity};
 use crate::sklive::{
     AppliedMemoryWrite, ArmMode, BreakWake, BreakpointGuard, DispatcherProfile, DispatcherSite,
     EventDispatcher, GuardedMemoryWrite, InstructionGuard, LiveControl, LiveMemoryWrite, LivePhase,
@@ -286,23 +286,7 @@ impl Session {
         epoch: &crate::skcontrol::StopEpoch,
         manifest: &crate::skservice::ServiceManifest,
     ) -> Result<ServiceTraceArm> {
-        self.ensure_preparation_succeeded()?;
-        let stop = self
-            .control()?
-            .stopped()
-            .cloned()
-            .context("service tracing requires one retained VTL1 stop")?;
-        if &stop.epoch != epoch {
-            bail!("service trace arm supplied a stale stop epoch");
-        }
-        if self.control()?.provider_count() != 1 {
-            bail!(
-                "service tracing requires exactly one selected VP; multi-VP ordering is not proved"
-            );
-        }
-        let image_base = self
-            .kernel_base()
-            .context("the live-memory provider did not report a Secure Kernel image base")?;
+        let (stop, image_base) = self.service_trace_identity(epoch)?;
         let deadline = self.stopped_service_deadline()?;
         let proof = manifest
             .verify_live_image(|rva, size| {
@@ -327,6 +311,100 @@ impl Session {
             image_base: HexU64(image_base),
             proof,
         })
+    }
+
+    fn service_trace_identity(
+        &self,
+        epoch: &crate::skcontrol::StopEpoch,
+    ) -> Result<(StopRecord, u64)> {
+        self.ensure_preparation_succeeded()?;
+        let stop = self
+            .control()?
+            .stopped()
+            .cloned()
+            .context("service tracing requires one retained VTL1 stop")?;
+        if &stop.epoch != epoch {
+            bail!("service trace arm supplied a stale stop epoch");
+        }
+        if self.control()?.provider_count() != 1 {
+            bail!(
+                "service tracing requires exactly one selected VP; multi-VP ordering is not proved"
+            );
+        }
+        if !self
+            .dispatcher
+            .memory
+            .as_ref()
+            .context("service tracing has no live-memory source")?
+            .source
+            .explicit_refresh_capability()
+        {
+            bail!(
+                "service tracing requires a live-memory source with explicit stop-scoped refresh"
+            );
+        }
+        let image_base = self
+            .kernel_base()
+            .context("the live-memory provider did not report a Secure Kernel image base")?;
+        Ok((stop, image_base))
+    }
+
+    /// Run one M6 service trace wholly on the live worker's engine thread. The published shared
+    /// handle contains only the engine-free recorder and stop bit; all controller and provider
+    /// work remains in this call.
+    #[allow(dead_code)] // M6.2's worker op publishes and drives this loop in the next slice.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_service_trace(
+        &mut self,
+        engine: &DebugEngine,
+        job: u64,
+        epoch: &crate::skcontrol::StopEpoch,
+        trace_id: String,
+        label: Option<String>,
+        limits: crate::skservicetrace::TraceLimits,
+        manifest: crate::skservice::ServiceManifest,
+        publish: impl FnOnce(crate::skservicetrace::SharedTrace),
+        mut pause_changed: impl FnMut(bool),
+    ) -> Result<crate::skservicetrace::ServiceTrace> {
+        // Build every engine-free object before the first register mutation. Once arm succeeds,
+        // the remaining fallible paths all pass through restoration below.
+        let (candidate, image_base) = self.service_trace_identity(epoch)?;
+        let recorder = crate::skservicetrace::Recorder::new(
+            trace_id,
+            label,
+            manifest.clone(),
+            candidate.target.clone(),
+            HexU64(image_base),
+            limits,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let shared = crate::skservicetrace::SharedTrace::new(recorder);
+        let mut decoder = crate::skservicetrace::ObservationDecoder::new(
+            manifest.clone(),
+            candidate.target,
+            HexU64(image_base),
+        )
+        .map_err(anyhow::Error::msg)?;
+        let breakpoints = manifest
+            .breakpoints(image_base)
+            .map_err(anyhow::Error::msg)?;
+        let armed = self.arm_service_trace(engine, epoch, &manifest)?;
+        debug_assert_eq!(armed.image_base, HexU64(image_base));
+        pause_changed(false);
+        publish(shared.clone());
+        let mut runtime = LiveServiceTraceRuntime {
+            session: self,
+            engine,
+            job,
+            pause_changed: &mut pause_changed,
+        };
+        drive_service_trace(
+            &mut runtime,
+            &shared,
+            &mut decoder,
+            &breakpoints,
+            limits.per_buffer_bytes,
+        )
     }
 
     pub(crate) fn secure_kernel_kd(&self) -> Option<crate::sklive::SecureKernelKdProfile> {
@@ -970,6 +1048,192 @@ impl fmt::Debug for OpenRequest {
             .field("allow_memory_writes", &self.allow_memory_writes)
             .field("additional_vps", &self.additional_vps.len())
             .finish()
+    }
+}
+
+/// The production M6 loop's only controller/provider boundary. Keeping the orchestration behind
+/// these operations lets the offline tier inject every wait, decode, re-arm and restoration
+/// failure without constructing a debugger engine or weakening the worker-thread ownership rule.
+trait ServiceTraceRuntime {
+    fn wait_for_trace_stop(&mut self, stop_requested: bool) -> Result<StopRecord>;
+    fn complete_trace_stop(&mut self, _stop: &mut StopRecord) -> Result<()> {
+        Ok(())
+    }
+    fn read_trace_memory(&mut self, address: u64, size: u32) -> Result<Vec<u8>, String>;
+    fn rearm_trace(
+        &mut self,
+        epoch: &crate::skcontrol::StopEpoch,
+        breakpoints: &[BreakpointGuard],
+    ) -> Result<()>;
+    fn restore_trace(&mut self, epoch: &crate::skcontrol::StopEpoch) -> Result<()>;
+}
+
+struct LiveServiceTraceRuntime<'a> {
+    session: &'a mut Session,
+    engine: &'a DebugEngine,
+    job: u64,
+    pause_changed: &'a mut dyn FnMut(bool),
+}
+
+impl ServiceTraceRuntime for LiveServiceTraceRuntime<'_> {
+    fn wait_for_trace_stop(&mut self, _stop_requested: bool) -> Result<StopRecord> {
+        let pause_changed = &mut self.pause_changed;
+        // Always cross the ordinary owned-event wait, including when a stop bit was set between
+        // the preceding observation and re-arm. A generic entry event can win that race at the
+        // dispatcher's owned event-site breakpoint. Calling `break_on_demand` directly would
+        // treat that real event as an unexpected stop while trying to settle native execution;
+        // the ordinary wait instead retains it, after which the loop restores from its exact
+        // epoch. The service manifest's generic entry breakpoint supplies the bounded rendezvous.
+        let stopped = self
+            .session
+            .wait_for_stop_for_job(self.engine, self.job, || (**pause_changed)(true));
+        crate::worker::drain_service_trace_interrupt(self.engine, self.job);
+        stopped
+    }
+
+    fn complete_trace_stop(&mut self, stop: &mut StopRecord) -> Result<()> {
+        // The controller's primary snapshot is deliberately limited to ownership and recovery
+        // state. M6 needs these semantic registers too, so read them twice while this exact epoch
+        // remains held and append only after the provider proves the two complete reads agree.
+        let registers = [
+            RegisterName::Rax,
+            RegisterName::Rcx,
+            RegisterName::Rdx,
+            RegisterName::R8,
+            RegisterName::R9,
+            RegisterName::R14,
+        ];
+        let deadline = self.session.stopped_service_deadline()?;
+        let values =
+            self.session
+                .read_stopped_registers_until(&stop.epoch, registers.to_vec(), deadline)?;
+        if values.iter().any(|value| value.high.0 != 0) {
+            bail!("service-trace general register has a nonzero high half");
+        }
+        stop.registers.values.extend(values);
+        Ok(())
+    }
+
+    fn read_trace_memory(&mut self, address: u64, size: u32) -> Result<Vec<u8>, String> {
+        let deadline = self
+            .session
+            .stopped_service_deadline()
+            .map_err(|error| format!("{error:#}"))?;
+        let read = self
+            .session
+            .read_memory_until(address, size, deadline)
+            .map_err(|error| format!("{error:#}"))?;
+        decode_live_hex(&read.data)
+    }
+
+    fn rearm_trace(
+        &mut self,
+        epoch: &crate::skcontrol::StopEpoch,
+        breakpoints: &[BreakpointGuard],
+    ) -> Result<()> {
+        self.session
+            .continue_to_breakpoints(self.engine, epoch, breakpoints.to_vec())?;
+        (self.pause_changed)(false);
+        Ok(())
+    }
+
+    fn restore_trace(&mut self, epoch: &crate::skcontrol::StopEpoch) -> Result<()> {
+        self.session.continue_from(self.engine, epoch)?;
+        (self.pause_changed)(false);
+        Ok(())
+    }
+}
+
+fn finish_service_trace(
+    runtime: &mut impl ServiceTraceRuntime,
+    epoch: &crate::skcontrol::StopEpoch,
+    shared: &crate::skservicetrace::SharedTrace,
+) -> Result<crate::skservicetrace::ServiceTrace> {
+    // Seal first so a concurrent read can never observe `armed: true` after restoration has
+    // begun. Restoration still runs if sealing finds an internal record error.
+    let finished = shared.finish().map_err(anyhow::Error::msg);
+    let restored = runtime.restore_trace(epoch);
+    match (finished, restored) {
+        (Ok(trace), Ok(())) => Ok(trace),
+        (Err(finish), Ok(())) => Err(finish),
+        (Ok(_), Err(restore)) => Err(restore),
+        (Err(finish), Err(restore)) => {
+            Err(restore.context(format!("the recorder also failed to seal: {finish:#}")))
+        }
+    }
+}
+
+fn drive_service_trace(
+    runtime: &mut impl ServiceTraceRuntime,
+    shared: &crate::skservicetrace::SharedTrace,
+    decoder: &mut crate::skservicetrace::ObservationDecoder,
+    breakpoints: &[BreakpointGuard],
+    per_buffer_bytes: u32,
+) -> Result<crate::skservicetrace::ServiceTrace> {
+    loop {
+        let mut stop = match runtime.wait_for_trace_stop(shared.stop_requested()) {
+            Ok(stop) => stop,
+            Err(error) => {
+                // LiveControl's wait failure path owns fault recovery because no retained epoch
+                // may exist. This layer still seals its public prefix before propagating it.
+                let finish = shared.finish().map_err(anyhow::Error::msg);
+                return match finish {
+                    Ok(_) => Err(error),
+                    Err(finish) => {
+                        Err(error.context(format!("the recorder also failed to seal: {finish:#}")))
+                    }
+                };
+            }
+        };
+
+        if shared.stop_requested() {
+            return finish_service_trace(runtime, &stop.epoch, shared);
+        }
+
+        if let Err(error) = runtime.complete_trace_stop(&mut stop) {
+            let restored = finish_service_trace(runtime, &stop.epoch, shared);
+            return match restored {
+                Ok(_) => Err(error.context("service-trace register capture failed")),
+                Err(restoration) => Err(restoration.context(format!(
+                    "service-trace register capture failed before restoration: {error:#}"
+                ))),
+            };
+        }
+
+        // Provider reads stay outside the shared recorder lock. The decoded observation then
+        // crosses the same one-lock boundary as a reader-side stop request: whichever wins is
+        // authoritative, and a stop that arrived during the reads discards the observation.
+        let decoded = decoder.decode(&stop, per_buffer_bytes, |address, size| {
+            runtime.read_trace_memory(address, size)
+        });
+        let observed =
+            decoded.and_then(|decoded| shared.observe(move |recorder| decoded.apply(recorder)));
+        if let Err(error) = observed {
+            let restored = finish_service_trace(runtime, &stop.epoch, shared);
+            return match restored {
+                Ok(_) => Err(anyhow::Error::msg(error)),
+                Err(restoration) => Err(restoration.context(format!(
+                    "service observation failed before restoration: {error}"
+                ))),
+            };
+        }
+        if shared.stop_requested() || shared.capacity_reached() {
+            return finish_service_trace(runtime, &stop.epoch, shared);
+        }
+
+        if let Err(error) = runtime.rearm_trace(&stop.epoch, breakpoints) {
+            // Guard verification can fail before the replacement transition mutates anything,
+            // leaving this exact stop retained and fully releasable. Do not merely seal the
+            // recorder and strand it: take the same restore-and-resume path as capacity, stop and
+            // decode failures.
+            let restored = finish_service_trace(runtime, &stop.epoch, shared);
+            return match restored {
+                Ok(_) => Err(error),
+                Err(restoration) => Err(restoration.context(format!(
+                    "service re-arm failed before restoration: {error:#}"
+                ))),
+            };
+        }
     }
 }
 
@@ -2513,6 +2777,11 @@ impl LiveGuestMemory {
     fn bind_root_inner(&mut self, cr3: u64, deadline: Option<Instant>) -> Result<()> {
         if cr3 == 0 || cr3 & 0xfff != 0 {
             bail!("live VTL1 stop CR3 must be nonzero and page aligned");
+        }
+        if self.source.explicit_refresh_capability() {
+            let deadline = deadline.unwrap_or_else(|| Instant::now() + LIVE_MEMORY_WAIT);
+            self.source
+                .refresh_until_cancelled(deadline, crate::worker::kd_teardown_requested)?;
         }
         let root = sk::Gpa(cr3);
         self.space = Self::walk_space_until(&self.source, root, "stop-CR3 rebind", deadline)?;
@@ -4455,7 +4724,14 @@ impl VmwpDispatcher<'_> {
             Some(Interruption::OnRequest) => {
                 bail!("native event completion was interrupted on request")
             }
-            None => bail!("vmwp stopped unexpectedly while settling native event completion"),
+            None => {
+                let rip = self.engine.instruction_pointer().map_err(debugger)?;
+                bail!(
+                    "vmwp stopped unexpectedly while settling native event completion at \
+                     {rip:#x}; debugger_output={:?}",
+                    run.output.trim()
+                )
+            }
         }
     }
 
@@ -5744,7 +6020,203 @@ impl VmTransition {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sklive::DispatcherLayout;
+    use crate::skcontrol::{HeldEvent, RegisterName, RegisterValue, StopEpoch, StopReason};
+    use crate::sklive::{ArmMode, DispatcherLayout, RegisterSnapshot};
+    use std::collections::{HashMap, VecDeque};
+
+    const TRACE_IMAGE_BASE: u64 = 0xffff_f807_0000_0000;
+    const TRACE_REQUEST: u64 = 0xffff_8000_0000_2000;
+    const TRACE_STACK: u64 = 0xffff_8000_0000_3000;
+
+    fn trace_stop(
+        manifest: &crate::skservice::ServiceManifest,
+        phase: &str,
+        epoch: u64,
+    ) -> StopRecord {
+        let site = manifest
+            .sites
+            .iter()
+            .find(|site| site.phase == phase)
+            .unwrap();
+        let instruction = manifest
+            .breakpoints(TRACE_IMAGE_BASE)
+            .unwrap()
+            .into_iter()
+            .find(|breakpoint| breakpoint.slot == site.slot)
+            .unwrap()
+            .instruction;
+        let phase_registers = match phase {
+            "entry" => vec![
+                (RegisterName::Rsp, TRACE_STACK),
+                (RegisterName::Rcx, TRACE_REQUEST),
+                (RegisterName::Rdx, 2),
+                (RegisterName::R8, 3),
+                (RegisterName::R9, 4),
+            ],
+            "dispatch" => vec![(RegisterName::R14, TRACE_REQUEST)],
+            "return" => vec![(RegisterName::Rax, 0)],
+            other => panic!("unknown trace phase {other}"),
+        };
+        let mut values = phase_registers
+            .into_iter()
+            .map(|(name, value)| RegisterValue {
+                name,
+                status: 0,
+                low: HexU64(value),
+                high: HexU64(0),
+            })
+            .collect::<Vec<_>>();
+        values.push(RegisterValue {
+            name: RegisterName::Cr3,
+            status: 0,
+            low: target().expected_cr3,
+            high: HexU64(0),
+        });
+        StopRecord {
+            epoch: StopEpoch::new(format!("trace-stop-{epoch:016x}")).unwrap(),
+            target: target(),
+            event: HeldEvent {
+                message_type: HexU64(1),
+                vector: 1,
+                vp: 0,
+                vtl: 1,
+                cpl: 0,
+                dispatcher_context: HexU64(0x2000),
+                advance_instruction_pointer: false,
+                reason: StopReason::HardwareBreakpoint { slot: site.slot },
+            },
+            registers: RegisterSnapshot { values },
+            instruction,
+            expected_rips: vec![HexU64(TRACE_IMAGE_BASE + u64::from(site.rva))],
+            arm_mode: ArmMode::Natural,
+        }
+    }
+
+    struct FakeTraceRuntime {
+        stops: VecDeque<Result<StopRecord, &'static str>>,
+        memory: HashMap<u64, u8>,
+        actions: Vec<String>,
+        fail_complete: bool,
+        fail_rearm: bool,
+        fail_restore: bool,
+    }
+
+    impl FakeTraceRuntime {
+        fn new(stops: impl IntoIterator<Item = Result<StopRecord, &'static str>>) -> Self {
+            let mut memory = HashMap::new();
+            for (offset, byte) in (TRACE_IMAGE_BASE + 0x2200)
+                .to_le_bytes()
+                .into_iter()
+                .enumerate()
+            {
+                memory.insert(TRACE_STACK + offset as u64, byte);
+            }
+            let manifest = crate::skservice::service_manifest().unwrap();
+            let mut request = vec![0x11; manifest.request_layout.size as usize];
+            request[2..4].copy_from_slice(&47_u16.to_le_bytes());
+            for (offset, byte) in request.into_iter().enumerate() {
+                memory.insert(TRACE_REQUEST + offset as u64, byte);
+            }
+            Self {
+                stops: stops.into_iter().collect(),
+                memory,
+                actions: Vec::new(),
+                fail_complete: false,
+                fail_rearm: false,
+                fail_restore: false,
+            }
+        }
+
+        fn selected_service(&mut self, service: u16) {
+            for (offset, byte) in service.to_le_bytes().into_iter().enumerate() {
+                self.memory.insert(TRACE_REQUEST + 2 + offset as u64, byte);
+            }
+        }
+    }
+
+    impl ServiceTraceRuntime for FakeTraceRuntime {
+        fn wait_for_trace_stop(&mut self, stop_requested: bool) -> Result<StopRecord> {
+            self.actions.push(if stop_requested {
+                "break_wait".into()
+            } else {
+                "wait".into()
+            });
+            self.stops
+                .pop_front()
+                .unwrap_or(Err("fake trace exhausted its stops"))
+                .map_err(anyhow::Error::msg)
+        }
+
+        fn complete_trace_stop(&mut self, _stop: &mut StopRecord) -> Result<()> {
+            if self.fail_complete {
+                bail!("injected semantic-register read failure");
+            }
+            Ok(())
+        }
+
+        fn read_trace_memory(&mut self, address: u64, size: u32) -> Result<Vec<u8>, String> {
+            (0..u64::from(size))
+                .map(|offset| {
+                    self.memory
+                        .get(&(address + offset))
+                        .copied()
+                        .ok_or_else(|| format!("unreadable {:#x}", address + offset))
+                })
+                .collect()
+        }
+
+        fn rearm_trace(
+            &mut self,
+            epoch: &StopEpoch,
+            _breakpoints: &[BreakpointGuard],
+        ) -> Result<()> {
+            self.actions.push(format!("rearm:{epoch}"));
+            if self.fail_rearm {
+                bail!("injected re-arm failure");
+            }
+            Ok(())
+        }
+
+        fn restore_trace(&mut self, epoch: &StopEpoch) -> Result<()> {
+            self.actions.push(format!("restore:{epoch}"));
+            if self.fail_restore {
+                bail!("injected restoration failure");
+            }
+            Ok(())
+        }
+    }
+
+    fn trace_parts(
+        trace_id: &str,
+        records: u32,
+    ) -> (
+        crate::skservicetrace::SharedTrace,
+        crate::skservicetrace::ObservationDecoder,
+        Vec<BreakpointGuard>,
+    ) {
+        let manifest = crate::skservice::service_manifest().unwrap();
+        let limits = crate::skservicetrace::TraceLimits::checked(records, 16, 1_024).unwrap();
+        let recorder = crate::skservicetrace::Recorder::new(
+            trace_id.into(),
+            None,
+            manifest.clone(),
+            target(),
+            HexU64(TRACE_IMAGE_BASE),
+            limits,
+        )
+        .unwrap();
+        let decoder = crate::skservicetrace::ObservationDecoder::new(
+            manifest.clone(),
+            target(),
+            HexU64(TRACE_IMAGE_BASE),
+        )
+        .unwrap();
+        (
+            crate::skservicetrace::SharedTrace::new(recorder),
+            decoder,
+            manifest.breakpoints(TRACE_IMAGE_BASE).unwrap(),
+        )
+    }
 
     fn export_fixture(function_rva: u32) -> Vec<u8> {
         let mut bytes = vec![0u8; 0x600];
@@ -5963,18 +6435,234 @@ mod tests {
     }
 
     #[test]
+    fn fake_trace_loop_records_one_selected_call_and_restores_at_capacity() {
+        let manifest = crate::skservice::service_manifest().unwrap();
+        let stops = [
+            Ok(trace_stop(&manifest, "entry", 1)),
+            Ok(trace_stop(&manifest, "dispatch", 2)),
+            Ok(trace_stop(&manifest, "return", 3)),
+        ];
+        let mut runtime = FakeTraceRuntime::new(stops);
+        let (shared, mut decoder, breakpoints) = trace_parts("sktrace-fake-complete", 1);
+
+        let trace =
+            drive_service_trace(&mut runtime, &shared, &mut decoder, &breakpoints, 16).unwrap();
+        assert_eq!(trace.records.len(), 1);
+        assert!(trace.records[0].complete);
+        assert!(trace.full);
+        assert!(!trace.armed);
+        assert_eq!(
+            runtime.actions,
+            [
+                "wait".to_string(),
+                format!("rearm:{}", trace_stop(&manifest, "entry", 1).epoch),
+                "wait".to_string(),
+                format!("rearm:{}", trace_stop(&manifest, "dispatch", 2).epoch),
+                "wait".to_string(),
+                format!("restore:{}", trace_stop(&manifest, "return", 3).epoch),
+            ]
+        );
+    }
+
+    #[test]
+    fn fake_trace_loop_stops_capacity_reached_at_selected_terminal_phases() {
+        let manifest = crate::skservice::service_manifest().unwrap();
+        let scenarios = [
+            vec![
+                Ok(trace_stop(&manifest, "entry", 20)),
+                Ok(trace_stop(&manifest, "dispatch", 21)),
+                Ok(trace_stop(&manifest, "dispatch", 22)),
+            ],
+            vec![
+                Ok(trace_stop(&manifest, "entry", 30)),
+                Ok(trace_stop(&manifest, "dispatch", 31)),
+                Ok(trace_stop(&manifest, "return", 32)),
+            ],
+        ];
+
+        for (index, stops) in scenarios.into_iter().enumerate() {
+            let mut runtime = FakeTraceRuntime::new(stops);
+            let (shared, mut decoder, breakpoints) =
+                trace_parts(&format!("sktrace-capacity-{index}"), 1);
+            let trace =
+                drive_service_trace(&mut runtime, &shared, &mut decoder, &breakpoints, 16).unwrap();
+            assert!(trace.full, "scenario {index} did not reach capacity");
+            assert!(!trace.armed);
+            assert_eq!(
+                runtime
+                    .actions
+                    .iter()
+                    .filter(|action| action.starts_with("restore:"))
+                    .count(),
+                1,
+                "scenario {index} did not restore exactly once"
+            );
+        }
+    }
+
+    #[test]
+    fn fake_trace_loop_ignores_unproved_reentry_and_out_of_order_return() {
+        let manifest = crate::skservice::service_manifest().unwrap();
+
+        let mut nonselected = FakeTraceRuntime::new([
+            Ok(trace_stop(&manifest, "entry", 40)),
+            Ok(trace_stop(&manifest, "dispatch", 41)),
+            Ok(trace_stop(&manifest, "return", 42)),
+            Err("injected no-hit bound"),
+        ]);
+        nonselected.selected_service(48);
+        let (shared, mut decoder, breakpoints) = trace_parts("sktrace-nonselected-loop", 8);
+        assert!(
+            drive_service_trace(&mut nonselected, &shared, &mut decoder, &breakpoints, 16,)
+                .unwrap_err()
+                .to_string()
+                .contains("no-hit")
+        );
+        let trace = shared.snapshot("sktrace-nonselected-loop").unwrap();
+        assert!(trace.records.is_empty());
+        assert!(!trace.armed);
+
+        let mut reentry = FakeTraceRuntime::new([
+            Ok(trace_stop(&manifest, "entry", 50)),
+            Ok(trace_stop(&manifest, "entry", 51)),
+            Ok(trace_stop(&manifest, "dispatch", 52)),
+            Ok(trace_stop(&manifest, "return", 53)),
+            Ok(trace_stop(&manifest, "return", 54)),
+            Err("injected no-hit bound"),
+        ]);
+        let (shared, mut decoder, breakpoints) = trace_parts("sktrace-reentry-loop", 8);
+        let _ = drive_service_trace(&mut reentry, &shared, &mut decoder, &breakpoints, 16);
+        let trace = shared.snapshot("sktrace-reentry-loop").unwrap();
+        assert_eq!(trace.records.len(), 1);
+        assert!(trace.records[0].complete);
+    }
+
+    #[test]
+    fn fake_trace_loop_stop_and_rearm_failure_both_restore_the_exact_epoch() {
+        let manifest = crate::skservice::service_manifest().unwrap();
+        let stopped = trace_stop(&manifest, "entry", 60);
+        let stopped_epoch = stopped.epoch.clone();
+        let mut runtime = FakeTraceRuntime::new([Ok(stopped)]);
+        let (shared, mut decoder, breakpoints) = trace_parts("sktrace-reader-stop", 8);
+        assert_eq!(
+            shared.request_stop("sktrace-reader-stop").unwrap(),
+            crate::skservicetrace::StopRequest::First
+        );
+        let trace =
+            drive_service_trace(&mut runtime, &shared, &mut decoder, &breakpoints, 16).unwrap();
+        assert!(trace.records.is_empty());
+        assert_eq!(
+            runtime.actions,
+            ["break_wait".to_string(), format!("restore:{stopped_epoch}")]
+        );
+
+        let stopped = trace_stop(&manifest, "entry", 61);
+        let stopped_epoch = stopped.epoch.clone();
+        let mut runtime = FakeTraceRuntime::new([Ok(stopped)]);
+        runtime.fail_rearm = true;
+        let (shared, mut decoder, breakpoints) = trace_parts("sktrace-rearm-failure", 8);
+        let error =
+            drive_service_trace(&mut runtime, &shared, &mut decoder, &breakpoints, 16).unwrap_err();
+        assert!(error.to_string().contains("re-arm failure"), "{error:#}");
+        assert_eq!(
+            runtime.actions.last(),
+            Some(&format!("restore:{stopped_epoch}"))
+        );
+        assert!(!shared.snapshot("sktrace-rearm-failure").unwrap().armed);
+    }
+
+    #[test]
+    fn fake_trace_loop_register_failure_seals_and_restores_the_exact_epoch() {
+        let manifest = crate::skservice::service_manifest().unwrap();
+        let stopped = trace_stop(&manifest, "entry", 62);
+        let stopped_epoch = stopped.epoch.clone();
+        let mut runtime = FakeTraceRuntime::new([Ok(stopped)]);
+        runtime.fail_complete = true;
+        let (shared, mut decoder, breakpoints) = trace_parts("sktrace-register-failure", 8);
+
+        let error =
+            drive_service_trace(&mut runtime, &shared, &mut decoder, &breakpoints, 16).unwrap_err();
+        assert!(error.to_string().contains("register capture"), "{error:#}");
+        assert_eq!(
+            runtime.actions.last(),
+            Some(&format!("restore:{stopped_epoch}"))
+        );
+        let trace = shared.snapshot("sktrace-register-failure").unwrap();
+        assert!(!trace.armed);
+        assert!(trace.records.is_empty());
+    }
+
+    #[test]
+    fn fake_trace_loop_restoration_failure_is_reported_after_the_trace_is_sealed() {
+        let manifest = crate::skservice::service_manifest().unwrap();
+        let mut runtime = FakeTraceRuntime::new([Ok(trace_stop(&manifest, "entry", 70))]);
+        runtime.fail_restore = true;
+        let (shared, mut decoder, breakpoints) = trace_parts("sktrace-restore-failure", 8);
+        shared.request_stop("sktrace-restore-failure").unwrap();
+
+        let error =
+            drive_service_trace(&mut runtime, &shared, &mut decoder, &breakpoints, 16).unwrap_err();
+        assert!(
+            error.to_string().contains("restoration failure"),
+            "{error:#}"
+        );
+        assert!(!shared.snapshot("sktrace-restore-failure").unwrap().armed);
+        assert_eq!(
+            runtime
+                .actions
+                .iter()
+                .filter(|action| action.starts_with("restore:"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn fake_trace_loop_reused_epoch_is_refused_then_restored_once() {
+        let manifest = crate::skservice::service_manifest().unwrap();
+        let entry = trace_stop(&manifest, "entry", 80);
+        let epoch = entry.epoch.clone();
+        let mut runtime = FakeTraceRuntime::new([Ok(entry.clone()), Ok(entry)]);
+        let (shared, mut decoder, breakpoints) = trace_parts("sktrace-reused-epoch", 8);
+
+        let error =
+            drive_service_trace(&mut runtime, &shared, &mut decoder, &breakpoints, 16).unwrap_err();
+        assert!(error.to_string().contains("stale stop epoch"), "{error:#}");
+        assert_eq!(
+            runtime
+                .actions
+                .iter()
+                .filter(|action| *action == &format!("restore:{epoch}"))
+                .count(),
+            1
+        );
+        let trace = shared.snapshot("sktrace-reused-epoch").unwrap();
+        assert!(trace.records.is_empty());
+        assert!(!trace.armed);
+    }
+
+    #[test]
     fn service_trace_proves_the_live_image_before_breakpoint_mutation() {
         let source = include_str!("skdispatch.rs").replace("\r\n", "\n");
         let body = source
             .split_once("    pub(crate) fn arm_service_trace(\n")
             .expect("the service-trace arm gate exists")
             .1
-            .split_once("    pub(crate) fn secure_kernel_kd(")
-            .expect("the service-trace arm gate ends before the KD accessor")
+            .split_once("    fn service_trace_identity(\n")
+            .expect("the service-trace arm gate ends before its identity helper")
             .0;
-        let single_vp = body
-            .find("provider_count() != 1")
-            .expect("the arm gate requires exactly one selected VP");
+        let identity = source
+            .split_once("    fn service_trace_identity(\n")
+            .expect("the service-trace identity gate exists")
+            .1
+            .split_once("    /// Run one M6 service trace")
+            .expect("the identity gate ends before the trace loop")
+            .0;
+        assert!(identity.contains("provider_count() != 1"));
+        assert!(identity.contains("explicit_refresh_capability()"));
+        let admitted = body
+            .find("self.service_trace_identity(epoch)")
+            .expect("the arm gate checks the retained identity and single-VP scope");
         let live_proof = body
             .find(".verify_live_image(")
             .expect("the arm gate proves the complete live image");
@@ -5985,10 +6673,84 @@ mod tests {
             .find("self.continue_to_breakpoints(")
             .expect("the existing atomic breakpoint transition is used");
 
-        assert!(single_vp < live_proof);
+        assert!(admitted < live_proof);
         assert!(live_proof < breakpoint_derivation);
         assert!(breakpoint_derivation < mutation);
         assert_eq!(body.matches("self.continue_to_breakpoints(").count(), 1);
+    }
+
+    #[test]
+    fn service_trace_loop_prepares_before_arm_and_seals_before_restore() {
+        let source = include_str!("skdispatch.rs").replace("\r\n", "\n");
+        let run = source
+            .split_once("    pub(crate) fn run_service_trace(\n")
+            .expect("the service-trace loop exists")
+            .1
+            .split_once("    pub(crate) fn secure_kernel_kd(")
+            .expect("the service-trace entry point ends before the KD accessor")
+            .0;
+        let recorder = run
+            .find("crate::skservicetrace::Recorder::new(")
+            .expect("the recorder is constructed");
+        let decoder = run
+            .find("crate::skservicetrace::ObservationDecoder::new(")
+            .expect("the decoder is constructed");
+        let breakpoints = run
+            .find(".breakpoints(image_base)")
+            .expect("the breakpoint set is derived");
+        let arm = run
+            .find("self.arm_service_trace(engine, epoch, &manifest)?")
+            .expect("the guarded arm starts the live loop");
+        let publish = run
+            .find("publish(shared.clone())")
+            .expect("the shared trace is published after arming");
+        let drive = run
+            .find("drive_service_trace(")
+            .expect("the fakeable trace loop is entered");
+        assert!(recorder < arm && decoder < arm && breakpoints < arm && arm < publish);
+        assert!(publish < drive);
+
+        let finish = source
+            .split_once("fn finish_service_trace(\n")
+            .expect("the restoration helper exists")
+            .1
+            .split_once("fn drive_service_trace(\n")
+            .expect("the restoration helper ends before the loop")
+            .0;
+        let seal = finish
+            .find("shared.finish()")
+            .expect("the recorder is sealed");
+        let restore = finish
+            .find("runtime.restore_trace(epoch)")
+            .expect("the exact stopped epoch crosses the restoration boundary");
+        assert!(seal < restore);
+
+        let driver = source
+            .split_once("fn drive_service_trace(\n")
+            .expect("the fakeable service-trace loop exists")
+            .1
+            .split_once("/// A stopped VTL1 read")
+            .expect("the fakeable loop ends before the read schema")
+            .0;
+        assert!(driver.matches("finish_service_trace(").count() >= 4);
+
+        let production = source
+            .split_once("impl ServiceTraceRuntime for LiveServiceTraceRuntime<'_> {")
+            .expect("the production trace runtime exists")
+            .1
+            .split_once("fn finish_service_trace(\n")
+            .expect("the production runtime ends before the restoration helper")
+            .0;
+        for register in ["Rax", "Rcx", "Rdx", "R8", "R9", "R14"] {
+            assert!(
+                production.contains(&format!("RegisterName::{register}")),
+                "the production trace runtime omitted {register}"
+            );
+        }
+        assert!(production.contains("read_stopped_registers_until("));
+        assert!(production.contains("wait_for_stop_for_job("));
+        assert!(!production.contains("break_on_demand("));
+        assert!(production.contains("self.session.continue_from(self.engine, epoch)?"));
     }
 
     #[test]

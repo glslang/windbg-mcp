@@ -1108,7 +1108,7 @@ impl RegisterSnapshot {
             .with_context(|| format!("register snapshot omitted {name:?}"))
     }
 
-    fn low(&self, name: RegisterName) -> Result<u64> {
+    pub(crate) fn low(&self, name: RegisterName) -> Result<u64> {
         Ok(self.value(name)?.low.0)
     }
 }
@@ -2297,7 +2297,7 @@ impl<P: ControlProvider> LiveControl<P> {
         deadline: Option<Instant>,
     ) -> Result<StopEpoch> {
         validate_breakpoints(&breakpoints, ArmMode::Natural)?;
-        self.require_stop_epoch(epoch)?;
+        let stop = self.require_stop_epoch(epoch)?.clone();
         if self.providers.len() != 1 {
             bail!(
                 "continue-to-breakpoints currently requires exactly one selected VP; multi-VP \
@@ -2360,6 +2360,27 @@ impl<P: ControlProvider> LiveControl<P> {
                 original_dr7,
                 (original_dr7 & !(DR7_ENABLE_MASK | owned_kind_mask)) | owned_enable_mask,
             )?;
+            // A hardware execution breakpoint is a fault at the guarded instruction. Replacing
+            // the same slot set while RIP still names that instruction must carry RF across the
+            // event return, or the processor immediately reports the same #DB again without
+            // executing anything. RF suppresses instruction breakpoints for exactly that next
+            // instruction and is then cleared architecturally; it is not retained trace state.
+            if breakpoints
+                .iter()
+                .any(|breakpoint| breakpoint.instruction.address == stop.instruction.address)
+            {
+                let cr3 = self.provider_cr3(active);
+                let current_flags = self.read_snapshot(active, cr3)?.low(RegisterName::Rflags)?;
+                if current_flags & (TF | RF) != 0 {
+                    bail!("replacement breakpoint suppression requires clear TF and RF");
+                }
+                self.write_one(
+                    active,
+                    RegisterName::Rflags,
+                    current_flags,
+                    current_flags | RF,
+                )?;
+            }
             match self.providers[active].provider_phase {
                 ProviderPhase::Stopped => self.providers[active].provider.release()?,
                 ProviderPhase::Arming => self.providers[active].provider.finish_arm()?,
@@ -4952,6 +4973,48 @@ mod tests {
                 Action::Wait,
                 Action::Release(ReleaseMode::Resume),
             ]
+        );
+    }
+
+    #[test]
+    fn a_replacement_at_the_stopped_instruction_carries_one_resume_flag() {
+        let mut dispatcher =
+            FakeDispatcher::new([observed(StopReason::HardwareBreakpoint { slot: 0 })]);
+        let mut control = LiveControl::open(FakeProvider::new()).unwrap();
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Redirect)
+            .unwrap();
+        let first = control.wait_for_stop(&mut dispatcher).unwrap();
+        let instruction = first.instruction.clone();
+
+        control
+            .continue_to_breakpoints(
+                &mut dispatcher,
+                &first.epoch,
+                vec![BreakpointGuard {
+                    slot: 0,
+                    instruction,
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(control.phase(), LivePhase::Running);
+        assert_ne!(
+            control
+                .test_provider()
+                .registers
+                .iter()
+                .find(|value| value.name == RegisterName::Rflags)
+                .unwrap()
+                .low
+                .0
+                & RF,
+            0,
+            "the same instruction would immediately re-trigger without RF"
+        );
+        assert_eq!(
+            dispatcher.actions.last(),
+            Some(&Action::Release(ReleaseMode::ArmNextStop))
         );
     }
 

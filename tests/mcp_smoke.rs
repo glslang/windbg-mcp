@@ -2201,7 +2201,12 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// tools move the surface to 133,682 B across 86 tools. Their 2,269 B carry the exact-build image
 /// and instruction guards, two owned software-breakpoint sites, typed VTL/VMCS coordinates and a
 /// separate arm/read lifecycle. The fixed ceiling leaves 1,318 B (1.0%).
-const MODEL_VISIBLE_CEILING: usize = 135_000;
+///
+/// **135,000 -> 138,000 for the M6 VTL1 semantic service trace** (2026-10-23). The two tools move
+/// the measured surface to 136,123 B across 88 tools. Their 2,441 B carry exact-build admission,
+/// three semantic phases, caller-selected capture bounds and the worker-owned stop/restoration
+/// lifecycle. The new ceiling leaves 1,877 B (1.4%).
+const MODEL_VISIBLE_CEILING: usize = 138_000;
 
 /// Ceiling on the whole `tools/list` payload — the serialized result, not the sum of its tools, so
 /// the array's own punctuation and every result-level field are inside it. 216,839 bytes as of
@@ -2384,7 +2389,12 @@ const MODEL_VISIBLE_CEILING: usize = 135_000;
 /// 377,120 -> 387,637 B. The two new closures carry the guarded exact-build identity and typed,
 /// bounded transition/VMCS-coordinate result; no existing output closure grew. The new ceiling
 /// leaves 7,363 B (1.9%).
-const WIRE_CEILING: usize = 395_000;
+///
+/// **395,000 -> 410,000 for the M6 VTL1 semantic service trace** (2026-10-23). The payload moves
+/// 387,637 -> 402,689 B. The two new closures carry the exact manifest/image identity, bounded
+/// typed phase records, provenance and named unavailable reads; existing output closures do not
+/// grow. The new ceiling leaves 7,311 B (1.8%).
+const WIRE_CEILING: usize = 410_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,296
 /// bytes (2026-10-14), because its `inputSchema` pulls the whole `StepAction`/`Check` vocabulary
@@ -3581,6 +3591,16 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
             json!({ "epoch": "fedcba9876543210" }),
             "error",
         ),
+        (
+            "sk_service_trace",
+            json!({ "epoch": "fedcba9876543210", "label": "smoke" }),
+            "error",
+        ),
+        (
+            "sk_service_trace_read",
+            json!({ "trace_id": "sktrace-smoke-01" }),
+            "error",
+        ),
         ("pool_find_tag", json!({ "tag": "Tgsm" }), "error"),
         (
             "pool_chunk",
@@ -4719,7 +4739,7 @@ fn a_listener_serves_the_narrowed_surface_it_was_started_with() {
     // was typed — `session` is added whatever it said.
     let log = listener.stderr();
     assert!(
-        log.contains("serving 13 of 86 tools (session, crash)"),
+        log.contains("serving 13 of 88 tools (session, crash)"),
         "the listener does not report the surface it ended up with: {log}"
     );
 }
@@ -4751,7 +4771,7 @@ fn two_clients_on_one_listener_are_served_two_surfaces() {
     let local_token = server.token.clone();
     assert!(
         server.wait_for_stderr(
-            "serving 20 of 86 tools (session, inspect) — except bench serves 13 of 86 tools \
+            "serving 20 of 88 tools (session, inspect) — except bench serves 13 of 88 tools \
              (session, crash)",
             Duration::from_secs(30)
         ),
