@@ -158,6 +158,12 @@ fn m7_identity() -> Value {
         "vmwp_pid": 4242,
         "workload_label": "m7-smoke-idle",
         "processor_count": 1,
+        "target_shape": {
+            "nested_virtualization": true,
+            "guest_hypervisor_started": true,
+            "outer_partition_vtl1": false,
+            "m6_provider": "nested_root",
+        },
         "layers": {
             "m4_vtl0": m7_binding("k3-nt", 'a'),
             "m5_hypervisor": m7_binding("k3-hypervisor", 'b'),

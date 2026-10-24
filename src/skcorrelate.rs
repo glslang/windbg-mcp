@@ -37,6 +37,77 @@ pub(crate) struct LayerBindings {
     pub(crate) m6_vtl1: LayerBinding,
 }
 
+/// The VTL1 boundary reached by M6. The existing provider runs beside the outer `vmwp`; a future
+/// nested-root provider would have to run inside the L1 root and prove access independently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum M6Vtl1Provider {
+    OuterVmwp,
+    NestedRoot,
+}
+
+/// Measured target shape that determines whether all three M7 layers refer to one boot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TargetShape {
+    pub(crate) nested_virtualization: bool,
+    pub(crate) guest_hypervisor_started: bool,
+    pub(crate) outer_partition_vtl1: bool,
+    pub(crate) m6_provider: M6Vtl1Provider,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LayerUnavailableReason {
+    M5NeedsNestedHypervisor,
+    M6OuterProviderCannotReachNestedVtl1,
+    M6OuterPartitionHasNoVtl1,
+    M6NestedProviderNeedsNestedHypervisor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LayerUnavailability {
+    pub(crate) layer: Layer,
+    pub(crate) reason: LayerUnavailableReason,
+}
+
+impl TargetShape {
+    /// Return every layer unavailable in this exact boot shape. M4's ordinary kernel remains at
+    /// the guest-root boundary in both shapes, so only M5 and M6 need topology admission here.
+    pub(crate) fn unavailable_layers(&self) -> Vec<LayerUnavailability> {
+        let mut unavailable = Vec::new();
+        if !self.nested_virtualization || !self.guest_hypervisor_started {
+            unavailable.push(LayerUnavailability {
+                layer: Layer::M5Hypervisor,
+                reason: LayerUnavailableReason::M5NeedsNestedHypervisor,
+            });
+        }
+        match self.m6_provider {
+            M6Vtl1Provider::OuterVmwp if self.nested_virtualization => {
+                unavailable.push(LayerUnavailability {
+                    layer: Layer::M6Vtl1,
+                    reason: LayerUnavailableReason::M6OuterProviderCannotReachNestedVtl1,
+                });
+            }
+            M6Vtl1Provider::OuterVmwp if !self.outer_partition_vtl1 => {
+                unavailable.push(LayerUnavailability {
+                    layer: Layer::M6Vtl1,
+                    reason: LayerUnavailableReason::M6OuterPartitionHasNoVtl1,
+                });
+            }
+            M6Vtl1Provider::NestedRoot
+                if !self.nested_virtualization || !self.guest_hypervisor_started =>
+            {
+                unavailable.push(LayerUnavailability {
+                    layer: Layer::M6Vtl1,
+                    reason: LayerUnavailableReason::M6NestedProviderNeedsNestedHypervisor,
+                });
+            }
+            M6Vtl1Provider::OuterVmwp | M6Vtl1Provider::NestedRoot => {}
+        }
+        unavailable
+    }
+}
+
 /// Coordinator-owned capture identity. None of these fields is presented as target-measured by
 /// an individual layer; the coordinator observes and freezes them before opening the transaction.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -49,6 +120,7 @@ pub(crate) struct CaptureIdentity {
     pub(crate) vmwp_pid: u32,
     pub(crate) workload_label: String,
     pub(crate) processor_count: u32,
+    pub(crate) target_shape: TargetShape,
     pub(crate) layers: LayerBindings,
 }
 
@@ -74,6 +146,12 @@ impl CaptureIdentity {
             return Err(format!(
                 "M7 admits exactly one runnable processor, observed {}",
                 self.processor_count
+            ));
+        }
+        let unavailable = self.target_shape.unavailable_layers();
+        if !unavailable.is_empty() {
+            return Err(format!(
+                "M7 target shape does not expose all three layers in one boot: {unavailable:?}"
             ));
         }
         for (name, layer) in [
@@ -148,6 +226,26 @@ pub(crate) fn admit_identity(
         "processor_count",
         preflight.processor_count,
         armed.processor_count
+    );
+    changed!(
+        "target_shape.nested_virtualization",
+        preflight.target_shape.nested_virtualization,
+        armed.target_shape.nested_virtualization
+    );
+    changed!(
+        "target_shape.guest_hypervisor_started",
+        preflight.target_shape.guest_hypervisor_started,
+        armed.target_shape.guest_hypervisor_started
+    );
+    changed!(
+        "target_shape.outer_partition_vtl1",
+        preflight.target_shape.outer_partition_vtl1,
+        armed.target_shape.outer_partition_vtl1
+    );
+    changed!(
+        "target_shape.m6_provider",
+        preflight.target_shape.m6_provider,
+        armed.target_shape.m6_provider
     );
     changed!(
         "layers.m4_vtl0.profile",
@@ -1098,6 +1196,12 @@ mod tests {
             vmwp_pid: 4242,
             workload_label: "m7-create-0001".into(),
             processor_count: 1,
+            target_shape: TargetShape {
+                nested_virtualization: true,
+                guest_hypervisor_started: true,
+                outer_partition_vtl1: false,
+                m6_provider: M6Vtl1Provider::NestedRoot,
+            },
             layers: LayerBindings {
                 m4_vtl0: binding("k3-nt", 'a'),
                 m5_hypervisor: binding("k3-hypervisor", 'b'),
@@ -1125,6 +1229,59 @@ mod tests {
     }
 
     #[test]
+    fn target_shape_matrix_refuses_the_two_measured_partial_shapes() {
+        let non_nested = TargetShape {
+            nested_virtualization: false,
+            guest_hypervisor_started: false,
+            outer_partition_vtl1: true,
+            m6_provider: M6Vtl1Provider::OuterVmwp,
+        };
+        assert_eq!(
+            non_nested.unavailable_layers(),
+            [LayerUnavailability {
+                layer: Layer::M5Hypervisor,
+                reason: LayerUnavailableReason::M5NeedsNestedHypervisor,
+            }]
+        );
+
+        let nested_with_outer_provider = TargetShape {
+            nested_virtualization: true,
+            guest_hypervisor_started: true,
+            outer_partition_vtl1: false,
+            m6_provider: M6Vtl1Provider::OuterVmwp,
+        };
+        assert_eq!(
+            nested_with_outer_provider.unavailable_layers(),
+            [LayerUnavailability {
+                layer: Layer::M6Vtl1,
+                reason: LayerUnavailableReason::M6OuterProviderCannotReachNestedVtl1,
+            }]
+        );
+
+        let nested_root_provider = TargetShape {
+            m6_provider: M6Vtl1Provider::NestedRoot,
+            ..nested_with_outer_provider
+        };
+        assert!(nested_root_provider.unavailable_layers().is_empty());
+    }
+
+    #[test]
+    fn transaction_refuses_an_incompatible_shape_before_opening_a_worker() {
+        let mut driver = MockDriver::new();
+        driver.identity.target_shape.m6_provider = M6Vtl1Provider::OuterVmwp;
+        let report = run_transaction(plan(false), &mut driver);
+        assert_eq!(report.verdict, TransactionVerdict::Incomplete);
+        assert_eq!(driver.calls, [Operation::Preflight]);
+        assert!(report.issues.iter().any(|issue| {
+            issue.state == TransactionState::Preflight
+                && issue.operation == "preflight"
+                && issue
+                    .message
+                    .contains("M6OuterProviderCannotReachNestedVtl1")
+        }));
+    }
+
+    #[test]
     fn every_identity_field_is_frozen_between_preflight_and_arm() {
         let original = identity();
         let mutations: Vec<IdentityMutation> = vec![
@@ -1144,6 +1301,22 @@ mod tests {
                 Box::new(|v| v.workload_label.push_str("-changed")),
             ),
             ("processor_count", Box::new(|v| v.processor_count += 1)),
+            (
+                "target_shape.nested_virtualization",
+                Box::new(|v| v.target_shape.nested_virtualization = false),
+            ),
+            (
+                "target_shape.guest_hypervisor_started",
+                Box::new(|v| v.target_shape.guest_hypervisor_started = false),
+            ),
+            (
+                "target_shape.outer_partition_vtl1",
+                Box::new(|v| v.target_shape.outer_partition_vtl1 = true),
+            ),
+            (
+                "target_shape.m6_provider",
+                Box::new(|v| v.target_shape.m6_provider = M6Vtl1Provider::OuterVmwp),
+            ),
             (
                 "layers.m4_vtl0.profile",
                 Box::new(|v| v.layers.m4_vtl0.profile.push_str("-changed")),

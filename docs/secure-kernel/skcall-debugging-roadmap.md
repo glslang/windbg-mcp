@@ -573,9 +573,10 @@ negative control. Only then may M7 treat an M6 record as a semantic endpoint.
 
 ### M7 — cross-layer correlation and investigations
 
-Status: in progress. M6's live exit gate and M7.0 are complete. M7.1's offline transaction and
-line-protocol gates are complete, but its live coexistence exit gate is incomplete at the M5
-hypervisor open; M7.2 does not start until that gate passes.
+Status: in progress. M6's live exit gate and M7.0 are complete. M7.1's offline transaction,
+line-protocol and one-boot topology-refusal gates are complete. The live coexistence exit gate is
+blocked because the qualified M5 and M6 providers require mutually exclusive K3 processor shapes;
+M7.2 does not start until one provider is qualified in a shape that exposes all three layers.
 
 Join M4–M6 without putting two targets in one DbgEng process. The coordinator owns session ids and
 lifecycles, not engines: each layer remains in its existing worker and contributes an immutable
@@ -663,16 +664,59 @@ identity, and independently make every restoration field unsafe. A real-binary s
 the engine-free `--m7-transaction-protocol` through both the complete idle order and a timed-out
 open carrying a recovery handle. Neither role constructs a debugger engine.
 
-The live adapter passed identity, one-VP, image, profile, boot, `vmwp`, QPC and clean-process
-preflight on three bounded runs, then the first M5 `attach_kernel` failed to land inside the
-server's 300-second call bound. M4 and M6 were never opened and no workload ran. Each retained
-hypervisor worker was recovered against the exact disposable VM, after which heartbeat was `OK`
-and no debugger process remained. Post-recovery inspection still measured hypervisor debugging
-enabled with the intended NET transport, host address, distinct port and profile key. A separate
-attempt to start the VM while a hypervisor listener was already bound entered Windows repair;
-that boot-priming path is rejected and removed from the runner. The guest was recovered, and this
-is not live qualification evidence. The live pass above remains required before deterministic
-joining begins.
+The original live adapter passed identity, one-VP, image, profile, boot, `vmwp`, QPC and
+clean-process preflight on three bounded runs, then the first M5 `attach_kernel` failed to land
+inside the server's 300-second call bound. Event 41 in the guest subsequently proved the cause:
+K3 had `ExposeVirtualizationExtensions=false`, so no nested guest hypervisor existed to answer
+M5. Enabling the setting and obtaining guest Hyper-V event 1 fixed that prerequisite, but exposed
+the deeper topology conflict below. A separate attempt to start the VM while a hypervisor listener
+was already bound entered Windows repair; that boot-priming path remains rejected and removed.
+Every failed attempt withheld the workload and was recovered to heartbeat `OK` with no debugger
+process retained.
+
+#### M7.1a — one-boot topology admission and provider refinement
+
+The three records must describe one boot. Switching `ExposeVirtualizationExtensions` between
+layers changes the boot identity and is never a correlation mechanism. The measured matrix is:
+
+| K3 processor shape | M4 guest NT | M5 hypervisor | existing M6 outer-`vmwp` VTL1 |
+| --- | --- | --- | --- |
+| non-nested | available | unavailable: no guest hypervisor | available |
+| nested, guest hypervisor started | available | available | unavailable: outer partition has no K3 Secure Kernel VTL1 |
+
+The capture identity now carries the measured nesting flag, guest-hypervisor-started evidence,
+outer-partition VTL1 availability and selected M6 provider boundary. The pure gate enumerates
+unavailable layers and refuses before the first worker opens. Matrix tests cover both measured
+partial shapes and the only admissible future shape (nested plus a separately qualified
+`nested_root` M6 provider); mutation tests freeze every shape field between preflight and arm. The
+live refusal in `target/codex-m7/live-coexistence/20261024T102334/report.json` measured a running
+nested hypervisor, outer-partition VTL1 register status 21 and `m6_provider: outer_vmwp`, then
+closed with no sessions opened, no workload, unchanged boot/`vmwp`, heartbeat `OK` and no retained
+process.
+
+A bounded read-only feasibility probe tested the shortest nested-root path. Inside K3, the pinned
+test-signed H3 driver issued only `HvCallGetVpRegisters` against partition `SELF`: VTL0 CR3 and
+`VsmVpStatus` succeeded, and the latter reported VTL1 enabled, while VTL1 CR3 and RIP both returned
+Hyper-V status 6 (`ACCESS_DENIED`). The temporary service and files were removed and K3 retained
+heartbeat `OK`; the local evidence is
+`target/codex-m7/m7-nested-vtl1-feasibility.json`. Therefore raw SELF/VTL1 hypercalls are a
+rejected provider design, not an implicit fallback.
+
+Refinement proceeds as three separately gated phases:
+
+1. **Provider choice.** Either prove a supported nested-root mechanism that can read and restore
+   the complete M6 register/event state, or use a separate debugger machine to observe the L0
+   hypervisor while K3 remains non-nested. A proposal must bind its observation to the exact K3
+   partition and boot before any mutation test. Cross-boot joins and raw VMCS parsing remain
+   forbidden.
+2. **Provider qualification.** A read-only RIP/CR3 positive control comes first. Then reproduce
+   M6's arm, held-event, reverse restoration, provider-death and three-clean-boot controls through
+   the chosen boundary. Access denied, unavailable state, identity ambiguity or incomplete
+   restoration fails the phase; none may be converted to coordinate-only for semantic tracing.
+3. **Idle coexistence.** Only after phase 2 may the transaction open M5 -> M4 -> M6 on one boot,
+   arm all three without a workload, drain in reverse order and prove byte/register baselines,
+   heartbeat, unchanged boot/`vmwp` and zero retained processes. Failure/timeout injection remains
+   part of this gate. M7.2 stays closed until this exact live control passes.
 
 #### M7.2 — deterministic join
 

@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **M7.1 now has a typed one-boot topology gate.** The capture identity freezes nested-
+  virtualization state, guest-hypervisor launch, outer-partition VTL1 availability and the M6
+  provider boundary. The transaction enumerates unavailable layers and refuses before opening a
+  worker: non-nested K3 exposes M4+M6 but no M5 hypervisor, while nested K3 exposes M4+M5 but the
+  existing outer-`vmwp` M6 provider cannot reach its Secure Kernel VTL1. A live refusal preserved
+  the boot, `vmwp`, heartbeat and zero-process baseline. A bounded guest-root feasibility probe
+  then proved that SELF/VTL0 register access works and VTL1 is enabled, but SELF/VTL1 CR3 and RIP
+  are both access-denied, rejecting that raw-hypercall provider path. The roadmap now gates M7.2
+  on qualifying either a supported nested-root M6 provider or an externally hosted L0 M5
+  provider, followed by the original idle three-worker coexistence control.
+
 - **M7.1 adds an engine-free three-worker transaction coordinator without adding an MCP tool.** A
   typed line protocol keeps the live adapter on the public MCP surface while the pure Rust runner
   owns preflight, opening, fixed M5 -> M4 -> M6 arm order, workload admission, reverse drain,
@@ -16,8 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unsafe running, held, dropped, unreadable or unrestored child state cannot pass. Failed opens
   retain and clean up a public recovery handle when one is available, and no coordinator path can
   force-kill a worker that may still own debugger state. The offline and real-binary protocol gates
-  pass; the live three-layer gate remains incomplete at the existing M5 hypervisor attach and M7.2
-  remains gated on it.
+  pass; the live three-layer gate remains incomplete at the one-boot provider-compatibility gate
+  and M7.2 remains gated on it.
 
 - **M7.0 adds the cross-layer identity and clock admission contract without adding a debugger
   role or MCP tool.** M4, M5 and M6 arm/read envelopes and events now retain optional raw Windows
