@@ -11411,6 +11411,7 @@ fn arm_sk_call_trace(
         };
         let elapsed_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         recorder.hit(crate::skcall::Hit {
+            host_qpc: crate::hostclock::sample(),
             // GetTickCount64 is host-boot scoped, monotonic and shared by every worker process,
             // which makes this coordinate useful to M7 where independent traces are joined.
             host_monotonic_us: unsafe {
@@ -11522,6 +11523,7 @@ fn disarm_sk_call_trace(e: &DebugEngine, trace: &SkCallTrace) -> Result<(), Fail
 fn sk_call_armed_report(trace: &SkCallTrace, replaced: bool) -> structured::SkCallTraceArmed {
     structured::SkCallTraceArmed {
         schema: SK_CALL_SCHEMA.to_string(),
+        host_qpc: crate::hostclock::sample(),
         trace_id: trace.trace_id.clone(),
         label: trace.label.clone(),
         entry: trace.entry.clone(),
@@ -11557,6 +11559,7 @@ fn read_sk_call_trace(
         });
         structured::SkCallTrace {
             schema: SK_CALL_SCHEMA.to_string(),
+            host_qpc: crate::hostclock::sample(),
             trace_id: trace.trace_id.clone(),
             label: trace.label.clone(),
             entry: trace.entry.clone(),
@@ -11608,6 +11611,9 @@ fn traced_sk_call(
         "host_monotonic_us".to_string(),
         "host_elapsed_us".to_string(),
     ];
+    if hit.host_qpc.is_some() {
+        measured.push("host_qpc".to_string());
+    }
     for (name, present) in [
         ("target_rip", hit.rip.is_some()),
         ("stack_pointer", hit.rsp.is_some()),
@@ -11638,6 +11644,7 @@ fn traced_sk_call(
         });
     structured::TracedSkCall {
         sequence: call.sequence,
+        host_qpc: hit.host_qpc,
         host_monotonic_us: hit.host_monotonic_us,
         host_elapsed_us: hit.elapsed_us,
         target_rip: hit.rip.map(structured::addr),
@@ -12167,6 +12174,7 @@ fn arm_hv_transition_trace(
         let target_vmcs = hv_vmcs_for_vtl(engine, vp, target_vtl, "target_vmcs", &mut failures);
         let elapsed_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         recorder.hit(crate::hvtransition::Hit {
+            host_qpc: crate::hostclock::sample(),
             host_monotonic_us: unsafe {
                 windows_sys::Win32::System::SystemInformation::GetTickCount64()
                     .saturating_mul(1_000)
@@ -12361,6 +12369,7 @@ fn hv_transition_armed_report(
 ) -> structured::HvTransitionTraceArmed {
     structured::HvTransitionTraceArmed {
         schema: HV_TRANSITION_SCHEMA.to_string(),
+        host_qpc: crate::hostclock::sample(),
         trace_id: trace.trace_id.clone(),
         label: trace.label.clone(),
         call_site: trace.call_site.clone(),
@@ -12407,6 +12416,7 @@ fn read_hv_transition_trace(
             .count();
         structured::HvTransitionTrace {
             schema: HV_TRANSITION_SCHEMA.to_string(),
+            host_qpc: crate::hostclock::sample(),
             trace_id: trace.trace_id.clone(),
             label: trace.label.clone(),
             call_site: trace.call_site.clone(),
@@ -12443,7 +12453,7 @@ fn structured_hv_transition(
     transition: &crate::hvtransition::Transition,
 ) -> structured::HvTransition {
     let hit = &transition.hit;
-    let measured = [
+    let mut measured: Vec<String> = [
         ("target_rip", hit.rip.is_some()),
         ("stack_pointer", hit.rsp.is_some()),
         ("processor", hit.processor.is_some()),
@@ -12464,8 +12474,12 @@ fn structured_hv_transition(
         "host_elapsed_us".to_string(),
     ])
     .collect();
+    if hit.host_qpc.is_some() {
+        measured.push("host_qpc".to_string());
+    }
     structured::HvTransition {
         sequence: transition.sequence,
+        host_qpc: hit.host_qpc,
         host_monotonic_us: hit.host_monotonic_us,
         host_elapsed_us: hit.elapsed_us,
         kind: match hit.kind {
@@ -12512,6 +12526,9 @@ fn structured_hv_vmcs(value: &crate::hvtransition::VmcsCoordinate) -> structured
         state: structured::addr(value.state),
         descriptor: value.descriptor.map(structured::addr),
         physical_address: value.physical_address.map(structured::addr),
+        availability: Some(structured::HvGuestStateAvailability::CoordinateOnly {
+            reason: "the supported debugger API exposes no architectural VMCS guest-state read; raw VMCS memory was not parsed".into(),
+        }),
     }
 }
 
@@ -17199,6 +17216,23 @@ mod tests {
             !armed.contains("execute("),
             "the hypervisor callback must not parse debugger command text"
         );
+    }
+
+    #[test]
+    fn hypervisor_guest_state_stays_coordinate_only_without_an_architectural_api() {
+        let coordinate = structured_hv_vmcs(&crate::hvtransition::VmcsCoordinate {
+            state: 0xffff_8000_0000_1000,
+            descriptor: Some(0xffff_8000_0000_2000),
+            physical_address: Some(0x1234_5000),
+        });
+        assert!(matches!(
+            coordinate.availability,
+            Some(structured::HvGuestStateAvailability::CoordinateOnly { ref reason })
+                if reason.contains("raw VMCS memory was not parsed")
+        ));
+        let source = bodies_of(&["structured_hv_vmcs"], 400);
+        assert!(!source.contains("read_physical"));
+        assert!(!source.contains("read_virtual"));
     }
 
     /// **A trace is not armed from a scan that read part of the driver**, for either of the two

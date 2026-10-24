@@ -14,6 +14,8 @@
 //! VTL1 decoder over an operator-supplied source, and [`skcontrol::CONTROL_PROBE_FLAG`] validates an
 //! operator-supplied live-control provider's non-mutating handshake; neither loads DbgEng or starts
 //! MCP.
+//! [`hostclock::CLOCK_PROBE_FLAG`] emits the M7 cross-process clock test vector and likewise exits
+//! before either a debugger engine or the MCP runtime exists.
 //! [`skinspect::INSPECT_FLAG`] reads a Hyper-V saved state's VTL1 and reports what is in it
 //! (`FOLLOWUPS.md` item 103); it speaks no MCP, and with `--symbols` it *does* load DbgEng — **one**
 //! target, and that target is a **file**: an image opened for its symbols, with no process behind it
@@ -33,6 +35,7 @@ mod engine;
 mod fault;
 mod framework;
 mod hazards;
+mod hostclock;
 mod hvtransition;
 mod ioctl;
 mod kdapi;
@@ -56,6 +59,7 @@ mod service;
 mod sk;
 mod skcall;
 mod skcontrol;
+mod skcorrelate;
 mod skdispatch;
 mod skinspect;
 mod sklive;
@@ -140,6 +144,9 @@ fn main() -> Result<()> {
     let to_file =
         matches!(service::requested(&args), Some(service::Role::Run)).then(service::log_path);
     init_logging(is_worker || is_live_control || is_sk_kd_target, to_file);
+    if args.iter().any(|arg| arg == hostclock::CLOCK_PROBE_FLAG) {
+        return hostclock::run_probe();
+    }
     if is_worker {
         // The rest of the command line is the worker's half of the protocol channel — two
         // inherited pipe handles, which is why a worker started by hand cannot get anywhere.

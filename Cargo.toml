@@ -71,6 +71,10 @@ windows-sys = { version = "0.61", features = [
     # window of its own. The obvious `GetConsoleWindow` is in the same feature and is the wrong
     # call: a ConPTY console has no window (issue #273).
     "Win32_System_Console",
+    # M7 correlates records emitted by three independent workers. QueryPerformanceCounter is the
+    # one high-resolution counter shared by those processes; GetTickCount64 remains on the wire
+    # for compatibility but is too coarse to order the measured transition rate.
+    "Win32_System_Performance",
     "Win32_System_Threading",
     # `IsWow64Process2`, which is how `src/target.rs` reads the architecture of a *live* process
     # before a worker is spawned for it. The call itself is in `Win32_System_Threading` above; this

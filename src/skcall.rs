@@ -56,6 +56,8 @@ pub fn decode_process_id(bytes: &[u8]) -> Option<u32> {
 /// One breakpoint hit after the worker has attempted every typed read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hit {
+    /// High-resolution host-wide sample at the hit.
+    pub host_qpc: Option<crate::structured::HostQpcSample>,
     /// Host uptime at the hit, comparable across worker processes on this host.
     pub host_monotonic_us: u64,
     /// Monotonic time since the trace was armed.
@@ -185,6 +187,10 @@ mod tests {
 
     fn hit(failures: &[&str]) -> Hit {
         Hit {
+            host_qpc: Some(crate::structured::HostQpcSample {
+                tick: 110_000,
+                frequency: 10_000_000,
+            }),
             host_monotonic_us: 11_000,
             elapsed_us: 7,
             rip: Some(0xffff_f800_0000_1000),

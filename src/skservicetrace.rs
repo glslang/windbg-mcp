@@ -146,6 +146,10 @@ pub(crate) struct CodeCoordinate {
 #[serde(deny_unknown_fields)]
 pub(crate) struct PhaseSite {
     pub(crate) epoch: StopEpoch,
+    /// High-resolution host-wide sample at this retained stop. Optional only for records written
+    /// before the M7 clock contract existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) host_qpc: Option<crate::structured::HostQpcSample>,
     pub(crate) host_monotonic_us: u64,
     pub(crate) host_elapsed_us: u64,
     pub(crate) coordinate: CodeCoordinate,
@@ -635,6 +639,9 @@ struct PendingCall {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ServiceTraceArmed {
     pub(crate) schema: String,
+    /// Worker-side sample taken while producing the arm milestone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) host_qpc: Option<crate::structured::HostQpcSample>,
     pub(crate) trace_id: String,
     pub(crate) label: Option<String>,
     pub(crate) manifest_id: String,
@@ -649,6 +656,9 @@ pub(crate) struct ServiceTraceArmed {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ServiceTrace {
     pub(crate) schema: String,
+    /// Worker-side sample taken while producing this immutable-prefix snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) host_qpc: Option<crate::structured::HostQpcSample>,
     pub(crate) trace_id: String,
     pub(crate) label: Option<String>,
     pub(crate) manifest_id: String,
@@ -681,6 +691,7 @@ pub(crate) struct Recorder {
     dropped_capture_bytes: u64,
     unreadable_fields: u64,
     sealed: bool,
+    terminal_host_qpc: Option<crate::structured::HostQpcSample>,
     seen_epochs: std::collections::HashSet<StopEpoch>,
 }
 
@@ -718,6 +729,7 @@ impl Recorder {
             dropped_capture_bytes: 0,
             unreadable_fields: 0,
             sealed: false,
+            terminal_host_qpc: None,
             seen_epochs: std::collections::HashSet::new(),
         })
     }
@@ -725,6 +737,7 @@ impl Recorder {
     pub(crate) fn armed(&self) -> ServiceTraceArmed {
         ServiceTraceArmed {
             schema: ARMED_SCHEMA.into(),
+            host_qpc: crate::hostclock::sample(),
             trace_id: self.trace_id.clone(),
             label: self.label.clone(),
             manifest_id: self.manifest.manifest_id.clone(),
@@ -741,6 +754,11 @@ impl Recorder {
     pub(crate) fn completed_prefix(&self) -> ServiceTrace {
         ServiceTrace {
             schema: TRACE_SCHEMA.into(),
+            host_qpc: if self.sealed {
+                self.terminal_host_qpc
+            } else {
+                crate::hostclock::sample()
+            },
             trace_id: self.trace_id.clone(),
             label: self.label.clone(),
             manifest_id: self.manifest.manifest_id.clone(),
@@ -921,6 +939,9 @@ impl Recorder {
     }
 
     pub(crate) fn finish(&mut self) -> Result<(), String> {
+        if self.sealed {
+            return Ok(());
+        }
         if let Some(pending) = self
             .pending
             .take()
@@ -928,6 +949,7 @@ impl Recorder {
         {
             self.seal_pending(pending, None, IncompleteReason::Stopped)?;
         }
+        self.terminal_host_qpc = crate::hostclock::sample();
         self.sealed = true;
         Ok(())
     }
@@ -1174,7 +1196,7 @@ enum DecodedEvent {
     },
     Return {
         cr3: HexU64,
-        returned: ReturnPhase,
+        returned: Box<ReturnPhase>,
     },
 }
 
@@ -1194,7 +1216,7 @@ impl DecodedObservation {
                 recorder.observe_dispatch(cr3, service, *dispatch)?;
             }
             Some(DecodedEvent::Return { cr3, returned }) => {
-                recorder.observe_return(cr3, returned)?
+                recorder.observe_return(cr3, *returned)?
             }
             None => {}
         }
@@ -1334,13 +1356,10 @@ impl ObservationDecoder {
                     Ok(caller) => (Some(caller), None),
                     Err(message) => (None, Some(message)),
                 };
+                let mut measured = phase_measured("entry", &phase_site);
+                measured.push("entry.raw_arguments".into());
                 let mut provenance = Provenance {
-                    measured: vec![
-                        "entry.site.epoch".into(),
-                        "entry.site.host_monotonic_us".into(),
-                        "entry.site.host_elapsed_us".into(),
-                        "entry.raw_arguments".into(),
-                    ],
+                    measured,
                     exact_build_layout_derived: vec!["entry.site.coordinate".into()],
                     inferred: Vec::new(),
                     unavailable: Vec::new(),
@@ -1470,6 +1489,10 @@ impl ObservationDecoder {
                     }
                     (Vec::new(), Vec::new())
                 };
+                let dispatch_measured = phase_measured("dispatch", &phase_site)
+                    .into_iter()
+                    .chain(["dispatch.request".into(), "dispatch.fields".into()])
+                    .collect();
                 let dispatch = DispatchPhase {
                     site: phase_site,
                     handler: CodeCoordinate {
@@ -1483,13 +1506,7 @@ impl ObservationDecoder {
                     fields,
                     buffers_before,
                     provenance: Provenance {
-                        measured: vec![
-                            "dispatch.site.epoch".into(),
-                            "dispatch.site.host_monotonic_us".into(),
-                            "dispatch.site.host_elapsed_us".into(),
-                            "dispatch.request".into(),
-                            "dispatch.fields".into(),
-                        ],
+                        measured: dispatch_measured,
                         exact_build_layout_derived: vec![
                             "dispatch.site.coordinate".into(),
                             "dispatch.handler".into(),
@@ -1531,17 +1548,16 @@ impl ObservationDecoder {
                     CapturePoint::Dispatch,
                     &mut read,
                 )?;
+                let return_measured = phase_measured("returned", &phase_site)
+                    .into_iter()
+                    .chain(["returned.status".into()])
+                    .collect();
                 let returned = ReturnPhase {
                     site: phase_site,
                     status: self.register(stop, RegisterName::Rax)? as u32,
                     buffers_after,
                     provenance: Provenance {
-                        measured: vec![
-                            "returned.site.epoch".into(),
-                            "returned.site.host_monotonic_us".into(),
-                            "returned.site.host_elapsed_us".into(),
-                            "returned.status".into(),
-                        ],
+                        measured: return_measured,
                         exact_build_layout_derived: vec!["returned.site.coordinate".into()],
                         inferred: Vec::new(),
                         unavailable: Vec::new(),
@@ -1552,7 +1568,10 @@ impl ObservationDecoder {
                         phase: ServicePhase::Return,
                         selected: true,
                     },
-                    event: Some(DecodedEvent::Return { cr3, returned }),
+                    event: Some(DecodedEvent::Return {
+                        cr3,
+                        returned: Box::new(returned),
+                    }),
                 })
             }
             other => Err(format!("manifest exposed unknown service phase {other}")),
@@ -1563,6 +1582,7 @@ impl ObservationDecoder {
         let origin = MONOTONIC_ORIGIN.get_or_init(Instant::now);
         PhaseSite {
             epoch: stop.epoch.clone(),
+            host_qpc: crate::hostclock::sample(),
             host_monotonic_us: duration_us(origin.elapsed()),
             host_elapsed_us: duration_us(self.started.elapsed()),
             coordinate: CodeCoordinate {
@@ -1640,6 +1660,18 @@ impl ObservationDecoder {
 
 static MONOTONIC_ORIGIN: OnceLock<Instant> = OnceLock::new();
 
+fn phase_measured(prefix: &str, site: &PhaseSite) -> Vec<String> {
+    let mut measured = vec![
+        format!("{prefix}.site.epoch"),
+        format!("{prefix}.site.host_monotonic_us"),
+        format!("{prefix}.site.host_elapsed_us"),
+    ];
+    if site.host_qpc.is_some() {
+        measured.push(format!("{prefix}.site.host_qpc"));
+    }
+    measured
+}
+
 fn duration_us(duration: std::time::Duration) -> u64 {
     duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
@@ -1714,6 +1746,10 @@ mod tests {
     fn site(rva: u32, elapsed: u64) -> PhaseSite {
         PhaseSite {
             epoch: StopEpoch::new(format!("epoch-{elapsed:016x}")).unwrap(),
+            host_qpc: Some(crate::structured::HostQpcSample {
+                tick: 10_000_000 + elapsed,
+                frequency: 10_000_000,
+            }),
             host_monotonic_us: 1_000_000 + elapsed,
             host_elapsed_us: elapsed,
             coordinate: CodeCoordinate {
@@ -2924,6 +2960,6 @@ mod tests {
         // This conservative standalone measurement remains a ratchet beside the registered
         // tools/list golden, whose shared schema definitions make its exact delta smaller.
         assert_eq!(model, 2_937);
-        assert_eq!(wire, 15_124);
+        assert_eq!(wire, 15_794);
     }
 }

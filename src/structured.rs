@@ -50,6 +50,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine::{EngineError, SessionKind, SessionState};
 
+/// One host-wide Windows performance-counter sample.
+///
+/// The raw tick is meaningful across processes only when every participant reports the same
+/// frequency. M7 validates that contract before it uses a point timestamp; older trace records
+/// omit their optional `host_qpc` field and therefore remain readable but cannot form a complete
+/// M7 capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HostQpcSample {
+    pub tick: u64,
+    pub frequency: u64,
+}
+
 /// **Here rather than in `src/worker.rs`, which is where it was written and used.** Every
 /// renderer this crate has extracted to be engine-free -- `device`, `ioctl`, `hazards` and
 /// `surface` -- left that module and lost reach of this on the way out, and all four print strings
@@ -3604,6 +3617,9 @@ pub struct TracedAllocation {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SkCallTraceArmed {
     pub schema: String,
+    /// Worker-side QPC sample taken while producing this arm acknowledgement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_qpc: Option<HostQpcSample>,
     /// Unique within this worker process and copied into later reads.
     pub trace_id: String,
     /// Optional workload label supplied by the caller.
@@ -3629,6 +3645,9 @@ pub struct SkCallTraceArmed {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SkCallTrace {
     pub schema: String,
+    /// Worker-side QPC sample taken while producing this read snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_qpc: Option<HostQpcSample>,
     pub trace_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
@@ -3651,6 +3670,10 @@ pub struct SkCallTrace {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TracedSkCall {
     pub sequence: u64,
+    /// High-resolution host-wide sample taken at the breakpoint hit. Optional only so records
+    /// written before M7 remain readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_qpc: Option<HostQpcSample>,
     /// Host uptime at the hit, in microseconds. Unlike `host_elapsed_us`, this is comparable
     /// across worker processes on the same host and boot.
     pub host_monotonic_us: u64,
@@ -3706,6 +3729,9 @@ pub struct SkCallProvenance {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HvTransitionTraceArmed {
     pub schema: String,
+    /// Worker-side QPC sample taken while producing this arm acknowledgement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_qpc: Option<HostQpcSample>,
     pub trace_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
@@ -3733,6 +3759,9 @@ pub struct HvTransitionTraceArmed {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HvTransitionTrace {
     pub schema: String,
+    /// Worker-side QPC sample taken while producing this read snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_qpc: Option<HostQpcSample>,
     pub trace_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
@@ -3771,12 +3800,41 @@ pub struct HvVmcsCoordinate {
     pub descriptor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub physical_address: Option<String>,
+    /// Whether an architectural debugger API supplied guest RIP/CR3 values for this state.
+    /// Older M5 records omit this field and are not complete M7 inputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availability: Option<HvGuestStateAvailability>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "availability", rename_all = "snake_case")]
+pub enum HvGuestStateAvailability {
+    /// The exact VMCS field encodings and physical coordinate remain available, but no supported
+    /// architectural debugger API exposed their values. Raw VMCS memory is never parsed.
+    CoordinateOnly { reason: String },
+    /// Values returned by a supported architectural debugger API, with the fields it read.
+    ArchitecturalApi {
+        api: String,
+        guest_rip: HvGuestStateValue,
+        guest_cr3: HvGuestStateValue,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HvGuestStateValue {
+    pub field: String,
+    pub value: String,
 }
 
 /// One selected hypervisor VTL transition.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HvTransition {
     pub sequence: u64,
+    /// High-resolution host-wide sample taken at the breakpoint hit. Optional only so records
+    /// written before M7 remain readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_qpc: Option<HostQpcSample>,
     /// Host uptime at the hit, in microseconds, comparable to the ordinary-kernel M4 trace.
     pub host_monotonic_us: u64,
     pub host_elapsed_us: u64,

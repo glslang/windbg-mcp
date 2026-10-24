@@ -573,7 +573,7 @@ negative control. Only then may M7 treat an M6 record as a semantic endpoint.
 
 ### M7 — cross-layer correlation and investigations
 
-Status: planned; M6's live exit gate is complete.
+Status: in progress. M6's live exit gate and M7.0 are complete; M7.1 is next.
 
 Join M4–M6 without putting two targets in one DbgEng process. The coordinator owns session ids and
 lifecycles, not engines: each layer remains in its existing worker and contributes an immutable
@@ -613,6 +613,26 @@ and skew; the coordinator rejects a changed boot, `vmwp`, image, profile or proc
 preflight and arm. Controls deliberately collide old timestamps and mutate each identity field.
 Any new clock fields are optional for old records, required for a new complete M7 capture, and move
 the schema goldens and both surface budgets by an explicitly measured delta.
+
+**M7.0 result, 2026-10-24: passed.** M4, M5 and M6 arm/read envelopes and events now retain an
+optional raw `host_qpc` tick and frequency while preserving `host_monotonic_us`. The engine-free
+`--m7-clock-probe` role exits before the MCP runtime; the smoke gate launched two independent
+processes, observed one frequency and ordered QPC ticks in both, and also observed the intended
+collisions in the old millisecond coordinate. The pure `src/skcorrelate.rs` admission gate records
+the QPC resolution and caller-selected skew bound, permits point order only when every worker
+sample has the common frequency and lies inside its coordinator bracket, and otherwise retains
+interval-only authority with named reasons. Touching/overlapping intervals never become a causal
+order. Mutation controls independently reject every capture, VM, boot, `vmwp`, workload,
+one-processor, layer-profile and exact-image binding between preflight and arm.
+
+The supported debugger API exposes no architectural VMCS guest-state read. M5 therefore adds a
+typed `coordinate_only` availability result beside each exact field/physical coordinate and a
+source ratchet forbids virtual or physical memory reads in that conversion; raw VMCS parsing and
+VTL0-register substitution are not fallbacks. All new result fields remain optional when reading
+pre-M7 records; a complete M7 capture will require them at transaction admission. The six output
+schemas add 0 model-visible and 2,729 wire bytes, moving the complete payload from 402,689 to
+405,418 bytes under
+unchanged 138,000/410,000 ceilings.
 
 #### M7.1 — three-worker capture transaction
 

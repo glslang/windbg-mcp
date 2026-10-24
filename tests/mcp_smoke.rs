@@ -89,6 +89,59 @@ use serde_json::{Value, json};
 /// connected MCP client holds a lock on — see `CLAUDE.md`.
 const EXE: &str = env!("CARGO_BIN_EXE_windbg-mcp");
 
+#[test]
+fn two_processes_share_an_ordered_high_resolution_clock_despite_legacy_collisions() {
+    fn probe() -> Value {
+        let output = Command::new(EXE)
+            .arg("--m7-clock-probe")
+            .output()
+            .expect("start the M7 clock probe");
+        assert!(
+            output.status.success(),
+            "clock probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("clock probe emits one JSON value")
+    }
+
+    let first = probe();
+    let second = probe();
+    assert_eq!(first["schema"], "windbg-mcp.m7-clock-probe.v1");
+    assert_eq!(second["schema"], first["schema"]);
+    assert_ne!(first["process_id"], second["process_id"]);
+
+    let vectors = [
+        first["samples"].as_array().unwrap(),
+        second["samples"].as_array().unwrap(),
+    ];
+    let frequency = vectors[0][0]["qpc"]["frequency"].as_u64().unwrap();
+    assert!(frequency > 0);
+    for samples in vectors {
+        assert_eq!(samples.len(), 256);
+        assert!(
+            samples
+                .iter()
+                .all(|sample| { sample["qpc"]["frequency"].as_u64() == Some(frequency) })
+        );
+        assert!(samples.windows(2).all(|pair| {
+            pair[0]["qpc"]["tick"].as_u64().unwrap() <= pair[1]["qpc"]["tick"].as_u64().unwrap()
+        }));
+        assert!(
+            samples.windows(2).any(|pair| {
+                pair[0]["host_monotonic_us"] == pair[1]["host_monotonic_us"]
+                    && pair[0]["qpc"]["tick"] != pair[1]["qpc"]["tick"]
+            }),
+            "the vector must exhibit the legacy millisecond collision M7 replaces"
+        );
+    }
+    assert!(
+        first["samples"].as_array().unwrap().last().unwrap()["qpc"]["tick"]
+            .as_u64()
+            .unwrap()
+            <= second["samples"][0]["qpc"]["tick"].as_u64().unwrap()
+    );
+}
+
 /// Per-request budget for protocol-tier calls. Generous enough that a loaded CI runner never
 /// trips it, bounded so a regression fails instead of hanging the suite.
 const STEP: Duration = Duration::from_secs(60);
@@ -2206,6 +2259,10 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// the measured surface to 136,123 B across 88 tools. Their 2,441 B carry exact-build admission,
 /// three semantic phases, caller-selected capture bounds and the worker-owned stop/restoration
 /// lifecycle. The new ceiling leaves 1,877 B (1.4%).
+///
+/// **M7.0 costs no model-visible bytes** (2026-10-24). Optional QPC samples and typed VMCS-value
+/// availability change only the existing output schemas, so the surface stays at 136,123 B and
+/// this ceiling stays fixed.
 const MODEL_VISIBLE_CEILING: usize = 138_000;
 
 /// Ceiling on the whole `tools/list` payload — the serialized result, not the sum of its tools, so
@@ -2394,6 +2451,10 @@ const MODEL_VISIBLE_CEILING: usize = 138_000;
 /// 387,637 -> 402,689 B. The two new closures carry the exact manifest/image identity, bounded
 /// typed phase records, provenance and named unavailable reads; existing output closures do not
 /// grow. The new ceiling leaves 7,311 B (1.8%).
+///
+/// **M7.0 stays under the 410,000 wire ceiling** (2026-10-24). Optional QPC samples on all six
+/// M4-M6 arm/read results plus typed VMCS-value availability add 2,729 B, moving the payload to
+/// 405,418 B. The fixed ceiling leaves 4,582 B (1.1%).
 const WIRE_CEILING: usize = 410_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,296

@@ -80,6 +80,7 @@ pub struct VmcsCoordinate {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hit {
+    pub host_qpc: Option<crate::structured::HostQpcSample>,
     pub host_monotonic_us: u64,
     pub elapsed_us: u64,
     pub kind: Kind,
@@ -205,6 +206,10 @@ mod tests {
 
     fn hit(kind: Kind, failures: &[&str]) -> Hit {
         Hit {
+            host_qpc: Some(crate::structured::HostQpcSample {
+                tick: 200_000,
+                frequency: 10_000_000,
+            }),
             host_monotonic_us: 20_000,
             elapsed_us: 7,
             kind,

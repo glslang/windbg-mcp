@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **M7.0 adds the cross-layer identity and clock admission contract without adding a debugger
+  role or MCP tool.** M4, M5 and M6 arm/read envelopes and events now retain optional raw Windows
+  performance-counter samples while preserving the older millisecond field. A standalone,
+  engine-free probe proves that two processes share one frequency and ordered QPC ticks even while
+  their old timestamps collide. The pure correlation module freezes the capture/VM/boot/`vmwp`,
+  one-vCPU, workload, profile and exact-image identities between preflight and arm, and degrades
+  missing, mismatched, out-of-bracket or over-skew clock samples to measured RPC intervals. M5
+  now states guest RIP/CR3 availability per VMCS coordinate; the current supported debugger API
+  has no architectural read, so it reports `coordinate_only` and never parses raw VMCS memory.
+
 - **M6 now has a proved first VTL1 service and an exact-build gate.** The supported-API guest
   harness accepts cumulative `baseline`, `create`, `load`, `initialize`, `terminate` and `delete`
   stages while preserving M4's original arguments and output schema. Staged records bracket the
@@ -53,7 +63,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inherited before publication so no stale arm milestone escapes. The worker retains any terminal
   re-arm/restoration failure beside the immutable prefix, so the supervisor's background job
   consumer cannot turn a failed trace into a successful later read. This completes the offline
-  and public M6.2 gate; M6.3 live qualification remains.
+  and public M6.2 gate. M6.3 subsequently passed its three-clean-boot 300-call matrix, capacity,
+  no-hit, forced-teardown, stale-input and fail-closed provider-death controls; the final recovery
+  audit restored a healthy VBS guest with no retained process.
 
 - **`hv_transition_trace` records the hypervisor half of a Secure Kernel service transition.** A
   distinct hypervisor KD worker admits the measured K3 Intel `hvix64.exe` only by exact image

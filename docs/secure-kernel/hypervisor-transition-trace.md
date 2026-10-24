@@ -54,6 +54,13 @@ Those are **coordinates**, not claimed values: VMCS memory is implementation-def
 does not decode it. In particular, it never substitutes the stopped VTL0 RIP or CR3 for the saved
 VTL1 frame. Every failed typed register or memory read is retained by stable field name.
 
+M7.0 made that availability machine-readable on each saved-state coordinate. The supported
+debugger API surface has no architectural VMCS guest-state read, so current records carry
+`availability: coordinate_only` with the exact field encodings and physical coordinate already
+reported. Raw VMCS memory parsing and VTL0-register substitution remain forbidden rather than
+fallbacks. A future `architectural_api` result must name the API and pair each returned value with
+the field it read.
+
 ## Workflow
 
 Create a distinct profile with `role: "hypervisor"` and the same `guest` claim as the ordinary
