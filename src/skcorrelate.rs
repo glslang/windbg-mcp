@@ -4,14 +4,21 @@
 //! records from the three existing workers; keeping identity and clock decisions here makes them
 //! exhaustively testable without a target and prevents a fourth engine role from appearing.
 
-#![allow(dead_code)] // M7.0 lands the pure admission gate before M7.1 wires the live coordinator.
+#![allow(dead_code)] // M7 is driven through a hidden role; some join types land before M7.2 uses them.
 
+use std::io::Write as _;
+
+use anyhow::{Context as _, anyhow};
 use schemars::JsonSchema;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::structured::HostQpcSample;
 
 pub(crate) const CAPTURE_SCHEMA: &str = "windbg-mcp.sk-correlation-capture.v1";
+pub(crate) const TRANSACTION_PROTOCOL_FLAG: &str = "--m7-transaction-protocol";
+const TRANSACTION_PROTOCOL_SCHEMA: &str = "windbg-mcp.m7-transaction-protocol.v1";
+const TRANSACTION_PROTOCOL_RESPONSE_SCHEMA: &str = "windbg-mcp.m7-transaction-protocol-response.v1";
 
 /// Profile and exact-image binding for one independently owned trace layer.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -324,6 +331,743 @@ pub(crate) fn interval_order(
     )
 }
 
+pub(crate) const TRANSACTION_SCHEMA: &str = "windbg-mcp.sk-correlation-transaction.v1";
+
+/// The three independently owned debugger layers in one M7 capture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Layer {
+    M4Vtl0,
+    M5Hypervisor,
+    M6Vtl1,
+}
+
+impl Layer {
+    const ALL: [Self; 3] = [Self::M4Vtl0, Self::M5Hypervisor, Self::M6Vtl1];
+
+    fn wire_name(self) -> &'static str {
+        match self {
+            Self::M4Vtl0 => "m4_vtl0",
+            Self::M5Hypervisor => "m5_hypervisor",
+            Self::M6Vtl1 => "m6_vtl1",
+        }
+    }
+}
+
+/// M5 is armed first because it is the lowest layer; M6 is armed last and therefore restored
+/// first, before either lower layer it depends on is released.
+pub(crate) const ARM_ORDER: [Layer; 3] = [Layer::M5Hypervisor, Layer::M4Vtl0, Layer::M6Vtl1];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TransactionState {
+    Preflight,
+    Opening,
+    Armed,
+    Workload,
+    Draining,
+    Restoring,
+    Closed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TransactionVerdict {
+    Pass,
+    Incomplete,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(crate) enum Attempt<T> {
+    Succeeded {
+        value: T,
+    },
+    Failed {
+        message: String,
+        /// An opener can fail after the supervisor has minted the only handle that can reach its
+        /// worker. Other operations leave this absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recovery: Option<RecoveryHandle>,
+    },
+    TimedOut {
+        timeout_ms: u64,
+        /// A caller-side timeout must retain a session handle if the public opener returned one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recovery: Option<RecoveryHandle>,
+    },
+}
+
+impl<T> Attempt<T> {
+    fn succeeded(&self) -> Option<&T> {
+        match self {
+            Self::Succeeded { value } => Some(value),
+            Self::Failed { .. } | Self::TimedOut { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryHandle {
+    pub(crate) session_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OpenAck {
+    pub(crate) session_id: String,
+}
+
+impl Attempt<OpenAck> {
+    fn cleanup_session(&self) -> Option<OpenAck> {
+        match self {
+            Self::Succeeded { value } => Some(value.clone()),
+            Self::Failed {
+                recovery: Some(handle),
+                ..
+            }
+            | Self::TimedOut {
+                recovery: Some(handle),
+                ..
+            } => Some(OpenAck {
+                session_id: handle.session_id.clone(),
+            }),
+            Self::Failed { recovery: None, .. } | Self::TimedOut { recovery: None, .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ArmAck {
+    pub(crate) trace_id: String,
+    /// The instrument is armed and its worker has completed the layer-specific transition needed
+    /// before a guest workload may start (for example, resuming a stopped KD target).
+    pub(crate) workload_ready: bool,
+    pub(crate) identity: CaptureIdentity,
+    pub(crate) clock: RpcClockBracket,
+}
+
+/// Final child state returned by a stopping trace read. A clean result proves both that capture
+/// has stopped and that the layer-specific patch/event/register baseline has been restored.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RestorationAudit {
+    pub(crate) restored: bool,
+    pub(crate) running: bool,
+    pub(crate) held: bool,
+    pub(crate) dropped_records: u64,
+    pub(crate) dropped_bytes: u64,
+    pub(crate) unreadable_fields: u64,
+}
+
+impl RestorationAudit {
+    fn clean(&self) -> bool {
+        self.restored
+            && !self.running
+            && !self.held
+            && self.dropped_records == 0
+            && self.dropped_bytes == 0
+            && self.unreadable_fields == 0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DrainAck {
+    pub(crate) audit: RestorationAudit,
+    pub(crate) clock: RpcClockBracket,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EndAck {
+    pub(crate) ended: bool,
+    pub(crate) retained_processes: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkloadAck {
+    pub(crate) label: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub(crate) enum WorkloadResult {
+    SkippedIdle,
+    Launched { attempt: Attempt<WorkloadAck> },
+    Withheld,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum IssueKind {
+    Failed,
+    TimedOut,
+    Invalid,
+    UnsafeChild,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TransactionIssue {
+    pub(crate) state: TransactionState,
+    pub(crate) layer: Option<Layer>,
+    pub(crate) operation: String,
+    pub(crate) kind: IssueKind,
+    pub(crate) message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LayerReport {
+    pub(crate) open: Option<Attempt<OpenAck>>,
+    pub(crate) arm: Option<Attempt<ArmAck>>,
+    pub(crate) restoration: Option<Attempt<DrainAck>>,
+    pub(crate) end: Option<Attempt<EndAck>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LayerReports {
+    pub(crate) m4_vtl0: LayerReport,
+    pub(crate) m5_hypervisor: LayerReport,
+    pub(crate) m6_vtl1: LayerReport,
+}
+
+impl LayerReports {
+    fn get(&self, layer: Layer) -> &LayerReport {
+        match layer {
+            Layer::M4Vtl0 => &self.m4_vtl0,
+            Layer::M5Hypervisor => &self.m5_hypervisor,
+            Layer::M6Vtl1 => &self.m6_vtl1,
+        }
+    }
+
+    fn get_mut(&mut self, layer: Layer) -> &mut LayerReport {
+        match layer {
+            Layer::M4Vtl0 => &mut self.m4_vtl0,
+            Layer::M5Hypervisor => &mut self.m5_hypervisor,
+            Layer::M6Vtl1 => &mut self.m6_vtl1,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TransactionReport {
+    pub(crate) schema: String,
+    pub(crate) state: TransactionState,
+    pub(crate) states: Vec<TransactionState>,
+    pub(crate) verdict: TransactionVerdict,
+    pub(crate) preflight: Attempt<CaptureIdentity>,
+    pub(crate) arm_order: Vec<Layer>,
+    pub(crate) successful_arm_order: Vec<Layer>,
+    pub(crate) cleanup_order: Vec<Layer>,
+    pub(crate) workload: WorkloadResult,
+    pub(crate) clock: Option<Attempt<ClockAdmission>>,
+    pub(crate) layers: LayerReports,
+    pub(crate) issues: Vec<TransactionIssue>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TransactionPlan {
+    pub(crate) launch_workload: bool,
+    pub(crate) max_skew_ticks: u64,
+}
+
+/// The live adapter may call only public MCP operations. In particular, there is deliberately no
+/// force-kill callback: a failed stopping read is followed by the public session teardown, whose
+/// worker-owned recovery contract remains authoritative.
+pub(crate) trait TransactionDriver {
+    fn preflight(&mut self) -> Attempt<CaptureIdentity>;
+    fn open(&mut self, layer: Layer) -> Attempt<OpenAck>;
+    fn arm(
+        &mut self,
+        layer: Layer,
+        session: &OpenAck,
+        preflight: &CaptureIdentity,
+    ) -> Attempt<ArmAck>;
+    fn launch_workload(&mut self, preflight: &CaptureIdentity) -> Attempt<WorkloadAck>;
+    fn drain(&mut self, layer: Layer, session: &OpenAck, arm: &ArmAck) -> Attempt<DrainAck>;
+    fn end_session(&mut self, layer: Layer, session: &OpenAck) -> Attempt<EndAck>;
+}
+
+#[derive(Serialize)]
+struct ProtocolRequest {
+    schema: &'static str,
+    sequence: u64,
+    operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    layer: Option<Layer>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session: Option<OpenAck>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arm: Option<ArmAck>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preflight: Option<CaptureIdentity>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProtocolResponse<T> {
+    schema: String,
+    sequence: u64,
+    attempt: Attempt<T>,
+}
+
+struct StdioTransactionDriver {
+    sequence: u64,
+}
+
+impl StdioTransactionDriver {
+    fn exchange<T: DeserializeOwned>(
+        &mut self,
+        operation: &'static str,
+        layer: Option<Layer>,
+        session: Option<&OpenAck>,
+        arm: Option<&ArmAck>,
+        preflight: Option<&CaptureIdentity>,
+    ) -> Attempt<T> {
+        self.sequence += 1;
+        let request = ProtocolRequest {
+            schema: TRANSACTION_PROTOCOL_SCHEMA,
+            sequence: self.sequence,
+            operation,
+            layer,
+            session: session.cloned(),
+            arm: arm.cloned(),
+            preflight: preflight.cloned(),
+        };
+        let exchanged = (|| -> Result<Attempt<T>, String> {
+            let encoded = serde_json::to_string(&request).map_err(|error| error.to_string())?;
+            println!("{encoded}");
+            std::io::stdout()
+                .flush()
+                .map_err(|error| format!("could not flush M7 request: {error}"))?;
+            let mut line = String::new();
+            let read = std::io::stdin()
+                .read_line(&mut line)
+                .map_err(|error| format!("could not read M7 response: {error}"))?;
+            if read == 0 {
+                return Err("the M7 adapter closed its response stream".into());
+            }
+            let response: ProtocolResponse<T> = serde_json::from_str(&line)
+                .map_err(|error| format!("invalid M7 response: {error}"))?;
+            if response.schema != TRANSACTION_PROTOCOL_RESPONSE_SCHEMA {
+                return Err(format!(
+                    "unsupported M7 response schema {}",
+                    response.schema
+                ));
+            }
+            if response.sequence != self.sequence {
+                return Err(format!(
+                    "M7 response sequence {} did not match request {}",
+                    response.sequence, self.sequence
+                ));
+            }
+            Ok(response.attempt)
+        })();
+        exchanged.unwrap_or_else(|message| Attempt::Failed {
+            message,
+            recovery: None,
+        })
+    }
+}
+
+impl TransactionDriver for StdioTransactionDriver {
+    fn preflight(&mut self) -> Attempt<CaptureIdentity> {
+        self.exchange("preflight", None, None, None, None)
+    }
+
+    fn open(&mut self, layer: Layer) -> Attempt<OpenAck> {
+        self.exchange("open", Some(layer), None, None, None)
+    }
+
+    fn arm(
+        &mut self,
+        layer: Layer,
+        session: &OpenAck,
+        preflight: &CaptureIdentity,
+    ) -> Attempt<ArmAck> {
+        self.exchange("arm", Some(layer), Some(session), None, Some(preflight))
+    }
+
+    fn launch_workload(&mut self, preflight: &CaptureIdentity) -> Attempt<WorkloadAck> {
+        self.exchange("workload", None, None, None, Some(preflight))
+    }
+
+    fn drain(&mut self, layer: Layer, session: &OpenAck, arm: &ArmAck) -> Attempt<DrainAck> {
+        self.exchange("drain", Some(layer), Some(session), Some(arm), None)
+    }
+
+    fn end_session(&mut self, layer: Layer, session: &OpenAck) -> Attempt<EndAck> {
+        self.exchange("end_session", Some(layer), Some(session), None, None)
+    }
+}
+
+/// Run the engine-free half of the repository-owned M7 live driver. Each emitted request must be
+/// answered by the adapter with one matching JSON line; the final emitted line is the complete
+/// transaction report rather than another request.
+pub(crate) fn run_transaction_protocol(args: &[String]) -> anyhow::Result<()> {
+    let launch_workload = args.iter().any(|argument| argument == "--m7-workload");
+    let skew = args
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--m7-max-skew-ticks="))
+        .ok_or_else(|| anyhow!("--m7-max-skew-ticks is required"))?
+        .parse::<u64>()
+        .context("--m7-max-skew-ticks must be an unsigned integer")?;
+    let mut driver = StdioTransactionDriver { sequence: 0 };
+    let report = run_transaction(
+        TransactionPlan {
+            launch_workload,
+            max_skew_ticks: skew,
+        },
+        &mut driver,
+    );
+    println!("{}", serde_json::to_string(&report)?);
+    std::io::stdout().flush()?;
+    Ok(())
+}
+
+/// Run one M7 transaction. The runner continues every reachable cleanup after a failure and keeps
+/// the result of each call in the report, so a serializer never has to reconstruct safety from a
+/// log line.
+pub(crate) fn run_transaction<D: TransactionDriver>(
+    plan: TransactionPlan,
+    driver: &mut D,
+) -> TransactionReport {
+    let preflight = driver.preflight();
+    let mut report = TransactionReport {
+        schema: TRANSACTION_SCHEMA.into(),
+        state: TransactionState::Preflight,
+        states: vec![TransactionState::Preflight],
+        verdict: TransactionVerdict::Incomplete,
+        preflight,
+        arm_order: ARM_ORDER.to_vec(),
+        successful_arm_order: Vec::new(),
+        cleanup_order: Vec::new(),
+        workload: WorkloadResult::Withheld,
+        clock: None,
+        layers: LayerReports::default(),
+        issues: Vec::new(),
+    };
+
+    let identity = match report.preflight.succeeded().cloned() {
+        Some(identity) => match identity.validate() {
+            Ok(()) => Some(identity),
+            Err(message) => {
+                report.issue(
+                    TransactionState::Preflight,
+                    None,
+                    "preflight",
+                    IssueKind::Invalid,
+                    message,
+                );
+                None
+            }
+        },
+        None => {
+            report.issue_from_attempt(
+                TransactionState::Preflight,
+                None,
+                "preflight",
+                &report.preflight.clone(),
+            );
+            None
+        }
+    };
+
+    let mut opened = Vec::new();
+    let mut brackets = Vec::new();
+    report.enter(TransactionState::Opening);
+    if identity.is_some() {
+        for layer in ARM_ORDER {
+            let attempt = driver.open(layer);
+            let succeeded = attempt.succeeded().is_some();
+            let cleanup_session = attempt.cleanup_session();
+            if cleanup_session
+                .as_ref()
+                .is_some_and(|open| open.session_id.is_empty())
+            {
+                report.issue(
+                    TransactionState::Opening,
+                    Some(layer),
+                    "open",
+                    IssueKind::Invalid,
+                    "the opened layer returned an empty session id".into(),
+                );
+            }
+            if !succeeded {
+                report.issue_from_attempt(TransactionState::Opening, Some(layer), "open", &attempt);
+            }
+            report.layers.get_mut(layer).open = Some(attempt);
+            if cleanup_session.is_some() {
+                opened.push(layer);
+            }
+            if !succeeded || !report.issues.is_empty() {
+                break;
+            }
+        }
+    }
+
+    report.enter(TransactionState::Armed);
+    if report.issues.is_empty() {
+        let identity = identity.as_ref().expect("validated preflight exists");
+        for layer in ARM_ORDER {
+            let session = report
+                .layers
+                .get(layer)
+                .open
+                .as_ref()
+                .and_then(Attempt::succeeded)
+                .expect("all layers opened before arming")
+                .clone();
+            let attempt = driver.arm(layer, &session, identity);
+            let succeeded = attempt.succeeded().is_some();
+            if let Some(arm) = attempt.succeeded() {
+                // A successful arm owns an instrument even if its acknowledgement is malformed;
+                // retain it in cleanup order before rejecting the transaction.
+                report.successful_arm_order.push(layer);
+                brackets.push(arm.clock.clone());
+                if arm.trace_id.is_empty() {
+                    report.issue(
+                        TransactionState::Armed,
+                        Some(layer),
+                        "arm",
+                        IssueKind::Invalid,
+                        "the armed layer returned an empty trace id".into(),
+                    );
+                }
+                if !arm.workload_ready {
+                    report.issue(
+                        TransactionState::Armed,
+                        Some(layer),
+                        "arm",
+                        IssueKind::Invalid,
+                        "the armed layer did not acknowledge workload readiness".into(),
+                    );
+                }
+                if arm.clock.layer != layer.wire_name() || arm.clock.operation != "arm" {
+                    report.issue(
+                        TransactionState::Armed,
+                        Some(layer),
+                        "arm",
+                        IssueKind::Invalid,
+                        "the arm clock bracket names a different layer or operation".into(),
+                    );
+                }
+                if let Err(error) = admit_identity(identity, &arm.identity) {
+                    report.issue(
+                        TransactionState::Armed,
+                        Some(layer),
+                        "arm_identity",
+                        IssueKind::Invalid,
+                        format!("{error:?}"),
+                    );
+                }
+            } else {
+                report.issue_from_attempt(TransactionState::Armed, Some(layer), "arm", &attempt);
+            }
+            report.layers.get_mut(layer).arm = Some(attempt);
+            if !succeeded || !report.issues.is_empty() {
+                break;
+            }
+        }
+    }
+
+    report.enter(TransactionState::Workload);
+    if report.issues.is_empty() && report.successful_arm_order.len() == ARM_ORDER.len() {
+        if plan.launch_workload {
+            let attempt = driver.launch_workload(identity.as_ref().unwrap());
+            if let Some(workload) = attempt.succeeded()
+                && workload.label != identity.as_ref().unwrap().workload_label
+            {
+                report.issue(
+                    TransactionState::Workload,
+                    None,
+                    "workload",
+                    IssueKind::Invalid,
+                    "the workload acknowledgement changed its capture label".into(),
+                );
+            } else if attempt.succeeded().is_none() {
+                report.issue_from_attempt(TransactionState::Workload, None, "workload", &attempt);
+            }
+            report.workload = WorkloadResult::Launched { attempt };
+        } else {
+            report.workload = WorkloadResult::SkippedIdle;
+        }
+    }
+
+    report.cleanup_order = cleanup_order(&report.successful_arm_order, &opened);
+    report.enter(TransactionState::Draining);
+    for layer in report
+        .successful_arm_order
+        .iter()
+        .rev()
+        .copied()
+        .collect::<Vec<_>>()
+    {
+        let layer_report = report.layers.get(layer);
+        let session = layer_report
+            .open
+            .as_ref()
+            .and_then(Attempt::succeeded)
+            .expect("an armed layer was opened")
+            .clone();
+        let arm = layer_report
+            .arm
+            .as_ref()
+            .and_then(Attempt::succeeded)
+            .expect("successful arm order contains only acknowledgements")
+            .clone();
+        let attempt = driver.drain(layer, &session, &arm);
+        if let Some(drain) = attempt.succeeded() {
+            brackets.push(drain.clock.clone());
+            if drain.clock.layer != layer.wire_name() || drain.clock.operation != "drain" {
+                report.issue(
+                    TransactionState::Draining,
+                    Some(layer),
+                    "drain",
+                    IssueKind::Invalid,
+                    "the drain clock bracket names a different layer or operation".into(),
+                );
+            }
+            if !drain.audit.clean() {
+                report.issue(
+                    TransactionState::Draining,
+                    Some(layer),
+                    "drain",
+                    IssueKind::UnsafeChild,
+                    "the child remained running, held, dropped, unreadable or unrestored".into(),
+                );
+            }
+        } else {
+            report.issue_from_attempt(TransactionState::Draining, Some(layer), "drain", &attempt);
+        }
+        report.layers.get_mut(layer).restoration = Some(attempt);
+    }
+
+    report.enter(TransactionState::Restoring);
+    for layer in report.cleanup_order.clone() {
+        let session = report
+            .layers
+            .get(layer)
+            .open
+            .as_ref()
+            .and_then(Attempt::cleanup_session)
+            .expect("cleanup order contains only opened layers");
+        let attempt = driver.end_session(layer, &session);
+        if let Some(end) = attempt.succeeded() {
+            if !end.ended || end.retained_processes != 0 {
+                report.issue(
+                    TransactionState::Restoring,
+                    Some(layer),
+                    "end_session",
+                    IssueKind::UnsafeChild,
+                    "the opened layer did not end cleanly with zero retained processes".into(),
+                );
+            }
+        } else {
+            report.issue_from_attempt(
+                TransactionState::Restoring,
+                Some(layer),
+                "end_session",
+                &attempt,
+            );
+        }
+        report.layers.get_mut(layer).end = Some(attempt);
+    }
+
+    if !brackets.is_empty() {
+        match admit_clock(brackets, plan.max_skew_ticks) {
+            Ok(clock) => report.clock = Some(Attempt::Succeeded { value: clock }),
+            Err(message) => {
+                report.issue(
+                    TransactionState::Restoring,
+                    None,
+                    "clock_admission",
+                    IssueKind::Invalid,
+                    message.clone(),
+                );
+                report.clock = Some(Attempt::Failed {
+                    message,
+                    recovery: None,
+                });
+            }
+        }
+    }
+
+    report.enter(TransactionState::Closed);
+    if report.issues.is_empty()
+        && opened.len() == Layer::ALL.len()
+        && report.successful_arm_order.len() == Layer::ALL.len()
+    {
+        report.verdict = TransactionVerdict::Pass;
+    }
+    report
+}
+
+fn cleanup_order(successful_arms: &[Layer], opened: &[Layer]) -> Vec<Layer> {
+    let mut order = successful_arms.iter().rev().copied().collect::<Vec<_>>();
+    order.extend(
+        opened
+            .iter()
+            .rev()
+            .copied()
+            .filter(|layer| !successful_arms.contains(layer)),
+    );
+    order
+}
+
+impl TransactionReport {
+    fn enter(&mut self, state: TransactionState) {
+        self.state = state;
+        self.states.push(state);
+    }
+
+    fn issue(
+        &mut self,
+        state: TransactionState,
+        layer: Option<Layer>,
+        operation: &str,
+        kind: IssueKind,
+        message: String,
+    ) {
+        self.issues.push(TransactionIssue {
+            state,
+            layer,
+            operation: operation.into(),
+            kind,
+            message,
+        });
+    }
+
+    fn issue_from_attempt<T>(
+        &mut self,
+        state: TransactionState,
+        layer: Option<Layer>,
+        operation: &str,
+        attempt: &Attempt<T>,
+    ) {
+        match attempt {
+            Attempt::Succeeded { .. } => {}
+            Attempt::Failed { message, .. } => {
+                self.issue(state, layer, operation, IssueKind::Failed, message.clone())
+            }
+            Attempt::TimedOut { timeout_ms, .. } => self.issue(
+                state,
+                layer,
+                operation,
+                IssueKind::TimedOut,
+                format!("operation exceeded {timeout_ms} ms"),
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -526,5 +1270,419 @@ mod tests {
             interval_order(&first, &touching).unwrap(),
             IntervalOrder::Overlap
         );
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Operation {
+        Preflight,
+        Open(Layer),
+        Arm(Layer),
+        Workload,
+        Drain(Layer),
+        End(Layer),
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum InjectedFailure {
+        Failed,
+        TimedOut,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum UnsafeAudit {
+        Unrestored,
+        Running,
+        Held,
+        Dropped,
+        Unreadable,
+    }
+
+    struct MockDriver {
+        identity: CaptureIdentity,
+        fault: Option<(Operation, InjectedFailure)>,
+        recovery_at_open: Option<Layer>,
+        unsafe_audit: Option<(Layer, UnsafeAudit)>,
+        drift_at_arm: Option<Layer>,
+        calls: Vec<Operation>,
+        next_tick: u64,
+    }
+
+    impl MockDriver {
+        fn new() -> Self {
+            Self {
+                identity: identity(),
+                fault: None,
+                recovery_at_open: None,
+                unsafe_audit: None,
+                drift_at_arm: None,
+                calls: Vec::new(),
+                next_tick: 1_000,
+            }
+        }
+
+        fn attempt<T>(&mut self, operation: Operation, value: T) -> Attempt<T> {
+            self.calls.push(operation);
+            match self.fault.filter(|(at, _)| *at == operation) {
+                Some((_, InjectedFailure::Failed)) => Attempt::Failed {
+                    message: format!("injected {operation:?} failure"),
+                    recovery: None,
+                },
+                Some((_, InjectedFailure::TimedOut)) => Attempt::TimedOut {
+                    timeout_ms: 37,
+                    recovery: None,
+                },
+                None => Attempt::Succeeded { value },
+            }
+        }
+
+        fn rpc_clock(&mut self, layer: Layer, operation: &str) -> RpcClockBracket {
+            let start = self.next_tick;
+            self.next_tick += 100;
+            RpcClockBracket {
+                layer: layer.wire_name().into(),
+                operation: operation.into(),
+                coordinator_before: sample(start),
+                worker: Some(sample(start + 10)),
+                coordinator_after: sample(start + 20),
+            }
+        }
+    }
+
+    impl TransactionDriver for MockDriver {
+        fn preflight(&mut self) -> Attempt<CaptureIdentity> {
+            self.attempt(Operation::Preflight, self.identity.clone())
+        }
+
+        fn open(&mut self, layer: Layer) -> Attempt<OpenAck> {
+            let mut attempt = self.attempt(
+                Operation::Open(layer),
+                OpenAck {
+                    session_id: format!("sess-{}", layer.wire_name()),
+                },
+            );
+            let recovery = (self.recovery_at_open == Some(layer)).then(|| RecoveryHandle {
+                session_id: format!("sess-{}", layer.wire_name()),
+            });
+            match &mut attempt {
+                Attempt::Failed {
+                    recovery: retained, ..
+                }
+                | Attempt::TimedOut {
+                    recovery: retained, ..
+                } => *retained = recovery,
+                Attempt::Succeeded { .. } => {}
+            }
+            attempt
+        }
+
+        fn arm(
+            &mut self,
+            layer: Layer,
+            _session: &OpenAck,
+            _preflight: &CaptureIdentity,
+        ) -> Attempt<ArmAck> {
+            let mut identity = self.identity.clone();
+            if self.drift_at_arm == Some(layer) {
+                identity.guest_boot_identity.push_str("-changed");
+            }
+            let clock = self.rpc_clock(layer, "arm");
+            self.attempt(
+                Operation::Arm(layer),
+                ArmAck {
+                    trace_id: format!("trace-{}", layer.wire_name()),
+                    workload_ready: true,
+                    identity,
+                    clock,
+                },
+            )
+        }
+
+        fn launch_workload(&mut self, _preflight: &CaptureIdentity) -> Attempt<WorkloadAck> {
+            self.attempt(
+                Operation::Workload,
+                WorkloadAck {
+                    label: self.identity.workload_label.clone(),
+                },
+            )
+        }
+
+        fn drain(&mut self, layer: Layer, _session: &OpenAck, _arm: &ArmAck) -> Attempt<DrainAck> {
+            let mut audit = RestorationAudit {
+                restored: true,
+                running: false,
+                held: false,
+                dropped_records: 0,
+                dropped_bytes: 0,
+                unreadable_fields: 0,
+            };
+            if let Some((_, unsafe_audit)) = self
+                .unsafe_audit
+                .filter(|(unsafe_layer, _)| *unsafe_layer == layer)
+            {
+                match unsafe_audit {
+                    UnsafeAudit::Unrestored => audit.restored = false,
+                    UnsafeAudit::Running => audit.running = true,
+                    UnsafeAudit::Held => audit.held = true,
+                    UnsafeAudit::Dropped => audit.dropped_records = 1,
+                    UnsafeAudit::Unreadable => audit.unreadable_fields = 1,
+                }
+            }
+            let clock = self.rpc_clock(layer, "drain");
+            self.attempt(Operation::Drain(layer), DrainAck { audit, clock })
+        }
+
+        fn end_session(&mut self, layer: Layer, _session: &OpenAck) -> Attempt<EndAck> {
+            self.attempt(
+                Operation::End(layer),
+                EndAck {
+                    ended: true,
+                    retained_processes: 0,
+                },
+            )
+        }
+    }
+
+    fn plan(launch_workload: bool) -> TransactionPlan {
+        TransactionPlan {
+            launch_workload,
+            max_skew_ticks: 1_000,
+        }
+    }
+
+    fn operation_points() -> Vec<Operation> {
+        let mut operations = vec![Operation::Preflight];
+        for layer in ARM_ORDER {
+            operations.push(Operation::Open(layer));
+        }
+        for layer in ARM_ORDER {
+            operations.push(Operation::Arm(layer));
+        }
+        operations.push(Operation::Workload);
+        for layer in ARM_ORDER.into_iter().rev() {
+            operations.push(Operation::Drain(layer));
+        }
+        for layer in ARM_ORDER.into_iter().rev() {
+            operations.push(Operation::End(layer));
+        }
+        operations
+    }
+
+    #[test]
+    fn idle_transaction_arms_every_worker_and_restores_in_reverse_order() {
+        let mut driver = MockDriver::new();
+        let report = run_transaction(plan(false), &mut driver);
+        assert_eq!(report.verdict, TransactionVerdict::Pass);
+        assert_eq!(
+            report.states,
+            [
+                TransactionState::Preflight,
+                TransactionState::Opening,
+                TransactionState::Armed,
+                TransactionState::Workload,
+                TransactionState::Draining,
+                TransactionState::Restoring,
+                TransactionState::Closed,
+            ]
+        );
+        assert_eq!(report.successful_arm_order, ARM_ORDER);
+        assert_eq!(
+            report.cleanup_order,
+            [Layer::M6Vtl1, Layer::M4Vtl0, Layer::M5Hypervisor]
+        );
+        assert_eq!(report.workload, WorkloadResult::SkippedIdle);
+        assert!(!driver.calls.contains(&Operation::Workload));
+        assert!(matches!(
+            report.clock,
+            Some(Attempt::Succeeded {
+                value: ClockAdmission {
+                    mode: ClockMode::Point,
+                    ..
+                }
+            })
+        ));
+        let drains = driver
+            .calls
+            .iter()
+            .filter_map(|operation| match operation {
+                Operation::Drain(layer) => Some(*layer),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(drains, report.cleanup_order);
+    }
+
+    #[test]
+    fn workload_is_launched_only_after_all_three_arm_acknowledgements() {
+        let mut driver = MockDriver::new();
+        let report = run_transaction(plan(true), &mut driver);
+        assert_eq!(report.verdict, TransactionVerdict::Pass);
+        let workload = driver
+            .calls
+            .iter()
+            .position(|operation| *operation == Operation::Workload)
+            .unwrap();
+        assert!(ARM_ORDER.into_iter().all(|layer| {
+            driver
+                .calls
+                .iter()
+                .position(|operation| *operation == Operation::Arm(layer))
+                .is_some_and(|armed| armed < workload)
+        }));
+
+        let mut failed = MockDriver::new();
+        failed.fault = Some((Operation::Arm(Layer::M4Vtl0), InjectedFailure::Failed));
+        let report = run_transaction(plan(true), &mut failed);
+        assert_eq!(report.verdict, TransactionVerdict::Incomplete);
+        assert!(!failed.calls.contains(&Operation::Workload));
+        assert_eq!(report.workload, WorkloadResult::Withheld);
+    }
+
+    #[test]
+    fn every_failure_and_timeout_keeps_reachable_cleanup_and_a_complete_audit() {
+        for failure in [InjectedFailure::Failed, InjectedFailure::TimedOut] {
+            for operation in operation_points() {
+                let mut driver = MockDriver::new();
+                driver.fault = Some((operation, failure));
+                let report = run_transaction(plan(true), &mut driver);
+                assert_eq!(
+                    report.verdict,
+                    TransactionVerdict::Incomplete,
+                    "{failure:?} at {operation:?} passed"
+                );
+                assert_eq!(report.state, TransactionState::Closed);
+                assert!(!report.issues.is_empty());
+
+                for layer in Layer::ALL {
+                    let layer_report = report.layers.get(layer);
+                    let opened = layer_report
+                        .open
+                        .as_ref()
+                        .and_then(Attempt::succeeded)
+                        .is_some();
+                    let end_calls = driver
+                        .calls
+                        .iter()
+                        .filter(|call| **call == Operation::End(layer))
+                        .count();
+                    assert_eq!(
+                        end_calls,
+                        usize::from(opened),
+                        "opened-layer cleanup mismatch for {layer:?}, {failure:?} at {operation:?}"
+                    );
+                    if !opened {
+                        assert!(!driver.calls.iter().any(|call| matches!(
+                            call,
+                            Operation::Arm(at) | Operation::Drain(at) | Operation::End(at)
+                                if *at == layer
+                        )));
+                    }
+                    if layer_report
+                        .arm
+                        .as_ref()
+                        .and_then(Attempt::succeeded)
+                        .is_some()
+                    {
+                        assert!(
+                            layer_report.restoration.is_some(),
+                            "armed layer lost its restoration result for {failure:?} at {operation:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_or_timed_out_open_with_a_handle_is_ended_exactly_once() {
+        for failure in [InjectedFailure::Failed, InjectedFailure::TimedOut] {
+            for layer in ARM_ORDER {
+                let mut driver = MockDriver::new();
+                driver.fault = Some((Operation::Open(layer), failure));
+                driver.recovery_at_open = Some(layer);
+                let report = run_transaction(plan(true), &mut driver);
+
+                assert_eq!(report.verdict, TransactionVerdict::Incomplete);
+                let failed_at = ARM_ORDER
+                    .iter()
+                    .position(|candidate| *candidate == layer)
+                    .unwrap();
+                let expected_cleanup = ARM_ORDER[..=failed_at]
+                    .iter()
+                    .rev()
+                    .copied()
+                    .collect::<Vec<_>>();
+                assert_eq!(report.cleanup_order, expected_cleanup);
+                for opened in &ARM_ORDER[..=failed_at] {
+                    assert_eq!(
+                        driver
+                            .calls
+                            .iter()
+                            .filter(|call| **call == Operation::End(*opened))
+                            .count(),
+                        1
+                    );
+                }
+                for untouched in &ARM_ORDER[failed_at + 1..] {
+                    assert!(!driver.calls.iter().any(|call| matches!(
+                        call,
+                        Operation::Open(at) | Operation::Arm(at) | Operation::Drain(at)
+                            if at == untouched
+                    )));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_child_hazard_can_be_reported_as_a_pass() {
+        for layer in Layer::ALL {
+            for unsafe_audit in [
+                UnsafeAudit::Unrestored,
+                UnsafeAudit::Running,
+                UnsafeAudit::Held,
+                UnsafeAudit::Dropped,
+                UnsafeAudit::Unreadable,
+            ] {
+                let mut driver = MockDriver::new();
+                driver.unsafe_audit = Some((layer, unsafe_audit));
+                let report = run_transaction(plan(false), &mut driver);
+                assert_eq!(
+                    report.verdict,
+                    TransactionVerdict::Incomplete,
+                    "{unsafe_audit:?} on {layer:?} passed"
+                );
+                assert!(report.issues.iter().any(|issue| {
+                    issue.layer == Some(layer) && issue.kind == IssueKind::UnsafeChild
+                }));
+                assert_eq!(
+                    driver
+                        .calls
+                        .iter()
+                        .filter(|call| **call == Operation::End(layer))
+                        .count(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn arm_time_identity_drift_still_restores_every_instrument_that_was_acknowledged() {
+        let mut driver = MockDriver::new();
+        driver.drift_at_arm = Some(Layer::M4Vtl0);
+        let report = run_transaction(plan(true), &mut driver);
+        assert_eq!(report.verdict, TransactionVerdict::Incomplete);
+        assert_eq!(
+            report.successful_arm_order,
+            [Layer::M5Hypervisor, Layer::M4Vtl0]
+        );
+        assert_eq!(
+            report.cleanup_order,
+            [Layer::M4Vtl0, Layer::M5Hypervisor, Layer::M6Vtl1]
+        );
+        assert!(report.layers.m4_vtl0.restoration.is_some());
+        assert!(report.layers.m5_hypervisor.restoration.is_some());
+        assert!(report.layers.m6_vtl1.arm.is_none());
+        assert!(!driver.calls.contains(&Operation::Workload));
     }
 }

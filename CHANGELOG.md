@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **M7.1 adds an engine-free three-worker transaction coordinator without adding an MCP tool.** A
+  typed line protocol keeps the live adapter on the public MCP surface while the pure Rust runner
+  owns preflight, opening, fixed M5 -> M4 -> M6 arm order, workload admission, reverse drain,
+  session restoration and the final verdict. Failure/timeout injection covers every operation;
+  unsafe running, held, dropped, unreadable or unrestored child state cannot pass. Failed opens
+  retain and clean up a public recovery handle when one is available, and no coordinator path can
+  force-kill a worker that may still own debugger state. The offline and real-binary protocol gates
+  pass; the live three-layer gate remains incomplete at the existing M5 hypervisor attach and M7.2
+  remains gated on it.
+
 - **M7.0 adds the cross-layer identity and clock admission contract without adding a debugger
   role or MCP tool.** M4, M5 and M6 arm/read envelopes and events now retain optional raw Windows
   performance-counter samples while preserving the older millisecond field. A standalone,

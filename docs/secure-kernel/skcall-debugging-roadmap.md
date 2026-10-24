@@ -573,7 +573,9 @@ negative control. Only then may M7 treat an M6 record as a semantic endpoint.
 
 ### M7 — cross-layer correlation and investigations
 
-Status: in progress. M6's live exit gate and M7.0 are complete; M7.1 is next.
+Status: in progress. M6's live exit gate and M7.0 are complete. M7.1's offline transaction and
+line-protocol gates are complete, but its live coexistence exit gate is incomplete at the M5
+hypervisor open; M7.2 does not start until that gate passes.
 
 Join M4–M6 without putting two targets in one DbgEng process. The coordinator owns session ids and
 lifecycles, not engines: each layer remains in its existing worker and contributes an immutable
@@ -649,6 +651,28 @@ are retained, and the top-level result cannot be `pass` while a child is running
 unreadable. The live coexistence control arms and removes all instruments without starting the
 guest harness, then proves the same boot, heartbeat, breakpoint bytes, debug-register baseline and
 zero retained processes.
+
+**M7.1 implementation result, 2026-10-24: offline passed; live incomplete.** The pure transaction
+runner now owns the seven states above, fixes the arm order as M5 hypervisor -> M4 VTL0 -> M6
+VTL1, withholds the workload until all three acknowledgements say they are ready, and drains
+successful arms in reverse order before ending every reachable session. Its driver has no
+force-kill operation. Failed and timed-out opens retain a public recovery session handle when one
+was returned, so that handle is ended exactly once rather than being mistaken for an unopened
+layer. Unit controls inject failure and timeout at every operation and layer, mutate arm-time
+identity, and independently make every restoration field unsafe. A real-binary smoke test drives
+the engine-free `--m7-transaction-protocol` through both the complete idle order and a timed-out
+open carrying a recovery handle. Neither role constructs a debugger engine.
+
+The live adapter passed identity, one-VP, image, profile, boot, `vmwp`, QPC and clean-process
+preflight on three bounded runs, then the first M5 `attach_kernel` failed to land inside the
+server's 300-second call bound. M4 and M6 were never opened and no workload ran. Each retained
+hypervisor worker was recovered against the exact disposable VM, after which heartbeat was `OK`
+and no debugger process remained. Post-recovery inspection still measured hypervisor debugging
+enabled with the intended NET transport, host address, distinct port and profile key. A separate
+attempt to start the VM while a hypervisor listener was already bound entered Windows repair;
+that boot-priming path is rejected and removed from the runner. The guest was recovered, and this
+is not live qualification evidence. The live pass above remains required before deterministic
+joining begins.
 
 #### M7.2 — deterministic join
 

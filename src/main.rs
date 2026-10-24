@@ -16,6 +16,8 @@
 //! MCP.
 //! [`hostclock::CLOCK_PROBE_FLAG`] emits the M7 cross-process clock test vector and likewise exits
 //! before either a debugger engine or the MCP runtime exists.
+//! [`skcorrelate::TRANSACTION_PROTOCOL_FLAG`] drives the M7 three-worker lifecycle over a typed
+//! line protocol; the adapter owns public MCP calls while this engine-free role owns policy.
 //! [`skinspect::INSPECT_FLAG`] reads a Hyper-V saved state's VTL1 and reports what is in it
 //! (`FOLLOWUPS.md` item 103); it speaks no MCP, and with `--symbols` it *does* load DbgEng — **one**
 //! target, and that target is a **file**: an image opened for its symbols, with no process behind it
@@ -146,6 +148,12 @@ fn main() -> Result<()> {
     init_logging(is_worker || is_live_control || is_sk_kd_target, to_file);
     if args.iter().any(|arg| arg == hostclock::CLOCK_PROBE_FLAG) {
         return hostclock::run_probe();
+    }
+    if args
+        .iter()
+        .any(|arg| arg == skcorrelate::TRANSACTION_PROTOCOL_FLAG)
+    {
+        return skcorrelate::run_transaction_protocol(&args);
     }
     if is_worker {
         // The rest of the command line is the worker's half of the protocol channel — two
