@@ -10,6 +10,7 @@
  *
  *   skcall_guest_harness.exe <label> [count] [startup-delay-ms] [output-jsonl] [error-log]
  *                            [enclave-image] [baseline|create|load|initialize|terminate|delete]
+ *                            [start-after-nonempty-file]
  *
  * Output is one JSON line per invocation. Labels are intentionally restricted to a small ASCII
  * alphabet so the output needs no ambiguous JSON escaping and can be joined to the debugger trace
@@ -98,13 +99,34 @@ static int default_image_path(wchar_t *path, size_t capacity)
     return wcscpy_s(path + prefix, capacity - prefix, L"spin_enclave.dll") == 0;
 }
 
+static int wait_for_nonempty_file(const wchar_t *path, DWORD timeout_ms)
+{
+    ULONGLONG started = GetTickCount64();
+    do {
+        HANDLE file = CreateFileW(path, GENERIC_READ,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                  NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (file != INVALID_HANDLE_VALUE) {
+            LARGE_INTEGER size;
+            BOOL measured = GetFileSizeEx(file, &size);
+            CloseHandle(file);
+            if (measured && size.QuadPart > 0) {
+                return 1;
+            }
+        }
+        Sleep(50);
+    } while (GetTickCount64() - started < timeout_ms);
+    return 0;
+}
+
 int wmain(int argc, wchar_t **argv)
 {
-    if (argc < 2 || argc > 8 || !valid_label(argv[1])) {
+    if (argc < 2 || argc > 9 || !valid_label(argv[1])) {
         fwprintf(stderr,
                  L"usage: %ls <label:[A-Za-z0-9_.-]{1,64}> [count:1-1000] "
                  L"[startup-delay-ms:0-30000] [output-jsonl] [error-log] [enclave-image] "
-                 L"[baseline|create|load|initialize|terminate|delete]\n",
+                 L"[baseline|create|load|initialize|terminate|delete] "
+                 L"[start-after-nonempty-file]\n",
                  argv[0]);
         return 2;
     }
@@ -143,6 +165,10 @@ int wmain(int argc, wchar_t **argv)
     }
     if (startup_delay_ms != 0) {
         Sleep(startup_delay_ms);
+    }
+    if (argc >= 9 && !wait_for_nonempty_file(argv[8], 120000)) {
+        fwprintf(stderr, L"start gate did not become nonempty: %ls\n", argv[8]);
+        return 4;
     }
     if (!IsEnclaveTypeSupported(ENCLAVE_TYPE_VBS)) {
         fwprintf(stderr, L"VBS enclaves are not supported (Win32 %lu)\n", GetLastError());

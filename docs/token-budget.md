@@ -347,20 +347,20 @@ None of these is a bug. They are recorded because they were invisible, and
 
    | group | tools | bytes | share |
    |---|---:|---:|---:|
-   | `allocator` | 12 | 19,807 | 14.8% |
-   | `ioctl` | 11 | 16,088 | 12.0% |
-   | `securekernel` | 20 | 30,148 | 22.6% |
-   | `exec` | 10 | 15,087 | 11.3% |
-   | `session` | 10 | 14,208 | 10.6% |
-   | `inspect` | 10 | 13,485 | 10.1% |
-   | `batch` | 1 | 10,296 | 7.7% |
-   | `crash` | 3 | 7,473 | 5.6% |
-   | `ttd` | 9 | 7,090 | 5.3% |
+   | `allocator` | 12 | 19,807 | 14.6% |
+   | `ioctl` | 11 | 16,088 | 11.8% |
+   | `securekernel` | 22 | 32,589 | 23.9% |
+   | `exec` | 10 | 15,087 | 11.1% |
+   | `session` | 10 | 14,208 | 10.4% |
+   | `inspect` | 10 | 13,485 | 9.9% |
+   | `batch` | 1 | 10,296 | 7.6% |
+   | `crash` | 3 | 7,473 | 5.5% |
+   | `ttd` | 9 | 7,090 | 5.2% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
    | *(absent)* | 66 | 103,534 |
-   | `all` | 86 | 133,682 |
+   | `all` | 88 | 136,123 |
    | `session,inspect,exec,crash` | 33 | 49,332 |
    | `session,inspect,crash` | 23 | 34,092 |
    | `crash` | 13 | 20,515 |
@@ -397,14 +397,14 @@ None of these is a bug. They are recorded because they were invisible, and
    **387,637 B**. The model ceiling stays at 135,000 B, leaving 1,318 B (1.0%); the wire ceiling
    deliberately moves to 395,000 B, leaving 7,363 B (1.9%).
 
-   M6.1 drafts `sk_service_trace` and `sk_service_trace_read` before registering either tool. The
-   same compact-JSON accounting used by the surface test measures their names, descriptions,
-   annotations and input schemas at **2,930 model-visible bytes**, and those fields plus stripped
-   output schemas at **15,098 bytes**. The model figure exceeds the complete surface's remaining
-   1,318 bytes by 1,612, so these tools do not fit the existing 135,000 B ceiling. The recorder is
-   intentionally still private; M6.2 will replace the estimate with the actual `tools/list`
-   golden and make one attributed ceiling change when the worker-owned stop/restoration lifecycle
-   makes the tools honest enough to expose.
+   M6.1 drafted `sk_service_trace` and `sk_service_trace_read` before registering either tool. Its
+   conservative standalone schema estimate is 2,937 model-visible and 15,124 wire bytes. M6.2's
+   registered `tools/list` measurement is **2,441 model-visible bytes** and **15,052 payload
+   bytes**: the complete surface is now **88 tools and 136,123 B**, and the payload is **402,689
+   B**. The worker-owned arm milestone, engine-free prefix read and trace-id-bound stop now make
+   the lifecycle callable. The model ceiling therefore moves once from 135,000 to **138,000 B**,
+   leaving 1,877 B (1.4%), and the wire ceiling moves from 395,000 to **410,000 B**, leaving 7,311
+   B (1.8%). No description or result field was removed to fit the previous ceilings.
 
    **The two tables do not reconcile, and that is the point of item 41.** The first is each group's
    share of the whole surface; the second is what a spec actually serves, which is less — `crash`

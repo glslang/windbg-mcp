@@ -43,7 +43,7 @@ use std::num::NonZeroUsize;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -378,6 +378,17 @@ static LIVE_CONTROL_ACTIVE: AtomicBool = AtomicBool::new(false);
 static KD_TEARDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 static KD_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+#[derive(Clone)]
+struct PublishedServiceTrace {
+    job: u64,
+    shared: crate::skservicetrace::SharedTrace,
+    failure: Arc<Mutex<Option<Failed>>>,
+}
+
+/// The only state the request reader shares with the M6 engine-thread job. It contains no engine,
+/// controller, provider or decoder: just the bounded recorder/stop bit and the job that owns it.
+static SERVICE_TRACE: Mutex<Option<PublishedServiceTrace>> = Mutex::new(None);
+
 pub(crate) fn kd_teardown_requested() -> bool {
     KD_TEARDOWN_REQUESTED.load(Ordering::SeqCst)
 }
@@ -623,6 +634,13 @@ struct Running {
     /// A wait result published before its claim is released, closing the race where the break
     /// request is read after DbgEng returns but before the worker emits that wait's reply.
     live_wait_outcome: Option<(u64, LiveBreakOutcome)>,
+    /// The M6 trace job whose shared stop bit was set by the request reader. Kept beside the live
+    /// wait binding so a stop arriving just before wait entry becomes a target-side rendezvous
+    /// without filing an unscoped interrupt.
+    service_trace_stop_job: Option<u64>,
+    /// Whether that exact trace stop filed `SetInterrupt` during its owned DbgEng interval. The
+    /// engine thread drains a natural-event-won race before it starts restoration.
+    service_trace_interrupt_filed: bool,
     /// Jobs that were broken in before they reached the engine thread, and must not start.
     ///
     /// The other half of what [`Self::tearing_down`] does for a teardown, for one run rather than
@@ -748,6 +766,10 @@ enum Cleanup {
     /// like a teardown and for the same structural reason: there is no phase to enter, the whole op
     /// is uninterruptible from its first instruction.
     NotInterruptible,
+    /// A worker-owned M6 service trace. Generic `break_in` is sealed out because it could arrive
+    /// between owned waits or during restoration; only `sk_service_trace_read { stop: true }`
+    /// may wake the exact published wait through its trace-id-bound path.
+    ServiceTrace,
 }
 
 static RUNNING: Mutex<Running> = Mutex::new(Running {
@@ -759,6 +781,8 @@ static RUNNING: Mutex<Running> = Mutex::new(Running {
     live_wait_activity: None,
     live_break: None,
     live_wait_outcome: None,
+    service_trace_stop_job: None,
+    service_trace_interrupt_filed: false,
     barred: BTreeSet::new(),
     tearing_down: false,
     uninterruptible: None,
@@ -857,6 +881,20 @@ impl Running {
         self.pumping
     }
 
+    /// Transfer teardown intent that arrived before an M6 trace published its shared recorder.
+    ///
+    /// Arming is sealed, so teardown cannot interrupt its proof or register transition. Once the
+    /// transition completes, however, this marker suppresses the arm milestone and makes the
+    /// trace take its ordinary scoped stop and restoration path before teardown runs.
+    fn publish_service_trace(&mut self, job: u64) -> bool {
+        if self.tearing_down && self.job == Some(job) && self.live_wait_job == Some(job) {
+            self.service_trace_stop_job = Some(job);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Bind the first queued break request to the live-wait claim that is current now.
     fn stage_live_break(&mut self, break_job: u64) -> LiveBreakDisposition {
         if self.tearing_down {
@@ -943,6 +981,10 @@ impl Running {
         {
             self.live_wait_activity = None;
         }
+        if self.service_trace_stop_job == Some(id) {
+            self.service_trace_stop_job = None;
+            self.service_trace_interrupt_filed = false;
+        }
         self.uninterruptible = None;
         self.interrupted.take() == Some(id)
     }
@@ -1010,6 +1052,9 @@ fn sealed_as(op: &EngineOp) -> Option<Cleanup> {
         | EngineOp::SkLiveContinueToSoftwareBreakpoints { .. }
         | EngineOp::SkLiveContinue { .. }
         | EngineOp::OpenSecureKernelKd(_) => Some(Cleanup::NotInterruptible),
+        EngineOp::SkServiceTraceRun { .. } | EngineOp::SkServiceTraceRead { .. } => {
+            Some(Cleanup::ServiceTrace)
+        }
         _ => None,
     }
 }
@@ -1093,7 +1138,16 @@ pub(crate) enum LiveWaitEntry {
 /// not entered DbgEng and can proceed directly to the target-side rendezvous.
 pub(crate) fn begin_live_wait(id: u64, activity: crate::skdispatch::WaitActivity) -> LiveWaitEntry {
     let mut current = running();
-    if current.job != Some(id) || current.live_wait_job != Some(id) || current.tearing_down {
+    if current.job != Some(id) || current.live_wait_job != Some(id) {
+        return LiveWaitEntry::Refused;
+    }
+    // The trace stop bit is set before teardown closes this worker to new waits. Giving it
+    // precedence lets the already-running trace take its ordinary retained-stop restoration path
+    // instead of turning a clean end_session into a wait failure and fault recovery.
+    if current.service_trace_stop_job == Some(id) {
+        return LiveWaitEntry::BreakRequested;
+    }
+    if current.tearing_down {
         return LiveWaitEntry::Refused;
     }
     if current
@@ -1106,6 +1160,198 @@ pub(crate) fn begin_live_wait(id: u64, activity: crate::skdispatch::WaitActivity
     current.live_wait_activity = Some((id, activity.clone()));
     tracing::info!("worker: Secure Kernel live-wait job {id} entered its owned DbgEng wait");
     LiveWaitEntry::Entered(LiveWaitGuard { id, activity })
+}
+
+enum ServiceTraceReadDisposition {
+    Answer(Box<Result<Output, Failed>>),
+    Queue,
+}
+
+fn published_service_trace() -> Option<PublishedServiceTrace> {
+    SERVICE_TRACE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()
+}
+
+fn publish_service_trace(job: u64, shared: crate::skservicetrace::SharedTrace) {
+    let armed = shared.armed();
+    *SERVICE_TRACE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(PublishedServiceTrace {
+        job,
+        shared,
+        failure: Arc::new(Mutex::new(None)),
+    });
+    let teardown_before_publish = running().publish_service_trace(job);
+    if teardown_before_publish {
+        if let Some(published) = published_service_trace() {
+            let _ = published.shared.request_stop(&armed.trace_id);
+        }
+        tracing::info!(
+            "worker: session teardown preceded service trace job {job}'s arm milestone; stopping and restoring without publishing the milestone"
+        );
+        return;
+    }
+    emit(&WorkerMessage::ServiceTraceArmed { id: job, armed });
+}
+
+fn record_service_trace_failure(job: u64, result: &Result<Output, Failed>) {
+    let Some(error) = result.as_ref().err() else {
+        return;
+    };
+    let Some(published) = published_service_trace().filter(|published| published.job == job) else {
+        return;
+    };
+    *published
+        .failure
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error.clone());
+}
+
+fn service_trace_output(
+    published: &PublishedServiceTrace,
+    trace_id: &str,
+) -> Result<Output, Failed> {
+    // Validate the id before returning a terminal failure, so a stale caller cannot learn the
+    // result of the trace that replaced its own.
+    let trace = published.shared.snapshot(trace_id).map_err(Failed::from)?;
+    if let Some(error) = published
+        .failure
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+    {
+        return Err(error);
+    }
+    Ok(Output::typed(
+        crate::skservicetrace::render_trace(&trace),
+        trace,
+    ))
+}
+
+/// Read or stop the engine-free half of an M6 trace from the request reader. A stopping read is
+/// queued only while the trace job is still active; by the time it reaches the engine thread the
+/// run job has sealed its recorder and completed restoration.
+fn service_trace_read(trace_id: &str, stop: bool) -> ServiceTraceReadDisposition {
+    let Some(published) = published_service_trace() else {
+        return ServiceTraceReadDisposition::Answer(Box::new(Err(Failed::from(
+            "this worker has no published Secure Kernel service trace",
+        ))));
+    };
+    if !stop {
+        return ServiceTraceReadDisposition::Answer(Box::new(service_trace_output(
+            &published, trace_id,
+        )));
+    }
+    match published.shared.request_stop(trace_id) {
+        Ok(crate::skservicetrace::StopRequest::Finished) => {
+            // `finish_service_trace` seals before it restores. During that interval the immutable
+            // prefix is readable, but a stopping read still promises that restoration and any
+            // terminal failure are settled before it answers. Queue behind the exact job while
+            // it retains the engine-thread claim; once that claim is gone the shared result is
+            // terminal and can be answered here without touching the engine.
+            if running().job == Some(published.job) {
+                ServiceTraceReadDisposition::Queue
+            } else {
+                ServiceTraceReadDisposition::Answer(Box::new(service_trace_output(
+                    &published, trace_id,
+                )))
+            }
+        }
+        Ok(crate::skservicetrace::StopRequest::First)
+        | Ok(crate::skservicetrace::StopRequest::AlreadyRequested) => {
+            if let Err(error) = wake_service_trace(published.job) {
+                // The shared stop remains authoritative. Its owned wait is bounded and the
+                // pre-entry marker prevents another wait from starting, so keep this read queued
+                // until the engine thread restores rather than answering before restoration.
+                tracing::warn!(
+                    "worker: service trace stop could not file its scoped wake ({error}); waiting for the bounded loop to restore"
+                );
+            }
+            ServiceTraceReadDisposition::Queue
+        }
+        Err(error) => ServiceTraceReadDisposition::Answer(Box::new(Err(Failed::from(error)))),
+    }
+}
+
+/// Set the trace job's pre-wait marker and, only when its exact owned DbgEng interval is active,
+/// use the repository's documented cross-thread interrupt exception to wake it.
+fn wake_service_trace(job: u64) -> Result<(), String> {
+    let mut current = running();
+    if current.job != Some(job) || current.live_wait_job != Some(job) {
+        // The job has already left its loop. The queued read will observe its sealed snapshot.
+        return Ok(());
+    }
+    current.service_trace_stop_job = Some(job);
+    let activity = current
+        .live_wait_activity
+        .as_ref()
+        .filter(|(active_job, _)| *active_job == job)
+        .map(|(_, activity)| activity.clone());
+    let Some(activity) = activity else {
+        return Ok(());
+    };
+    if !activity.request_break() {
+        // A repeated stop or teardown can find the same exact wait already waking. The shared stop
+        // bit is authoritative; no second interrupt is needed.
+        return Ok(());
+    }
+    let Some(handle) = INTERRUPT.get() else {
+        activity.cancel_break();
+        return Err("the live-control worker has no interrupt handle yet".into());
+    };
+    drop(current);
+    let Some(interrupted) = activity.while_active(|| handle.interrupt()) else {
+        return Ok(());
+    };
+    match interrupted {
+        Ok(filed) => {
+            let mut current = running();
+            if current.job == Some(job) && current.service_trace_stop_job == Some(job) {
+                current.service_trace_interrupt_filed = true;
+            }
+            tracing::info!(
+                "worker: Secure Kernel service trace woke live-wait job {job}, filed as {filed:?}"
+            );
+            Ok(())
+        }
+        Err(error) => {
+            activity.cancel_break();
+            Err(format!(
+                "could not wake Secure Kernel service trace job {job}: {}",
+                es(error)
+            ))
+        }
+    }
+}
+
+fn stop_active_service_trace() {
+    let Some(published) = published_service_trace() else {
+        return;
+    };
+    let trace_id = published.shared.armed().trace_id;
+    if matches!(
+        published.shared.request_stop(&trace_id),
+        Ok(crate::skservicetrace::StopRequest::First
+            | crate::skservicetrace::StopRequest::AlreadyRequested)
+    ) && let Err(error) = wake_service_trace(published.job)
+    {
+        tracing::warn!("worker: could not wake service trace for teardown ({error})");
+    }
+}
+
+/// Drain a trace wake on the engine thread before any restore operation can inherit it. The
+/// natural-event-won race is the only case where DbgEng may not have consumed the filed break.
+pub(crate) fn drain_service_trace_interrupt(engine: &DebugEngine, job: u64) {
+    let mut current = running();
+    if current.job == Some(job)
+        && current.service_trace_stop_job == Some(job)
+        && current.service_trace_interrupt_filed
+    {
+        let _ = engine.interrupted();
+        current.service_trace_interrupt_filed = false;
+    }
 }
 
 /// Bind a queued `sk_live_break` to the live wait that is running now. Only the scoped DbgEng wait
@@ -1379,6 +1625,21 @@ pub fn run(args: &[String]) -> ! {
                         Ok(LiveBreakDisposition::Unbound | LiveBreakDisposition::Bound { .. }) => {}
                     }
                 }
+                // A non-stopping trace read is wholly engine-free and answers here. A stopping
+                // read first linearizes its stop and wakes only the exact scoped live wait, then
+                // queues behind the run job so its answer cannot precede baseline restoration.
+                if let EngineOp::SkServiceTraceRead { ref trace_id, stop } = request.op {
+                    match service_trace_read(trace_id, stop) {
+                        ServiceTraceReadDisposition::Answer(result) => {
+                            emit(&WorkerMessage::Done {
+                                id: request.id,
+                                result: *result,
+                            });
+                            continue;
+                        }
+                        ServiceTraceReadDisposition::Queue => {}
+                    }
+                }
                 // Acted on here, before it is queued, because the thread that will run it is the
                 // one it is about: a batch on that thread has to be told to stop *now* if the
                 // release behind it is not to wait out every step it has left. This loop is never
@@ -1390,6 +1651,7 @@ pub fn run(args: &[String]) -> ! {
                         report_sk_kd_phase(crate::proto::SecureKernelKdPhase::Releasing);
                     }
                     announce_teardown(request.id);
+                    stop_active_service_trace();
                     if KD_ACTIVE.load(Ordering::SeqCst) {
                         stop_managed_kd();
                     } else {
@@ -1473,6 +1735,7 @@ pub fn run(args: &[String]) -> ! {
     // halted live kernel the paragraph above exists to prevent, reached by the one path where
     // nobody is left to ask again.
     KD_TEARDOWN_REQUESTED.store(true, Ordering::SeqCst);
+    stop_active_service_trace();
     if KD_ACTIVE.load(Ordering::SeqCst) {
         report_sk_kd_phase(crate::proto::SecureKernelKdPhase::Releasing);
         stop_managed_kd();
@@ -1816,7 +2079,10 @@ fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
             &engine,
             id,
             sealed_as(&request.op),
-            matches!(request.op, EngineOp::SkLiveWait),
+            matches!(
+                request.op,
+                EngineOp::SkLiveWait | EngineOp::SkServiceTraceRun { .. }
+            ),
         );
         // A panic inside a dbgscope method (several use `.expect`) must not kill the session —
         // surface it as an error for this one op. The engine survives, so this stays a
@@ -1861,6 +2127,10 @@ fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
         } else {
             result
         };
+        // The supervisor consumes an armed trace job's final reply in the background. Retain its
+        // failure beside the immutable prefix before any queued read can run, so restoration or
+        // re-arm failure cannot be mistaken for a successful stopped trace.
+        record_service_trace_failure(id, &result);
         // **Before the `Done`, which is what makes it worth a message of its own.** The channel is
         // one pipe read in order, so a retirement sent here is applied by the supervisor before
         // this op's answer reaches its caller — and before anything queued behind it is
@@ -1979,6 +2249,15 @@ fn announce_teardown(id: u64) {
 fn stop_resuming() {
     let mut current = running();
     let pumping = current.begin_teardown();
+    if current
+        .service_trace_stop_job
+        .is_some_and(|job| current.job == Some(job))
+    {
+        tracing::info!(
+            "worker: service-trace teardown already owns the exact scoped wake; no second interrupt was filed"
+        );
+        return;
+    }
     if let Some((job, activity)) = current.live_wait_activity.clone() {
         let Some(handle) = INTERRUPT.get() else {
             tracing::warn!("worker: live-control teardown found no interrupt handle");
@@ -2201,6 +2480,13 @@ fn interrupt_running(bound: Option<u64>) -> Result<(Interrupted, String), String
                      leaf budgets, which its report carries — and `end_session` ends the session \
                      outright if it has to be stopped, at the cost of re-reading the capture."
                 ),
+                Cleanup::ServiceTrace => format!(
+                    "Not interrupted. The operation on this session (job {job}) is a guarded \
+                     Secure Kernel service trace. A generic Ctrl+Break is not allowed to land \
+                     between its owned waits or during baseline restoration; stop it with \
+                     `sk_service_trace_read` and its exact trace id, or end the session. Those \
+                     paths wake only its scoped wait and return after engine-thread restoration."
+                ),
                 // Deliberately not offering `end_session` as the way out, which is the advice
                 // above and is void here: this *is* that teardown.
                 Cleanup::Teardown => format!(
@@ -2323,6 +2609,8 @@ fn refuse_when_the_target_is_gone(e: &DebugEngine, op: &EngineOp) -> Option<Fail
             | EngineOp::SkLiveContinueToBreakpoints { .. }
             | EngineOp::SkLiveContinueToSoftwareBreakpoints { .. }
             | EngineOp::SkLiveContinue { .. }
+            | EngineOp::SkServiceTraceRun { .. }
+            | EngineOp::SkServiceTraceRead { .. }
             | EngineOp::SkKdServe
         )
     {
@@ -2766,6 +3054,8 @@ fn watch_for(op: &EngineOp) -> Watch {
         | EngineOp::SkLiveContinueToBreakpoints { .. }
         | EngineOp::SkLiveContinueToSoftwareBreakpoints { .. }
         | EngineOp::SkLiveContinue { .. }
+        | EngineOp::SkServiceTraceRun { .. }
+        | EngineOp::SkServiceTraceRead { .. }
         | EngineOp::SkKdServe => Watch::Ignore,
         _ => Watch::Compare,
     }
@@ -3574,6 +3864,47 @@ fn execute(
                 crate::skdispatch::render_transition(&transition),
                 transition,
             ))
+        }
+
+        EngineOp::SkServiceTraceRun {
+            epoch,
+            trace_id,
+            label,
+            limits,
+        } => {
+            let session = held_live_control(&mut sk_live.session)?;
+            let max_pause_ms = session.max_pause_ms();
+            let manifest = crate::skservice::service_manifest().map_err(Failed::from)?;
+            let trace = session
+                .run_service_trace(
+                    e,
+                    id,
+                    &epoch,
+                    trace_id,
+                    label,
+                    limits,
+                    manifest,
+                    |shared| publish_service_trace(id, shared),
+                    |paused| {
+                        if paused {
+                            emit(&WorkerMessage::SecureKernelPauseStarted { max_pause_ms });
+                        } else {
+                            emit(&WorkerMessage::SecureKernelPauseEnded);
+                        }
+                    },
+                )
+                .map_err(failed)?;
+            Ok(Output::typed(
+                crate::skservicetrace::render_trace(&trace),
+                trace,
+            ))
+        }
+
+        EngineOp::SkServiceTraceRead { trace_id, .. } => {
+            let published = published_service_trace().ok_or_else(|| {
+                Failed::from("this worker has no published Secure Kernel service trace")
+            })?;
+            service_trace_output(&published, &trace_id)
         }
 
         EngineOp::Launch { command_line } => open(
@@ -15086,6 +15417,81 @@ mod tests {
     }
 
     #[test]
+    fn service_trace_reads_and_teardown_linearize_on_the_request_reader() {
+        let source = include_str!("worker.rs").replace("\r\n", "\n");
+        let reader = source
+            .split_once("for line in BufReader::new(requests).lines()")
+            .expect("the request reader exists")
+            .1
+            .split_once("// The request channel closed")
+            .expect("the request-reader boundary exists")
+            .0;
+        let trace_read = reader
+            .find("service_trace_read(trace_id, stop)")
+            .expect("trace reads are intercepted by the request reader");
+        let queue = reader
+            .find("tx.send(Job::Run")
+            .expect("ordinary requests are queued");
+        assert!(trace_read < queue);
+
+        let teardown = reader
+            .split_once("if matches!(request.op, EngineOp::EndSession) {")
+            .expect("the reader handles teardown")
+            .1
+            .split_once("// The one request that is *answered* here")
+            .expect("the teardown reader branch ends before interrupt handling")
+            .0;
+        let stop = teardown
+            .find("stop_active_service_trace();")
+            .expect("teardown stops a published trace");
+        let close_wait = teardown
+            .find("stop_resuming();")
+            .expect("teardown closes later waits");
+        assert!(stop < close_wait);
+
+        let publish = source
+            .split_once("fn publish_service_trace(")
+            .expect("the trace publication boundary exists")
+            .1
+            .split_once("/// Read or stop the engine-free half")
+            .expect("the trace publication boundary ends before reads")
+            .0;
+        let inherited_teardown = publish
+            .find("running().publish_service_trace(job)")
+            .expect("publication inherits teardown that arrived during arm");
+        let milestone = publish
+            .find("WorkerMessage::ServiceTraceArmed")
+            .expect("publication reports its arm milestone");
+        assert!(inherited_teardown < milestone);
+
+        let eof = source
+            .split_once(
+                "tracing::info!(\"worker: supervisor is gone; releasing the target before exit\")",
+            )
+            .expect("the EOF teardown path exists")
+            .1
+            .split_once("let (ack, reply) = mpsc::channel();")
+            .expect("the EOF stop signals precede release queueing")
+            .0;
+        assert!(eof.contains("stop_active_service_trace();"));
+
+        let completion = source
+            .split_once("        let result = if release(id) {")
+            .expect("the engine-thread completion boundary exists")
+            .1
+            .split_once("        if let Emit::Unencodable")
+            .expect("the ordinary Done emission ends the completion boundary")
+            .0;
+        let retained_failure = completion
+            .find("record_service_trace_failure(id, &result);")
+            .expect("trace failure is retained on the engine thread");
+        let target_watch = completion
+            .find("watch_the_target(&engine, id, watch);")
+            .expect("target observation precedes the job reply");
+        assert!(retained_failure < target_watch);
+    }
+
+    #[test]
     fn live_step_and_software_rearm_keep_the_pause_timer_until_a_true_continue() {
         let source = include_str!("worker.rs");
         let dispatch = source
@@ -15117,7 +15523,7 @@ mod tests {
             .split_once("EngineOp::SkLiveContinue { epoch } =>")
             .expect("the live-continue dispatch arm exists")
             .1
-            .split_once("EngineOp::Launch { command_line } =>")
+            .split_once("EngineOp::SkServiceTraceRun {")
             .expect("the next dispatch arm exists")
             .0;
 
@@ -19297,6 +19703,8 @@ mod tests {
             live_wait_activity: None,
             live_break: None,
             live_wait_outcome: None,
+            service_trace_stop_job: None,
+            service_trace_interrupt_filed: false,
             uninterruptible: None,
         }
     }
@@ -19335,6 +19743,60 @@ mod tests {
             !running.kd_waiting,
             "a service claim given back must close its interrupt interval"
         );
+    }
+
+    #[test]
+    fn teardown_before_service_trace_publication_becomes_that_traces_stop() {
+        let mut running = idle();
+        running.claim(7);
+        running.live_wait_job = Some(7);
+        assert!(!running.publish_service_trace(7));
+
+        running.begin_teardown();
+        assert!(running.publish_service_trace(7));
+        assert_eq!(running.service_trace_stop_job, Some(7));
+        assert!(
+            !running.publish_service_trace(8),
+            "teardown intent may not be transferred to a different job"
+        );
+        running.release(7);
+        assert_eq!(running.service_trace_stop_job, None);
+    }
+
+    #[test]
+    fn a_service_trace_terminal_failure_survives_its_background_job_reply() {
+        let trace_id = "sktrace-terminal-failure";
+        let recorder = crate::skservicetrace::Recorder::new(
+            trace_id.into(),
+            None,
+            crate::skservice::service_manifest().unwrap(),
+            crate::skcontrol::TargetIdentity {
+                vm_id: "00000000-0000-0000-0000-000000000001".into(),
+                partition_id: crate::skcontrol::HexU64(1),
+                vp: 0,
+                vtl: 1,
+                expected_cr3: crate::skcontrol::HexU64(0x1000),
+            },
+            crate::skcontrol::HexU64(0xffff_f807_0000_0000),
+            crate::skservicetrace::TraceLimits::checked(4, 16, 1_024).unwrap(),
+        )
+        .unwrap();
+        let published = PublishedServiceTrace {
+            job: 7,
+            shared: crate::skservicetrace::SharedTrace::new(recorder),
+            failure: Arc::new(Mutex::new(None)),
+        };
+        assert!(service_trace_output(&published, trace_id).is_ok());
+        published.shared.finish().unwrap();
+        *published.failure.lock().unwrap() = Some(Failed::from(
+            "VTL1 restoration was not proved; VM remains paused",
+        ));
+
+        let error = service_trace_output(&published, trace_id).unwrap_err();
+        assert!(error.message.contains("restoration was not proved"));
+        let stale = service_trace_output(&published, "sktrace-stale-id").unwrap_err();
+        assert!(stale.message.contains("stale"));
+        assert!(!stale.message.contains("restoration"));
     }
 
     #[test]
@@ -19738,6 +20200,24 @@ mod tests {
             None,
             "the one live operation that waits inside DbgEng must remain interruptible"
         );
+        for op in [
+            EngineOp::SkServiceTraceRun {
+                epoch: crate::skcontrol::StopEpoch::new("0123456789abcdef").unwrap(),
+                trace_id: "sktrace-sealed-01".into(),
+                label: None,
+                limits: crate::skservicetrace::TraceLimits::checked(4, 16, 1_024).unwrap(),
+            },
+            EngineOp::SkServiceTraceRead {
+                trace_id: "sktrace-sealed-01".into(),
+                stop: true,
+            },
+        ] {
+            assert_eq!(
+                sealed_as(&op),
+                Some(Cleanup::ServiceTrace),
+                "generic break_in must not reach the trace between waits or during restore"
+            );
+        }
         assert_eq!(
             sealed_as(&EngineOp::Batch(BatchOp {
                 steps: Vec::new(),

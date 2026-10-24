@@ -847,6 +847,8 @@ fn refuse_op_on_kind(kind: SessionKind, op: &EngineOp) -> Option<String> {
             | EngineOp::SkLiveContinueToBreakpoints { .. }
             | EngineOp::SkLiveContinueToSoftwareBreakpoints { .. }
             | EngineOp::SkLiveContinue { .. }
+            | EngineOp::SkServiceTraceRun { .. }
+            | EngineOp::SkServiceTraceRead { .. }
     );
     let kd_op = matches!(op, EngineOp::OpenSecureKernelKd(_) | EngineOp::SkKdServe);
     let always = matches!(
@@ -1015,6 +1017,10 @@ pub struct Session {
     /// target only from inside `WaitForEvent`: a second run would have to wait for the first, so
     /// two handles could never both be live. Refusing the second is the same fact said out loud.
     execution: Mutex<Option<Execution>>,
+    /// The one worker-owned M6 trace this session may have in flight. The bounded recorder itself
+    /// stays in the worker; this slot exists only to refuse calls that would otherwise queue
+    /// invisibly behind its long-running engine-thread loop.
+    service_trace: Mutex<Option<ServiceTraceSlot>>,
     /// Serialises "may this call run?" against "put it in the queue", for this session.
     ///
     /// Both submitters read the execution slot and then send on [`Self::tx`], and between those
@@ -1085,6 +1091,9 @@ struct Waiting {
     /// `continue_async` still waiting when its job is answered has to be woken by the answer, not
     /// left holding a milestone that will never come.
     resumed: Option<oneshot::Sender<()>>,
+    /// Where an M6 run reports the point at which all guards and hardware slots are live.
+    service_trace_armed:
+        Option<oneshot::Sender<Result<crate::skservicetrace::ServiceTraceArmed, EngineError>>>,
     /// Whether this job's transaction has already been reported as unwound.
     ///
     /// The worker's two `RollingBack` messages are emitted by *different threads* — the promise by
@@ -1267,6 +1276,25 @@ fn mint_execution_id() -> String {
 }
 
 static EXECUTION_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn mint_service_trace_id() -> String {
+    let n = SERVICE_TRACE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0);
+    format!("sktrace-{nanos:x}-{n}")
+}
+
+static SERVICE_TRACE_SEQ: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug)]
+struct ServiceTraceSlot {
+    job: u64,
+    trace_id: String,
+    running: bool,
+    armed: bool,
+}
 
 impl Session {
     fn kernel_unresolved(&self) -> bool {
@@ -1613,6 +1641,59 @@ impl Session {
             .as_ref()
             .filter(|execution| execution.running())
             .map(|execution| (execution.handle.clone(), execution.ran_for()))
+    }
+
+    fn running_service_trace(&self) -> Option<(u64, String, bool)> {
+        self.service_trace
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .filter(|trace| trace.running)
+            .map(|trace| (trace.job, trace.trace_id.clone(), trace.armed))
+    }
+
+    fn claim_service_trace(&self, job: u64, trace_id: String) -> Result<(), String> {
+        let mut slot = self
+            .service_trace
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(trace) = slot.as_ref().filter(|trace| trace.running) {
+            return Err(format!(
+                "Secure Kernel service trace `{}` is still running on this session",
+                trace.trace_id
+            ));
+        }
+        *slot = Some(ServiceTraceSlot {
+            job,
+            trace_id,
+            running: true,
+            armed: false,
+        });
+        Ok(())
+    }
+
+    fn service_trace_armed(&self, job: u64) {
+        if let Some(trace) = self
+            .service_trace
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_mut()
+            .filter(|trace| trace.job == job)
+        {
+            trace.armed = true;
+        }
+    }
+
+    fn finish_service_trace(&self, job: u64) {
+        if let Some(trace) = self
+            .service_trace
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_mut()
+            .filter(|trace| trace.job == job)
+        {
+            trace.running = false;
+        }
     }
 
     /// Installs a run, replacing whatever the slot held. Refuses while one is still going.
@@ -2431,6 +2512,7 @@ impl Sessions {
             Call::new(EngineOp::SkKdServe).named(true),
             id,
             None,
+            None,
         )?;
         reply
             .await
@@ -2463,12 +2545,15 @@ impl Sessions {
         call: Call,
         id: u64,
         resumed: Option<oneshot::Sender<()>>,
+        service_trace_armed: Option<
+            oneshot::Sender<Result<crate::skservicetrace::ServiceTraceArmed, EngineError>>,
+        >,
     ) -> Result<oneshot::Receiver<Result<Output, EngineError>>, EngineError> {
         let _gate = session
             .submit_gate
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        self.submit_gated(session, call, id, resumed)
+        self.submit_gated(session, call, id, resumed, service_trace_armed)
     }
 
     /// [`Self::submit`] with [`Session::submit_gate`] already held, for the one caller that has to
@@ -2480,6 +2565,9 @@ impl Sessions {
         call: Call,
         id: u64,
         resumed: Option<oneshot::Sender<()>>,
+        service_trace_armed: Option<
+            oneshot::Sender<Result<crate::skservicetrace::ServiceTraceArmed, EngineError>>,
+        >,
     ) -> Result<oneshot::Receiver<Result<Output, EngineError>>, EngineError> {
         if session.kernel_unresolved() && !matches!(call.op, EngineOp::PreserveKernel) {
             return Err(EngineError::RecoveryRequired(stale_handle(
@@ -2532,6 +2620,7 @@ impl Sessions {
                         ending: matches!(call.op, EngineOp::EndSession),
                         progress: crate::progress::current(),
                         resumed,
+                        service_trace_armed,
                         unwound: false,
                     },
                 );
@@ -2571,6 +2660,21 @@ impl Sessions {
     /// ([`Session::claim_execution`]), which reports the handle already holding it rather than the
     /// generic sentence here.
     fn refuse_while_running(&self, session: &Arc<Session>, op: &EngineOp) -> Option<EngineError> {
+        if let Some((job, trace_id, armed)) = session.running_service_trace() {
+            let admitted = matches!(
+                op,
+                EngineOp::SkServiceTraceRead { .. } | EngineOp::EndSession
+            ) || matches!(op, EngineOp::SkServiceTraceRun { trace_id: own, .. } if own == &trace_id);
+            if !admitted {
+                return Some(EngineError::TargetRunning(format!(
+                    "Secure Kernel service trace `{trace_id}` is {} on session `{}` (worker job \
+                     {job}). Only `sk_service_trace_read` or `end_session` may pass its guarded \
+                     engine-thread loop; stop the trace before issuing another debugger call.",
+                    if armed { "armed" } else { "being armed" },
+                    session.id,
+                )));
+            }
+        }
         if matches!(
             op,
             EngineOp::Interrupt { .. } | EngineOp::EndSession | EngineOp::Resume { .. }
@@ -2601,7 +2705,7 @@ impl Sessions {
     ) -> Result<Output, EngineError> {
         // Borrowed rather than consumed, so an expired budget can be extended below without losing
         // the reply that may still be coming.
-        let mut rx = self.submit(session, call, id, None)?;
+        let mut rx = self.submit(session, call, id, None, None)?;
         // The sender is dropped only when the worker's reader gives up on it, which it does by
         // answering first — so `Err` here is the residual case, not the normal one.
         let settled = |reply: Result<Result<Output, EngineError>, oneshot::error::RecvError>| {
@@ -3008,7 +3112,7 @@ impl Sessions {
             timeout_ms: bound.as_millis().min(u128::from(u32::MAX)) as u32,
         })
         .named(named);
-        let reply = match self.submit_gated(session, call, job, Some(resumed_tx)) {
+        let reply = match self.submit_gated(session, call, job, Some(resumed_tx), None) {
             Ok(reply) => reply,
             Err(why) => {
                 // Nothing was queued, so nothing will ever answer this job — and a slot left
@@ -3120,6 +3224,62 @@ impl Sessions {
                 session.id
             )))
         })
+    }
+
+    /// Start one worker-owned M6 trace and return only at its post-arm milestone. The final reply
+    /// is consumed in the background because it belongs to the trace lifecycle: stopping reads
+    /// receive the sealed snapshot after the same job has restored the complete baseline.
+    pub(crate) async fn start_service_trace(
+        &self,
+        session: &Arc<Session>,
+        named: bool,
+        epoch: crate::skcontrol::StopEpoch,
+        label: Option<String>,
+        limits: crate::skservicetrace::TraceLimits,
+    ) -> Result<crate::skservicetrace::ServiceTraceArmed, EngineError> {
+        let trace_id = mint_service_trace_id();
+        let job = session.next_id.fetch_add(1, Ordering::Relaxed);
+        let gate = session
+            .submit_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        session
+            .claim_service_trace(job, trace_id.clone())
+            .map_err(EngineError::TargetRunning)?;
+        let (armed_tx, armed_rx) = oneshot::channel();
+        let call = Call::new(EngineOp::SkServiceTraceRun {
+            epoch,
+            trace_id: trace_id.clone(),
+            label,
+            limits,
+        })
+        .named(named);
+        let reply = match self.submit_gated(session, call, job, None, Some(armed_tx)) {
+            Ok(reply) => reply,
+            Err(error) => {
+                session.finish_service_trace(job);
+                return Err(error);
+            }
+        };
+        drop(gate);
+
+        let filing = Arc::clone(session);
+        tokio::spawn(async move {
+            let _ = reply.await;
+            filing.finish_service_trace(job);
+        });
+
+        match tokio::time::timeout(self.call_timeout, armed_rx).await {
+            Ok(Ok(armed)) => armed,
+            Ok(Err(_)) => Err(EngineError::Lost(worker_gone(&session.id))),
+            Err(_) => Err(EngineError::Timeout(format!(
+                "Secure Kernel service trace `{trace_id}` did not finish arming within {}. The \
+                 worker job remains owned by session `{}`; use `sk_service_trace_read` with this \
+                 trace id and `stop: true`, or end the session.",
+                crate::server::fmt_duration(self.call_timeout),
+                session.id,
+            ))),
+        }
     }
 
     /// Waits for an asynchronous run to stop, for at most `wait`.
@@ -4083,6 +4243,7 @@ impl Sessions {
             kernel_handoff_complete: AtomicBool::new(false),
             unwinding,
             execution: Mutex::new(None),
+            service_trace: Mutex::new(None),
             submit_gate: Mutex::new(()),
             execution_changed: tokio::sync::watch::Sender::new(0),
             child: Mutex::new(Some(child)),
@@ -5523,6 +5684,23 @@ async fn reader(
                 // exists not to do.
                 session.execution_moved();
             }
+            WorkerMessage::ServiceTraceArmed { id, armed } => {
+                let told = waiters
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .get_mut(&id)
+                    .and_then(|waiting| waiting.service_trace_armed.take());
+                match told {
+                    Some(tx) => {
+                        session.service_trace_armed(id);
+                        let _ = tx.send(Ok(armed));
+                    }
+                    None => tracing::debug!(
+                        "session {}: job {id} reported its service trace armed with nobody waiting on the milestone",
+                        session.id
+                    ),
+                }
+            }
             WorkerMessage::Committed { id } | WorkerMessage::Opened { id } => {
                 tracing::warn!(
                     "session {}: job {id} reported an opener milestone",
@@ -5596,11 +5774,25 @@ async fn reader(
                 let Some(Waiting {
                     done: waiter,
                     ending,
+                    service_trace_armed,
                     ..
                 }) = waiter
                 else {
                     continue;
                 };
+                session.finish_service_trace(id);
+                if let Some(armed) = service_trace_armed {
+                    let early = result.as_ref().map_or_else(
+                        |error| engine_error(error.clone()),
+                        |_| {
+                            EngineError::Debugger(
+                                "the Secure Kernel service trace ended before it reported every guard and hardware slot armed"
+                                    .into(),
+                            )
+                        },
+                    );
+                    let _ = armed.send(Err(early));
+                }
                 let confirmed_guarded_release = ending
                     && matches!(
                         session.kind,
@@ -5885,7 +6077,19 @@ mod tests {
                     bytes: vec![0x90],
                 }],
             },
-            EngineOp::SkLiveContinue { epoch },
+            EngineOp::SkLiveContinue {
+                epoch: epoch.clone(),
+            },
+            EngineOp::SkServiceTraceRun {
+                epoch,
+                trace_id: "sktrace-kind-check".into(),
+                label: None,
+                limits: crate::skservicetrace::TraceLimits::checked(4, 16, 1_024).unwrap(),
+            },
+            EngineOp::SkServiceTraceRead {
+                trace_id: "sktrace-kind-check".into(),
+                stop: false,
+            },
         ];
         for op in &live_ops {
             assert!(
@@ -5913,6 +6117,193 @@ mod tests {
                 "{op:?} must reach a live-control session"
             );
         }
+    }
+
+    #[test]
+    fn a_service_trace_excludes_everything_but_its_reads_and_teardown() {
+        let sessions = Sessions::new(Duration::from_secs(30));
+        let live = secure_kernel_live_double("sess-service-trace", SessionState::Open, 4100);
+        let trace_id = "sktrace-exclusive-01".to_string();
+        live.claim_service_trace(77, trace_id.clone()).unwrap();
+        let epoch = crate::skcontrol::StopEpoch::new("0123456789abcdef").unwrap();
+        let limits = crate::skservicetrace::TraceLimits::checked(4, 16, 1_024).unwrap();
+
+        for op in [
+            EngineOp::SkServiceTraceRun {
+                epoch: epoch.clone(),
+                trace_id: trace_id.clone(),
+                label: None,
+                limits,
+            },
+            EngineOp::SkServiceTraceRead {
+                trace_id: trace_id.clone(),
+                stop: false,
+            },
+            EngineOp::SkServiceTraceRead {
+                trace_id: trace_id.clone(),
+                stop: true,
+            },
+            EngineOp::EndSession,
+        ] {
+            assert!(
+                sessions.refuse_while_running(&live, &op).is_none(),
+                "the trace lifecycle refused its own operation: {op:?}"
+            );
+        }
+        for op in [
+            EngineOp::SkLiveRegisters,
+            EngineOp::Interrupt { job: Some(77) },
+            EngineOp::SkServiceTraceRun {
+                epoch,
+                trace_id: "sktrace-second-02".into(),
+                label: None,
+                limits,
+            },
+        ] {
+            let error = sessions
+                .refuse_while_running(&live, &op)
+                .unwrap_or_else(|| panic!("trace admitted unrelated operation {op:?}"));
+            assert!(error.to_string().contains(&trace_id), "{error}");
+        }
+
+        live.finish_service_trace(77);
+        assert!(
+            sessions
+                .refuse_while_running(&live, &EngineOp::SkLiveRegisters)
+                .is_none()
+        );
+    }
+
+    fn armed_service_trace(trace_id: &str) -> crate::skservicetrace::ServiceTraceArmed {
+        crate::skservicetrace::Recorder::new(
+            trace_id.to_string(),
+            Some("milestone-test".into()),
+            crate::skservice::service_manifest().unwrap(),
+            crate::skcontrol::TargetIdentity {
+                vm_id: "00000000-0000-0000-0000-000000000001".into(),
+                partition_id: crate::skcontrol::HexU64(1),
+                vp: 0,
+                vtl: 1,
+                expected_cr3: crate::skcontrol::HexU64(0x1000),
+            },
+            crate::skcontrol::HexU64(0xffff_f807_0000_0000),
+            crate::skservicetrace::TraceLimits::checked(4, 16, 1_024).unwrap(),
+        )
+        .unwrap()
+        .armed()
+    }
+
+    #[tokio::test]
+    async fn a_service_trace_arm_milestone_marks_the_slot_before_waking_its_caller() {
+        let (jobs, mut queue) = mpsc::unbounded_channel();
+        let live = secure_kernel_live_double("trace-arm-milestone", SessionState::Open, 4100);
+        let live = Arc::new(Session {
+            tx: jobs,
+            ..Arc::into_inner(live).unwrap()
+        });
+        let sessions = registry_of(std::slice::from_ref(&live));
+        let trace_id = "sktrace-arm-milestone".to_string();
+        let job = 77;
+        live.claim_service_trace(job, trace_id.clone()).unwrap();
+        let (armed_tx, armed_rx) = oneshot::channel();
+        let reply = sessions
+            .submit(
+                &live,
+                Call::new(EngineOp::SkServiceTraceRun {
+                    epoch: crate::skcontrol::StopEpoch::new("0123456789abcdef").unwrap(),
+                    trace_id: trace_id.clone(),
+                    label: None,
+                    limits: crate::skservicetrace::TraceLimits::checked(4, 16, 1_024).unwrap(),
+                }),
+                job,
+                None,
+                Some(armed_tx),
+            )
+            .unwrap();
+        let queued = queue.recv().await.unwrap();
+        assert_eq!(queued.id, job);
+
+        let (messages, rx) = mpsc::unbounded_channel();
+        let reading = tokio::spawn(reader(
+            Arc::downgrade(&live),
+            rx,
+            live.waiters.clone(),
+            sessions,
+        ));
+        let armed = armed_service_trace(&trace_id);
+        messages
+            .send(WorkerMessage::ServiceTraceArmed {
+                id: job,
+                armed: armed.clone(),
+            })
+            .unwrap();
+        assert_eq!(armed_rx.await.unwrap().unwrap(), armed);
+        assert_eq!(
+            live.running_service_trace(),
+            Some((job, trace_id.clone(), true)),
+            "the milestone woke its caller before publishing the armed slot"
+        );
+
+        messages
+            .send(WorkerMessage::Done {
+                id: job,
+                result: Ok(Output::text("trace stopped")),
+            })
+            .unwrap();
+        assert!(reply.await.unwrap().is_ok());
+        assert!(live.running_service_trace().is_none());
+        reading.abort();
+    }
+
+    #[tokio::test]
+    async fn a_service_trace_that_ends_before_arming_reports_its_exact_failure() {
+        let (jobs, mut queue) = mpsc::unbounded_channel();
+        let live = secure_kernel_live_double("trace-arm-failure", SessionState::Open, 4100);
+        let live = Arc::new(Session {
+            tx: jobs,
+            ..Arc::into_inner(live).unwrap()
+        });
+        let sessions = registry_of(std::slice::from_ref(&live));
+        let trace_id = "sktrace-arm-failure".to_string();
+        let job = 78;
+        live.claim_service_trace(job, trace_id.clone()).unwrap();
+        let (armed_tx, armed_rx) = oneshot::channel();
+        let reply = sessions
+            .submit(
+                &live,
+                Call::new(EngineOp::SkServiceTraceRun {
+                    epoch: crate::skcontrol::StopEpoch::new("0123456789abcdef").unwrap(),
+                    trace_id,
+                    label: None,
+                    limits: crate::skservicetrace::TraceLimits::checked(4, 16, 1_024).unwrap(),
+                }),
+                job,
+                None,
+                Some(armed_tx),
+            )
+            .unwrap();
+        assert_eq!(queue.recv().await.unwrap().id, job);
+
+        let (messages, rx) = mpsc::unbounded_channel();
+        let reading = tokio::spawn(reader(
+            Arc::downgrade(&live),
+            rx,
+            live.waiters.clone(),
+            sessions,
+        ));
+        messages
+            .send(WorkerMessage::Done {
+                id: job,
+                result: Err(crate::proto::Failed::from("manifest guard changed")),
+            })
+            .unwrap();
+
+        let arm_error = armed_rx.await.unwrap().unwrap_err();
+        assert!(arm_error.to_string().contains("manifest guard changed"));
+        let reply_error = reply.await.unwrap().unwrap_err();
+        assert!(reply_error.to_string().contains("manifest guard changed"));
+        assert!(live.running_service_trace().is_none());
+        reading.abort();
     }
 
     #[test]
@@ -7637,6 +8028,7 @@ mod tests {
                 ending: false,
                 progress: None,
                 resumed: None,
+                service_trace_armed: None,
                 unwound: false,
             },
         );
@@ -8155,6 +8547,7 @@ mod tests {
                 ending: false,
                 progress: None,
                 resumed: None,
+                service_trace_armed: None,
                 unwound: false,
             },
         );
@@ -8470,6 +8863,7 @@ mod tests {
                         }),
                         42,
                         None,
+                        None,
                     )
                     .unwrap();
                 drop(answer);
@@ -8540,7 +8934,7 @@ mod tests {
         assert_eq!(Arc::strong_count(&live), baseline + 1);
 
         let answer = sessions
-            .submit(&live, Call::new(EngineOp::EndSession), 42, None)
+            .submit(&live, Call::new(EngineOp::EndSession), 42, None, None)
             .unwrap();
         drop(answer);
         live.preserve_live_control("caller timed out");
@@ -8668,6 +9062,7 @@ mod tests {
                 &kernel,
                 Call::new(EngineOp::Interrupt { job: None }),
                 17,
+                None,
                 None
             ),
             Err(EngineError::RecoveryRequired(_))
@@ -8899,6 +9294,7 @@ mod tests {
                     ending: false,
                     progress: None,
                     resumed: None,
+                    service_trace_armed: None,
                     unwound: false,
                 },
             );
@@ -8994,6 +9390,7 @@ mod tests {
                     ending: false,
                     progress: None,
                     resumed: None,
+                    service_trace_armed: None,
                     unwound: false,
                 },
             );
@@ -9270,6 +9667,7 @@ mod tests {
                 ending: false,
                 progress: None,
                 resumed: None,
+                service_trace_armed: None,
                 unwound: false,
             },
         );
@@ -9592,6 +9990,7 @@ mod tests {
             kernel_handoff_complete: AtomicBool::new(false),
             unwinding: Arc::new(Mutex::new(None)),
             execution: Mutex::new(None),
+            service_trace: Mutex::new(None),
             submit_gate: Mutex::new(()),
             execution_changed: tokio::sync::watch::Sender::new(0),
             child: Mutex::new(None),
@@ -9673,6 +10072,7 @@ mod tests {
                     ending: false,
                     progress: None,
                     resumed: None,
+                    service_trace_armed: None,
                     unwound: false,
                 },
             );
@@ -10054,6 +10454,7 @@ mod tests {
                 ending: false,
                 progress: Some(reporter),
                 resumed: None,
+                service_trace_armed: None,
                 unwound: false,
             },
         );
@@ -10086,6 +10487,7 @@ mod tests {
                 ending: false,
                 progress: Some(reporter),
                 resumed: None,
+                service_trace_armed: None,
                 unwound: false,
             },
         );
@@ -10125,6 +10527,7 @@ mod tests {
                     ending: false,
                     progress: None,
                     resumed: None,
+                    service_trace_armed: None,
                     unwound: false,
                 },
             );

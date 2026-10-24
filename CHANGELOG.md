@@ -20,15 +20,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hardware-slot count; `src/skservice.rs` validates and consumes it, including stale-byte, RVA,
   layout, identity and fifth-slot refusal tests. This completes M6.0.
 
-  M6.1 now has its non-public, engine-free record contract and bounded recorder. A record carries
+  M6.1 introduced the engine-free record contract and bounded recorder. A record carries
   exact target/image identity and ordered entry, dispatch and return evidence; mutable partial work
   is never exposed by a snapshot. Whole page-split captures are bounded per buffer and in total,
   failed or short reads become named unavailability, inferred values are refused, and event/byte
   capacity accounts for every dropped record. The state machine refuses stale epochs, CR3s and
   layout values and keeps nested, repeated or missing phases incomplete instead of joining
-  adjacent hits. Draft schemas for the future `sk_service_trace` pair are pinned at 2,930
-  model-visible and 15,098 total estimated bytes. The tools remain unregistered until M6.2 can
-  satisfy their worker-owned run, scoped stop and proved restoration contract.
+  adjacent hits. Its conservative standalone schema estimate remains pinned at 2,937
+  model-visible and 15,124 total bytes.
+
+  M6.2 now decodes exact retained VTL1 stops into that recorder, including
+  typed request fields, measured register arguments, caller and bounded before/after buffers. The
+  before image is sampled from the manifest's entry-time `rcx` and retained privately until the
+  selected dispatch proves the same request at `r14`; the after image uses that proved dispatch
+  coordinate. A changed pointer is refused and an out-of-order dispatch names the missing entry
+  capture instead of presenting a late read as before-state.
+  Non-selected dispatches consume their own return rather than becoming an adjacent incomplete
+  call, and changed stop guards fail before an observation is recorded. The engine-free shared
+  state gives concurrent reads an immutable prefix and gives simultaneous stop requests one
+  linearization point. The engine-thread loop publishes only after the proved arm, seals before
+  baseline restoration and routes stop, capacity and observation failure through the same
+  restoration helper. `sk_service_trace` now returns only after a distinct post-arm worker
+  milestone; `sk_service_trace_read` copies a prefix on the request-reader thread or, with
+  `stop: true`, sets the trace-id-bound stop bit, wakes only the exact scoped DbgEng wait and
+  queues its answer until restoration completes. Generic interrupts and unrelated calls are
+  refused while the trace owns the engine. The registered pair moves the complete surface to 88
+  tools and 136,123 model-visible bytes (402,689 bytes on the wire), with explicit ceiling moves
+  to 138,000 and 410,000 respectively. The production loop's fake provider/dispatcher matrix
+  covers selected and non-selected traffic, re-entry, out-of-order stops, each capacity phase,
+  no-hit, reader stop, re-arm and restoration failures, teardown races and epoch reuse. Re-arm
+  guard failure now restores its retained epoch, and teardown arriving during sealed arming is
+  inherited before publication so no stale arm milestone escapes. The worker retains any terminal
+  re-arm/restoration failure beside the immutable prefix, so the supervisor's background job
+  consumer cannot turn a failed trace into a successful later read. This completes the offline
+  and public M6.2 gate; M6.3 live qualification remains.
 
 - **`hv_transition_trace` records the hypervisor half of a Secure Kernel service transition.** A
   distinct hypervisor KD worker admits the measured K3 Intel `hvix64.exe` only by exact image

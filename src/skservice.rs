@@ -10,6 +10,7 @@
 use std::collections::HashSet;
 use std::fmt::Display;
 
+use iced_x86::{Decoder, DecoderOptions};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -346,6 +347,8 @@ impl ServiceManifest {
                 || (!region.before && !region.after)
                 || region.entry_base_register.is_empty()
                 || region.dispatch_base_register.is_empty()
+                || region.entry_base_register != "rcx"
+                || region.dispatch_base_register != "r14"
             {
                 return Err(format!("invalid capture region {}", region.name));
             }
@@ -502,11 +505,20 @@ impl ServiceManifest {
                 let address = image_base
                     .checked_add(u64::from(site.rva))
                     .ok_or_else(|| format!("{} breakpoint address wraps", site.phase))?;
+                let guard = decode_hex(&site.phase, &site.guard)?;
+                let mut decoder = Decoder::with_ip(64, &guard, address, DecoderOptions::NONE);
+                let instruction = decoder.decode();
+                if instruction.is_invalid() || instruction.len() == 0 {
+                    return Err(format!(
+                        "{} site does not begin with a complete AMD64 instruction",
+                        site.phase
+                    ));
+                }
                 Ok(crate::sklive::BreakpointGuard {
                     slot: site.slot,
                     instruction: crate::sklive::InstructionGuard {
                         address: crate::skcontrol::HexU64(address),
-                        bytes: decode_hex(&site.phase, &site.guard)?,
+                        bytes: guard[..instruction.len()].to_vec(),
                     },
                 })
             })
@@ -910,10 +922,16 @@ mod tests {
         for (breakpoint, site) in breakpoints.iter().zip(&manifest.sites) {
             assert_eq!(breakpoint.slot, site.slot);
             assert_eq!(breakpoint.instruction.address.0, base + u64::from(site.rva));
-            assert_eq!(
-                breakpoint.instruction.bytes,
-                decode_hex(&site.phase, &site.guard).unwrap()
-            );
+            let complete_guard = decode_hex(&site.phase, &site.guard).unwrap();
+            assert!(complete_guard.starts_with(&breakpoint.instruction.bytes));
+            breakpoint.validate().unwrap();
         }
+        assert_eq!(
+            breakpoints
+                .iter()
+                .map(|breakpoint| breakpoint.instruction.bytes.len())
+                .collect::<Vec<_>>(),
+            vec![2, 5, 5]
+        );
     }
 }
