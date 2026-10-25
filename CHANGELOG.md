@@ -117,12 +117,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   private marker, and cannot coexist with a pool trace because DbgEng has one callback slot. The
   supported-API guest harness in `tools/skcall_guest_harness.c` labels each VBS-enclave
   create/load/initialize/terminate/delete invocation for later cross-layer correlation. The exact
-  entry uses a one-byte processor execution breakpoint instead of patching the protected transition
-  code. The runbook is `docs/secure-kernel/vtl0-call-trace.md`; this is M4 of the Secure Kernel
-  call-debugging roadmap.
-  Its exact-build K3 gate retained 256 complete calls with no read failure, including 199 from the
-  single PID emitted by three successful labelled lifecycle invocations, then disarmed, detached
-  and left the same guest boot and `vmwp` healthy with no retained worker.
+  entry uses a DbgEng-owned software breakpoint, the kind the hypervisor trace uses; it was a
+  one-byte processor execution breakpoint until 2026-10-25, when the M7.1a nested run measured
+  that slot shared with the VTL1 layer on the same VP. The runbook is
+  `docs/secure-kernel/vtl0-call-trace.md`; this is M4 of the Secure Kernel call-debugging roadmap.
+  Its exact-build K3 gate, taken with the processor execution breakpoint, retained 256 complete
+  calls with no read failure, including 199 from the single PID emitted by three successful
+  labelled lifecycle invocations, then disarmed, detached and left the same guest boot and `vmwp`
+  healthy with no retained worker. The software breakpoint's first live record is the M7.1a
+  coexistence rerun.
 
 - **The WinDbg pane is installable from this marketplace, beside the server.** `mods/windbg-pane/`
   — the Claude Code mod that draws a WinDbg-style pane from the server's tool calls as they happen

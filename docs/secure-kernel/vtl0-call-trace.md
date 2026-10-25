@@ -6,9 +6,14 @@ Secure Kernel capture or share a DbgEng engine with the supervisor.
 
 ## Contract
 
-`sk_call_trace` sets one one-byte processor execution breakpoint (`ba e1`) at exactly
-`nt!VslpEnterIumSecureMode`. It does not patch an `int 3` into the VTL-transition path. Before
-accepting it, the worker proves all of the following:
+`sk_call_trace` sets one DbgEng-owned software breakpoint at exactly `nt!VslpEnterIumSecureMode`,
+the kind the hypervisor trace uses. Until 2026-10-25 it was a one-byte processor execution
+breakpoint (`ba e1`), chosen on the premise that the entry's bytes must not be patched. No run ever
+measured that premise, and the debug-register slot the breakpoint occupied is shared with VTL1 on
+the same VP, so the VTL1 layer's arm overwrote it (the roadmap's M7.1a record); only the VTL1 layer
+holds hardware breakpoints now. The live record below was taken with the processor breakpoint, and
+the software breakpoint's first live record is the M7.1a coexistence rerun. Before accepting the
+arm, the worker proves all of the following:
 
 - the session is a live x64 kernel target;
 - the symbol resolves at displacement zero inside the current `nt` image;
