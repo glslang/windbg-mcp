@@ -74,9 +74,22 @@ one VP, pin whatever is meant to be caught.
 **And on one VP they are shared between VTLs: DR0-DR6 are one set, only DR7 is per VTL.** Measured
 2026-10-24 on the M7 nested child (`docs/secure-kernel/skcall-debugging-roadmap.md`, M7.1a): a
 VTL1 slot-0 arm found the VTL0 kernel session's `ba` address in DR0 and its B0 bit in DR6, and
-overwrote both. So the VTL1 layer is the only one that holds hardware breakpoints — `sk_call_trace`
-and the hypervisor trace arm DbgEng software breakpoints, and a source test pins each kind — and a
-VTL1 stop's DR6 can carry bits a VTL0 debugger left there.
+overwrote both. So a VTL0 `ba` and a VTL1 slot collide, and a VTL1 stop's DR6 can carry bits a
+VTL0 debugger left there. The obvious escape, a software breakpoint at
+`nt!VslpEnterIumSecureMode`, deadlocks a VBS guest at its first hit (measured 2026-10-25, M7.1a
+run `20261025T073515`): the kernel debugger writes HVCI-protected text through
+`VslWriteProtectedPage` -> `VslpEnterIumSecureMode`, so the write that services the `int 3`
+executes it with `KdDebuggerLock` held and the one processor spins in `KeFreezeExecution` for ever.
+Never place a software breakpoint on that write path; `sk_call_trace` stays a processor breakpoint
+(a source test pins the kind) and the hypervisor trace stays on software breakpoints. The two
+layers share the one VP's slots by **partition**: `open_sk_live_control` takes
+`reserved_hardware_slots` (M7 reserves slot 0 for M4's `ba`), and `LiveControl` writes, restores
+and compares only the slots it armed and reads DR6 only through them (`owned_slots`,
+`owned_cause_mask`, `matches_outside_foreign_slots`); a manifest's sites are armed outside the
+reservation through `ServiceManifest::breakpoints_outside` and mapped back by the decoder's
+`SlotMap`. The kernel debugger writes its whole cached debug-register block back at every stop, so
+the VTL1 controller's slot writes must never overlap a VTL0 debugger stop: the transaction arms M6
+before M4 and drains M4 before M6, and per-event writes happen while the VP is held in VTL1.
 
 **A stop wanted while the trace runs is a pump, never a settle.** The trace stays armed until the
 VP is quiescent, Hyper-V cannot pause a VM whose `vmwp` is debugger-stopped, and the event-site

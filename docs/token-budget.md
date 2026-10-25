@@ -347,20 +347,20 @@ None of these is a bug. They are recorded because they were invisible, and
 
    | group | tools | bytes | share |
    |---|---:|---:|---:|
-   | `allocator` | 12 | 19,807 | 14.6% |
+   | `allocator` | 12 | 19,807 | 14.5% |
    | `ioctl` | 11 | 16,088 | 11.8% |
-   | `securekernel` | 22 | 32,589 | 23.9% |
-   | `exec` | 10 | 15,087 | 11.1% |
+   | `securekernel` | 22 | 33,058 | 24.2% |
+   | `exec` | 10 | 15,087 | 11% |
    | `session` | 10 | 14,208 | 10.4% |
    | `inspect` | 10 | 13,485 | 9.9% |
-   | `batch` | 1 | 10,296 | 7.6% |
+   | `batch` | 1 | 10,296 | 7.5% |
    | `crash` | 3 | 7,473 | 5.5% |
    | `ttd` | 9 | 7,090 | 5.2% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
    | *(absent)* | 66 | 103,534 |
-   | `all` | 88 | 136,123 |
+   | `all` | 88 | 136,592 |
    | `session,inspect,exec,crash` | 33 | 49,332 |
    | `session,inspect,crash` | 23 | 34,092 |
    | `crash` | 13 | 20,515 |

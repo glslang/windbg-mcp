@@ -11171,14 +11171,22 @@ fn arm_sk_call_trace(
     let generation = SK_CALL_TRACE_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
     let trace_id = format!("skcall-{generation}");
     let marker = format!("$$ sk_call_trace {generation}");
-    // One DbgEng-owned software breakpoint, the kind the hypervisor trace arms. Until 2026-10-25
-    // this was a one-byte processor execution breakpoint, on the never-measured premise that the
-    // entry's bytes must not be patched. That choice occupied DR0 on the traced VP, and DR0-DR6
-    // are shared between VTL0 and VTL1 on a VP, so the VTL1 layer's slot-0 arm overwrote it
-    // (M7.1a run 20261024T212721). Only the VTL1 layer holds hardware breakpoints.
-    let spec = BreakpointSpec::code(BreakpointAt::Expression(
-        "nt!VslpEnterIumSecureMode".to_string(),
-    ))
+    // A processor execution breakpoint, never an `int 3`, for a reason measured on 2026-10-25
+    // (M7.1a run 20261025T073515): on a VBS guest the kernel debugger inserts and removes a
+    // software breakpoint in HVCI-protected text through MiDbgCopyMemory -> MiDbgWriteCheck ->
+    // MiCopyToUntrustedMemory -> MiDbgCopyPrivilegedData -> VslWriteProtectedPage ->
+    // VslpEnterIumSecureMode, so an `int 3` at this entry is executed by the very write that
+    // services it, a second breakpoint trap is dispatched while KdDebuggerLock is held, and a
+    // one-processor guest spins for ever in KeFreezeExecution. The slot this occupies is shared
+    // with VTL1 on the same VP (DR0-DR6 are one set per VP, only DR7 is per VTL), which the
+    // roadmap's M7.1a carries as an open design item.
+    let spec = BreakpointSpec::data(
+        BreakpointAt::Expression("nt!VslpEnterIumSecureMode".to_string()),
+        DataWatch {
+            access: DataAccess::Execute,
+            size: 1,
+        },
+    )
     .with_command(marker.clone());
     let timeout_ms = remaining.as_millis().clamp(1, u128::from(u32::MAX)) as u32;
     let armed = e
@@ -15372,6 +15380,7 @@ mod tests {
             allow_transition_cr3: false,
             allow_memory_writes: false,
             additional_vps: Vec::new(),
+            reserved_hardware_slots: Vec::new(),
         }))
     }
 
@@ -17142,9 +17151,10 @@ mod tests {
             "the trace no longer marks the breakpoint it owns"
         );
         assert!(
-            armed.contains("BreakpointSpec::code(") && !armed.contains("BreakpointSpec::data("),
-            "the VTL0 entry must use a DbgEng-owned software breakpoint; a processor execution \
-             breakpoint occupies a debug register the VP shares with the VTL1 layer"
+            armed.contains("access: DataAccess::Execute") && armed.contains("size: 1"),
+            "the VTL0 entry must use a one-byte processor execution breakpoint: an `int 3` there \
+             is executed by the debugger's own protected-text write and deadlocks a VBS guest \
+             (measured 2026-10-25)"
         );
         assert!(
             armed.contains("recorder.owns(id, command.as_deref())"),

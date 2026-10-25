@@ -205,7 +205,14 @@ proved VM pause to keep provider state stable:
    distinct, the selected set is bounded at 16, and every selected VP receives the same set of at
    most four hardware breakpoint slots. Opening does not pause,
    attach to or inspect the VM, and starts no provider. `allow_transition_cr3` defaults to false and
-   is accepted only with natural arming.
+   is accepted only with natural arming. `reserved_hardware_slots` names debug-register slots
+   another controller owns on the selected VPs, such as a VTL0 kernel debugger's processor
+   breakpoint: DR0-DR3 and DR6 are one set per VP shared across VTLs and only DR7 is per VTL
+   (measured 2026-10-24), so the session never writes, arms or borrows a reserved slot, restores and
+   compares only the slots it armed, and reads DR6 only through them. A service-trace manifest's
+   sites are armed in the lowest free slots and mapped back to their phases by the trace decoder.
+   Because the kernel debugger writes its whole cached debug-register block back at every stop, the
+   VTL1 controller must arm before and disarm after any VTL0 debugger on the same VP.
 2. The first `sk_live_arm` pauses the VM, verifies its `vmwp` binding and exact build, discovers the
    dispatcher VND, VID partition handle and partition id on the worker engine thread, then starts the register
    provider and validates its reported CR3. It opens live memory against that identity, validates

@@ -1233,6 +1233,9 @@ pub(crate) struct ObservationDecoder {
     manifest: ServiceManifest,
     target: TargetIdentity,
     image_base: HexU64,
+    /// Armed hardware slot to manifest site slot; identity unless the controller had to arm the
+    /// sites outside a slot another controller owns.
+    slot_map: crate::skservice::SlotMap,
     started: Instant,
     entry_captures: std::collections::VecDeque<PendingEntryCapture>,
     selected_requests: Vec<u64>,
@@ -1263,15 +1266,23 @@ impl ObservationDecoder {
         if image_base.0 == 0 {
             return Err("service-trace image base must be nonzero".into());
         }
+        let slot_map = crate::skservice::SlotMap::identity(manifest.hardware_slots_required);
         Ok(Self {
             manifest,
             target,
             image_base,
+            slot_map,
             started: Instant::now(),
             entry_captures: std::collections::VecDeque::new(),
             selected_requests: Vec::new(),
             seen_epochs: std::collections::HashSet::new(),
         })
+    }
+
+    /// Decode stops that arrived on remapped hardware slots (`ServiceManifest::breakpoints_outside`).
+    pub(crate) fn with_slot_map(mut self, slot_map: crate::skservice::SlotMap) -> Self {
+        self.slot_map = slot_map;
+        self
     }
 
     #[cfg(test)]
@@ -1303,23 +1314,27 @@ impl ObservationDecoder {
         if !self.seen_epochs.insert(stop.epoch.clone()) {
             return Err("service observation reused a stale stop epoch".into());
         }
-        let slot = match stop.event.reason {
+        let armed_slot = match stop.event.reason {
             StopReason::HardwareBreakpoint { slot } => slot,
             _ => return Err("service trace observed a stop it does not own".into()),
         };
+        let slot = self
+            .slot_map
+            .site_slot(armed_slot)
+            .ok_or_else(|| format!("service trace observed unowned hardware slot {armed_slot}"))?;
         let site = self
             .manifest
             .sites
             .iter()
             .find(|site| site.slot == slot)
             .cloned()
-            .ok_or_else(|| format!("service trace observed unowned hardware slot {slot}"))?;
+            .ok_or_else(|| format!("service trace observed unowned hardware slot {armed_slot}"))?;
         let expected = self
             .manifest
             .breakpoints(self.image_base.0)?
             .into_iter()
             .find(|breakpoint| breakpoint.slot == slot)
-            .ok_or_else(|| format!("manifest has no breakpoint for slot {slot}"))?;
+            .ok_or_else(|| format!("manifest has no breakpoint for site slot {slot}"))?;
         if stop.instruction != expected.instruction {
             return Err(format!(
                 "{} stop instruction no longer matches its manifest guard",

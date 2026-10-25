@@ -27,7 +27,7 @@ const RF: u64 = 1 << 16;
 const DR6_CAUSE_MASK: u64 = 0xe00f;
 const DR7_ENABLE_MASK: u64 = 0xff;
 const MAX_INSTRUCTION_BYTES: usize = 15;
-const MAX_HARDWARE_BREAKPOINTS: usize = 4;
+pub(crate) const MAX_HARDWARE_BREAKPOINTS: usize = 4;
 const MAX_GUARDED_WRITE_BYTES: usize = 64;
 pub(crate) const MAX_SOFTWARE_BREAKPOINTS: usize = 64;
 pub(crate) const MAX_LIVE_CONTROL_VPS: usize = 16;
@@ -1233,6 +1233,11 @@ pub(crate) struct LiveControl<P> {
     /// register-write reply deliberately leaves the dispatcher contained on that event.
     software_restart_rip_unproved: bool,
     allow_transition_cr3: bool,
+    /// Mask over DR0-DR3 of slots another controller owns on these VPs. DR0-DR3 and DR6 are one
+    /// set per VP shared across VTLs and only DR7 is per VTL (measured 2026-10-24), so this
+    /// controller writes only the slots it arms, restores only those, reads DR6 only through the
+    /// slots it owns, and never arms or borrows a reserved one.
+    reserved_slots: u8,
     fault: Option<FaultRecord>,
 }
 
@@ -1252,10 +1257,24 @@ impl<P: ControlProvider> LiveControl<P> {
         Self::open_many_with_transition(providers, false)
     }
 
+    #[cfg(test)]
     pub(crate) fn open_many_with_transition(
-        mut providers: Vec<P>,
+        providers: Vec<P>,
         allow_transition_cr3: bool,
     ) -> Result<Self> {
+        Self::open_many_with_options(providers, allow_transition_cr3, 0)
+    }
+
+    /// `reserved_slots` names the debug-register slots another controller owns on these VPs (bit
+    /// `n` for DR`n`); at most three, so one slot is always left to arm.
+    pub(crate) fn open_many_with_options(
+        mut providers: Vec<P>,
+        allow_transition_cr3: bool,
+        reserved_slots: u8,
+    ) -> Result<Self> {
+        if reserved_slots & !0xf != 0 || reserved_slots == 0xf {
+            bail!("reserved hardware slots must name at most three of DR0-DR3");
+        }
         if providers.is_empty() {
             bail!("live control requires at least one VP provider");
         }
@@ -1315,8 +1334,78 @@ impl<P: ControlProvider> LiveControl<P> {
             expected_stop: None,
             software_restart_rip_unproved: false,
             allow_transition_cr3,
+            reserved_slots,
             fault: None,
         })
+    }
+
+    /// Slots another controller owns on these VPs, as a mask over DR0-DR3.
+    pub(crate) fn reserved_slots(&self) -> u8 {
+        self.reserved_slots
+    }
+
+    fn require_unreserved(&self, breakpoints: &[BreakpointGuard]) -> Result<()> {
+        if let Some(breakpoint) = breakpoints
+            .iter()
+            .find(|breakpoint| self.reserved_slots & (1 << breakpoint.slot) != 0)
+        {
+            bail!(
+                "hardware breakpoint slot {} is reserved for another controller on this VP",
+                breakpoint.slot
+            );
+        }
+        Ok(())
+    }
+
+    /// The debug-register slots this controller may write: the ones it has armed, plus `extra`
+    /// (a slot a step borrows or has just released).
+    fn owned_slots(&self, extra: impl IntoIterator<Item = u8>) -> Vec<u8> {
+        let mut slots: Vec<u8> = self
+            .breakpoints
+            .iter()
+            .map(|breakpoint| breakpoint.slot)
+            .chain(extra)
+            .collect();
+        slots.sort_unstable();
+        slots.dedup();
+        slots
+    }
+
+    fn owned_registers(&self, extra: impl IntoIterator<Item = u8>) -> Vec<RegisterName> {
+        self.owned_slots(extra)
+            .into_iter()
+            .map(breakpoint_register)
+            .collect()
+    }
+
+    /// The DR6 B bits this controller may read. DR6 is shared across VTLs on a VP, so a slot
+    /// another controller owns can carry its sticky bit into this controller's stop.
+    fn owned_cause_mask(&self, extra: impl IntoIterator<Item = u8>) -> u64 {
+        self.owned_slots(extra)
+            .into_iter()
+            .fold(0, |mask, slot| mask | 1 << u32::from(slot))
+    }
+
+    /// Snapshot equality that ignores the debug-register slots this controller does not own,
+    /// which another controller may have moved while this one was armed.
+    fn matches_outside_foreign_slots(
+        &self,
+        left: &RegisterSnapshot,
+        right: &RegisterSnapshot,
+    ) -> bool {
+        let owned = self.owned_registers(std::iter::empty());
+        let foreign = |name: RegisterName| {
+            matches!(
+                name,
+                RegisterName::Dr0 | RegisterName::Dr1 | RegisterName::Dr2 | RegisterName::Dr3
+            ) && !owned.contains(&name)
+        };
+        left.values.len() == right.values.len()
+            && left
+                .values
+                .iter()
+                .zip(&right.values)
+                .all(|(l, r)| l == r || (l.name == r.name && foreign(l.name)))
     }
 
     /// Whether this controller can own vector-3 events for the bounded one-shot transition.
@@ -1533,6 +1622,7 @@ impl<P: ControlProvider> LiveControl<P> {
     ) -> Result<StopEpoch> {
         self.require_running_unarmed()?;
         validate_breakpoints(&breakpoints, mode)?;
+        self.require_unreserved(&breakpoints)?;
         if self.allow_transition_cr3 && mode != ArmMode::Natural {
             bail!("transition CR3 control requires natural arm mode");
         }
@@ -1939,8 +2029,10 @@ impl<P: ControlProvider> LiveControl<P> {
                 .find(|breakpoint| breakpoint.instruction.address.0 == rip)
                 .map(|breakpoint| breakpoint.slot)
                 .or_else(|| {
-                    (0..MAX_HARDWARE_BREAKPOINTS as u8)
-                        .find(|slot| !self.breakpoints.iter().any(|bp| bp.slot == *slot))
+                    (0..MAX_HARDWARE_BREAKPOINTS as u8).find(|slot| {
+                        self.reserved_slots & (1 << *slot) == 0
+                            && !self.breakpoints.iter().any(|bp| bp.slot == *slot)
+                    })
                 })
                 .unwrap_or_else(|| {
                     self.breakpoints
@@ -2129,12 +2221,9 @@ impl<P: ControlProvider> LiveControl<P> {
                 },
                 baseline_dr7 & !DR7_ENABLE_MASK,
             )?;
-            for register in [
-                RegisterName::Dr0,
-                RegisterName::Dr1,
-                RegisterName::Dr2,
-                RegisterName::Dr3,
-            ] {
+            let owned =
+                self.owned_registers(released_step_over_slot.into_iter().chain(step_over_slot));
+            for register in owned {
                 self.write_one(
                     active,
                     register,
@@ -2333,6 +2422,7 @@ impl<P: ControlProvider> LiveControl<P> {
         deadline: Option<Instant>,
     ) -> Result<StopEpoch> {
         validate_breakpoints(&breakpoints, ArmMode::Natural)?;
+        self.require_unreserved(&breakpoints)?;
         let stop = self.require_stop_epoch(epoch)?.clone();
         if self.providers.len() != 1 {
             bail!(
@@ -2840,9 +2930,15 @@ impl<P: ControlProvider> LiveControl<P> {
                 if event.reason != StopReason::DebugException {
                     bail!("the held dispatcher event is not an unclassified debug exception");
                 }
-                let causes = registers.low(RegisterName::Dr6)? & 0xf;
+                // DR6 is shared across VTLs on a VP, so a slot another controller owns can carry
+                // its sticky B bit into this stop; only the slots this controller armed are read.
+                let dr6 = registers.low(RegisterName::Dr6)?;
+                let causes = dr6 & self.owned_cause_mask(std::iter::empty());
                 if causes.count_ones() != 1 {
-                    bail!("hardware-stop DR6 must name exactly one breakpoint slot");
+                    bail!(
+                        "hardware-stop DR6 {dr6:#x} must name exactly one of this controller's \
+                         breakpoint slots"
+                    );
                 }
                 let slot = causes.trailing_zeros() as u8;
                 let breakpoint = self
@@ -2880,7 +2976,8 @@ impl<P: ControlProvider> LiveControl<P> {
                 }
                 if !expected_rips.contains(&HexU64(registers.low(RegisterName::Rip)?))
                     || registers.low(RegisterName::Dr6)? & (1 << 14) == 0
-                    || registers.low(RegisterName::Dr6)? & 0xf != 0
+                    || registers.low(RegisterName::Dr6)? & self.owned_cause_mask(std::iter::empty())
+                        != 0
                     || registers.low(RegisterName::Rflags)? & TF == 0
                     || registers.low(RegisterName::Rflags)? & RF != 0
                 {
@@ -2904,7 +3001,7 @@ impl<P: ControlProvider> LiveControl<P> {
                 }
                 let register = breakpoint_register(*slot);
                 let enable_mask = breakpoint_enable_mask(*slot);
-                let causes = registers.low(RegisterName::Dr6)? & 0xf;
+                let causes = registers.low(RegisterName::Dr6)? & self.owned_cause_mask([*slot]);
                 if causes != 1_u64 << u32::from(*slot)
                     || registers.low(RegisterName::Rip)? != destination.0
                     || registers.low(register)? != destination.0
@@ -3113,16 +3210,10 @@ impl<P: ControlProvider> LiveControl<P> {
             current_dr7,
             current_dr7 & !DR7_ENABLE_MASK,
         )?;
-        for name in [
-            RegisterName::Rflags,
-            RegisterName::Rip,
-            RegisterName::Rsp,
-            RegisterName::Dr0,
-            RegisterName::Dr1,
-            RegisterName::Dr2,
-            RegisterName::Dr3,
-            RegisterName::Dr6,
-        ] {
+        let mut names = vec![RegisterName::Rflags, RegisterName::Rip, RegisterName::Rsp];
+        names.extend(self.owned_registers(std::iter::empty()));
+        names.push(RegisterName::Dr6);
+        for name in names {
             self.write_one(provider, name, current.low(name)?, baseline.low(name)?)?;
         }
         let disabled_dr7 = self.read_snapshot(provider, cr3)?.low(RegisterName::Dr7)?;
@@ -3133,7 +3224,7 @@ impl<P: ControlProvider> LiveControl<P> {
             baseline.low(RegisterName::Dr7)?,
         )?;
         let restored = self.read_snapshot(provider, cr3)?;
-        if restored != baseline {
+        if !self.matches_outside_foreign_slots(&restored, &baseline) {
             bail!("restored VTL1 state does not match the saved baseline");
         }
         Ok(())
@@ -3165,13 +3256,11 @@ impl<P: ControlProvider> LiveControl<P> {
             current_flags,
             restored_flags,
         )?;
-        for name in [
-            RegisterName::Dr0,
-            RegisterName::Dr1,
-            RegisterName::Dr2,
-            RegisterName::Dr3,
-            RegisterName::Dr6,
-        ] {
+        // Only the slots this controller armed are its to restore: a foreign slot holds another
+        // controller's breakpoint on the same shared DR0-DR3.
+        let mut owned = self.owned_registers(std::iter::empty());
+        owned.push(RegisterName::Dr6);
+        for name in owned.iter().copied() {
             let expected = self.read_snapshot(provider, cr3)?.low(name)?;
             self.write_one(provider, name, expected, baseline.low(name)?)?;
         }
@@ -3184,14 +3273,8 @@ impl<P: ControlProvider> LiveControl<P> {
         )?;
 
         let restored = self.read_snapshot(provider, cr3)?;
-        for name in [
-            RegisterName::Dr0,
-            RegisterName::Dr1,
-            RegisterName::Dr2,
-            RegisterName::Dr3,
-            RegisterName::Dr6,
-            RegisterName::Dr7,
-        ] {
+        owned.push(RegisterName::Dr7);
+        for name in owned {
             if restored.low(name)? != baseline.low(name)? {
                 bail!("restored natural-flow debug state does not match the saved baseline");
             }
@@ -6979,6 +7062,163 @@ mod tests {
             advance_instruction_pointer: false,
             reason,
         }
+    }
+
+    /// DR0-DR3 are one set per VP shared across VTLs (measured 2026-10-24), so a slot a VTL0
+    /// debugger holds must never be armed, borrowed or restored by this controller.
+    #[test]
+    fn a_reserved_slot_is_refused_at_arm_and_skipped_by_a_break_request() {
+        let mut dispatcher = FakeDispatcher::new([]);
+        let mut control =
+            LiveControl::open_many_with_options(vec![FakeProvider::new()], false, 0b0001).unwrap();
+        let refused = control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Natural)
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("slot 0 is reserved"), "{refused}");
+        assert_eq!(control.phase(), LivePhase::Running);
+        assert!(dispatcher.actions.is_empty(), "{:?}", dispatcher.actions);
+
+        let slot_one = vec![BreakpointGuard {
+            slot: 1,
+            instruction: instruction(),
+        }];
+        control
+            .arm(&mut dispatcher, slot_one, ArmMode::Natural)
+            .unwrap();
+        control
+            .request_break_until(
+                &mut dispatcher,
+                Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .unwrap();
+        // The transient slot is the lowest free slot the reservation allows: 2, never 0.
+        assert!(matches!(
+            control.expected_stop,
+            Some(ExpectedStop::BreakRequest { slot: 2 })
+        ));
+        let registers = &control.test_provider().registers;
+        let low = |name| {
+            registers
+                .iter()
+                .find(|register| register.name == name)
+                .unwrap()
+                .low
+                .0
+        };
+        assert_eq!(
+            low(RegisterName::Dr0),
+            0,
+            "the reserved slot was not written"
+        );
+        assert_eq!(
+            low(RegisterName::Dr2),
+            BASE_RIP,
+            "the transient took slot 2"
+        );
+        assert_eq!(low(RegisterName::Dr7) & DR7_ENABLE_MASK, 0x14);
+    }
+
+    /// With the VTL1 controller armed before the VTL0 debugger, the debugger's address appears in
+    /// a shared slot after this controller's baseline was taken. A restore that wrote every slot
+    /// back from that baseline would overwrite it (run 20261024T212721 recovered exactly so).
+    #[test]
+    fn restore_writes_only_the_slots_the_controller_armed() {
+        let mut dispatcher =
+            FakeDispatcher::new([observed(StopReason::HardwareBreakpoint { slot: 1 })]);
+        let mut control =
+            LiveControl::open_many_with_options(vec![FakeProvider::new()], false, 0b0001).unwrap();
+        control
+            .arm(
+                &mut dispatcher,
+                vec![BreakpointGuard {
+                    slot: 1,
+                    instruction: instruction(),
+                }],
+                ArmMode::Natural,
+            )
+            .unwrap();
+        let foreign = 0xffff_f804_a105_eeb0;
+        set_low(
+            &mut control.providers[0].provider.registers,
+            RegisterName::Dr0,
+            foreign,
+        );
+
+        let stop = control.wait_for_stop(&mut dispatcher).unwrap();
+        assert_eq!(
+            stop.event.reason,
+            StopReason::HardwareBreakpoint { slot: 1 }
+        );
+        control.continue_from(&mut dispatcher, &stop.epoch).unwrap();
+
+        let registers = &control.test_provider().registers;
+        let low = |name| {
+            registers
+                .iter()
+                .find(|register| register.name == name)
+                .unwrap()
+                .low
+                .0
+        };
+        assert_eq!(
+            low(RegisterName::Dr0),
+            foreign,
+            "the foreign slot is left alone"
+        );
+        assert_eq!(
+            low(RegisterName::Dr1),
+            0,
+            "the owned slot returns to its baseline"
+        );
+        assert_eq!(low(RegisterName::Dr7) & DR7_ENABLE_MASK, 0);
+    }
+
+    /// DR6 is shared too: a VTL0 debugger's sticky B0 arrives in this controller's stop beside its
+    /// own slot's bit (run 20261024T212721 read a baseline with B0 set) and must not be counted,
+    /// while a stop that names only the foreign slot is still not this controller's.
+    #[test]
+    fn a_foreign_sticky_dr6_bit_does_not_disqualify_an_owned_stop() {
+        let mut dispatcher = FakeDispatcher::new([]);
+        let mut control =
+            LiveControl::open_many_with_options(vec![FakeProvider::new()], false, 0b0001).unwrap();
+        control
+            .arm(
+                &mut dispatcher,
+                vec![BreakpointGuard {
+                    slot: 1,
+                    instruction: instruction(),
+                }],
+                ArmMode::Natural,
+            )
+            .unwrap();
+        let snapshot = |dr6: u64| {
+            let mut values = register_values(TARGET_RIP, dr6, 0x404, 0x46);
+            set_low(&mut values, RegisterName::Dr1, TARGET_RIP);
+            RegisterSnapshot { values }
+        };
+
+        let (reason, _, _) = control
+            .validate_stop_registers(
+                &event(StopReason::DebugException),
+                &snapshot(0xffff_0ff3),
+                &ExpectedStop::Hardware,
+            )
+            .unwrap();
+        assert_eq!(reason, StopReason::HardwareBreakpoint { slot: 1 });
+
+        let refused = control
+            .validate_stop_registers(
+                &event(StopReason::DebugException),
+                &snapshot(0xffff_0ff1),
+                &ExpectedStop::Hardware,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("exactly one of this controller's breakpoint slots"),
+            "{refused}"
+        );
     }
 
     fn observed(_reason: StopReason) -> ObservedStop {

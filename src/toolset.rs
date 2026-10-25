@@ -32,7 +32,7 @@
 //!   ioctl           11   16,088  driver objects, IRP stacks, reachability, hazards, IOCTL maps,
 //!                                  references to an address, device security and the
 //!                                  whole-driver survey
-//!   securekernel    22   32,589  captured and live VTL1 inspection and execution control, plus
+//!   securekernel    22   33,058  captured and live VTL1 inspection and execution control, plus
 //!                                  ordinary-kernel and hypervisor transition tracing
 //! ```
 //!

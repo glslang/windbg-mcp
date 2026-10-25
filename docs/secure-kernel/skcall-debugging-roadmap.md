@@ -291,11 +291,17 @@ All three guest invocations completed create/load/initialize/terminate/delete, `
 removed the owned breakpoint, detach terminated the worker, guest boot identity and `vmwp` PID
 were unchanged, heartbeat stayed healthy, and no process was retained.
 
-On 2026-10-25 the breakpoint became a DbgEng-owned software breakpoint, the kind M5 arms. The
-processor execution breakpoint occupied DR0 on the traced VP, and DR0-DR6 are shared between VTL0
-and VTL1 on a VP, so the VTL1 layer's slot-0 arm overwrote it (M7.1a, run `20261024T212721`); the
-no-patch premise behind it had never been measured. The record above was taken with the processor
-breakpoint. The software breakpoint's first live record is the M7.1a coexistence rerun.
+On 2026-10-25 the breakpoint was changed to a DbgEng-owned software breakpoint, the kind M5 arms,
+because the processor execution breakpoint occupied DR0 on the traced VP and DR0-DR6 are shared
+with VTL1 on the same VP (M7.1a, run `20261024T212721`). Its first live arm (M7.1a run
+`20261025T073515`) deadlocked the one-processor child on the first hit: the debugger inserts and
+removes a software breakpoint in HVCI-protected text through `MiDbgCopyMemory` ->
+`MiDbgWriteCheck` -> `MiCopyToUntrustedMemory` -> `MiDbgCopyPrivilegedData` ->
+`VslWriteProtectedPage` -> `VslpEnterIumSecureMode`, so the write that services the breakpoint
+executes the `int 3` it is servicing, a second breakpoint trap is dispatched while
+`KdDebuggerLock` is held, and the processor spins in `KeFreezeExecution` for ever. The arm is a
+processor execution breakpoint again, with that measured reason in place of the earlier unmeasured
+one; the record above stands, and the collision with M6 is the open design item under M7.1a.
 
 ### M5 — hypervisor transition tracer
 
@@ -591,10 +597,14 @@ exists and opened and armed all three layers once; the live coexistence exit gat
 two findings from the reruns under the inverted arm order: M6's stop of a running trace asserts
 that no event arrives during its settle run and its recovery hangs on VMMS, and the child VP's
 DR0-DR6 are shared between VTLs, so M4's hardware breakpoint and M6's slot-0 breakpoint cannot
-both be armed on it. Both are addressed in the tree: only VTL1 holds hardware breakpoints and M4
-arms a software breakpoint, and the running disarm now holds an arriving event as its disarm
-point instead of faulting. Both are recorded under M7.1a and await their live proof in the rerun,
-so M7.2 remains closed.
+both be armed on it. The running disarm now holds an arriving event as its disarm point instead
+of faulting and awaits its live proof. The debug-register collision is resolved by partition: a
+software breakpoint at `nt!VslpEnterIumSecureMode` was armed live on 2026-10-25 and deadlocked the
+child on its first hit, because the kernel debugger's own protected-text write path enters VTL1
+through that entry (run `20261025T073515`, measured under M7.1a), so M4 keeps its processor
+breakpoint in slot 0 and M6 reserves that slot, arming its sites in slots 1-3 and touching only
+those; M6 is armed before M4 and drained after it. Both await their live proof in the rerun, so
+M7.2 remains closed.
 
 Join M4–M6 without putting two targets in one DbgEng process. The coordinator owns session ids and
 lifecycles, not engines: each layer remains in its existing worker and contributes an immutable
@@ -847,9 +857,10 @@ Refinement proceeds as three separately gated phases:
 3. **Idle coexistence: attempted, blocked.** Phase 2 is satisfied; the transaction opened and
    armed all three layers in one live parent/child topology on 2026-10-24, first as
    M5 -> M4 -> M6 until M5's trace cap froze the parent and child, then as M4 -> M6 -> M5 until
-   M6's drain faulted under its own bootstrap traffic, and a third run showed M4's and M6's
-   hardware breakpoints sharing the child VP's DR0 (all recorded below). It must still arm all
-   three without a workload,
+   M6's drain faulted under its own bootstrap traffic, a third run showed M4's and M6's
+   hardware breakpoints sharing the child VP's DR0, and a fourth, with M4 on a software
+   breakpoint, deadlocked the child on that breakpoint's first hit (all recorded below). It must
+   still arm all three without a workload,
    drain in reverse order and prove byte/register baselines, both heartbeats, unchanged
    boots/`vmwp` processes and zero retained processes, with failure/timeout injection. M7.2 stays
    closed until this exact live control passes.
@@ -911,6 +922,16 @@ measurements along the way decide how the driver must behave:
   happened unnoticed in the previous run, whose 371 events were all clean slot-0 hits. Both runs'
   host and K3 residue was removed by exact PID and the staging cleanup, and both guests ended
   healthy.
+- In `live-coexistence/20261025T073515/`, on build `0.23.0+g2296ed9c`, preflight, all three opens
+  and M4's arm succeeded, the first live arm of M4's software breakpoint. M6's arm then failed in
+  the driver's bootstrap step: PowerShell Direct into the child broke 33 s after M4 armed, M4's
+  drain break-in produced no stop in 60 s, and M4's worker was retained with the child's KDNET
+  port. From K3 the child read Running, CPU 79%, heartbeat lost, and a fresh `l2-nt` attach from
+  the host parked. The child's VTL0 state and stack were read from K3 and are the measurement in
+  continuation item 2: a nested breakpoint trap under a held `KdDebuggerLock`, raised by the
+  debugger's own protected-text write entering VTL1 through the patched entry. M6's stop fix was
+  never reached. The host orphan was terminated by exact PID, the parked attach handed off with
+  `kernel_handoff_pid`, and the K3 staging removed; the child needs a turn-off and start from K3.
 
 Continuation order from this checkpoint:
 
@@ -925,16 +946,52 @@ Continuation order from this checkpoint:
    disturb. The cap stays as it is: on an idle child it is reached about 2 s after
    M5 is armed and becomes M5's drain point, and for M7.2 it is the latency budget inside which
    the workload must land, a measurement for that gate rather than a coexistence blocker.
-2. **Decided 2026-10-25: only the VTL1 layer holds hardware breakpoints.** DR0-DR6 are shared
-   between VTL0 and VTL1 on a VP and only DR7 is per VTL, as run `20261024T212721` measured: M6's
-   arm found M4's `nt!VslpEnterIumSecureMode` address in DR0 and M4's B0 in DR6, overwrote both,
-   and refused its first event. M4's processor execution breakpoint rested on the premise that the
-   entry's bytes must not be patched, which no run ever measured, and M5 already arms DbgEng-owned
-   software breakpoints in the hypervisor. `sk_call_trace` therefore arms a DbgEng-owned software
-   breakpoint at the same entry; the source test pins the kind, and the runbook and changelog say
-   which record was taken with which kind. Its first live record is the rerun below. The
+2. **Decided 2026-10-25 and done in the tree: the two layers partition the child VP's slots.**
+   M4 keeps its processor breakpoint in slot 0; M6 opens with `reserved_hardware_slots: [0]`, arms
+   the manifest's three sites in slots 1-3 (`ServiceManifest::breakpoints_outside`, mapped back by
+   the decoder's `SlotMap`), writes, restores and compares only the slots it armed, and reads DR6
+   only through its own B bits (`LiveControl::owned_slots`, `owned_cause_mask`). DR7 is per VTL, so
+   each VTL enables only its own slots and neither fires on the other's address. Because the
+   kernel debugger writes its whole cached debug-register block back at every stop, M6's slot
+   writes must never overlap a VTL0 debugger stop: the transaction arms M6 before M4 and drains M4
+   before M6 (`ARM_ORDER` is now M6 -> M4 -> M5), and M6's per-event writes happen while the VP is
+   held in VTL1. Offline: a reserved slot is refused at arm and skipped by a break request, a
+   restore leaves a foreign slot's value alone, a foreign sticky DR6 bit does not disqualify an
+   owned stop while a stop naming only the foreign slot is refused, the manifest remaps to slots
+   1-3 and the decoder follows, and the coordinator's order tests moved; each controller test was
+   mutation-verified against the half of the discipline it pins. What the rerun measures and
+   nothing offline can: that the VTL0 debugger's write-back at its stops preserves slot 1-3 values
+   it did not set, read as DR0-DR3 and both DR7s from K3 after each arm. The alternatives
+   considered and the measurement that ruled out the first answer follow.
+   The history: DR0-DR6 are shared between VTL0 and VTL1 on a VP and only DR7 is per VTL, as run
+   `20261024T212721` measured: M6's arm found M4's `nt!VslpEnterIumSecureMode` address in DR0 and
+   M4's B0 in DR6, overwrote both, and refused its first event. The first answer, a DbgEng software
+   breakpoint at the same entry, was armed live in run `20261025T073515` and deadlocked the child
+   on its first hit. Read from K3 while the child answered neither heartbeat nor KDNET: VP0's VTL0
+   state was identical in six samples, one byte past a `pause` in `nt!KxTryToAcquireSpinLock`
+   spinning on `nt!KdDebuggerLock` (word 1) under `KeFreezeExecution` <- `KdEnterDebugger` <-
+   `KdpReport` <- `KdpTrap` <- `KdTrap` <- `KiDispatchException`; the deeper frames were
+   `KiBreakpointTrap` with trap RIP `VslpEnterIumSecureMode+1` under `VslWriteProtectedPage` <-
+   `MiDbgCopyPrivilegedData` <- `MiCopyToUntrustedMemory` <- `MiDbgWriteCheck` <-
+   `MiDbgCopyMemory`, and the entry's first byte was still `cc`. So the kernel debugger writes
+   HVCI-protected text by asking the Secure Kernel through the very entry that was patched: the
+   write that inserts or removes the breakpoint executes it, the second trap finds the debugger
+   lock held, and the single processor never returns. The old no-patch comment was right for a
+   reason it never stated; it is measured now, and the arm is a processor execution breakpoint
+   again. Any software breakpoint on the debugger's protected-write path (`VslWriteProtectedPage`,
+   `VslpEnterIumSecureMode` and what they call) has the same effect; software breakpoints
+   elsewhere in protected text are what that path exists for. The candidates weighed before
+   the partition: M4 arms
+   software breakpoints at the `call` sites inside the callers the workload exercises
+   (`VslCreateEnclave`, `VslLoadEnclaveModule`, `VslInitializeEnclave`, `VslCallEnclave`,
+   `PsTerminateVsmEnclave`), where CL, DX, R8D and R9 are already loaded and the debugger's write
+   path never runs, refusing any site on that path; or M4 arms nothing and the NT-side arguments
+   come from M6's entry phase, with the VTL0 process and caller identity supplied another way.
+   The partition keeps M4's own instrument and needs no new VTL0 site. The
    single-step bit that reached VTL1's first event after a VM resume still needs its path
    measured; M6's exactly-one-slot check reads only the four B bits, so it does not count it.
+   Records: `live-coexistence/20261025T073515/l2-vtl0-hang-sample.json`,
+   `l2-vtl0-hang-deeper-stack.json` and `l2-vtl0-hang-symbols.txt`.
 3. **Done in the tree, 2026-10-25: the stop of a running natural trace holds an arriving event
    as its disarm point.** Run `20261024T210251` measured the fault: the last event's completion
    re-armed the trace, arrival breakpoint installed and DR7 live, and 1.3 ms later the stop
@@ -963,7 +1020,9 @@ Continuation order from this checkpoint:
    natively. The driver's `await_m6_quiescence` gate is removed so the drain is issued while the
    trigger may still fire; a non-stopping trace read before the drain stays as a reading. The
    multi-provider stop keeps its pre-existing window (a winner completed before its pause with
-   DR7 still armed); M7 selects one VP and that path is out of this item's scope.
+   DR7 still armed); M7 selects one VP and that path is out of this item's scope. Run
+   `20261025T073515` never reached M6's arm (the child hung on M4's first hit, item 2), so this
+   is still unproven live.
 4. Then rerun `run-m7-nested-coexistence.ps1`: open all three, arm M4 -> M6 -> M5, launch no
    workload, drain M5 -> M6 -> M4, and repeat the relevant failure and timeout injections. M4's
    software breakpoint is first exercised live here. The gate requires

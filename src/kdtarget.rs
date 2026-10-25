@@ -461,6 +461,7 @@ impl ManagedRequest {
                 allow_transition_cr3: false,
                 allow_memory_writes: false,
                 additional_vps: Vec::new(),
+                reserved_hardware_slots: Vec::new(),
             },
             pipe,
             kernel_base,

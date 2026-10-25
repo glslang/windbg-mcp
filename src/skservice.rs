@@ -105,6 +105,59 @@ pub(crate) struct Site {
     pub(crate) guard: String,
 }
 
+/// Armed hardware slot to manifest site slot and back, for a controller that must arm a
+/// manifest's sites outside slots another controller owns on the same VP. A manifest numbers its
+/// sites `0..n`; DR0-DR3 are one set per VP shared across VTLs, so the VTL1 controller may have to
+/// leave a VTL0 debugger's slot alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SlotMap {
+    /// Indexed by armed slot: the manifest site slot it carries.
+    site_of_armed: [Option<u8>; 4],
+}
+
+impl SlotMap {
+    /// Sites `0..count` armed in slots `0..count`.
+    pub(crate) fn identity(count: u8) -> Self {
+        let mut site_of_armed = [None; 4];
+        for slot in 0..count.min(4) {
+            site_of_armed[usize::from(slot)] = Some(slot);
+        }
+        Self { site_of_armed }
+    }
+
+    /// Sites `0..count` armed, in site order, in the lowest slots `reserved` does not name.
+    pub(crate) fn outside(count: u8, reserved: u8) -> Result<Self, String> {
+        let free: Vec<u8> = (0..4u8)
+            .filter(|slot| reserved & (1 << slot) == 0)
+            .collect();
+        if usize::from(count) > free.len() {
+            return Err(format!(
+                "the manifest needs {count} hardware slots but only {} are not reserved",
+                free.len()
+            ));
+        }
+        let mut site_of_armed = [None; 4];
+        for (site, armed) in free.into_iter().take(usize::from(count)).enumerate() {
+            site_of_armed[usize::from(armed)] = Some(site as u8);
+        }
+        Ok(Self { site_of_armed })
+    }
+
+    pub(crate) fn site_slot(&self, armed: u8) -> Option<u8> {
+        self.site_of_armed
+            .get(usize::from(armed))
+            .copied()
+            .flatten()
+    }
+
+    pub(crate) fn armed_slot(&self, site: u8) -> Option<u8> {
+        self.site_of_armed
+            .iter()
+            .position(|slot| *slot == Some(site))
+            .map(|armed| armed as u8)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StaticGuard {
@@ -494,6 +547,29 @@ impl ServiceManifest {
         })
     }
 
+    /// The manifest's breakpoints armed into the hardware slots left free by `reserved_slots` (a
+    /// mask over DR0-DR3 another controller owns on the VP), in site order, with the map from the
+    /// armed slot back to the manifest's site slot. A manifest numbers its sites `0..n`; the live
+    /// controller may have to avoid a slot the VTL0 debugger holds on the same shared DR0-DR3.
+    pub(crate) fn breakpoints_outside(
+        &self,
+        image_base: u64,
+        reserved_slots: u8,
+    ) -> Result<(Vec<crate::sklive::BreakpointGuard>, SlotMap), String> {
+        let map = SlotMap::outside(self.hardware_slots_required, reserved_slots)?;
+        let breakpoints = self
+            .breakpoints(image_base)?
+            .into_iter()
+            .map(|mut breakpoint| {
+                breakpoint.slot = map
+                    .armed_slot(breakpoint.slot)
+                    .ok_or_else(|| format!("site slot {} has no armed slot", breakpoint.slot))?;
+                Ok(breakpoint)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok((breakpoints, map))
+    }
+
     pub(crate) fn breakpoints(
         &self,
         image_base: u64,
@@ -819,6 +895,35 @@ mod tests {
             error.contains("service source and request layout disagree"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn sites_are_armed_outside_a_reserved_slot_and_mapped_back() {
+        let map = SlotMap::outside(3, 0b0001).unwrap();
+        assert_eq!(
+            (0..4).map(|slot| map.site_slot(slot)).collect::<Vec<_>>(),
+            [None, Some(0), Some(1), Some(2)]
+        );
+        assert_eq!(
+            (0..3).map(|slot| map.armed_slot(slot)).collect::<Vec<_>>(),
+            [Some(1), Some(2), Some(3)]
+        );
+        assert_eq!(SlotMap::identity(3).site_slot(2), Some(2));
+        assert_eq!(SlotMap::identity(3).site_slot(3), None);
+        let error = SlotMap::outside(3, 0b0011).unwrap_err();
+        assert!(error.contains("only 2 are not reserved"), "{error}");
+
+        let manifest = service_manifest().unwrap();
+        let base = 0xffff_f807_0000_0000;
+        let (outside, _) = manifest.breakpoints_outside(base, 0b0001).unwrap();
+        let inside = manifest.breakpoints(base).unwrap();
+        assert_eq!(
+            outside.iter().map(|b| b.slot).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        for (moved, original) in outside.iter().zip(&inside) {
+            assert_eq!(moved.instruction, original.instruction);
+        }
     }
 
     #[test]
