@@ -620,7 +620,10 @@ way the same afternoon (run `20261025T145507`: M6 armed, drained and closed, the
 clean, M4 and M5 armed and closed, the switch read clean again, M6 reopened and closed, the
 independent finalize check passing with no failure); M7.2 is to be designed off M4's hardware
 breakpoints, with M6's entry data still to be proved against M4's fields; the in-`vmwp`
-redelivery stays a fallback. M7.1 is complete under the revised criterion; M7.2 remains open.
+redelivery stays a fallback. M7.1 is complete under the revised criterion. M7.2's join is built
+and qualified offline (2026-10-25), with the first-stage field table recorded under it; a chain
+that is `complete` live waits on M7.3's capture, which needs M4 and M6 in one window or an
+M6-entry first stage, and a clock common to M5 and M6.
 
 Join M4–M6 without putting two targets in one DbgEng process. The coordinator owns session ids and
 lifecycles, not engines: each layer remains in its existing worker and contributes an immutable
@@ -1269,7 +1272,8 @@ Continuation order from this checkpoint:
    process. Any Hyper-V management query of the child while a layer holds its `vmwp` must be
    bounded, for the reason the provider-death control measured.
 5. Only after that live coexistence result is recorded may M7.2 implement and qualify the
-   deterministic join below.
+   deterministic join below. **Done 2026-10-25**, after M7.1 passed under its revised criterion:
+   the join is implemented and qualified offline under M7.2, and its live qualification is M7.3's.
 
 The event, provider-death and qualification harnesses depend on the `src/listen.rs` change that
 adds the explicitly bound non-loopback IP to rmcp's Host-header allowlist while retaining the
@@ -1306,6 +1310,97 @@ unmatched/ambiguous sets, drops and restoration audit. Render a bounded table/ti
 JSON; the table is not an independent source. Property tests generate nested calls, equal
 timestamps, reordered arrivals, missing phases, unmatched returns and drops, and assert that input
 permutation does not change a decision once layer sequence numbers are fixed.
+
+**M7.2 implementation result, 2026-10-25: the join is built and passes offline; a chain's first
+stage stays provisional until a capture holds M4 and M6 on one VP.** `src/skjoin.rs` is the pure
+join and `windbg-mcp --m7-join <input.json>` the engine-free role over it. The input is the three
+drained trace reads as the workers answered them, the validated capture identity, the
+transaction's clock admission, each layer's arm and drain brackets, and the two values only the
+coordinator knows: the expected selected-call count and the workload process. The output is one
+versioned record (`windbg-mcp.sk-correlation-join.v1`) carrying the sources verbatim, the events
+normalized and ordered by their own sequence numbers, the hypervisor round trips, one chain per
+VTL1 record with a decision per stage, the unmatched and ambiguous sets with their candidates as
+sequence ranges, the marks that stop a complete verdict, the per-chain cross-checks of the fields
+M4 and M6 both carry, and the first-stage field table; `--m7-join-table` renders a bounded table
+from that record and from nothing else. `target/codex-m7/join-m7-run.py` assembles the input from
+a run's `report.json` and leaves `join-input.json`, `join.json` and `join.txt` beside it.
+
+How it decides. Within a layer the order is the sequence number and nothing else, so arrival order
+cannot change a decision. Across layers a point order is used only when the admission is `point`
+and both events carry a sample on the admitted frequency; an equal tick proves nothing and keeps
+both candidates. A chain's M4 entry is the one selected secure-service entry (kind 2, the selected
+service) after the previous VTL1 record's latest phase and before this record's entry. Its M5
+stages are the round trips enclosing the VTL1 entry and the VTL1 return, the round trips paired by
+a stack over the hypervisor's calls and returns, so the normal-mode calls inside a service appear
+as `nested_round_trips` rather than breaking the pairing. Without a point order the coordinator's
+brackets relate two recording windows and no more: disjoint windows leave a stage unmatched; one
+window certainly recording throughout the other's, with both traces complete runs of equal
+length, pairs by rank; anything else leaves every candidate in place. A round trip with no
+recorded return bounds nothing when its trace was capped, dropped events or was still armed,
+because the trace stopping says nothing about where the VP was; a trace that ran to a clean end
+left the VP in VTL1, and its open round trip encloses what follows up to the layer's window. A
+chain is `complete` when all six stages matched from an M4 entry and every cross-check agreed,
+`provisional` when every observed stage matched but the first stage is M6's entry phase standing
+in for an M4 entry the capture did not record, and `incomplete` otherwise; a `call_id` is assigned
+to the first two only. Zero VTL1 records is `incomplete` with that reason, not a vacuous pass, and
+a chain count that differs from the expected one is a reason, never a correction.
+
+The first stage, field by field, as the record carries it (`first_stage.fields`). The layout rows
+rest on the two K3 records of service 47 taken two days apart, M4's of 2026-10-21 and M6's of
+2026-10-23: a layout correspondence across runs, not an identity on one call, which is why they
+say *copied* and why the join cross-checks `service`, `transition_kind` against `dispatch_mode`,
+and bytes 8..64 of the block against the request on every chain whose M4 entry is matched.
+
+| M4 field at `nt!VslpEnterIumSecureMode` | M6 counterpart | Without M4 | Basis |
+| --- | --- | --- | --- |
+| `transition_kind` (CL) | `dispatch.fields.dispatch_mode`, request+0 | copied | 2 at 255 of the 256 entries of the M4 record (the one kind-1 entry was `nt!VslCallEnclave`, service 0) and 2 at request+0 in all 100 service-47 requests of the M6 record |
+| `service` (DX) | `entry.service`; `service_number` at request+2 | copied | one number space |
+| `call_context` (R8D) | none | unavailable | 0 in all 256 entries; no VTL1 field carries it |
+| `argument_block` (0x68 bytes at R9) | `request.before`, bytes 8..64 at `rcx` | copied | the two service-47 blocks agree in layout from offset 8: an address in the harness image (`0x140000288` against `0x140000284`), a user allocation, `0x10000000`, two kernel pointers, a small count; bytes 0..8 differ by construction (zero in VTL0, the header in VTL1) and 64..104 are not captured by M6 |
+| `argument_block_pointer` (R9) | `entry.raw_arguments.rcx` | replaced | a VTL1 address of the request, never equal |
+| `caller`, `caller_symbol` | none | unavailable | VTL1 sees no VTL0 stack; the manifest's `caller_symbol` is an exact-build expectation, not a reading |
+| `process_id` | none; `workload_process_id` from the coordinator's envelope | coordinator envelope | no VTL1 object names the VTL0 caller of a secure service |
+| `thread` | none | unavailable | as above |
+| `processor` | `target.vp` | copied | one runnable VP is an admission condition |
+| `target_rip`, `stack_pointer` | `entry.site.coordinate` | replaced | VTL1 coordinates |
+
+Offline: fourteen unit tests over a seeded generator of one-VP timelines (selected and ambient
+secure calls, enclave calls, normal-mode calls inside a service and ambient secure calls inside
+those) assert that a clean point capture joins every selected call to its six stages with the
+truth's events and nesting count; that shuffling all three layers' arrival order changes no
+decision; that a capture without M4 is provisional with the field table saying what the first
+stage lacks; that a capped hypervisor trace leaves stages past the cut unmatched or ambiguous and
+never matched to a transition still recorded; that an incomplete VTL1 record yields no call id and
+leaves its neighbours' decisions unchanged; that a stray return is marked and changes no
+decision; that an equal tick is ambiguous and two candidates stay two when the record between
+them is gone; that interval-only clocks pair by rank only under containment with equal counts and
+otherwise leave ranges, with disjoint windows unmatched; that a differing cross-check refuses the
+chain; that the expected count is a reason and zero records are incomplete; that the table is a
+projection of the JSON; and that input which cannot be joined is an error rather than a verdict.
+Four of those rules were mutation-verified the same day by flipping the rule and watching its
+test fail: an open round trip treated as bounding, an equal tick treated as before, the first
+candidate taken when several survive, and the hypervisor layer left in arrival order. The
+real-binary smoke test drives the role over one point-mode chain in the public wire shapes and
+reads `complete` back from the JSON and from the table.
+
+Two exercises on real records, neither evidence about a call. The three K3 qualification records
+(M4 2026-10-21, M5 2026-10-22, M6 2026-10-23: three boots) assembled under a synthetic identity
+and an interval-only admission parsed as 256, 1,024 and 100 events, all three traces at capacity,
+and joined to 100 incomplete chains: the one selected M4 entry stays a single ambiguous candidate
+because a capped trace is not a complete run, and every M5 stage holds all 512 round trips. The
+M7.1 run `20261025T145507` joined to zero chains, `incomplete` for that reason, with the M4 and
+M5 windows disjoint from M6's as the alternating plan makes them, and neither of its two idle M4
+entries a selected-service entry.
+
+What M7.3 needs before any chain can be `complete` live, and neither is a change to the join. One
+window holding M4 and M6 on one VP (M7.1a continuation item 2's options), or a capture definition
+whose first stage is M6's entry with the workload process from the coordinator's envelope, which
+the join already reports as `provisional`. And a clock common to M5 and M6: in the nested lab M6's
+worker runs in K3 and its samples are K3's counter, so the admission is `interval_only` and every
+M5 stage is ambiguous however clean the capture. The candidate is the partition's reference
+counter, read by M6's provider at each held stop and by M5's trace at each hit, with the admission
+extended to say which layer pairs it orders; that is a provider and record change with its own
+measurement, not a rule the join can adopt from here.
 
 #### M7.3 — correlated live gate and investigations
 

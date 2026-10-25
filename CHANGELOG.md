@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **M7.2 adds the deterministic join as an engine-free role, `--m7-join`.** `src/skjoin.rs`
+  takes the three drained trace reads with the capture identity, the clock admission and each
+  layer's arm and drain brackets, and writes one versioned record
+  (`windbg-mcp.sk-correlation-join.v1`) holding the sources verbatim, the events by their own
+  sequence numbers, the hypervisor round trips paired by a stack, one chain per VTL1 record with a
+  decision per stage, the unmatched and ambiguous sets with candidates as sequence ranges, the
+  marks that stop a complete verdict, the per-chain cross-checks of the fields M4 and M6 both
+  carry, and the first-stage field table; `--m7-join-table` renders a bounded table from that
+  record. A point order is used only under a `point` admission with samples on the admitted
+  frequency, where an equal tick keeps both candidates; otherwise the brackets relate recording
+  windows and no more, disjoint windows leave a stage unmatched, and rank pairing applies only
+  when one window contains the other and both complete runs count the same. A capped trace's open
+  round trip bounds nothing. Chains are `complete`, `provisional` (M6's entry phase standing in
+  for an M4 entry the capture did not record) or `incomplete`, and a `call_id` goes to the first
+  two only; zero VTL1 records is `incomplete`, not a vacuous pass. Offline, fourteen seeded
+  property tests and a real-binary smoke test cover the join, and four of its rules were
+  mutation-verified. No MCP tool is added.
+
 - **M7.1 now selects and types a live nested-child topology.** The capture identity freezes both
   the L2 workload and its L1 parent VM/boot/`vmwp`, workload placement, guest-hypervisor launch,
   outer and child VTL1 availability, and the independently selected M5 and M6 provider boundaries.

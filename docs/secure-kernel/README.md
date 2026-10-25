@@ -49,7 +49,10 @@ exact-build guard, event contract and deterministic guest workload are in the
 [VTL0 call-trace runbook](vtl0-call-trace.md). M5's independent hypervisor KD worker records the
 authoritative transition selection through `hv_transition_trace` and
 `hv_transition_trace_read`; its symbol-free exact-image gate and saved-state coordinates are in
-the [hypervisor transition runbook](hypervisor-transition-trace.md).
+the [hypervisor transition runbook](hypervisor-transition-trace.md). M7.2's deterministic join of
+the three layers is a command-line role over their drained trace reads, `windbg-mcp --m7-join`,
+rather than a tool; the roadmap's M7.2 result says how it decides and what its three verdicts
+mean.
 
 **And since 0.22.0 an installed WinDbg can sit in front of that controller.**
 `open_sk_kd` owns the controller as an MCP session, returns a generated local named pipe, and

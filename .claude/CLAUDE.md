@@ -109,7 +109,7 @@ them — read it to pick the one you want.
 | `tool-surface.md` | any `src/` or `tests/` Rust, or `build.rs` | adding a tool: the second file, output schemas carrying no prose, per-client surfaces, `TOOL_NOTES`/`SUMMARY_NOTES` |
 | `listener-clients.md` | any `src/` or `tests/` Rust, or `build.rs` | several clients on one listener: credentials, per-client surfaces, ambient identity, the lease, driving `2026-07-28` by hand |
 | `transcripts.md` | any `src/` or `tests/` Rust, or `build.rs` | `WINDBG_MCP_TRANSCRIPT`, what it records that stderr cannot, and `--render-cast` |
-| `secure-kernel-live.md` | any `src/` or `tests/` Rust, or `build.rs` | driving the seven live tools: the `extra` group, quiet-to-arm against busy-to-stop, CR3 discovered rather than asserted, the step's root, per-VP debug registers, and what a passing run does *not* establish |
+| `secure-kernel-live.md` | any `src/` or `tests/` Rust, or `build.rs` | driving the seven live tools: the `extra` group, quiet-to-arm against busy-to-stop, CR3 discovered rather than asserted, the step's root, per-VP debug registers, what a passing run does *not* establish, and what the M7.2 join can and cannot decide from a capped or interval-only capture |
 
 | Skill (`.claude/skills/`) | Invoke when |
 |---|---|
