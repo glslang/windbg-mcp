@@ -588,13 +588,14 @@ negative control. Only then may M7 treat an M6 record as a semantic endpoint.
 
 ### M7 — cross-layer correlation and investigations
 
-Status: in progress. M6's live exit gate and M7.0 are complete. M7.1's offline transaction,
+Status: in progress. M6's live exit gate, M7.0 and M7.1 (under its criterion as revised
+2026-10-25) are complete. M7.1's offline transaction,
 line-protocol and live-topology admission gates are complete, its provider-choice gate selected a
 nested L2 workload under K3, and the nested-parent provider is qualified: the read-only, no-op
 write, arm/restore and natural held-event controls, the provider-death control and the complete
 positive sequence on three clean child boots all passed. The admitted-topology coexistence driver
-exists and opened and armed all three layers once; the live coexistence exit gate is blocked on
-two findings from the reruns under the inverted arm order: M6's stop of a running trace asserts
+exists and opened and armed all three layers once; the live coexistence exit gate was blocked on
+two findings from the reruns under the inverted arm order: M6's stop of a running trace asserted
 that no event arrives during its settle run and its recovery hangs on VMMS, and the child VP's
 DR0-DR6 are shared between VTLs, so M4's hardware breakpoint and M6's slot-0 breakpoint cannot
 both be armed on it. The running disarm now holds an arriving event as its disarm point instead
@@ -614,9 +615,12 @@ day across five runs: the root-side ways tried to hand that exception back to VT
 on this hypervisor and no root-side redelivery path has been demonstrated, so the VTL0 debugger
 loses every break and breakpoint hit while M6's handler is registered, and M4 and M6 cannot
 share a VP in one window with what exists. Decided 2026-10-25: M7.1's idle gate runs M6 and M4
-in alternation, a revision of its acceptance criterion recorded under M7.1; M7.2 is to be
-designed off M4's hardware breakpoints, with M6's entry data still to be proved against M4's
-fields; the in-`vmwp` redelivery stays a fallback. Both milestones remain open.
+in alternation, a revision of its acceptance criterion recorded under M7.1, and it passed that
+way the same afternoon (run `20261025T145507`: M6 armed, drained and closed, the switch read
+clean, M4 and M5 armed and closed, the switch read clean again, M6 reopened and closed, the
+independent finalize check passing with no failure); M7.2 is to be designed off M4's hardware
+breakpoints, with M6's entry data still to be proved against M4's fields; the in-`vmwp`
+redelivery stays a fallback. M7.1 is complete under the revised criterion; M7.2 remains open.
 
 Join M4–M6 without putting two targets in one DbgEng process. The coordinator owns session ids and
 lifecycles, not engines: each layer remains in its existing worker and contributes an immutable
@@ -700,7 +704,8 @@ from `vmwp` (the dispatcher's deferred cleanup reached and its scratch freed), n
 enabled, and no exception or trap-flag state pending on the child's VP read from K3
 (`pending_event0` and `pending_interruption` clear, `rflags.TF` clear in both VTLs). The
 same-window arm of all three is not claimed by M7.1 any more; it is what M7.2's join would need
-and is open there.
+and is open there. The revised gate passed on 2026-10-25, run `20261025T145507`; the live
+result below has the readings.
 
 Offline transaction tests inject failure and timeout at every state and for every worker. They
 assert that unopened layers are untouched, opened layers are ended once, all restoration results
@@ -710,17 +715,26 @@ guest harness, then proves the same boot, heartbeat, breakpoint bytes, debug-reg
 zero retained processes.
 
 **M7.1 implementation result, 2026-10-24: offline passed; live incomplete.** The pure transaction
-runner now owns the seven states above, fixes the arm order as M4 VTL0 -> M6 VTL1 -> M5
-hypervisor (inverted the same evening from M5 first, after the live run recorded under M7.1a
-showed that a stopped hypervisor holds every layer beneath it), withholds the workload until all
+runner now owns the seven states above plus `transition`, fixes the one-window arm order as M6
+VTL1 -> M4 VTL0 -> M5 hypervisor (M5 last since the evening of 2026-10-24, when the live run
+recorded under M7.1a showed that a stopped hypervisor holds every layer beneath it; M6 before
+M4 since 2026-10-25, the slot partition), and since 2026-10-25 runs the alternating plan under
+`--m7-alternate` (`ALTERNATING_WINDOWS`: M6 alone, then M4 with M5, then M6 again), asking the
+adapter for a `transition` between windows whose typed acknowledgement must read clean before
+the next window opens and refusing a workload for that plan, since no window holds every
+layer. It withholds the workload until all
 three acknowledgements say they are ready, and drains
 successful arms in reverse order before ending every reachable session. Its driver has no
 force-kill operation. Failed and timed-out opens retain a public recovery session handle when one
 was returned, so that handle is ended exactly once rather than being mistaken for an unopened
 layer. Unit controls inject failure and timeout at every operation and layer, mutate arm-time
-identity, and independently make every restoration field unsafe. A real-binary smoke test drives
-the engine-free `--m7-transaction-protocol` through both the complete idle order and a timed-out
-open carrying a recovery handle. Neither role constructs a debugger engine.
+identity, independently make every restoration field unsafe, and for the alternating plan make
+each leftover a switch can read (the handler still registered or unread, a VTL1 or VTL0 slot
+enabled, a pending event, the trap flag, an engine worker) open nothing further and let a window
+that fails end the plan after its own cleanup. A real-binary smoke test drives the engine-free
+`--m7-transaction-protocol` through the complete idle order, the alternating plan with its two
+transitions, and a timed-out open carrying a recovery handle. Neither role constructs a
+debugger engine.
 
 The original live adapter passed identity, one-VP, image, profile, boot, `vmwp`, QPC and
 clean-process preflight on three bounded runs, then the first M5 `attach_kernel` failed to land
@@ -731,6 +745,39 @@ the deeper topology conflict below. A separate attempt to start the VM while a h
 was already bound entered Windows repair; that boot-priming path remains rejected and removed.
 Every failed attempt withheld the workload and was recovered to heartbeat `OK` with no debugger
 process retained.
+
+**M7.1 live result, 2026-10-25: passed under the revised criterion.** Run
+`live-coexistence/20261025T145507/`, build `0.23.0+gcda1c8e1-dirty.3fa83efb` on host and K3
+alike, 3 min 22 s end to end on the one-vCPU L2 child (`vmwp` 7964, child boot
+`2026-10-25T13:13:00Z`) under the K3 parent (boot `2026-10-24T18:28:16Z`, unchanged by the
+run). Window 1: M6 opened in 3.1 s, armed in 65.6 s (the bootstrap trigger, held in VTL1 and
+completed), drained in 4.6 s with 0 records and ended in 11.1 s with the target released and
+the worker terminated. Switch 1 (4.8 s): the dispatcher's verification of its handler
+unregistration present once in the listener's log for its two registrations and no
+containment, no slot enabled in either VTL's DR7, no pending event or interruption under any
+InputVtl encoding, the trap flag clear in both VTLs, 0 engine workers, the VTL1 baseline
+restored and the Secure Kernel text unchanged. Window 2: M4 opened in 0.8 s and M5 in 1.7 s,
+M4 armed in 0.8 s with VTL0 DR7 enabling slot 0 alone at M4's entry and VTL1 enabling nothing,
+M5 armed in 0.1 s; M5 drained first with 0 transitions and the hypervisor resumed, M4 drained
+with 2 calls recorded on the idle child and its entry bytes restored; both ended released.
+Switch 2 (2.6 s): clean on every field, with no VTL1 handler to read. Window 3: M6 reopened in
+2.9 s, armed in 56.6 s, drained with 0 records, ended released. Postflight: both boots and both
+`vmwp` pids unchanged, VTL1 debug state restored, text unchanged, 0 engine workers in K3, 0
+staged host processes, both heartbeats `OK`; the harness's cleanup completed with nothing owed
+and no residue in K3 (no staging, listener task, firewall rule or driver service), and the
+independent finalize check (`finalize-m7-nested-coexistence.ps1`, reading the raw records and
+the live lab) wrote `m7-nested-coexistence.json` as `pass` with no failures. Clock admission
+was `interval_only`, as in every nested run: M6's worker QPC is K3's clock and sits outside the
+host bracket. Two attempts that hour failed in the driver, not the lab, and left nothing
+behind: `144453` read the switch's handler evidence from the wrong log line (the clean release
+writes one `verified handler unregistration and callback scratch release` line per session,
+after the last of its two registered contexts' deferred cleanup, not the per-context free
+line), and `145011` read M4's slot at the stop where the trace armed, where VTL0 DR7 is `0x400`:
+a kernel debugger's `ba` reaches the processor's DR7 with the continue that resumes the
+target, so the slot is measured once the bounded run is under way. One reading to keep: after
+M4's window closed, VTL0's DR0 still held M4's entry address with its enable clear, so the
+detach clears the enable and not the value; the switch reads enabled slots, and M6 reserves
+slot 0 regardless.
 
 #### M7.1a — live-topology admission and provider refinement
 
@@ -1043,6 +1090,16 @@ measurements along the way decide how the driver must behave:
   consumed without a trap). What re-delivers an exception nobody claims is `vmwp`'s own
   handler writing through VID's deferred VP-state path, flushed in the completion's own
   hypercall; no root-side path into that batch has been demonstrated.
+- In `live-coexistence/20261025T144453/`, the first run of the alternating plan: window 1
+  (M6) opened, armed, drained and ended clean, and the first switch read every field clean
+  except the handler, which the driver's evidence looked for under the per-context free line
+  the clean release does not write; the coordinator refused the next window on it, as built.
+- In `live-coexistence/20261025T145011/`, the switch passed and M4's arm was refused by the
+  driver's own slot check: VTL0 DR7 read `0x400` with the target stopped at the arm, because the
+  kernel debugger's `ba` reaches DR7 with the continue. M4 and M5 were ended, nothing retained.
+- In `live-coexistence/20261025T145507/`, with the slot read after the bounded run starts: the
+  three windows and both switches passed, and the finalize check passed on the raw records and
+  the live lab; the M7.1 live result paragraph has the readings.
 
 Continuation order from this checkpoint:
 
@@ -1131,7 +1188,8 @@ Continuation order from this checkpoint:
    hit and single step while M6's handler is registered, and the slot partition does not change
    that. **Decided the same day:** (a) alternate at session level, closing M6 between M4's
    windows, as the interim containment for M7.1's idle gate; this revises that gate's acceptance
-   criterion and is recorded under M7.1 with the transition checks each switch must prove. (c)
+   criterion and is recorded under M7.1 with the transition checks each switch must prove;
+   **done the same afternoon**, run `20261025T145507`, finalized `pass`. (c)
    Design M7.2 off M4's hardware breakpoints and off the shared VP's exception path, reading the
    NT-side arguments from M6's entry phase; before adopting it, prove field by field that M6's
    entry data preserves every required M4 field or name the replacement, recorded under M7.2.

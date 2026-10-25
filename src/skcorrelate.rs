@@ -605,6 +605,19 @@ impl Layer {
 /// the VP is held in VTL1, where no VTL0 stop can be in progress.
 pub(crate) const ARM_ORDER: [Layer; 3] = [Layer::M6Vtl1, Layer::M4Vtl0, Layer::M5Hypervisor];
 
+/// The windows of the alternating plan, M7.1's idle gate as revised 2026-10-25. The VTL1
+/// dispatcher's exception intercept is per partition, not per VTL, so a VTL0 kernel debugger's
+/// break-in, breakpoint hit or single step raises through M6's handler while it is registered,
+/// and no root-side way to hand the exception back has been demonstrated: M4 and M6 cannot share
+/// a VP in one window. So M6 is armed, drained and closed on its own, M4 then opens with M5 after
+/// it (M5 keeps its place last, as [`ARM_ORDER`] says why), and M6 reopens once M4 has closed.
+/// Each switch is a [`TransactionDriver::transition`] the next window waits on.
+pub(crate) const ALTERNATING_WINDOWS: [&[Layer]; 3] = [
+    &[Layer::M6Vtl1],
+    &[Layer::M4Vtl0, Layer::M5Hypervisor],
+    &[Layer::M6Vtl1],
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TransactionState {
@@ -614,6 +627,9 @@ pub(crate) enum TransactionState {
     Workload,
     Draining,
     Restoring,
+    /// Between two windows of an alternating plan: the closed window's instruments are proved
+    /// gone before the next window opens.
+    Transition,
     Closed,
 }
 
@@ -734,6 +750,77 @@ pub(crate) struct EndAck {
     pub(crate) retained_processes: u32,
 }
 
+/// What the adapter read between two windows of an alternating plan, after the closed window's
+/// sessions ended and before the next window's open. Every field is a reading, not a promise:
+/// the handler state comes from `vmwp`, the slots, pending state and trap flag from the
+/// hypervisor through the parent, and the worker count from the host's process table.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TransitionAck {
+    /// The VTL1 session's exception handler is gone from `vmwp`: its unregister returned and
+    /// the deferred cleanup freed its scratch. `None` when the closed window held no VTL1
+    /// session; a closed VTL1 window needs `Some(true)`.
+    pub(crate) handler_unregistered: Option<bool>,
+    /// Slots VTL1's DR7 enables on the child's VP. Must be empty.
+    pub(crate) vtl1_enabled_slots: Vec<u8>,
+    /// Slots VTL0's DR7 enables on the child's VP. Must be empty.
+    pub(crate) vtl0_enabled_slots: Vec<u8>,
+    /// No exception event and no interruption is pending on the VP.
+    pub(crate) pending_clear: bool,
+    /// The trap flag is clear in both VTLs.
+    pub(crate) trap_flag_clear: bool,
+    /// Engine workers still running for the child on the layers' host. Must be zero.
+    pub(crate) engine_workers: u32,
+}
+
+impl TransitionAck {
+    /// Everything the next window needs gone, named together so one reading reports every
+    /// leftover rather than the first. `closed_vtl1` says whether the window that closed held
+    /// the VTL1 session, whose handler must then have been read as unregistered.
+    fn clean(&self, closed_vtl1: bool) -> Result<(), String> {
+        let mut leftover = Vec::new();
+        match self.handler_unregistered {
+            Some(true) => {}
+            Some(false) => {
+                leftover.push("the VTL1 exception handler is still registered".to_string())
+            }
+            None if closed_vtl1 => {
+                leftover.push("the VTL1 exception handler's state was not read".to_string())
+            }
+            None => {}
+        }
+        if !self.vtl1_enabled_slots.is_empty() {
+            leftover.push(format!(
+                "VTL1 DR7 enables slots {:?}",
+                self.vtl1_enabled_slots
+            ));
+        }
+        if !self.vtl0_enabled_slots.is_empty() {
+            leftover.push(format!(
+                "VTL0 DR7 enables slots {:?}",
+                self.vtl0_enabled_slots
+            ));
+        }
+        if !self.pending_clear {
+            leftover.push("an exception event or interruption is pending on the VP".to_string());
+        }
+        if !self.trap_flag_clear {
+            leftover.push("the trap flag is set in a VTL".to_string());
+        }
+        if self.engine_workers != 0 {
+            leftover.push(format!(
+                "{} engine workers still run for the child",
+                self.engine_workers
+            ));
+        }
+        if leftover.is_empty() {
+            Ok(())
+        } else {
+            Err(leftover.join("; "))
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WorkloadAck {
@@ -810,9 +897,18 @@ pub(crate) struct TransactionReport {
     pub(crate) states: Vec<TransactionState>,
     pub(crate) verdict: TransactionVerdict,
     pub(crate) preflight: Attempt<CaptureIdentity>,
+    /// Every layer the plan arms, window by window: [`ARM_ORDER`] for one window, the
+    /// concatenation of [`ALTERNATING_WINDOWS`] for the alternating plan, where M6 appears twice.
     pub(crate) arm_order: Vec<Layer>,
     pub(crate) successful_arm_order: Vec<Layer>,
     pub(crate) cleanup_order: Vec<Layer>,
+    /// The plan's windows in order.
+    pub(crate) windows: Vec<Vec<Layer>>,
+    /// One entry per window that ran, holding only that window's layers; `layers` below keeps
+    /// each layer's most recent window.
+    pub(crate) window_reports: Vec<LayerReports>,
+    /// One per switch between windows, in order; absent for a one-window plan.
+    pub(crate) transitions: Vec<Attempt<TransitionAck>>,
     pub(crate) workload: WorkloadResult,
     pub(crate) clock: Option<Attempt<ClockAdmission>>,
     pub(crate) layers: LayerReports,
@@ -823,6 +919,9 @@ pub(crate) struct TransactionReport {
 pub(crate) struct TransactionPlan {
     pub(crate) launch_workload: bool,
     pub(crate) max_skew_ticks: u64,
+    /// Arm the layers in [`ALTERNATING_WINDOWS`] rather than together in [`ARM_ORDER`]. No
+    /// window then holds every layer, so the plan cannot launch a workload.
+    pub(crate) alternate: bool,
 }
 
 /// The live adapter may call only public MCP operations. In particular, there is deliberately no
@@ -840,6 +939,9 @@ pub(crate) trait TransactionDriver {
     fn launch_workload(&mut self, preflight: &CaptureIdentity) -> Attempt<WorkloadAck>;
     fn drain(&mut self, layer: Layer, session: &OpenAck, arm: &ArmAck) -> Attempt<DrainAck>;
     fn end_session(&mut self, layer: Layer, session: &OpenAck) -> Attempt<EndAck>;
+    /// Between two windows of an alternating plan, after `closed`'s sessions have ended and
+    /// before `opening`'s first open: read what the closed window must have left behind.
+    fn transition(&mut self, closed: &[Layer], opening: &[Layer]) -> Attempt<TransitionAck>;
 }
 
 #[derive(Serialize)]
@@ -855,6 +957,26 @@ struct ProtocolRequest {
     arm: Option<ArmAck>,
     #[serde(skip_serializing_if = "Option::is_none")]
     preflight: Option<CaptureIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window_closed: Option<Vec<Layer>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window_opening: Option<Vec<Layer>>,
+}
+
+impl ProtocolRequest {
+    fn new(operation: &'static str) -> Self {
+        Self {
+            schema: TRANSACTION_PROTOCOL_SCHEMA,
+            sequence: 0,
+            operation,
+            layer: None,
+            session: None,
+            arm: None,
+            preflight: None,
+            window_closed: None,
+            window_opening: None,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -870,24 +992,9 @@ struct StdioTransactionDriver {
 }
 
 impl StdioTransactionDriver {
-    fn exchange<T: DeserializeOwned>(
-        &mut self,
-        operation: &'static str,
-        layer: Option<Layer>,
-        session: Option<&OpenAck>,
-        arm: Option<&ArmAck>,
-        preflight: Option<&CaptureIdentity>,
-    ) -> Attempt<T> {
+    fn exchange<T: DeserializeOwned>(&mut self, mut request: ProtocolRequest) -> Attempt<T> {
         self.sequence += 1;
-        let request = ProtocolRequest {
-            schema: TRANSACTION_PROTOCOL_SCHEMA,
-            sequence: self.sequence,
-            operation,
-            layer,
-            session: session.cloned(),
-            arm: arm.cloned(),
-            preflight: preflight.cloned(),
-        };
+        request.sequence = self.sequence;
         let exchanged = (|| -> Result<Attempt<T>, String> {
             let encoded = serde_json::to_string(&request).map_err(|error| error.to_string())?;
             println!("{encoded}");
@@ -926,11 +1033,14 @@ impl StdioTransactionDriver {
 
 impl TransactionDriver for StdioTransactionDriver {
     fn preflight(&mut self) -> Attempt<CaptureIdentity> {
-        self.exchange("preflight", None, None, None, None)
+        self.exchange(ProtocolRequest::new("preflight"))
     }
 
     fn open(&mut self, layer: Layer) -> Attempt<OpenAck> {
-        self.exchange("open", Some(layer), None, None, None)
+        self.exchange(ProtocolRequest {
+            layer: Some(layer),
+            ..ProtocolRequest::new("open")
+        })
     }
 
     fn arm(
@@ -939,19 +1049,44 @@ impl TransactionDriver for StdioTransactionDriver {
         session: &OpenAck,
         preflight: &CaptureIdentity,
     ) -> Attempt<ArmAck> {
-        self.exchange("arm", Some(layer), Some(session), None, Some(preflight))
+        self.exchange(ProtocolRequest {
+            layer: Some(layer),
+            session: Some(session.clone()),
+            preflight: Some(preflight.clone()),
+            ..ProtocolRequest::new("arm")
+        })
     }
 
     fn launch_workload(&mut self, preflight: &CaptureIdentity) -> Attempt<WorkloadAck> {
-        self.exchange("workload", None, None, None, Some(preflight))
+        self.exchange(ProtocolRequest {
+            preflight: Some(preflight.clone()),
+            ..ProtocolRequest::new("workload")
+        })
     }
 
     fn drain(&mut self, layer: Layer, session: &OpenAck, arm: &ArmAck) -> Attempt<DrainAck> {
-        self.exchange("drain", Some(layer), Some(session), Some(arm), None)
+        self.exchange(ProtocolRequest {
+            layer: Some(layer),
+            session: Some(session.clone()),
+            arm: Some(arm.clone()),
+            ..ProtocolRequest::new("drain")
+        })
     }
 
     fn end_session(&mut self, layer: Layer, session: &OpenAck) -> Attempt<EndAck> {
-        self.exchange("end_session", Some(layer), Some(session), None, None)
+        self.exchange(ProtocolRequest {
+            layer: Some(layer),
+            session: Some(session.clone()),
+            ..ProtocolRequest::new("end_session")
+        })
+    }
+
+    fn transition(&mut self, closed: &[Layer], opening: &[Layer]) -> Attempt<TransitionAck> {
+        self.exchange(ProtocolRequest {
+            window_closed: Some(closed.to_vec()),
+            window_opening: Some(opening.to_vec()),
+            ..ProtocolRequest::new("transition")
+        })
     }
 }
 
@@ -960,6 +1095,7 @@ impl TransactionDriver for StdioTransactionDriver {
 /// transaction report rather than another request.
 pub(crate) fn run_transaction_protocol(args: &[String]) -> anyhow::Result<()> {
     let launch_workload = args.iter().any(|argument| argument == "--m7-workload");
+    let alternate = args.iter().any(|argument| argument == "--m7-alternate");
     let skew = args
         .iter()
         .find_map(|argument| argument.strip_prefix("--m7-max-skew-ticks="))
@@ -971,6 +1107,7 @@ pub(crate) fn run_transaction_protocol(args: &[String]) -> anyhow::Result<()> {
         TransactionPlan {
             launch_workload,
             max_skew_ticks: skew,
+            alternate,
         },
         &mut driver,
     );
@@ -981,11 +1118,22 @@ pub(crate) fn run_transaction_protocol(args: &[String]) -> anyhow::Result<()> {
 
 /// Run one M7 transaction. The runner continues every reachable cleanup after a failure and keeps
 /// the result of each call in the report, so a serializer never has to reconstruct safety from a
-/// log line.
+/// log line. A one-window plan opens, arms, drains and ends [`ARM_ORDER`] once; the alternating
+/// plan runs [`ALTERNATING_WINDOWS`] one after another with a transition between them, and a
+/// window that leaves an issue or a transition that reads anything left behind ends the plan
+/// there, after that window's own cleanup.
 pub(crate) fn run_transaction<D: TransactionDriver>(
     plan: TransactionPlan,
     driver: &mut D,
 ) -> TransactionReport {
+    let windows: Vec<Vec<Layer>> = if plan.alternate {
+        ALTERNATING_WINDOWS
+            .iter()
+            .map(|window| window.to_vec())
+            .collect()
+    } else {
+        vec![ARM_ORDER.to_vec()]
+    };
     let preflight = driver.preflight();
     let mut report = TransactionReport {
         schema: TRANSACTION_SCHEMA.into(),
@@ -993,9 +1141,12 @@ pub(crate) fn run_transaction<D: TransactionDriver>(
         states: vec![TransactionState::Preflight],
         verdict: TransactionVerdict::Incomplete,
         preflight,
-        arm_order: ARM_ORDER.to_vec(),
+        arm_order: windows.concat(),
         successful_arm_order: Vec::new(),
         cleanup_order: Vec::new(),
+        windows: windows.clone(),
+        window_reports: Vec::new(),
+        transitions: Vec::new(),
         workload: WorkloadResult::Withheld,
         clock: None,
         layers: LayerReports::default(),
@@ -1026,12 +1177,121 @@ pub(crate) fn run_transaction<D: TransactionDriver>(
             None
         }
     };
+    if plan.alternate && plan.launch_workload {
+        report.issue(
+            TransactionState::Preflight,
+            None,
+            "preflight",
+            IssueKind::Invalid,
+            "an alternating plan never has every layer armed at once, so it cannot launch a workload"
+                .into(),
+        );
+    }
 
-    let mut opened = Vec::new();
     let mut brackets = Vec::new();
+    let mut opened_total = 0;
+    let mut armed_total = 0;
+    for (index, window) in windows.iter().enumerate() {
+        if index > 0 {
+            report.enter(TransactionState::Transition);
+            let closed = &windows[index - 1];
+            let attempt = driver.transition(closed, window);
+            match attempt.succeeded() {
+                Some(ack) => {
+                    if let Err(message) = ack.clean(closed.contains(&Layer::M6Vtl1)) {
+                        report.issue(
+                            TransactionState::Transition,
+                            None,
+                            "transition",
+                            IssueKind::UnsafeChild,
+                            message,
+                        );
+                    }
+                }
+                None => report.issue_from_attempt(
+                    TransactionState::Transition,
+                    None,
+                    "transition",
+                    &attempt,
+                ),
+            }
+            report.transitions.push(attempt);
+            if !report.issues.is_empty() {
+                break;
+            }
+        }
+        let mut layers = LayerReports::default();
+        let (opened, armed) = run_window(
+            &mut report,
+            &mut layers,
+            driver,
+            &plan,
+            window,
+            identity.as_ref(),
+            &mut brackets,
+        );
+        opened_total += opened;
+        armed_total += armed;
+        for layer in window {
+            *report.layers.get_mut(*layer) = layers.get(*layer).clone();
+        }
+        report.window_reports.push(layers);
+        if !report.issues.is_empty() {
+            break;
+        }
+    }
+    if plan.alternate && report.issues.is_empty() && armed_total == report.arm_order.len() {
+        report.workload = WorkloadResult::SkippedIdle;
+    }
+
+    if !brackets.is_empty() {
+        match admit_clock(brackets, plan.max_skew_ticks) {
+            Ok(clock) => report.clock = Some(Attempt::Succeeded { value: clock }),
+            Err(message) => {
+                report.issue(
+                    TransactionState::Restoring,
+                    None,
+                    "clock_admission",
+                    IssueKind::Invalid,
+                    message.clone(),
+                );
+                report.clock = Some(Attempt::Failed {
+                    message,
+                    recovery: None,
+                });
+            }
+        }
+    }
+
+    report.enter(TransactionState::Closed);
+    if report.issues.is_empty()
+        && opened_total == report.arm_order.len()
+        && armed_total == report.arm_order.len()
+        && report.transitions.len() + 1 == windows.len()
+    {
+        report.verdict = TransactionVerdict::Pass;
+    }
+    report
+}
+
+/// One window: open its layers in order, arm them in order, launch the workload if this is the
+/// one window of a plan that asked for one, then drain the successful arms in reverse and end
+/// every reachable session. Returns how many layers opened and how many armed. `layers` receives
+/// this window's results alone; the report's running orders and issues are appended to.
+fn run_window<D: TransactionDriver>(
+    report: &mut TransactionReport,
+    layers: &mut LayerReports,
+    driver: &mut D,
+    plan: &TransactionPlan,
+    window: &[Layer],
+    identity: Option<&CaptureIdentity>,
+    brackets: &mut Vec<RpcClockBracket>,
+) -> (usize, usize) {
+    let mut opened = Vec::new();
+    let mut armed = Vec::new();
     report.enter(TransactionState::Opening);
-    if identity.is_some() {
-        for layer in ARM_ORDER {
+    if identity.is_some() && report.issues.is_empty() {
+        for layer in window.iter().copied() {
             let attempt = driver.open(layer);
             let succeeded = attempt.succeeded().is_some();
             let cleanup_session = attempt.cleanup_session();
@@ -1050,7 +1310,7 @@ pub(crate) fn run_transaction<D: TransactionDriver>(
             if !succeeded {
                 report.issue_from_attempt(TransactionState::Opening, Some(layer), "open", &attempt);
             }
-            report.layers.get_mut(layer).open = Some(attempt);
+            layers.get_mut(layer).open = Some(attempt);
             if cleanup_session.is_some() {
                 opened.push(layer);
             }
@@ -1061,11 +1321,10 @@ pub(crate) fn run_transaction<D: TransactionDriver>(
     }
 
     report.enter(TransactionState::Armed);
-    if report.issues.is_empty() {
-        let identity = identity.as_ref().expect("validated preflight exists");
-        for layer in ARM_ORDER {
-            let session = report
-                .layers
+    if report.issues.is_empty() && opened.len() == window.len() {
+        let identity = identity.expect("validated preflight exists");
+        for layer in window.iter().copied() {
+            let session = layers
                 .get(layer)
                 .open
                 .as_ref()
@@ -1078,6 +1337,7 @@ pub(crate) fn run_transaction<D: TransactionDriver>(
                 // A successful arm owns an instrument even if its acknowledgement is malformed;
                 // retain it in cleanup order before rejecting the transaction.
                 report.successful_arm_order.push(layer);
+                armed.push(layer);
                 brackets.push(arm.clock.clone());
                 if arm.trace_id.is_empty() {
                     report.issue(
@@ -1118,46 +1378,49 @@ pub(crate) fn run_transaction<D: TransactionDriver>(
             } else {
                 report.issue_from_attempt(TransactionState::Armed, Some(layer), "arm", &attempt);
             }
-            report.layers.get_mut(layer).arm = Some(attempt);
+            layers.get_mut(layer).arm = Some(attempt);
             if !succeeded || !report.issues.is_empty() {
                 break;
             }
         }
     }
 
-    report.enter(TransactionState::Workload);
-    if report.issues.is_empty() && report.successful_arm_order.len() == ARM_ORDER.len() {
-        if plan.launch_workload {
-            let attempt = driver.launch_workload(identity.as_ref().unwrap());
-            if let Some(workload) = attempt.succeeded()
-                && workload.label != identity.as_ref().unwrap().workload_label
-            {
-                report.issue(
-                    TransactionState::Workload,
-                    None,
-                    "workload",
-                    IssueKind::Invalid,
-                    "the workload acknowledgement changed its capture label".into(),
-                );
-            } else if attempt.succeeded().is_none() {
-                report.issue_from_attempt(TransactionState::Workload, None, "workload", &attempt);
+    if !plan.alternate {
+        report.enter(TransactionState::Workload);
+        if report.issues.is_empty() && armed.len() == window.len() {
+            if plan.launch_workload {
+                let identity = identity.expect("validated preflight exists");
+                let attempt = driver.launch_workload(identity);
+                if let Some(workload) = attempt.succeeded()
+                    && workload.label != identity.workload_label
+                {
+                    report.issue(
+                        TransactionState::Workload,
+                        None,
+                        "workload",
+                        IssueKind::Invalid,
+                        "the workload acknowledgement changed its capture label".into(),
+                    );
+                } else if attempt.succeeded().is_none() {
+                    report.issue_from_attempt(
+                        TransactionState::Workload,
+                        None,
+                        "workload",
+                        &attempt,
+                    );
+                }
+                report.workload = WorkloadResult::Launched { attempt };
+            } else {
+                report.workload = WorkloadResult::SkippedIdle;
             }
-            report.workload = WorkloadResult::Launched { attempt };
-        } else {
-            report.workload = WorkloadResult::SkippedIdle;
         }
     }
 
-    report.cleanup_order = cleanup_order(&report.successful_arm_order, &opened);
+    let cleanup = cleanup_order(&armed, &opened);
+    report.cleanup_order.extend(cleanup.iter().copied());
     report.enter(TransactionState::Draining);
-    for layer in report
-        .successful_arm_order
-        .iter()
-        .rev()
-        .copied()
-        .collect::<Vec<_>>()
-    {
-        let layer_report = report.layers.get(layer);
+    for layer in armed.iter().rev().copied() {
+        let layer_report = layers.get(layer);
         let session = layer_report
             .open
             .as_ref()
@@ -1194,13 +1457,12 @@ pub(crate) fn run_transaction<D: TransactionDriver>(
         } else {
             report.issue_from_attempt(TransactionState::Draining, Some(layer), "drain", &attempt);
         }
-        report.layers.get_mut(layer).restoration = Some(attempt);
+        layers.get_mut(layer).restoration = Some(attempt);
     }
 
     report.enter(TransactionState::Restoring);
-    for layer in report.cleanup_order.clone() {
-        let session = report
-            .layers
+    for layer in cleanup {
+        let session = layers
             .get(layer)
             .open
             .as_ref()
@@ -1225,36 +1487,9 @@ pub(crate) fn run_transaction<D: TransactionDriver>(
                 &attempt,
             );
         }
-        report.layers.get_mut(layer).end = Some(attempt);
+        layers.get_mut(layer).end = Some(attempt);
     }
-
-    if !brackets.is_empty() {
-        match admit_clock(brackets, plan.max_skew_ticks) {
-            Ok(clock) => report.clock = Some(Attempt::Succeeded { value: clock }),
-            Err(message) => {
-                report.issue(
-                    TransactionState::Restoring,
-                    None,
-                    "clock_admission",
-                    IssueKind::Invalid,
-                    message.clone(),
-                );
-                report.clock = Some(Attempt::Failed {
-                    message,
-                    recovery: None,
-                });
-            }
-        }
-    }
-
-    report.enter(TransactionState::Closed);
-    if report.issues.is_empty()
-        && opened.len() == Layer::ALL.len()
-        && report.successful_arm_order.len() == Layer::ALL.len()
-    {
-        report.verdict = TransactionVerdict::Pass;
-    }
-    report
+    (opened.len(), armed.len())
 }
 
 fn cleanup_order(successful_arms: &[Layer], opened: &[Layer]) -> Vec<Layer> {
@@ -1774,6 +2009,31 @@ mod tests {
         Workload,
         Drain(Layer),
         End(Layer),
+        Transition,
+    }
+
+    /// One leftover a transition can read, each the single field it dirties.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Leftover {
+        HandlerUnread,
+        HandlerRegistered,
+        Vtl1Slot,
+        Vtl0Slot,
+        Pending,
+        TrapFlag,
+        EngineWorker,
+    }
+
+    impl Leftover {
+        const ALL: [Self; 7] = [
+            Self::HandlerUnread,
+            Self::HandlerRegistered,
+            Self::Vtl1Slot,
+            Self::Vtl0Slot,
+            Self::Pending,
+            Self::TrapFlag,
+            Self::EngineWorker,
+        ];
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1797,6 +2057,9 @@ mod tests {
         recovery_at_open: Option<Layer>,
         unsafe_audit: Option<(Layer, UnsafeAudit)>,
         drift_at_arm: Option<Layer>,
+        /// Which transition (by index) reads which leftover.
+        leftover_at_transition: Option<(usize, Leftover)>,
+        transitions: usize,
         calls: Vec<Operation>,
         next_tick: u64,
     }
@@ -1809,6 +2072,8 @@ mod tests {
                 recovery_at_open: None,
                 unsafe_audit: None,
                 drift_at_arm: None,
+                leftover_at_transition: None,
+                transitions: 0,
                 calls: Vec::new(),
                 next_tick: 1_000,
             }
@@ -1934,13 +2199,75 @@ mod tests {
                 },
             )
         }
+
+        fn transition(&mut self, closed: &[Layer], _opening: &[Layer]) -> Attempt<TransitionAck> {
+            let index = self.transitions;
+            self.transitions += 1;
+            let mut ack = TransitionAck {
+                handler_unregistered: closed.contains(&Layer::M6Vtl1).then_some(true),
+                vtl1_enabled_slots: Vec::new(),
+                vtl0_enabled_slots: Vec::new(),
+                pending_clear: true,
+                trap_flag_clear: true,
+                engine_workers: 0,
+            };
+            if let Some((_, leftover)) = self.leftover_at_transition.filter(|(at, _)| *at == index)
+            {
+                match leftover {
+                    Leftover::HandlerUnread => ack.handler_unregistered = None,
+                    Leftover::HandlerRegistered => ack.handler_unregistered = Some(false),
+                    Leftover::Vtl1Slot => ack.vtl1_enabled_slots = vec![1],
+                    Leftover::Vtl0Slot => ack.vtl0_enabled_slots = vec![0],
+                    Leftover::Pending => ack.pending_clear = false,
+                    Leftover::TrapFlag => ack.trap_flag_clear = false,
+                    Leftover::EngineWorker => ack.engine_workers = 1,
+                }
+            }
+            self.attempt(Operation::Transition, ack)
+        }
     }
 
     fn plan(launch_workload: bool) -> TransactionPlan {
         TransactionPlan {
             launch_workload,
             max_skew_ticks: 1_000,
+            alternate: false,
         }
+    }
+
+    fn alternating_plan() -> TransactionPlan {
+        TransactionPlan {
+            launch_workload: false,
+            max_skew_ticks: 1_000,
+            alternate: true,
+        }
+    }
+
+    /// The calls an alternating idle plan makes when nothing goes wrong.
+    fn alternating_operation_points() -> Vec<Operation> {
+        use Layer::{M4Vtl0 as M4, M5Hypervisor as M5, M6Vtl1 as M6};
+        use Operation::{Arm, Drain, End, Open, Preflight, Transition};
+        vec![
+            Preflight,
+            Open(M6),
+            Arm(M6),
+            Drain(M6),
+            End(M6),
+            Transition,
+            Open(M4),
+            Open(M5),
+            Arm(M4),
+            Arm(M5),
+            Drain(M5),
+            Drain(M4),
+            End(M5),
+            End(M4),
+            Transition,
+            Open(M6),
+            Arm(M6),
+            Drain(M6),
+            End(M6),
+        ]
     }
 
     fn operation_points() -> Vec<Operation> {
@@ -1959,6 +2286,164 @@ mod tests {
             operations.push(Operation::End(layer));
         }
         operations
+    }
+
+    #[test]
+    fn alternating_plan_closes_each_window_and_proves_the_switch_before_the_next_opens() {
+        let mut driver = MockDriver::new();
+        let report = run_transaction(alternating_plan(), &mut driver);
+        assert_eq!(
+            report.verdict,
+            TransactionVerdict::Pass,
+            "{:?}",
+            report.issues
+        );
+        assert_eq!(driver.calls, alternating_operation_points());
+        assert_eq!(
+            report.states,
+            [
+                TransactionState::Preflight,
+                TransactionState::Opening,
+                TransactionState::Armed,
+                TransactionState::Draining,
+                TransactionState::Restoring,
+                TransactionState::Transition,
+                TransactionState::Opening,
+                TransactionState::Armed,
+                TransactionState::Draining,
+                TransactionState::Restoring,
+                TransactionState::Transition,
+                TransactionState::Opening,
+                TransactionState::Armed,
+                TransactionState::Draining,
+                TransactionState::Restoring,
+                TransactionState::Closed,
+            ]
+        );
+        assert_eq!(
+            report.arm_order,
+            [
+                Layer::M6Vtl1,
+                Layer::M4Vtl0,
+                Layer::M5Hypervisor,
+                Layer::M6Vtl1
+            ]
+        );
+        assert_eq!(report.successful_arm_order, report.arm_order);
+        assert_eq!(
+            report.cleanup_order,
+            [
+                Layer::M6Vtl1,
+                Layer::M5Hypervisor,
+                Layer::M4Vtl0,
+                Layer::M6Vtl1
+            ]
+        );
+        assert_eq!(report.workload, WorkloadResult::SkippedIdle);
+        assert_eq!(report.transitions.len(), 2);
+        assert_eq!(report.window_reports.len(), 3);
+        // The first window's record survives the second M6 window, which `layers` reflects.
+        assert!(report.window_reports[0].m6_vtl1.end.is_some());
+        assert!(report.window_reports[0].m4_vtl0.open.is_none());
+        assert!(report.window_reports[1].m6_vtl1.open.is_none());
+        assert!(report.window_reports[2].m6_vtl1.end.is_some());
+        assert!(matches!(
+            report.clock,
+            Some(Attempt::Succeeded {
+                value: ClockAdmission {
+                    mode: ClockMode::Point,
+                    ..
+                }
+            })
+        ));
+    }
+
+    #[test]
+    fn a_switch_that_reads_anything_left_behind_opens_no_further_window() {
+        for at in 0..2 {
+            for leftover in Leftover::ALL {
+                let mut driver = MockDriver::new();
+                driver.leftover_at_transition = Some((at, leftover));
+                let report = run_transaction(alternating_plan(), &mut driver);
+                let opens_after = driver
+                    .calls
+                    .iter()
+                    .skip_while(|call| **call != Operation::Transition)
+                    .skip(1)
+                    .filter(|call| matches!(call, Operation::Open(_)))
+                    .count();
+                if at == 1 && leftover == Leftover::HandlerUnread {
+                    // The window that closed held no VTL1 session; there was no handler to read.
+                    assert_eq!(report.verdict, TransactionVerdict::Pass, "{leftover:?}");
+                    continue;
+                }
+                assert_eq!(
+                    report.verdict,
+                    TransactionVerdict::Incomplete,
+                    "{leftover:?} at {at}"
+                );
+                let issue = report
+                    .issues
+                    .iter()
+                    .find(|issue| issue.operation == "transition")
+                    .unwrap_or_else(|| panic!("no transition issue for {leftover:?} at {at}"));
+                assert_eq!(issue.kind, IssueKind::UnsafeChild);
+                assert_eq!(issue.state, TransactionState::Transition);
+                assert_eq!(driver.transitions, at + 1, "{leftover:?} at {at}");
+                let expected_opens_after_first_switch = if at == 0 { 0 } else { 2 };
+                assert_eq!(
+                    opens_after, expected_opens_after_first_switch,
+                    "{leftover:?} at {at}"
+                );
+                assert_eq!(report.window_reports.len(), at + 1);
+                assert_eq!(report.workload, WorkloadResult::Withheld);
+            }
+        }
+    }
+
+    #[test]
+    fn a_window_that_leaves_an_issue_ends_the_alternation_after_its_own_cleanup() {
+        let mut driver = MockDriver::new();
+        driver.fault = Some((Operation::Arm(Layer::M4Vtl0), InjectedFailure::Failed));
+        let report = run_transaction(alternating_plan(), &mut driver);
+        assert_eq!(report.verdict, TransactionVerdict::Incomplete);
+        assert_eq!(driver.transitions, 1);
+        assert_eq!(
+            driver
+                .calls
+                .iter()
+                .filter(|call| **call == Operation::Open(Layer::M6Vtl1))
+                .count(),
+            1
+        );
+        // The failed window still ends both of its opened sessions, M5 first.
+        assert_eq!(
+            report.cleanup_order,
+            [Layer::M6Vtl1, Layer::M5Hypervisor, Layer::M4Vtl0]
+        );
+        assert!(!driver.calls.contains(&Operation::Arm(Layer::M5Hypervisor)));
+        assert_eq!(report.window_reports.len(), 2);
+        assert_eq!(report.state, TransactionState::Closed);
+    }
+
+    #[test]
+    fn an_alternating_plan_cannot_launch_a_workload() {
+        let mut driver = MockDriver::new();
+        let report = run_transaction(
+            TransactionPlan {
+                launch_workload: true,
+                ..alternating_plan()
+            },
+            &mut driver,
+        );
+        assert_eq!(report.verdict, TransactionVerdict::Incomplete);
+        assert_eq!(report.workload, WorkloadResult::Withheld);
+        assert_eq!(driver.calls, [Operation::Preflight]);
+        assert!(
+            report.issues.iter().any(|issue| {
+                issue.operation == "preflight" && issue.kind == IssueKind::Invalid
+            })
+        );
     }
 
     #[test]
@@ -1984,6 +2469,12 @@ mod tests {
             [Layer::M5Hypervisor, Layer::M4Vtl0, Layer::M6Vtl1]
         );
         assert_eq!(report.workload, WorkloadResult::SkippedIdle);
+        assert!(report.transitions.is_empty());
+        assert_eq!(
+            report.window_reports.as_slice(),
+            std::slice::from_ref(&report.layers)
+        );
+        assert!(!driver.calls.contains(&Operation::Transition));
         assert!(!driver.calls.contains(&Operation::Workload));
         assert!(matches!(
             report.clock,

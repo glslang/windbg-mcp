@@ -67,6 +67,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   has been demonstrated, so M4 and M6 cannot yet share a VP in one window. The
   profile layout gains `event_software` and `event_instruction_length` for the record of what
   arrived; a provider without the capability keeps every event the controller's own, as before.
+- **The M7 transaction coordinator runs an alternating plan.** `--m7-alternate` arms M6 alone,
+  then M4 with M5, then M6 again (`ALTERNATING_WINDOWS`), and between windows asks the adapter
+  for a `transition` whose typed acknowledgement must read clean before the next window opens:
+  the VTL1 handler verified unregistered when a VTL1 window closed, no slot enabled in either
+  VTL's DR7, no pending exception event or interruption, the trap flag clear in both VTLs, no
+  engine worker. A window that leaves an issue ends the plan after its own cleanup, and the plan
+  refuses a workload, since no window holds every layer. The report carries `windows`, one
+  `window_reports` entry per window and `transitions`; `layers` keeps each layer's most recent
+  window. This is M7.1's idle gate as revised 2026-10-25, after the VTL1 dispatcher's
+  per-partition exception intercept was measured to take the VTL0 debugger's break-ins (above),
+  and it passed live the same afternoon in the M7.1a nested lab (run `20261025T145507`: three
+  windows, two clean switches, nothing retained, the independent finalize check passing).
+  Offline, each leftover a switch can read opens nothing further, a failed window ends the plan
+  after its own cleanup, the plan refuses a workload, and the real-binary smoke test drives the
+  alternating protocol through its two transitions.
 
 - **M7.0 adds the cross-layer identity and clock admission contract without adding a debugger
   role or MCP tool.** M4, M5 and M6 arm/read envelopes and events now retain optional raw Windows
