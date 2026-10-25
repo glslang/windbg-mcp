@@ -579,9 +579,10 @@ nested L2 workload under K3, and the nested-parent provider is qualified: the re
 write, arm/restore and natural held-event controls, the provider-death control and the complete
 positive sequence on three clean child boots all passed. The admitted-topology coexistence driver
 exists and opened and armed all three layers once; the live coexistence exit gate is blocked on
-the transaction's arm order, which armed the hypervisor first and drained it last although a
-stopped hypervisor is unreachable from every layer beneath it. The order is inverted in the tree
-and the live control has not been rerun under it, so M7.2 remains closed.
+two findings from the reruns under the inverted arm order: M6's running-trace stop faults within
+a second of a VTL1 event and its recovery hangs on VMMS, and the child VP's DR0-DR6 are shared
+between VTLs, so M4's hardware breakpoint and M6's slot-0 breakpoint cannot both be armed on it.
+Both are recorded under M7.1a, so M7.2 remains closed.
 
 Join M4–M6 without putting two targets in one DbgEng process. The coordinator owns session ids and
 lifecycles, not engines: each layer remains in its existing worker and contributes an immutable
@@ -831,9 +832,12 @@ Refinement proceeds as three separately gated phases:
    clean child boots through the nested-parent boundary all passed, as recorded above. Access
    denied, unavailable state, identity ambiguity or incomplete restoration would have failed the
    phase; none was converted to coordinate-only for semantic tracing.
-3. **Idle coexistence: attempted, blocked.** Phase 2 is satisfied, and the transaction opened
-   and armed M5 -> M4 -> M6 in one live parent/child topology on 2026-10-24 before M5's trace cap
-   froze the parent and child (recorded below). It must still arm all three without a workload,
+3. **Idle coexistence: attempted, blocked.** Phase 2 is satisfied; the transaction opened and
+   armed all three layers in one live parent/child topology on 2026-10-24, first as
+   M5 -> M4 -> M6 until M5's trace cap froze the parent and child, then as M4 -> M6 -> M5 until
+   M6's drain faulted under its own bootstrap traffic, and a third run showed M4's and M6's
+   hardware breakpoints sharing the child VP's DR0 (all recorded below). It must still arm all
+   three without a workload,
    drain in reverse order and prove byte/register baselines, both heartbeats, unchanged
    boots/`vmwp` processes and zero retained processes, with failure/timeout injection. M7.2 stays
    closed until this exact live control passes.
@@ -872,6 +876,29 @@ measurements along the way decide how the driver must behave:
   its debugger holds every partition under it, so nothing beneath M5 can be armed, drained or
   reached while M5 is stopped. The transaction arms M5 first and drains it last, which is the
   one order that cannot work; the trace cap is only where that stop first landed.
+- In `live-coexistence/20261024T210251/`, under the inverted order, preflight, all three opens,
+  all three arms and M5's drain succeeded, with M5 attached and settled last beside the open M4
+  and M6 sessions. The M6 arm's bootstrap (`spin_host.exe DE1 2000` as a scheduled task in the
+  child) drove the VTL1 trigger at about ten events per second for 37 s, 371 retained stops; the
+  coordinator drained M6 about 0.4 s after the last one, and the running-trace stop path settled
+  `vmwp` for its 1 s window with the arrival breakpoint installed and DR7 still armed, so one more
+  event faulted it ("vmwp stopped unexpectedly while settling native event completion"). Its
+  recovery asked VMMS to pause the child while the dispatcher held `vmwp` stopped, which hung for
+  60 s; the session failed closed with the child paused, M4's break-in never landed, both workers
+  were retained, and terminating the M6 worker took `vmwp` with it and left the child Off, started
+  again from K3. The K3 listener log is saved beside the report.
+- In `live-coexistence/20261024T212721/`, with a quiescence wait added to the driver's M6 arm,
+  M6's arm failed on its first event: the provider's guarded writes logged
+  `Dr0 expected=0xfffff804a105eeb0`, which is `nt+0x2eeeb0` at that boot's kernel base, M4's
+  `nt!VslpEnterIumSecureMode` breakpoint, and `Dr6 expected=0xffff0ff1`, M4's B0, while VTL1's
+  DR7 read `0x400`. The first event, 9 ms after the arm's VM resume, carried `DR6=0xffff4ff0`,
+  single-step only, and was refused as "hardware-stop DR6 must name exactly one breakpoint slot".
+  M6 recovered cleanly with the child running; M4's drain found no stop in 60 s because the child
+  sat in a KD break its dead orphan could not answer, and a fresh `l2-nt` attach read
+  `dr0=fffff804a105eeb0 dr6=ffff0ff0 dr7=400` from VTL0 and released it. The same overwrite
+  happened unnoticed in the previous run, whose 371 events were all clean slot-0 hits. Both runs'
+  host and K3 residue was removed by exact PID and the staging cleanup, and both guests ended
+  healthy.
 
 Continuation order from this checkpoint:
 
@@ -886,12 +913,31 @@ Continuation order from this checkpoint:
    disturb. The cap stays as it is: on an idle child it is reached about 2 s after
    M5 is armed and becomes M5's drain point, and for M7.2 it is the latency budget inside which
    the workload must land, a measurement for that gate rather than a coexistence blocker.
-2. Then rerun `run-m7-nested-coexistence.ps1`: open all three, arm M4 -> M6 -> M5, launch no
+2. **Decide debug-register ownership on the child VP; this is a design decision, not a lab one.**
+   DR0-DR6 are shared between VTL0 and VTL1 on a VP and only DR7 is per VTL, as run
+   `20261024T212721` measured: M6's arm found M4's `nt!VslpEnterIumSecureMode` address in DR0 and
+   M4's B0 in DR6, overwrote both, and refused its first event. M4's trace is a processor
+   execution breakpoint on purpose, because that entry runs on the VTL-transition path and its
+   bytes must not be patched. The candidates are: M4 traces the same call from a caller site with
+   a software breakpoint; M6 takes a slot M4 does not use, masks its DR6 check to the slots it
+   owns and preserves the other slots' values at arm and restore; or the NT-side arguments are
+   read in VTL1 at service entry and M4 arms nothing. Each moves tool code and needs offline tests
+   before a live run, and the single-step bit that reached VTL1's first event after a VM resume
+   needs its path measured before any choice relies on DR6.
+3. **Fix M6's stop of a running natural trace under traffic, as its own item.** Run
+   `20261024T210251` measured the defect: the stop settles `vmwp` for `NATIVE_SETTLE_WAIT` before
+   it disarms, with the arrival breakpoint installed and DR7 armed, so an event inside that window
+   faults the session, and the fail-closed recovery then asks VMMS to pause a `vmwp` the
+   dispatcher itself holds stopped. The driver's half is done: `await_m6_quiescence` reads the
+   trace without stopping it until nothing has moved for three seconds. The server's half is that
+   the stop should pause, disarm and then settle, and that no recovery path may call VMMS while
+   the dispatcher holds `vmwp` stopped.
+4. Then rerun `run-m7-nested-coexistence.ps1`: open all three, arm M4 -> M6 -> M5, launch no
    workload, drain M5 -> M6 -> M4, and repeat the relevant failure and timeout injections. The gate requires
    unchanged identities and byte/register baselines, healthy parent and child, and no retained
    process. Any Hyper-V management query of the child while a layer holds its `vmwp` must be
    bounded, for the reason the provider-death control measured.
-3. Only after that live coexistence result is recorded may M7.2 implement and qualify the
+5. Only after that live coexistence result is recorded may M7.2 implement and qualify the
    deterministic join below.
 
 The event, provider-death and qualification harnesses depend on the `src/listen.rs` change that
