@@ -26,14 +26,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **M7.1 adds an engine-free three-worker transaction coordinator without adding an MCP tool.** A
   typed line protocol keeps the live adapter on the public MCP surface while the pure Rust runner
-  owns preflight, opening, a fixed M4 -> M6 -> M5 arm order that arms the hypervisor last and
-  drains it first because a stopped hypervisor holds every layer beneath it, workload admission, reverse drain,
+  owns preflight, opening, a fixed M6 -> M4 -> M5 arm order that arms the hypervisor last and
+  drains it first because a stopped hypervisor holds every layer beneath it, and arms the VTL1 layer
+  before the VTL0 debugger because the child VP's DR0-DR3 are one set shared across VTLs and the
+  two must never write it in the same window, workload admission, reverse drain,
   session restoration and the final verdict. Failure/timeout injection covers every operation;
   unsafe running, held, dropped, unreadable or unrestored child state cannot pass. Failed opens
   retain and clean up a public recovery handle when one is available, and no coordinator path can
   force-kill a worker that may still own debugger state. The offline and real-binary protocol gates
   pass; the live three-layer gate remains incomplete at nested-parent provider qualification and
   M7.2 remains gated on it.
+
+- **`open_sk_live_control` takes `reserved_hardware_slots`, and the live controller owns only
+  the slots it arms.** DR0-DR3 and DR6 are one set per VP shared across VTLs and only DR7 is per
+  VTL, measured 2026-10-24 in the M7.1a nested lab when M6's slot-0 arm overwrote the VTL0 kernel
+  debugger's `ba` on the same child VP. A session opened with reserved slots never writes, arms or
+  borrows them: an arm naming one is refused, a break request's transient slot skips them, every
+  restore writes back only the slots the session armed and compares only those, and the
+  exactly-one-slot DR6 check reads only the session's own B bits, so a foreign sticky bit no longer
+  disqualifies a stop. The service-trace manifest still numbers its sites from slot 0; the trace
+  arms them in the lowest free slots and its decoder maps each stop back to its site. M7 reserves
+  slot 0 for M4's processor breakpoint and arms M6 before M4.
 
 - **M7.0 adds the cross-layer identity and clock admission contract without adding a debugger
   role or MCP tool.** M4, M5 and M6 arm/read envelopes and events now retain optional raw Windows
@@ -117,15 +130,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   private marker, and cannot coexist with a pool trace because DbgEng has one callback slot. The
   supported-API guest harness in `tools/skcall_guest_harness.c` labels each VBS-enclave
   create/load/initialize/terminate/delete invocation for later cross-layer correlation. The exact
-  entry uses a DbgEng-owned software breakpoint, the kind the hypervisor trace uses; it was a
-  one-byte processor execution breakpoint until 2026-10-25, when the M7.1a nested run measured
-  that slot shared with the VTL1 layer on the same VP. The runbook is
-  `docs/secure-kernel/vtl0-call-trace.md`; this is M4 of the Secure Kernel call-debugging roadmap.
-  Its exact-build K3 gate, taken with the processor execution breakpoint, retained 256 complete
-  calls with no read failure, including 199 from the single PID emitted by three successful
-  labelled lifecycle invocations, then disarmed, detached and left the same guest boot and `vmwp`
-  healthy with no retained worker. The software breakpoint's first live record is the M7.1a
-  coexistence rerun.
+  entry uses a one-byte processor execution breakpoint rather than a software breakpoint, for a
+  reason measured on 2026-10-25 in the M7.1a nested lab: the kernel debugger inserts and removes a
+  software breakpoint in HVCI-protected text through `VslWriteProtectedPage`, which enters VTL1
+  through `VslpEnterIumSecureMode` itself, so an `int 3` at that entry is executed by the write
+  that services it and a one-processor guest deadlocks on `KdDebuggerLock` at the first hit. The
+  runbook is `docs/secure-kernel/vtl0-call-trace.md`; this is M4 of the Secure Kernel
+  call-debugging roadmap.
+  Its exact-build K3 gate retained 256 complete calls with no read failure, including 199 from the
+  single PID emitted by three successful labelled lifecycle invocations, then disarmed, detached
+  and left the same guest boot and `vmwp` healthy with no retained worker.
 
 - **The WinDbg pane is installable from this marketplace, beside the server.** `mods/windbg-pane/`
   — the Claude Code mod that draws a WinDbg-style pane from the server's tool calls as they happen

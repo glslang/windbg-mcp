@@ -195,6 +195,7 @@ struct PendingControl {
     allow_transition_cr3: bool,
     allow_memory_writes: bool,
     additional_vps: Vec<AdditionalVp>,
+    reserved_slots: u8,
 }
 
 impl Session {
@@ -244,6 +245,7 @@ impl Session {
                     allow_transition_cr3: request.allow_transition_cr3,
                     allow_memory_writes: request.allow_memory_writes,
                     additional_vps: request.additional_vps.clone(),
+                    reserved_slots: reserved_slot_mask(&request.reserved_hardware_slots)?,
                 }),
                 preparation_failed: None,
                 max_pause_ms: request.max_pause_ms,
@@ -289,6 +291,7 @@ impl Session {
         engine: &DebugEngine,
         epoch: &crate::skcontrol::StopEpoch,
         manifest: &crate::skservice::ServiceManifest,
+        breakpoints: Vec<BreakpointGuard>,
     ) -> Result<ServiceTraceArm> {
         let (stop, image_base) = self.service_trace_identity(epoch)?;
         let deadline = self.stopped_service_deadline()?;
@@ -305,9 +308,14 @@ impl Session {
                 decode_live_hex(&read.data)
             })
             .map_err(anyhow::Error::msg)?;
-        let breakpoints = manifest
-            .breakpoints(image_base)
+        // The caller derived its set from this manifest outside the controller's reserved slots;
+        // prove that against the manifest just verified before anything is written.
+        let (expected, _) = manifest
+            .breakpoints_outside(image_base, self.control()?.reserved_slots())
             .map_err(anyhow::Error::msg)?;
+        if breakpoints != expected {
+            bail!("the service-trace breakpoint set is not the proved manifest's");
+        }
         let transition = self.continue_to_breakpoints(engine, epoch, breakpoints)?;
         Ok(ServiceTraceArm {
             transition,
@@ -383,16 +391,20 @@ impl Session {
         )
         .map_err(anyhow::Error::msg)?;
         let shared = crate::skservicetrace::SharedTrace::new(recorder);
+        // The manifest numbers its sites from slot 0; arm them in the slots the controller's
+        // reservation leaves free (a VTL0 debugger's slot on the same shared DR0-DR3), and let the
+        // decoder translate each stop's slot back to its site.
+        let (breakpoints, slot_map) = manifest
+            .breakpoints_outside(image_base, self.control()?.reserved_slots())
+            .map_err(anyhow::Error::msg)?;
         let mut decoder = crate::skservicetrace::ObservationDecoder::new(
             manifest.clone(),
             candidate.target,
             HexU64(image_base),
         )
-        .map_err(anyhow::Error::msg)?;
-        let breakpoints = manifest
-            .breakpoints(image_base)
-            .map_err(anyhow::Error::msg)?;
-        let armed = self.arm_service_trace(engine, epoch, &manifest)?;
+        .map_err(anyhow::Error::msg)?
+        .with_slot_map(slot_map);
+        let armed = self.arm_service_trace(engine, epoch, &manifest, breakpoints.clone())?;
         debug_assert_eq!(armed.image_base, HexU64(image_base));
         pause_changed(false);
         publish(shared.clone());
@@ -521,8 +533,11 @@ impl Session {
             );
             providers.push(provider);
         }
-        let control =
-            LiveControl::open_many_with_transition(providers, pending.allow_transition_cr3)?;
+        let control = LiveControl::open_many_with_options(
+            providers,
+            pending.allow_transition_cr3,
+            pending.reserved_slots,
+        )?;
         self.dispatcher
             .bind_software_breakpoint_capability(control.supports_software_breakpoint_events())?;
         self.control = Some(control);
@@ -1008,6 +1023,29 @@ pub(crate) struct OpenRequest {
     pub(crate) allow_memory_writes: bool,
     #[serde(default)]
     pub(crate) additional_vps: Vec<AdditionalVp>,
+    /// Debug-register slots (`0..=3`) another controller owns on the selected VPs, which this
+    /// session never writes, arms or borrows.
+    #[serde(default)]
+    pub(crate) reserved_hardware_slots: Vec<u8>,
+}
+
+/// Fold distinct slot numbers into the controller's mask, refusing anything out of range,
+/// repeated, or so many that no slot is left to arm.
+pub(crate) fn reserved_slot_mask(slots: &[u8]) -> Result<u8> {
+    let mut mask = 0u8;
+    for slot in slots {
+        if usize::from(*slot) >= crate::sklive::MAX_HARDWARE_BREAKPOINTS {
+            bail!("reserved hardware slot {slot} is not in 0..=3");
+        }
+        if mask & (1 << slot) != 0 {
+            bail!("reserved hardware slot {slot} is named twice");
+        }
+        mask |= 1 << slot;
+    }
+    if mask == 0xf {
+        bail!("reserving every hardware slot leaves none for this controller to arm");
+    }
+    Ok(mask)
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -1412,6 +1450,7 @@ impl AcceptanceRequest {
                 allow_transition_cr3: false,
                 allow_memory_writes: false,
                 additional_vps: Vec::new(),
+                reserved_hardware_slots: Vec::new(),
             },
             instruction,
             arm_mode,
@@ -6812,6 +6851,53 @@ mod tests {
         );
     }
 
+    /// With slot 0 reserved for the VTL0 debugger the manifest's three sites arm in slots 1-3, and
+    /// the decoder still names each stop's phase; a stop on the manifest's own slot number is
+    /// unowned once the map is in force.
+    #[test]
+    fn fake_trace_loop_decodes_stops_armed_outside_a_reserved_slot() {
+        let manifest = crate::skservice::service_manifest().unwrap();
+        let (breakpoints, map) = manifest
+            .breakpoints_outside(TRACE_IMAGE_BASE, 0b0001)
+            .unwrap();
+        assert_eq!(
+            breakpoints.iter().map(|b| b.slot).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        let remapped = |phase: &str, epoch: u64| {
+            let mut stop = trace_stop(&manifest, phase, epoch);
+            let site = manifest
+                .sites
+                .iter()
+                .find(|site| site.phase == phase)
+                .unwrap();
+            stop.event.reason = StopReason::HardwareBreakpoint {
+                slot: map.armed_slot(site.slot).unwrap(),
+            };
+            stop
+        };
+        let stops = [
+            Ok(remapped("entry", 1)),
+            Ok(remapped("dispatch", 2)),
+            Ok(remapped("return", 3)),
+        ];
+        let mut runtime = FakeTraceRuntime::new(stops);
+        let (shared, decoder, _) = trace_parts("sktrace-fake-remapped", 1);
+        let mut decoder = decoder.with_slot_map(map);
+        let trace =
+            drive_service_trace(&mut runtime, &shared, &mut decoder, &breakpoints, 16).unwrap();
+        assert_eq!(trace.records.len(), 1);
+        assert!(trace.records[0].complete);
+
+        let (shared, decoder, _) = trace_parts("sktrace-fake-remapped-unowned", 1);
+        let mut decoder = decoder.with_slot_map(map);
+        let mut runtime = FakeTraceRuntime::new([Ok(trace_stop(&manifest, "entry", 7))]);
+        let error = drive_service_trace(&mut runtime, &shared, &mut decoder, &breakpoints, 16)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unowned hardware slot 0"), "{error}");
+    }
+
     #[test]
     fn fake_trace_loop_stops_capacity_reached_at_selected_terminal_phases() {
         let manifest = crate::skservice::service_manifest().unwrap();
@@ -7015,7 +7101,7 @@ mod tests {
             .find(".verify_live_image(")
             .expect("the arm gate proves the complete live image");
         let breakpoint_derivation = body
-            .find(".breakpoints(image_base)")
+            .find(".breakpoints_outside(image_base")
             .expect("breakpoints are derived from the proved manifest");
         let mutation = body
             .find("self.continue_to_breakpoints(")
@@ -7044,10 +7130,10 @@ mod tests {
             .find("crate::skservicetrace::ObservationDecoder::new(")
             .expect("the decoder is constructed");
         let breakpoints = run
-            .find(".breakpoints(image_base)")
-            .expect("the breakpoint set is derived");
+            .find(".breakpoints_outside(image_base")
+            .expect("the breakpoint set is derived outside the reserved slots");
         let arm = run
-            .find("self.arm_service_trace(engine, epoch, &manifest)?")
+            .find("self.arm_service_trace(engine, epoch, &manifest, breakpoints.clone())?")
             .expect("the guarded arm starts the live loop");
         let publish = run
             .find("publish(shared.clone())")
@@ -7403,6 +7489,7 @@ mod tests {
                 control_transport: "provider --vp 1".into(),
                 target: additional,
             }],
+            reserved_hardware_slots: Vec::new(),
         };
 
         let error = match Session::open(&request) {

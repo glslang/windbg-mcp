@@ -1188,6 +1188,12 @@ pub struct SkLiveOpenArgs {
     /// the whole selected set at 16 VPs.
     #[serde(default)]
     pub additional_vps: Vec<u32>,
+    /// Hardware debug-register slots (`0..=3`) another controller owns on the selected VPs, such
+    /// as a VTL0 kernel debugger's processor breakpoint. DR0-DR3 and DR6 are one set per VP
+    /// shared across VTLs, so this session never writes, arms or borrows a reserved slot and reads
+    /// DR6 only through its own. At most three may be reserved.
+    #[serde(default)]
+    pub reserved_hardware_slots: Vec<u8>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -4601,6 +4607,14 @@ impl WindbgServer {
                 TargetCreated::No,
             );
         }
+        if let Err(error) = crate::skdispatch::reserved_slot_mask(&args.reserved_hardware_slots) {
+            return open_failure(
+                ErrorCategory::InvalidArgument,
+                error.to_string(),
+                None,
+                TargetCreated::No,
+            );
+        }
         if args.additional_vps.len() + 1 > crate::sklive::MAX_LIVE_CONTROL_VPS
             || args
                 .additional_vps
@@ -4685,6 +4699,7 @@ impl WindbgServer {
                 allow_transition_cr3: args.allow_transition_cr3,
                 allow_memory_writes: authorized.allow_memory_writes,
                 additional_vps,
+                reserved_hardware_slots: args.reserved_hardware_slots,
             })),
         )
         .await
@@ -4833,6 +4848,7 @@ impl WindbgServer {
                     allow_transition_cr3: false,
                     allow_memory_writes: false,
                     additional_vps: Vec::new(),
+                    reserved_hardware_slots: Vec::new(),
                 },
                 pipe,
                 kernel_base: None,
