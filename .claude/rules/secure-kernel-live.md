@@ -101,6 +101,30 @@ accepted only its own deadline, the next event faulted the session, and recovery
 debugger-held `vmwp` for 60 s. Do not reintroduce a wait that asserts the guest is idle, and never
 call a Hyper-V management helper while the dispatcher holds `vmwp` stopped.
 
+**Every event at the site is triaged before it is held, because the intercept is per partition.**
+The exception intercept vectors 1 and 3 install for the child is not per VTL: a VTL0 kernel
+debugger's `int 3` break-in, its `ba` hit and DbgEng's trap-flag step over its breakpoint all
+raise through the VTL1 controller's handler context, and completing them natively discards
+them, so the VTL0 kernel never sees its break (measured 2026-10-25, runs `20261025T084354` and
+`20261025T113332`: M4's break-in got no stop until M6's teardown unregistered the handler). The
+user-side message carries no VTL, so the dispatcher cannot decide alone: `wait_for_stop` and
+`begin_disarm` take an `EventTriage`, `LiveControl` answers it through the provider's
+`active_vtl` (`HV_INPUT_VTL` with the byte clear reads the executing VTL; read as a target VTL,
+`vsm_vp_status` names the VTL asked about, which is why it never discriminated), and a foreign
+event is carried through the native completion with the site re-armed instead of being held
+and faulting the session. Recovery triages nothing and holds whatever arrives, as before. **That
+VTL still loses the exception, and three ways of handing it back were measured not to work**
+(runs `20261025T115420` to `20261025T130540`): forcing the completion result (at
+`handle_return` the handler's return only picks the flags of the next
+`VidMessageSlotHandleAndGetNext`, and a zero leaves the message outstanding with the VP
+suspended); `HvRegisterPendingInterruption` from the root, refused with `HV_STATUS 0x0005`
+however the input VTL is written; and `HvRegisterPendingEvent0`, accepted and consumed without a
+trap whether armed before the completion or under an explicit suspension held across it, which
+also blocks VID's completion until something else moves the VM. What re-delivers an exception
+nobody claims is `vmwp`'s own handler writing through VID's deferred VP-state path, flushed in
+the completion's own hypercall; nothing outside `vmwp` can join that batch. So M4 and M6 cannot
+share a VP in one window; the M7 roadmap has the options.
+
 **`sk_live_wait` carries its own deadline and takes no timeout argument.** It comes from the
 operation's budget, which is of the order of a minute — so anything timed to arrive later than that
 cannot be caught by it, and a delay chosen to give the arm headroom can quietly exceed it. Time

@@ -1413,6 +1413,7 @@
         "live_transport: string",
         "partition_id: string|null",
         "profile: string",
+        "reserved_hardware_slots: array<integer/uint8>",
         "vm_id: string",
         "vmwp_pid: integer|null/uint32",
         "vp: integer|null/uint32"

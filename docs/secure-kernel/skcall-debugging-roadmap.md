@@ -603,8 +603,17 @@ software breakpoint at `nt!VslpEnterIumSecureMode` was armed live on 2026-10-25 
 child on its first hit, because the kernel debugger's own protected-text write path enters VTL1
 through that entry (run `20261025T073515`, measured under M7.1a), so M4 keeps its processor
 breakpoint in slot 0 and M6 reserves that slot, arming its sites in slots 1-3 and touching only
-those; M6 is armed before M4 and drained after it. Both await their live proof in the rerun, so
-M7.2 remains closed.
+those; M6 is armed before M4 and drained after it. Run `20261025T084354` measured the partition
+holding after M6's arm, and then measured the blocker beneath it: the VTL1 dispatcher's exception
+intercept also receives VTL0 debug exceptions and its completion suppresses them, so M4's KD
+break-in never reached the VTL0 kernel while M6's handler was registered. Built 2026-10-25:
+every event at the dispatcher's site is put to the controller, whose provider reads the executing
+VTL from the hypervisor, and another VTL's exception is carried through the native completion
+with the site re-armed, so M6 stays armed and healthy beside the VTL0 debugger. Measured the same
+day across five runs: handing that exception back to VTL0 from the root does not work on this
+hypervisor, so the VTL0 debugger loses every break and breakpoint hit while M6's handler is
+registered, and M4 and M6 cannot share a VP in one window. M7.1's idle gate therefore needs M6
+closed between M4's windows, or M4 redesigned off hardware breakpoints; M7.2 remains closed.
 
 Join M4–M6 without putting two targets in one DbgEng process. The coordinator owns session ids and
 lifecycles, not engines: each layer remains in its existing worker and contributes an immutable
@@ -932,6 +941,93 @@ measurements along the way decide how the driver must behave:
   debugger's own protected-text write entering VTL1 through the patched entry. M6's stop fix was
   never reached. The host orphan was terminated by exact PID, the parked attach handed off with
   `kernel_handoff_pid`, and the K3 staging removed; the child needs a turn-off and start from K3.
+- In `live-coexistence/20261025T084128/` and `20261025T084354/`, on build `0.23.0+gb108cd87`
+  with the slot partition and the order M6 -> M4 -> M5: the first run was refused at M6's arm by
+  the driver's own slot-0 bootstrap breakpoint and released everything cleanly; the second armed
+  M6 on slots 1-3 with the partition measured from K3, then lost M4's break-in to the VTL1
+  dispatcher's intercept (continuation item 2). Both runs cleaned up completely with both guests
+  healthy; no residue on the host or in K3.
+- In `live-coexistence/20261025T113332/`, on build `0.23.0+gb108cd87-dirty.fde8a56f` (the
+  committed tree plus a record dump at the event site and an `HV_INPUT_VTL` sweep in the K3
+  probe): M6 armed on slots 1-3, the sweep at idle and at the VTL1 hold measured the active-VTL
+  encoding (continuation item 2), M4's break-in was lost exactly as in `084354`, and both
+  guests were healthy at cleanup. The record dumps scrolled out of the 16 KB log tail the
+  harness kept; it now keeps the whole listener log beside the run.
+- In `live-coexistence/20261025T115420/`, on build `0.23.0+gb108cd87-dirty.0e1a862e` (the
+  pass-through built): M6's service trace, still at a 16-record limit, filled on the bootstrap
+  trigger and restored its slots within a second, so the partition check read VTL1 DR7 `0x400`
+  and failed before M4 armed; the driver's emergency `end_session` of M4 then broke into the
+  child, and that `int 3` reached M6's dispatcher during its capacity disarm. The triage
+  worked to the last step: the provider read the active VTL as 0 (the record dump read
+  `03 01 01`, vector 3, software, length 1), and the re-delivery write naming target VTL 0 was
+  refused with `HV_STATUS 0x0005`. The provider died on the refusal, recovery held the event
+  as its own with no register access left, and the child was left paused under a contained
+  `vmwp` with VMMS blocked; M4's host worker was orphaned by its supervisor's exit. Recovered
+  with `recover-m7-provider-death.ps1` (bounded CIM off, exact worker and provider kill,
+  staging removal, deliberate restart: child up on a fresh boot at 12:07Z, K3's boot
+  unchanged) and the orphan killed by exact PID and path. Fixes: the provider writes the
+  pending interruption with the InputVtl byte clear, as VID's own completion does, and
+  answers an error instead of exiting; the driver's trace keeps the server's 1024-record
+  limit so M6 stays armed through M4's window.
+- In `live-coexistence/20261025T121217/`, on the same build with those fixes: M6 armed and
+  stayed armed, every VTL1 event of the trace was triaged as its own (the provider answered
+  `active_vtl` 1 for each), the partition check passed, and M4's break-in reached M6's wait
+  loop as the `int 3` it is: triage read the active VTL as 0 and asked for the re-delivery,
+  and the pending-interruption write was refused with `HV_STATUS 0x0005` again, this time
+  with the InputVtl byte clear. So that register is refused in this state whichever way it
+  is addressed, and the typed interruption form is not the hypervisor's door here. The
+  provider answered an error, the session faulted with recovery intact (`recovery_errors`
+  none, the child left running), M4's break-in was lost once more, and everything released:
+  both guests healthy, no residue. Next attempt: the pending exception event
+  (`HvRegisterPendingEvent0`, the form WHP documents for exception injection) first, the
+  typed interruption as fallback, with the dispatcher asking VID's completion to advance past
+  a software exception's instruction when the event form is used.
+- In `live-coexistence/20261025T122621/`, on build `0.23.0+gb108cd87-dirty.5def51e9`: the
+  hypervisor accepted the pending exception event (`HvRegisterPendingEvent0`, value
+  `0x30001`, written with the InputVtl byte clear), the dispatcher wrote the record's advance
+  byte, carried the `int 3` natively and re-armed its site, and `vmwp` then stopped at the
+  site some 430 times in the next minute for events the dispatcher does not own, about every
+  60 ms in pairs, while the VTL0 debugger still saw no stop. The second break-in, the
+  driver's emergency end of M4, faulted at retention: the record is the VP's fixed message
+  slot and VID does not clear the advance byte for the next message, so it still read 1 and
+  recovery, finding the same byte, left `vmwp` contained and the child paused. Recovered as
+  before (bounded off, exact worker kill, staging removed, deliberate restart; K3's boot
+  unchanged). Fixes: the carry clears the byte again once completion has consumed it, the
+  dispatcher logs the events it passes at its site, the provider reads the armed register
+  back after the write, and the driver reads the child's VTL0 RIP when a break-in times out,
+  so the next run says whether the re-delivered exception reached the kernel debugger and,
+  if not, where VTL0 is instead.
+- In `live-coexistence/20261025T124429/`, on build `0.23.0+gb108cd87-dirty.b0bb8d71`: the
+  armed event read back `0x30001` right after the write, and when the break-in timed out the
+  probe read it as `0x30000`, consumed, with VTL0 back at its idle RIP and stack, DR6 clean
+  and no trap taken, while the host's debugger session still pumped its run. So the
+  completion of the intercepted message discards whatever pending event is armed at that
+  moment, which is also what it does to the intercepted exception itself. The 949 events the
+  dispatcher passed at its site in the following minute were 933 of VND message type `0x1`
+  on VP 0 through one `vmwp` handler context, about every 64 ms, a handful of type `0x7` and
+  `0x9` with no VP, and one `0x1000003`; their meaning is unmeasured. The trace's wait then
+  reached its own deadline, recovery's pump met a stop at `ntdll!DbgBreakPoint` it refused
+  as not its own, and the session was left contained; recovered as before. The redelivery
+  is now two halves around the completion: the provider holds the VP with
+  `HvRegisterExplicitSuspend` before the dispatcher completes the message, and once the
+  completion is behind it arms the pending exception event and releases the suspension.
+  During the running disarm's pump no redelivery is attempted, because its own resume could
+  undo the pause the pump is waiting for; the loss is logged.
+- In `live-coexistence/20261025T130540/`, on build `0.23.0+gb108cd87-dirty.54c2925d`, the two
+  halves ran in order: the provider held the VP with `HvRegisterExplicitSuspend`, the
+  dispatcher wrote the advance byte and ran `vmwp` toward its native return, and that return
+  took 13.3 s to arrive, when the dispatcher's own delayed completion kick paused the VM at
+  13:08:07; the event was then armed (readback `0x30001`) and the suspension released with
+  status 0, yet at the break-in's timeout VTL0 was again at its idle RIP with the event read
+  as `0x30000`, no trap taken, and the kick's resume failed with "VM did not resume", so the
+  trace's wait reached its deadline and the session was left contained; recovered as before.
+  Three ways of handing the exception back are now measured not to work, and the code is
+  back to triage and carry: the typed pending interruption (refused), the pending event armed
+  before the completion (discarded with the intercepted exception), and the pending event
+  armed under an explicit suspension held across the completion (blocks VID's completion,
+  consumed without a trap). What re-delivers an exception nobody claims is `vmwp`'s own
+  handler writing through VID's deferred VP-state path, flushed in the completion's own
+  hypercall, and nothing outside `vmwp` can join that batch.
 
 Continuation order from this checkpoint:
 
@@ -961,8 +1057,74 @@ Continuation order from this checkpoint:
    1-3 and the decoder follows, and the coordinator's order tests moved; each controller test was
    mutation-verified against the half of the discipline it pins. What the rerun measures and
    nothing offline can: that the VTL0 debugger's write-back at its stops preserves slot 1-3 values
-   it did not set, read as DR0-DR3 and both DR7s from K3 after each arm. The alternatives
-   considered and the measurement that ruled out the first answer follow.
+   it did not set, read as DR0-DR3 and both DR7s from K3 after each arm.
+   **Measured 2026-10-25, runs `20261025T084128` and `20261025T084354`.** The first failed at
+   once because the driver's own bootstrap `sk_live_arm` still named slot 0; the reservation
+   refused it cleanly and everything released. In the second, M6's arm succeeded on slots 1-3
+   and the K3 probe read, after it, VTL1 DR7 `0x454` (slots 1-3 enabled), VTL0 DR7 `0x400`
+   (nothing enabled), DR1-DR3 holding the three Secure Kernel sites identically in both VTL
+   views, DR0 zero, and the bootstrap stop on slot 1: the partition holds and DR7 is per VTL.
+   M4's arm then failed: its break-in at 08:45:40.5 produced no VTL0 stop in 60 s, and 1.2 s
+   after it M6's trace faulted on "the dispatcher event context does not match the registered
+   exception handler", the vector-3 handler's context. The kernel debugger's break-in is an
+   `int 3` in VTL0; the dispatcher's exception intercept delivered it to vmwp as if it were a
+   VTL1 event, the dispatcher held it, live control refused it, recovery completed it natively,
+   and native completion reports the event *handled* (`rax == 1` at `handle_return` is
+   required), which suppresses the exception rather than injecting it, so the VTL0 kernel never
+   saw its break and the child re-executed the `int 3` until M6's teardown unregistered the
+   handler, after which the child read healthy. Yesterday's single-step-only event in run
+   `20261024T212721` was the same mechanism on vector 1: DbgEng's TF step over M4's breakpoint in
+   VTL0, delivered to M6's dispatcher 9 ms after its VM resume. So the exception intercept is
+   VTL-agnostic, M4's own `ba` hits and single steps would be eaten the same way while M6's
+   handler is registered (and a suppressed execute-breakpoint fault re-fires at the same RIP),
+   and the `vsm_vp_status` the provider reads is `0x30010` at genuine VTL1 holds and at idle
+   alike, so it does not tell the VTLs apart. Coexistence therefore needs the dispatcher to hand
+   VTL0 exceptions back to VTL0.
+   **Measured and built 2026-10-25, run `20261025T113332`.** Three things decided the shape. The
+   user-side message VID builds carries no VTL: Ghidra over `Vid.sys` shows
+   `VidHandleExceptionIntercept` writing the vector (`+0x20`), its software flag (`+0x21`), the
+   raising instruction's length (`+0x22`), the error code and the parameter, and
+   `VidMessageBufferPrep` the type, VP and context, nothing else, so the `ExecutionState.Vtl`
+   this item hoped to read lives in the kernel's record only. The forced completion was never
+   an answer: in `VndCompletionThread::RunSelf` the handler's return at `handle_return` only
+   picks the flags of the next `VidMessageSlotHandleAndGetNext` (3 against 1), and a zero would
+   leave the message outstanding with the VP suspended; what re-delivers an exception nobody
+   claims is `vmwp`'s own `WorkerExceptionHandler::Notify`, which writes
+   `HvRegisterPendingInterruption` (`0x00010002`) with pending, type 3 for a hardware exception
+   or 6 for a software one (5 for `INT1`), the instruction length at bits 5-8 and the vector at
+   bits 16-31. Written from the root while the VP sits in its intercept, that register was
+   refused with `HV_STATUS 0x0005` both naming target VTL 0 (run `20261025T115420`) and with
+   the InputVtl byte clear, the way `VidCompleteInterceptReturnCallback` writes VP registers
+   (run `20261025T121217`). `HvRegisterPendingEvent0` was accepted, read back `0x30001`, and
+   consumed without a trap, armed before the completion (run `20261025T124429`) or under an
+   explicit suspension held across the completion, which also blocked VID's completion for 13 s
+   (run `20261025T130540`). And the hypervisor does say which VTL is executing: `HvGetVpRegisters` with
+   `HV_INPUT_VTL` UseTargetVtl clear returned VTL0's CR3, RIP and RSP in three idle samples and
+   VTL1's while VP0 was held at the bootstrap breakpoint, with `vsm_vp_status` read the same way
+   at `0x30010` and `0x30001`; read as a target VTL (`0x10 | vtl`) the status names the VTL asked
+   about, which is why the provider's reading never discriminated. What stays in the tree is
+   triage and carry: the provider gained `foreign_events` with `active_vtl`, the dispatcher puts
+   every event at its site to the controller's `EventTriage` before holding it, in a wait and in
+   the running disarm's pump, and a foreign event is carried natively with the site re-armed,
+   so M6 neither takes it as its own stop nor faults; the profile layout locates VID's two
+   bytes for the record. Offline: a foreign event is carried and the wait continues, a provider
+   without the capability keeps every event, and the running disarm carries one before its
+   pause; each pinned against the mutation it is for. **The conclusion, 2026-10-25:** with the
+   intercept per partition and no way from the root to hand the exception back, the VTL0
+   debugger loses every break-in, breakpoint hit and single step while M6's handler is
+   registered, and the slot partition does not change that. The options are the user's: (a)
+   alternate at session level, closing M6 between M4's windows, which serves M7.1's idle gate
+   and not M7.2's same-call join; (b) re-deliver from inside `vmwp` through VID's own deferred
+   VP-state path, which `WorkerExceptionHandler::Notify` reaches through a VND VP-state vtable
+   (`+0x1b8`) and the dispatcher would reach by calling it on the callback thread as it calls
+   the handler registration, a reverse-engineering and call-marshalling task with its own live
+   proof still to run, and with every M4 `ba` hit then costing a `vmwp` round trip; (c) take
+   M4 off hardware breakpoints and off the shared VP's exception path altogether, reading the
+   NT-side arguments from M6's entry phase, which is what M7.2 needs anyway. Two smaller
+   facts from the same runs, both unmeasured further: after a lost break-in `vmwp` saw a VND
+   message of type `0x1` on VP 0 about every 64 ms, and recovery's pump once refused a stop at
+   `ntdll!DbgBreakPoint` as not its own.
+   The alternatives considered and the measurement that ruled out the first answer follow.
    The history: DR0-DR6 are shared between VTL0 and VTL1 on a VP and only DR7 is per VTL, as run
    `20261024T212721` measured: M6's arm found M4's `nt!VslpEnterIumSecureMode` address in DR0 and
    M4's B0 in DR6, overwrote both, and refused its first event. The first answer, a DbgEng software

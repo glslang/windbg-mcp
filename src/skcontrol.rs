@@ -258,6 +258,14 @@ pub(crate) enum Capability {
     Release,
     /// The provider can retain and echo raw vector-3 events produced by owned `INT3` patches.
     BreakpointEvents,
+    /// The provider can say which VTL a selected VP is executing while the controller's own VTL
+    /// runs. The hypervisor's exception intercept is installed for the partition rather than for
+    /// one VTL, so another VTL's vector-1 and vector-3 exceptions reach the dispatcher's site
+    /// through the controller's own handler context; with this the controller carries them
+    /// natively instead of taking them as its own stops and faulting (measured 2026-10-25).
+    /// Handing them back to that VTL is not built: a pending event armed from the root is
+    /// consumed without delivery, measured the same day.
+    ForeignEvents,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -413,10 +421,18 @@ pub(crate) enum Operation {
     Capabilities,
     BeginArm,
     FinishArm,
-    PublishStop { event: HeldEvent },
+    PublishStop {
+        event: HeldEvent,
+    },
     HeldEvent,
-    ReadRegisters { registers: Vec<RegisterName> },
-    WriteRegisters { writes: Vec<RegisterWrite> },
+    ReadRegisters {
+        registers: Vec<RegisterName>,
+    },
+    WriteRegisters {
+        writes: Vec<RegisterWrite>,
+    },
+    /// Which VTL the target VP is executing now; allowed while running.
+    ActiveVtl,
     Release,
 }
 
@@ -440,6 +456,7 @@ pub(crate) enum ReplyValue {
     HeldEvent { event: HeldEvent },
     Registers { values: Vec<RegisterValue> },
     RegistersWritten { values: Vec<RegisterValue> },
+    ActiveVtl { vtl: u8 },
     Released,
 }
 
@@ -764,6 +781,22 @@ impl<R: BufRead, W: Write> ControlSession<R, W> {
             "control provider released the retained stop"
         );
         Ok(())
+    }
+
+    /// Which VTL the target VP is executing right now. Asked while the controller's own VTL
+    /// runs, about an exception the dispatcher holds at its site before anyone knows whose it
+    /// is, so it is the one register question allowed in the running phase.
+    pub(crate) fn active_vtl(&mut self) -> Result<u8> {
+        self.require_capability(Capability::ForeignEvents)?;
+        let response = self.exchange(Operation::ActiveVtl)?;
+        let ReplyValue::ActiveVtl { vtl } = response else {
+            bail!("provider returned the wrong reply to active_vtl")
+        };
+        if vtl > 15 {
+            self.poisoned = true;
+            bail!("provider reported active VTL {vtl}, outside 0..=15");
+        }
+        Ok(vtl)
     }
 
     fn held(&self) -> Option<&HeldEvent> {
@@ -1346,6 +1379,10 @@ impl ControlProcess {
     pub(crate) fn release(&mut self) -> Result<()> {
         self.call(ControlSession::release)
     }
+
+    pub(crate) fn active_vtl(&mut self) -> Result<u8> {
+        self.call(ControlSession::active_vtl)
+    }
 }
 
 fn provider_io_timed_out(error: &anyhow::Error) -> bool {
@@ -1378,6 +1415,7 @@ enum ExpectedReply {
     HeldEvent,
     Registers,
     RegistersWritten,
+    ActiveVtl,
     Released,
 }
 
@@ -1391,6 +1429,7 @@ impl ExpectedReply {
             Operation::HeldEvent => Self::HeldEvent,
             Operation::ReadRegisters { .. } => Self::Registers,
             Operation::WriteRegisters { .. } => Self::RegistersWritten,
+            Operation::ActiveVtl => Self::ActiveVtl,
             Operation::Release => Self::Released,
         }
     }
@@ -1405,6 +1444,7 @@ impl ExpectedReply {
                 | (Self::HeldEvent, ReplyValue::HeldEvent { .. })
                 | (Self::Registers, ReplyValue::Registers { .. })
                 | (Self::RegistersWritten, ReplyValue::RegistersWritten { .. })
+                | (Self::ActiveVtl, ReplyValue::ActiveVtl { .. })
                 | (Self::Released, ReplyValue::Released)
         )
     }
@@ -1663,6 +1703,7 @@ mod tests {
                 Capability::ReadRegisters,
                 Capability::WriteRegisters,
                 Capability::Release,
+                Capability::ForeignEvents,
             ],
             writable_registers: readable_registers
                 .iter()
@@ -1719,6 +1760,72 @@ mod tests {
             ControlSession::open(Cursor::new(input.into_bytes()), Vec::new(), target()).unwrap();
         assert_eq!(skipped, ["banner from provider"]);
         session
+    }
+
+    /// The active-VTL question runs while the controller's VTL runs and is not a state
+    /// transition: the epoch stands. An answer outside 0..=15 poisons the session rather than
+    /// being believed.
+    #[test]
+    fn the_active_vtl_question_runs_in_the_running_phase_and_keeps_the_epoch() {
+        let lines = vec![
+            response(
+                1,
+                EPOCH_RUNNING,
+                ReplyValue::Capabilities {
+                    value: capabilities(),
+                },
+            ),
+            response(2, EPOCH_RUNNING, ReplyValue::ActiveVtl { vtl: 0 }),
+            response(3, EPOCH_RUNNING, ReplyValue::ActiveVtl { vtl: 16 }),
+        ];
+        let mut session = scripted(&lines);
+        session.capabilities().unwrap();
+        assert_eq!(session.active_vtl().unwrap(), 0);
+        assert_eq!(session.epoch(), &StopEpoch::new(EPOCH_RUNNING).unwrap());
+        assert!(!session.poisoned);
+
+        let error = session.active_vtl().unwrap_err();
+
+        assert!(error.to_string().contains("outside 0..=15"), "{error:#}");
+        assert!(session.poisoned);
+    }
+
+    #[test]
+    fn foreign_event_operations_need_the_capability() {
+        let mut advertised = capabilities();
+        advertised
+            .capabilities
+            .retain(|capability| *capability != Capability::ForeignEvents);
+        let lines = vec![response(
+            1,
+            EPOCH_RUNNING,
+            ReplyValue::Capabilities { value: advertised },
+        )];
+        let mut session = scripted(&lines);
+        session.capabilities().unwrap();
+
+        let error = session.active_vtl().unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("did not advertise ForeignEvents"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn foreign_event_operations_serialize_under_their_protocol_names() {
+        assert_eq!(
+            serde_json::to_string(&Operation::ActiveVtl).unwrap(),
+            r#"{"op":"active_vtl"}"#
+        );
+        let reply: ReplyValue = serde_json::from_str(r#"{"kind":"active_vtl","vtl":1}"#).unwrap();
+        assert_eq!(reply, ReplyValue::ActiveVtl { vtl: 1 });
+        assert_eq!(
+            serde_json::to_string(&Capability::ForeignEvents).unwrap(),
+            r#""foreign_events""#
+        );
     }
 
     #[test]

@@ -41,10 +41,21 @@ use crate::sk::RawSource;
 use crate::skcontrol::{HeldEvent, HexU64, RegisterName, StopReason, TargetIdentity};
 use crate::sklive::{
     AppliedMemoryWrite, ArmMode, BreakWake, BreakpointGuard, Disarmed, DispatcherProfile,
-    DispatcherSite, EventDispatcher, GuardedMemoryWrite, InstructionGuard, LiveControl,
-    LiveMemoryWrite, LivePhase, LiveTransition, ObservedStop, PreparedMemoryWrite, ReleaseMode,
-    StopRecord, is_break_wake,
+    DispatcherSite, EventDispatcher, EventTriage, GuardedMemoryWrite, InstructionGuard,
+    LiveControl, LiveMemoryWrite, LivePhase, LiveTransition, ObservedStop, PreparedMemoryWrite,
+    ReleaseMode, SiteEvent, StopRecord, Triage, is_break_wake,
 };
+
+/// Recovery has no controller to ask whose an event is, so it holds whatever arrives as its own,
+/// which is what every event was before triage existed: another VTL's break lost once, during a
+/// fault, rather than a recovery that cannot proceed.
+struct OwnEverything;
+
+impl EventTriage for OwnEverything {
+    fn triage(&mut self, _event: &SiteEvent) -> Result<Triage> {
+        Ok(Triage::Own)
+    }
+}
 
 pub(crate) const LIVE_CONTROL_FLAG: &str = "--sk-live-control";
 
@@ -3280,6 +3291,7 @@ impl VmwpDispatcher<'_> {
         &mut self,
         targets: &[TargetIdentity],
         deadline: Option<Instant>,
+        triage: &mut dyn EventTriage,
     ) -> Result<Disarmed> {
         targets
             .first()
@@ -3299,7 +3311,7 @@ impl VmwpDispatcher<'_> {
 
         match preparation {
             Some(RunningDisarmPreparation::PumpUntilPausedOrHeld) => {
-                self.pause_or_hold_running_target(targets, deadline)
+                self.pause_or_hold_running_target(targets, deadline, triage)
             }
             // Suspend-VM can block behind an attached DbgEng target even when no native event
             // exists. With the VM already paused no VP can raise one, so remove the exact owned
@@ -3337,6 +3349,7 @@ impl VmwpDispatcher<'_> {
         &mut self,
         targets: &[TargetIdentity],
         deadline: Option<Instant>,
+        triage: &mut dyn EventTriage,
     ) -> Result<Disarmed> {
         let target = targets
             .first()
@@ -3368,7 +3381,21 @@ impl VmwpDispatcher<'_> {
             && let Some((event_pointer, event)) =
                 self.classify_event_at_site(targets, event_site)?
         {
-            return self.hold_event_at_site(event_pointer, event_site, event, targets, deadline);
+            let site = self.site_event(event_pointer, &event, true)?;
+            match triage.triage(&site)? {
+                Triage::Own => {
+                    return self.hold_event_at_site(
+                        event_pointer,
+                        event_site,
+                        event,
+                        targets,
+                        deadline,
+                    );
+                }
+                Triage::Foreign { vtl } => {
+                    self.carry_foreign_event(event_pointer, event_site, &event, vtl, deadline)?;
+                }
+            }
         }
         // A pause this disarm asked for earlier (recovery re-entering after a fault) is reused; any
         // other pending transition, such as a step's resume kick, is joined before a pause is asked
@@ -3442,13 +3469,27 @@ impl VmwpDispatcher<'_> {
                     if let Some((event_pointer, event)) =
                         self.classify_event_at_site(targets, event_site)?
                     {
-                        return self.hold_event_at_site(
-                            event_pointer,
-                            event_site,
-                            event,
-                            targets,
-                            deadline,
-                        );
+                        let site = self.site_event(event_pointer, &event, true)?;
+                        match triage.triage(&site)? {
+                            Triage::Own => {
+                                return self.hold_event_at_site(
+                                    event_pointer,
+                                    event_site,
+                                    event,
+                                    targets,
+                                    deadline,
+                                );
+                            }
+                            // Another VTL's exception: carried natively under the pending
+                            // pause, and the pump goes on.
+                            Triage::Foreign { vtl } => self.carry_foreign_event(
+                                event_pointer,
+                                event_site,
+                                &event,
+                                vtl,
+                                deadline,
+                            )?,
+                        }
                     }
                     // A handler event this adapter does not own; vmwp carries it natively, as the
                     // ordinary wait lets it.
@@ -3559,16 +3600,21 @@ impl EventDispatcher for VmwpDispatcher<'_> {
             .require_single_processor_software_breakpoint_scope()
     }
 
-    fn begin_disarm(&mut self, targets: &[TargetIdentity]) -> Result<Disarmed> {
-        self.begin_disarm_inner(targets, None)
+    fn begin_disarm(
+        &mut self,
+        targets: &[TargetIdentity],
+        triage: &mut dyn EventTriage,
+    ) -> Result<Disarmed> {
+        self.begin_disarm_inner(targets, None, triage)
     }
 
     fn begin_disarm_until(
         &mut self,
         targets: &[TargetIdentity],
         deadline: Instant,
+        triage: &mut dyn EventTriage,
     ) -> Result<Disarmed> {
-        self.begin_disarm_inner(targets, Some(deadline))
+        self.begin_disarm_inner(targets, Some(deadline), triage)
     }
 
     fn finish_arm(&mut self) -> Result<()> {
@@ -3682,6 +3728,7 @@ impl EventDispatcher for VmwpDispatcher<'_> {
         &mut self,
         targets: &[TargetIdentity],
         instructions: &[InstructionGuard],
+        triage: &mut dyn EventTriage,
     ) -> Result<ObservedStop> {
         if targets.is_empty()
             || targets
@@ -3752,7 +3799,7 @@ impl EventDispatcher for VmwpDispatcher<'_> {
 
             let deadline = Instant::now() + Duration::from_millis(u64::from(DEBUG_WAIT));
             let (event_pointer, event) =
-                self.wait_for_owned_event(targets, event_site, deadline)?;
+                self.wait_for_owned_event(targets, event_site, deadline, triage)?;
             // The callback is held as soon as the owned breakpoint returns. Start the absolute
             // budget before any retention cleanup, including a pending Hyper-V transition join.
             let retained_at = Instant::now();
@@ -4088,7 +4135,7 @@ impl VmwpDispatcher<'_> {
             )
         {
             return self
-                .pause_or_hold_running_target(targets, deadline)
+                .pause_or_hold_running_target(targets, deadline, &mut OwnEverything)
                 .map(|_| ());
         }
         // A wait may fail while its asynchronous Resume-VM is still outstanding. With no retained
@@ -4249,13 +4296,29 @@ impl VmwpDispatcher<'_> {
         targets: &[TargetIdentity],
         event_site: u64,
         deadline: Instant,
+        triage: &mut dyn EventTriage,
     ) -> Result<(u64, HeldEvent)> {
         let activity = self.state.wait_activity.clone();
         let _activity = activity.as_ref().map(WaitActivity::enter).transpose()?;
         loop {
             self.run_to_current_breakpoint(deadline)?;
-            if let Some(owned) = self.classify_event_at_site(targets, event_site)? {
-                return Ok(owned);
+            if let Some((event_pointer, event)) =
+                self.classify_event_at_site(targets, event_site)?
+            {
+                let site = self.site_event(event_pointer, &event, false)?;
+                match triage.triage(&site)? {
+                    Triage::Own => return Ok((event_pointer, event)),
+                    Triage::Foreign { vtl } => {
+                        self.carry_foreign_event(
+                            event_pointer,
+                            event_site,
+                            &event,
+                            vtl,
+                            Some(deadline),
+                        )?;
+                        continue;
+                    }
+                }
             }
             let deadline_expired = self
                 .state
@@ -4267,6 +4330,83 @@ impl VmwpDispatcher<'_> {
                 bail!("too many unrelated dispatcher events before an owned exception event");
             }
         }
+    }
+
+    /// What the controller needs to decide whose event this is: the VP and vector the
+    /// classification established, and VID's software flag and instruction length when the
+    /// profile locates them in the record.
+    fn site_event(
+        &self,
+        event_pointer: u64,
+        event: &HeldEvent,
+        during_disarm: bool,
+    ) -> Result<SiteEvent> {
+        let layout = &self.state.profile.layout;
+        let byte_at = |offset: Option<u32>| -> Result<Option<u8>> {
+            offset
+                .map(|offset| {
+                    self.read_u8(
+                        event_pointer
+                            .checked_add(u64::from(offset))
+                            .context("event record field address overflowed")?,
+                    )
+                })
+                .transpose()
+        };
+        let software = byte_at(layout.event_software)?;
+        let instruction_length = byte_at(layout.event_instruction_length)?;
+        Ok(SiteEvent {
+            vp: event.vp,
+            vector: event.vector,
+            software: software.map(|flag| flag != 0),
+            instruction_length,
+            during_disarm,
+        })
+    }
+
+    /// Carry an exception another VTL raised through vmwp's native completion and re-arm the
+    /// event site. Nothing is published to a provider and no VTL1 state is touched; the thread is
+    /// retained only so recovery can finish the completion if this fails midway. A transition
+    /// already pending (the running disarm's pause) cannot complete while the event is
+    /// outstanding, so it is set aside around the retention exactly as an own event's hold does,
+    /// and put back before the completion so no second transition is started beside it.
+    ///
+    /// The completion discards the exception, so that VTL loses it. Handing it back is not
+    /// built: a pending event armed from the root before the completion is discarded with it,
+    /// one armed under an explicit suspension held across the completion blocks VID's
+    /// completion until something else moves the VM and is then consumed without a trap
+    /// (measured 2026-10-25, M7 runs `20261025T124429` and `20261025T130540`).
+    fn carry_foreign_event(
+        &mut self,
+        event_pointer: u64,
+        event_site: u64,
+        event: &HeldEvent,
+        vtl: u8,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        let foreign = HeldEvent {
+            vtl,
+            ..event.clone()
+        };
+        let pending = self.state.completion_kick.take();
+        let retained = self.retain_current_event(event_pointer, event_site, &foreign, deadline);
+        if self.state.completion_kick.is_none() {
+            self.state.completion_kick = pending;
+        }
+        retained?;
+        self.complete_retained_event(&foreign, deadline)?;
+        let held_site = self.state.profile.event_held.clone();
+        self.set_site_breakpoint(&held_site)?;
+        self.state.phase = DispatcherPhase::ReadyForStop;
+        self.state.recovery_deadline = None;
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            vp = foreign.vp,
+            vtl,
+            vector = foreign.vector,
+            "dispatcher carried another VTL's exception natively and re-armed its event site"
+        );
+        Ok(())
     }
 
     /// Read the native event vmwp holds at the event site and decide whether this adapter owns it:
@@ -4301,6 +4441,7 @@ impl VmwpDispatcher<'_> {
             && let Some(vector @ (DEBUG_VECTOR | BREAKPOINT_VECTOR)) = vector
             && let Some(target) = targets.iter().find(|target| target.vp == vp)
         {
+            self.log_event_record(event_pointer, vector);
             return Ok(Some((
                 event_pointer,
                 HeldEvent {
@@ -4319,7 +4460,50 @@ impl VmwpDispatcher<'_> {
                 },
             )));
         }
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            message_type = format_args!("{message_type:#x}"),
+            context = format_args!("{context:#x}"),
+            vp,
+            "dispatcher passed an event it does not own at the site"
+        );
         Ok(None)
+    }
+
+    /// Record the native exception message vmwp holds, byte for byte, so what it does and does
+    /// not carry is measured rather than inferred. The user-side body VID builds for an exception
+    /// intercept names the vector, its software flag, instruction length, error code and
+    /// parameter; the measurement question is whether anything in it says which VTL raised.
+    fn log_event_record(&self, event_pointer: u64, vector: u8) {
+        const RECORD_BYTES: usize = 0x180;
+        match self.engine.read_memory(event_pointer, RECORD_BYTES) {
+            Ok(bytes) => {
+                let hex = bytes
+                    .chunks(16)
+                    .map(|row| {
+                        row.iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<Vec<_>>()
+                            .join("")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                tracing::info!(
+                    target: "windbg_mcp::secure_kernel_mutation",
+                    event_pointer = format_args!("{event_pointer:#x}"),
+                    vector,
+                    record = %hex,
+                    "dispatcher read the native exception event record at the event site"
+                );
+            }
+            Err(error) => tracing::info!(
+                target: "windbg_mcp::secure_kernel_mutation",
+                event_pointer = format_args!("{event_pointer:#x}"),
+                vector,
+                error = %error,
+                "dispatcher could not read the native exception event record"
+            ),
+        }
     }
 
     fn retain_current_event(
@@ -6821,6 +7005,66 @@ mod tests {
         assert!(!transition_gate.contains("run_vm_query"));
     }
 
+    /// Every event at the site is the controller's to triage before it is held: a kernel debugger
+    /// on the VP's other VTL raises through the same intercept, and a break swallowed there is
+    /// what the 2026-10-25 runs measured. The carry re-arms the site and publishes nothing.
+    #[test]
+    fn every_event_at_the_site_is_triaged_before_it_is_held() {
+        let source = include_str!("skdispatch.rs").replace("\r\n", "\n");
+        let wait = source
+            .split_once("    fn wait_for_owned_event(\n")
+            .expect("the wait loop exists")
+            .1
+            .split_once("    /// What the controller needs to decide whose event this is")
+            .expect("the site event follows the wait loop")
+            .0;
+        let triaged = wait.find("triage.triage(").expect("the wait triages");
+        let held = wait
+            .find("return Ok((event_pointer, event))")
+            .expect("the wait returns the owned event");
+        assert!(triaged < held, "the wait triages before it holds");
+
+        let pump = source
+            .split_once("    fn pause_or_hold_running_target(\n")
+            .expect("the pump exists")
+            .1
+            .split_once("    fn hold_event_at_site(\n")
+            .expect("the hold follows the pump")
+            .0;
+        assert_eq!(
+            pump.matches("triage.triage(").count(),
+            pump.matches("self.hold_event_at_site(").count(),
+            "every hold in the pump is preceded by a triage"
+        );
+
+        let carry = source
+            .split_once("    fn carry_foreign_event(\n")
+            .expect("the carry exists")
+            .1
+            .split_once("\n    }\n")
+            .expect("the carry ends")
+            .0;
+        assert!(!carry.contains("confirm_retained_provider_stop"));
+        assert!(!carry.contains("publish"));
+        assert!(carry.contains("completion_kick.take()"));
+        assert!(carry.contains("set_site_breakpoint(&held_site)"));
+        assert!(carry.contains("DispatcherPhase::ReadyForStop"));
+        let retained = carry
+            .find("retain_current_event(")
+            .expect("the carry retains the thread");
+        let completed = carry
+            .find("complete_retained_event(")
+            .expect("the carry completes natively");
+        let rearmed = carry
+            .find("set_site_breakpoint(&held_site)")
+            .expect("the carry re-arms the site");
+        assert!(
+            retained < completed && completed < rearmed,
+            "retain, complete natively, re-arm: the carry writes no guest state"
+        );
+        assert!(!carry.contains("write_u8"));
+    }
+
     #[test]
     fn fake_trace_loop_records_one_selected_call_and_restores_at_capacity() {
         let manifest = crate::skservice::service_manifest().unwrap();
@@ -7660,7 +7904,7 @@ mod tests {
             .split_once("    fn pause_or_hold_running_target(\n")
             .expect("the pump follows the disarm")
             .0;
-        assert!(disarm.contains("pause_or_hold_running_target(targets, deadline)"));
+        assert!(disarm.contains("pause_or_hold_running_target(targets, deadline, triage)"));
         assert!(!disarm.contains("settle_native_completion"));
 
         let pump = source
@@ -7696,7 +7940,7 @@ mod tests {
             .expect("recovery follows its pause")
             .0;
         let pump_route = recovery
-            .find("pause_or_hold_running_target(targets, deadline)")
+            .find("pause_or_hold_running_target(targets, deadline, &mut OwnEverything)")
             .expect("recovery from a running arm pumps");
         let join = recovery
             .find("finish_completion_kick_until(deadline)")
@@ -8343,6 +8587,8 @@ mod tests {
                 callback_mirror: 0x30,
                 event_context: 8,
                 event_vp: 0x10,
+                event_software: Some(0x21),
+                event_instruction_length: Some(0x22),
                 exchange_advance: 0x148,
                 callback_pointer: 0x80,
                 callback_flags: 0x88,
