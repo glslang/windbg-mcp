@@ -591,9 +591,10 @@ exists and opened and armed all three layers once; the live coexistence exit gat
 two findings from the reruns under the inverted arm order: M6's stop of a running trace asserts
 that no event arrives during its settle run and its recovery hangs on VMMS, and the child VP's
 DR0-DR6 are shared between VTLs, so M4's hardware breakpoint and M6's slot-0 breakpoint cannot
-both be armed on it. The second is decided: only VTL1 holds hardware breakpoints and M4 arms a
-software breakpoint. The first is a server fix still to make. Both are recorded under M7.1a, so
-M7.2 remains closed.
+both be armed on it. Both are addressed in the tree: only VTL1 holds hardware breakpoints and M4
+arms a software breakpoint, and the running disarm now holds an arriving event as its disarm
+point instead of faulting. Both are recorded under M7.1a and await their live proof in the rerun,
+so M7.2 remains closed.
 
 Join M4–M6 without putting two targets in one DbgEng process. The coordinator owns session ids and
 lifecycles, not engines: each layer remains in its existing worker and contributes an immutable
@@ -934,26 +935,35 @@ Continuation order from this checkpoint:
    which record was taken with which kind. Its first live record is the rerun below. The
    single-step bit that reached VTL1's first event after a VM resume still needs its path
    measured; M6's exactly-one-slot check reads only the four B bits, so it does not count it.
-3. **Fix the stop of a running natural trace; the fault is the server's assertion, not the
-   traffic.** Run `20261024T210251` measured it: the last event's completion re-armed the trace,
-   arrival breakpoint installed and DR7 live, and 1.3 ms later the stop path ran
+3. **Done in the tree, 2026-10-25: the stop of a running natural trace holds an arriving event
+   as its disarm point.** Run `20261024T210251` measured the fault: the last event's completion
+   re-armed the trace, arrival breakpoint installed and DR7 live, and 1.3 ms later the stop
+   request's wake sent the next wait into break-on-demand, whose running disarm ran
    `settle_native_completion`, a 1 s `g` whose only accepted ending is its own deadline. The
    armed trace fired at the arrival site, as an armed trace does, and the code called that
    "unexpected"; the fail-closed recovery then asked VMMS to pause a `vmwp` the dispatcher itself
-   held stopped, which hung for 60 s. The assertion holds only while the trigger is idle, which
-   is a property of the guest's activity and not of the dispatcher's state, and the solo
-   qualification never exercised it because its drains ran long after the trigger went quiet. The
-   fix is in `skdispatch`: an event that arrives while a stop is wanted is the disarm point, not
-   a fault. Hold it, restore the VTL1 baseline at the hold (the per-event path already writes
-   DR6, DR7 and RFLAGS there), release it with `ReleaseMode::Resume` so nothing re-arms, and only
-   then settle, detach and pause for handler teardown; with DR7 clear, the settle's deadline is
-   the only ending left. The no-event path keeps its order but carries the same hazard in a worse
-   form: between `remove_owned_breakpoint`, detach and Suspend-VM an intercept would reach
-   `vmwp`'s handler with no dispatcher breakpoint and DR7 still armed, and what the native handler
-   does with a VTL1 `#DB` nobody is waiting for is unmeasured. No recovery path may call VMMS
-   while the dispatcher holds `vmwp` stopped. The driver's `await_m6_quiescence` makes the same
-   assumption with a longer window; it is a stopgap, not evidence for the gate, and comes out
-   once the server is fixed.
+   held stopped, which hung for 60 s. The assertion held only while the trigger was idle, a
+   property of the guest's activity and not of the dispatcher's state, and the solo qualification
+   never exercised it because its drains ran long after the trigger went quiet. The replacement is
+   `pause_or_hold_running_target` in `src/skdispatch.rs`: the running disarm asks Hyper-V to
+   pause from a helper thread and pumps `vmwp` in 250 ms slices under the installed event-site
+   breakpoint until either the pause is reported complete at a watchdog break, so no VP can raise
+   an event, or an owned event arrives and is retained exactly as a wait retains one. Live
+   control restores the VTL1 baseline under that event; a wait adopts it as its stop, a break
+   request takes it in place of a transient slot, and a close completes it into the pause teardown
+   needs. Recovery from a running arm takes the same path, so no path pauses a debugger-held
+   `vmwp`. This also folds in the VTL1 debug-exception hazard: the breakpoint stays installed and
+   `vmwp` stays attached until no VP can raise an event, so an intercept never reaches `vmwp`'s
+   handler with nothing watching it, and what the native handler would do with a VTL1 `#DB` nobody
+   is waiting for stays unmeasured by design. Offline, 130 dispatcher and live-control tests pass,
+   including the new pump-decision, adoption and close tests, each mutation-verified against the
+   half of the fix it pins. Two things the rerun measures that offline tests cannot: that
+   Suspend-VM completes while `vmwp` runs attached under DbgEng (Resume-VM already does, in the
+   post-step wait), and that a pending pause completes once the held event has been carried
+   natively. The driver's `await_m6_quiescence` gate is removed so the drain is issued while the
+   trigger may still fire; a non-stopping trace read before the drain stays as a reading. The
+   multi-provider stop keeps its pre-existing window (a winner completed before its pause with
+   DR7 still armed); M7 selects one VP and that path is out of this item's scope.
 4. Then rerun `run-m7-nested-coexistence.ps1`: open all three, arm M4 -> M6 -> M5, launch no
    workload, drain M5 -> M6 -> M4, and repeat the relevant failure and timeout injections. M4's
    software breakpoint is first exercised live here. The gate requires

@@ -215,6 +215,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   host-only-adapter deployment bound successfully but rejected every remote request with `403`.
   The configured bind IP now joins rmcp's loopback defaults; arbitrary host names remain refused.
 
+- **Stopping a running live Secure Kernel trace no longer treats the next VTL1 event as a
+  fault.** A stop, break request or close reaching a naturally armed running session used to run
+  a one-second settle whose only accepted ending was its own deadline, while the trace stayed
+  armed and the event-site breakpoint stayed installed; the M7.1a nested run `20261024T210251`
+  measured the next event landing inside that second, the session failing closed, and recovery
+  asking Hyper-V to pause a `vmwp` the debugger still held for 60 s. The running disarm now asks
+  Hyper-V to pause from a helper thread and pumps `vmwp` under the installed breakpoint until
+  either the pause is reported complete at a watchdog break or an owned event arrives. That event
+  is the disarm point: it is retained as a wait retains one, the controller restores the VTL1
+  baseline under it, the next wait adopts it as its hardware stop (a break request takes it in
+  place of a transient slot), and a close completes it into the pause teardown needs. Recovery
+  from a running arm takes the same path, so no path pauses a debugger-held `vmwp`, and the
+  breakpoint stays installed until no VP can raise an event, closing the window in which an
+  intercept reached `vmwp`'s handler with nothing watching it. Offline tests pin the pump's
+  decisions, the adoption and the close; the live proof is the M7.1a coexistence rerun.
+
 - **A kernel attach refused before it claimed anything no longer leaves a controller reserved when
   the caller's deadline got there first** (issue #462). The deadline answers `target: unknown` and
   preserves the session, which is right while the outcome is unknown. A KDNET port another process

@@ -78,6 +78,16 @@ overwrote both. So the VTL1 layer is the only one that holds hardware breakpoint
 and the hypervisor trace arm DbgEng software breakpoints, and a source test pins each kind — and a
 VTL1 stop's DR6 can carry bits a VTL0 debugger left there.
 
+**A stop wanted while the trace runs is a pump, never a settle.** The trace stays armed until the
+VP is quiescent, Hyper-V cannot pause a VM whose `vmwp` is debugger-stopped, and the event-site
+breakpoint cannot stay installed across a detach — so `pause_or_hold_running_target` asks for the
+pause from a helper thread and pumps `vmwp` under the installed breakpoint until the pause is
+reported or an owned event arrives, and that event is the disarm point (`Disarmed::Held`), adopted
+by the next wait. Measured 2026-10-24 (M7.1a run `20261024T210251`): the earlier one-second settle
+accepted only its own deadline, the next event faulted the session, and recovery then paused a
+debugger-held `vmwp` for 60 s. Do not reintroduce a wait that asserts the guest is idle, and never
+call a Hyper-V management helper while the dispatcher holds `vmwp` stopped.
+
 **`sk_live_wait` carries its own deadline and takes no timeout argument.** It comes from the
 operation's budget, which is of the order of a minute — so anything timed to arrive later than that
 cannot be caught by it, and a delay chosen to give the arm headroom can quietly exceed it. Time

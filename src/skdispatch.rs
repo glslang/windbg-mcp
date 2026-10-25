@@ -40,15 +40,19 @@ use crate::sk;
 use crate::sk::RawSource;
 use crate::skcontrol::{HeldEvent, HexU64, RegisterName, StopReason, TargetIdentity};
 use crate::sklive::{
-    AppliedMemoryWrite, ArmMode, BreakWake, BreakpointGuard, DispatcherProfile, DispatcherSite,
-    EventDispatcher, GuardedMemoryWrite, InstructionGuard, LiveControl, LiveMemoryWrite, LivePhase,
-    LiveTransition, ObservedStop, PreparedMemoryWrite, ReleaseMode, StopRecord, is_break_wake,
+    AppliedMemoryWrite, ArmMode, BreakWake, BreakpointGuard, Disarmed, DispatcherProfile,
+    DispatcherSite, EventDispatcher, GuardedMemoryWrite, InstructionGuard, LiveControl,
+    LiveMemoryWrite, LivePhase, LiveTransition, ObservedStop, PreparedMemoryWrite, ReleaseMode,
+    StopRecord, is_break_wake,
 };
 
 pub(crate) const LIVE_CONTROL_FLAG: &str = "--sk-live-control";
 
 const DEBUG_WAIT: u32 = 60_000;
 const NATIVE_SETTLE_WAIT: u32 = 1_000;
+/// One `g` slice of the running disarm: vmwp runs under the event-site breakpoint for this long
+/// before the watchdog stops it so the pending Hyper-V pause can be polled.
+const DISARM_PUMP_SLICE: Duration = Duration::from_millis(250);
 const COMPLETION_KICK_AFTER: Duration = Duration::from_secs(12);
 const POWERSHELL_WAIT: Duration = Duration::from_secs(60);
 const LIVE_MEMORY_WAIT: Duration = Duration::from_secs(60);
@@ -1514,6 +1518,9 @@ struct RetainedEvent {
     event: HeldEvent,
     validation_complete: bool,
     release_eligible: bool,
+    /// Held by the running disarm while a stop was wanted. The next `wait_for_stop` adopts it as
+    /// its stop instead of pumping for another.
+    adoptable: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2522,7 +2529,9 @@ enum DispatcherPhase {
     Registering,
     ReadyForStop,
     /// The event-site breakpoint remained armed until a deadline or scoped request interrupted
-    /// ordinary vmwp execution. This is the only no-event stop that may detach before Suspend-VM.
+    /// ordinary vmwp execution. With the VM already paused this no-event stop may detach before
+    /// Suspend-VM; otherwise a disarm pumps it under the installed breakpoint until Hyper-V pauses
+    /// the VM or an owned event arrives (`pause_or_hold_running_target`).
     ReadyForStopInterrupted,
     Holding(HeldEvent),
     ReturningCallback(HeldEvent),
@@ -2555,8 +2564,47 @@ enum ArmPreparation {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RunningDisarmPreparation {
-    SettleNativeExecution,
-    AlreadyInterrupted,
+    /// The VP may still run and the trace is armed: pump vmwp under the event-site breakpoint
+    /// while Hyper-V pauses the VM, holding any owned event that arrives first.
+    PumpUntilPausedOrHeld,
+    /// A completed step or an earlier transition left the VM paused, so no VP can raise an event:
+    /// remove the breakpoint, detach and prove the pause the ordinary way.
+    AlreadyPaused,
+}
+
+/// What one bounded `g` slice of the running disarm decided (`pause_or_hold_running_target`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DisarmPumpStep {
+    /// vmwp stopped at the owned event site: that event is the disarm point.
+    HoldEvent,
+    /// Hyper-V reported the pause complete while vmwp sat at a watchdog break: no VP can raise an
+    /// event any more, and provider writes are quiesced.
+    Paused,
+    /// The slice expired with the pause still pending and no event; run another.
+    KeepPumping,
+    /// A host asked for this engine wait to end; the disarm does not continue past that.
+    Interrupted,
+    /// vmwp stopped somewhere this adapter does not own.
+    UnownedStop,
+}
+
+/// An arrival at the event site wins over every other reading of the slice, because the event is
+/// outstanding whatever else happened and nothing but this adapter may carry it. `pause` is the
+/// helper's verdict so far: `None` while it is still running, `Some(true)` once the VM is paused.
+fn disarm_pump_step(
+    cut_short: Option<&Interruption>,
+    at_event_site: bool,
+    pause: Option<bool>,
+) -> DisarmPumpStep {
+    if at_event_site {
+        return DisarmPumpStep::HoldEvent;
+    }
+    match (cut_short, pause) {
+        (None, _) => DisarmPumpStep::UnownedStop,
+        (Some(Interruption::OnRequest), _) => DisarmPumpStep::Interrupted,
+        (Some(Interruption::Deadline { .. }), Some(true)) => DisarmPumpStep::Paused,
+        (Some(Interruption::Deadline { .. }), _) => DisarmPumpStep::KeepPumping,
+    }
 }
 
 impl DispatcherPhase {
@@ -2586,9 +2634,12 @@ impl DispatcherPhase {
 
     fn running_disarm_preparation(&self, vm_paused: bool) -> Option<RunningDisarmPreparation> {
         match self {
-            Self::ReadyForStop if vm_paused => Some(RunningDisarmPreparation::AlreadyInterrupted),
-            Self::ReadyForStop => Some(RunningDisarmPreparation::SettleNativeExecution),
-            Self::ReadyForStopInterrupted => Some(RunningDisarmPreparation::AlreadyInterrupted),
+            Self::ReadyForStop | Self::ReadyForStopInterrupted if vm_paused => {
+                Some(RunningDisarmPreparation::AlreadyPaused)
+            }
+            Self::ReadyForStop | Self::ReadyForStopInterrupted => {
+                Some(RunningDisarmPreparation::PumpUntilPausedOrHeld)
+            }
             _ => None,
         }
     }
@@ -3190,7 +3241,7 @@ impl VmwpDispatcher<'_> {
         &mut self,
         targets: &[TargetIdentity],
         deadline: Option<Instant>,
-    ) -> Result<()> {
+    ) -> Result<Disarmed> {
         targets
             .first()
             .context("running disarm requires at least one selected VP")?;
@@ -3207,16 +3258,216 @@ impl VmwpDispatcher<'_> {
             bail!("running disarm requires the armed target set with no retained event");
         }
 
-        // Suspend-VM can block behind an attached DbgEng target even when no native event exists.
-        // Stop vmwp with the ordinary watchdog, remove the exact owned breakpoint, and detach
-        // before asking Hyper-V to pause. Reattach only after that pause proves provider-write
-        // quiescence; teardown still owns the registered callback and scratch allocation.
-        // A request-scoped SetInterrupt has already produced the debugger stop in the interrupted
-        // phase. Resuming it here would discard that wake and enter a second owned wait.
-        if preparation == Some(RunningDisarmPreparation::SettleNativeExecution) {
-            self.settle_native_completion(deadline)?;
+        match preparation {
+            Some(RunningDisarmPreparation::PumpUntilPausedOrHeld) => {
+                self.pause_or_hold_running_target(targets, deadline)
+            }
+            // Suspend-VM can block behind an attached DbgEng target even when no native event
+            // exists. With the VM already paused no VP can raise one, so remove the exact owned
+            // breakpoint and detach before asking Hyper-V to confirm the pause; reattach only
+            // after it proves provider-write quiescence. Teardown still owns the registered
+            // callback and scratch allocation.
+            Some(RunningDisarmPreparation::AlreadyPaused) | None => {
+                self.pause_armed_without_event_inner(targets, deadline)?;
+                Ok(Disarmed::Paused)
+            }
         }
-        self.pause_armed_without_event_inner(targets, deadline)
+    }
+
+    /// Disarm a target whose VP may still run.
+    ///
+    /// The trace is armed while the stop is wanted, so it can fire at any instant, and the VTL1
+    /// slots cannot be cleared until the VP is quiescent: held in an owned event, or stopped by a
+    /// VM-wide pause. Hyper-V cannot pause the VM while vmwp is debugger-stopped, and the
+    /// event-site breakpoint cannot stay installed across a detach, so the one ordering that
+    /// observes every intercept the armed slots can raise is this: ask Hyper-V to pause from a
+    /// helper thread, and pump vmwp under the installed breakpoint until either the pause is
+    /// reported complete at a watchdog break (no VP can raise an event any more) or an owned
+    /// event arrives and is retained exactly as a wait retains one. That event is the disarm
+    /// point: the controller restores the VTL1 baseline under it, and the pending pause completes
+    /// once the event has been carried natively.
+    ///
+    /// Measured 2026-10-24 (M7.1a run 20261024T210251): the previous shape ran a one-second settle
+    /// whose only accepted ending was its own deadline while the trace stayed armed; the next
+    /// event faulted the session, and recovery then asked Hyper-V to pause a vmwp the debugger
+    /// still held. Its no-event path also opened a window between breakpoint removal, detach and
+    /// Suspend-VM in which an intercept would have reached vmwp's handler with nothing watching
+    /// it; what the native handler does with a VTL1 `#DB` nobody is waiting for is unmeasured,
+    /// and this ordering never finds out.
+    fn pause_or_hold_running_target(
+        &mut self,
+        targets: &[TargetIdentity],
+        deadline: Option<Instant>,
+    ) -> Result<Disarmed> {
+        let target = targets
+            .first()
+            .context("running disarm requires at least one selected VP")?;
+        if self.state.targets != targets
+            || self.state.retained_event.is_some()
+            || !self.state.attached
+            || !matches!(
+                self.state.phase,
+                DispatcherPhase::ReadyForStop | DispatcherPhase::ReadyForStopInterrupted
+            )
+        {
+            bail!(
+                "the running disarm requires the attached armed target set with no retained event"
+            );
+        }
+        let event_site = self.site_address(&self.state.profile.event_held)?;
+        let owned = self
+            .state
+            .breakpoint
+            .as_ref()
+            .context("the running disarm requires the installed event-site breakpoint")?;
+        if owned.address != event_site {
+            bail!("the owned vmwp breakpoint is not at the event site");
+        }
+        // vmwp may already sit at the site with an unread event: a request-owned stop or a fault
+        // can land there.
+        if self.engine.instruction_pointer().map_err(debugger)? == event_site
+            && let Some((event_pointer, event)) =
+                self.classify_event_at_site(targets, event_site)?
+        {
+            return self.hold_event_at_site(event_pointer, event_site, event, targets, deadline);
+        }
+        // A pause this disarm asked for earlier (recovery re-entering after a fault) is reused; any
+        // other pending transition, such as a step's resume kick, is joined before a pause is asked
+        // for.
+        let pause_pending = self
+            .state
+            .completion_kick
+            .as_ref()
+            .is_some_and(|kick| matches!(kick.action, Some(VmAction::Pause)));
+        if !pause_pending {
+            self.state.finish_completion_kick_until(deadline)?;
+        }
+        self.state.claim_vm_pause(targets)?;
+        if !pause_pending {
+            self.state.completion_kick = Some(VmTransition::immediate(
+                target.vm_id.clone(),
+                VmAction::Pause,
+            ));
+        }
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            vm_id = %target.vm_id,
+            "dispatcher asked Hyper-V to pause the VM and is pumping vmwp under its event-site \
+             breakpoint until the pause completes or an owned event arrives"
+        );
+        let bound = deadline
+            .unwrap_or_else(|| Instant::now() + Duration::from_millis(u64::from(DEBUG_WAIT)));
+        loop {
+            let remaining = bound.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                self.state.phase = DispatcherPhase::ReadyForStopInterrupted;
+                bail!(
+                    "neither a VM pause nor an owned event arrived before the running disarm \
+                     deadline; the VM is retained as possibly paused"
+                );
+            }
+            let slice = remaining.min(DISARM_PUMP_SLICE);
+            let timeout = slice.as_millis().clamp(1, u128::from(u32::MAX)) as u32;
+            let run = self
+                .engine
+                .execute_and_wait("g", timeout)
+                .map_err(debugger)?;
+            if run.target_gone {
+                bail!("vmwp left the debugger during the running disarm");
+            }
+            let rip = self.engine.instruction_pointer().map_err(debugger)?;
+            let pause = match self.state.completion_kick.as_mut() {
+                Some(kick) => kick.try_finish(),
+                None => Some(Ok(())),
+            };
+            let pause = match pause {
+                None => None,
+                Some(Ok(())) => {
+                    self.state.completion_kick = None;
+                    Some(true)
+                }
+                Some(Err(error)) => {
+                    // The helper may have paused the VM before failing its verification; recovery
+                    // and teardown issue an idempotent resume.
+                    self.state.completion_kick = None;
+                    self.state.vm_paused = true;
+                    self.state.provider_writes_quiesced = false;
+                    return Err(error.context(
+                        "the Hyper-V pause failed during the running disarm, so the VM is \
+                         conservatively retained as paused",
+                    ));
+                }
+            };
+            match disarm_pump_step(run.cut_short.as_ref(), rip == event_site, pause) {
+                DisarmPumpStep::HoldEvent => {
+                    if let Some((event_pointer, event)) =
+                        self.classify_event_at_site(targets, event_site)?
+                    {
+                        return self.hold_event_at_site(
+                            event_pointer,
+                            event_site,
+                            event,
+                            targets,
+                            deadline,
+                        );
+                    }
+                    // A handler event this adapter does not own; vmwp carries it natively, as the
+                    // ordinary wait lets it.
+                }
+                DisarmPumpStep::Paused => {
+                    self.state.confirm_vm_pause()?;
+                    self.state.phase = DispatcherPhase::ReadyForStop;
+                    tracing::info!(
+                        target: "windbg_mcp::secure_kernel_mutation",
+                        vm_id = %target.vm_id,
+                        "dispatcher proved the VM pause with its event-site breakpoint still \
+                         installed and no event outstanding"
+                    );
+                    return Ok(Disarmed::Paused);
+                }
+                DisarmPumpStep::KeepPumping => {}
+                DisarmPumpStep::Interrupted => {
+                    self.state.phase = DispatcherPhase::ReadyForStopInterrupted;
+                    bail!("the running disarm was interrupted on request");
+                }
+                DisarmPumpStep::UnownedStop => bail!(
+                    "vmwp stopped at {rip:#x} for an event the live-control adapter does not own \
+                     during the running disarm"
+                ),
+            }
+        }
+    }
+
+    /// Retain the owned event vmwp holds at the event site as the disarm point.
+    fn hold_event_at_site(
+        &mut self,
+        event_pointer: u64,
+        event_site: u64,
+        event: HeldEvent,
+        targets: &[TargetIdentity],
+        deadline: Option<Instant>,
+    ) -> Result<Disarmed> {
+        // The pending pause cannot complete while this event is outstanding, so retention must not
+        // join it: set it aside, and it is joined after the event has been carried natively.
+        let pending_pause = self.state.completion_kick.take();
+        let retained = self.retain_current_event(event_pointer, event_site, &event, deadline);
+        if self.state.completion_kick.is_none() {
+            self.state.completion_kick = pending_pause;
+        }
+        retained?;
+        self.state
+            .retained_event
+            .as_mut()
+            .context("the held event lost its retained-thread record")?
+            .adoptable = true;
+        self.state.confirm_retained_provider_stop(targets)?;
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            vp = event.vp,
+            vector = event.vector,
+            "dispatcher held a VTL1 event that arrived during the disarm; it is the disarm point"
+        );
+        Ok(Disarmed::Held(event))
     }
 }
 
@@ -3269,11 +3520,15 @@ impl EventDispatcher for VmwpDispatcher<'_> {
             .require_single_processor_software_breakpoint_scope()
     }
 
-    fn begin_disarm(&mut self, targets: &[TargetIdentity]) -> Result<()> {
+    fn begin_disarm(&mut self, targets: &[TargetIdentity]) -> Result<Disarmed> {
         self.begin_disarm_inner(targets, None)
     }
 
-    fn begin_disarm_until(&mut self, targets: &[TargetIdentity], deadline: Instant) -> Result<()> {
+    fn begin_disarm_until(
+        &mut self,
+        targets: &[TargetIdentity],
+        deadline: Instant,
+    ) -> Result<Disarmed> {
         self.begin_disarm_inner(targets, Some(deadline))
     }
 
@@ -3397,46 +3652,84 @@ impl EventDispatcher for VmwpDispatcher<'_> {
             bail!("the stop request does not match the dispatcher target");
         }
         let primary = targets.first().context("no live-control VP targets")?;
-        match &self.state.phase {
-            DispatcherPhase::ReadyForStop => {}
-            other => bail!("wait_for_stop requires an armed dispatcher, got {other:?}"),
-        }
-        if self.state.retained_event.is_some() {
-            bail!("wait_for_stop found dispatcher events retained from an earlier stop");
-        }
-        let event_site = self.site_address(&self.state.profile.event_held)?;
-        if self.state.breakpoint.is_none() {
-            let site = self.state.profile.event_held.clone();
-            self.set_site_breakpoint(&site)?;
-        }
+        let adoptable = match (&self.state.phase, &self.state.retained_event) {
+            (DispatcherPhase::Holding(held), Some(retained))
+                if retained.adoptable && &retained.event == held =>
+            {
+                Some(held.clone())
+            }
+            _ => None,
+        };
+        let (event, pause_deadline) = if let Some(event) = adoptable {
+            // The running disarm held this event while a stop was wanted
+            // (`pause_or_hold_running_target`). It is this wait's stop; the VM pause the disarm
+            // asked for stays pending behind it and is joined after the event has been carried
+            // natively, so nothing here may join the transition.
+            self.state
+                .retained_event
+                .as_mut()
+                .context("the adoptable event lost its retained-thread record")?
+                .adoptable = false;
+            let pause_deadline = self
+                .state
+                .wait_activity
+                .as_ref()
+                .and_then(|activity| activity.mark_stop_retained(Instant::now()));
+            if let Some(notice) = self.retention_notice.take() {
+                notice();
+            }
+            self.state.confirm_retained_provider_stop(targets)?;
+            tracing::info!(
+                target: "windbg_mcp::secure_kernel_mutation",
+                vp = event.vp,
+                "live Secure Kernel wait adopted the VTL1 event held by the disarm as its stop"
+            );
+            (event, pause_deadline)
+        } else {
+            match &self.state.phase {
+                DispatcherPhase::ReadyForStop => {}
+                other => bail!("wait_for_stop requires an armed dispatcher, got {other:?}"),
+            }
+            if self.state.retained_event.is_some() {
+                bail!("wait_for_stop found dispatcher events retained from an earlier stop");
+            }
+            let event_site = self.site_address(&self.state.profile.event_held)?;
+            if self.state.breakpoint.is_none() {
+                let site = self.state.profile.event_held.clone();
+                self.set_site_breakpoint(&site)?;
+            }
 
-        if self.state.vm_paused {
-            // A completed step can leave the delayed native-completion kick pending while the VM
-            // remains paused. Cancel that delay and begin the resume needed for this exact wait.
-            self.state.finish_completion_kick()?;
-            self.state.begin_vm_resume();
-            self.state.completion_kick = Some(VmTransition::immediate(
-                primary.vm_id.clone(),
-                VmAction::Resume,
-            ));
-        }
+            if self.state.vm_paused {
+                // A completed step can leave the delayed native-completion kick pending while the
+                // VM remains paused. Cancel that delay and begin the resume needed for this exact
+                // wait.
+                self.state.finish_completion_kick()?;
+                self.state.begin_vm_resume();
+                self.state.completion_kick = Some(VmTransition::immediate(
+                    primary.vm_id.clone(),
+                    VmAction::Resume,
+                ));
+            }
 
-        let deadline = Instant::now() + Duration::from_millis(u64::from(DEBUG_WAIT));
-        let (event_pointer, event) = self.wait_for_owned_event(targets, event_site, deadline)?;
-        // The callback is held as soon as the owned breakpoint returns. Start the absolute budget
-        // before any retention cleanup, including a pending Hyper-V transition join.
-        let retained_at = Instant::now();
-        let pause_deadline = self
-            .state
-            .wait_activity
-            .as_ref()
-            .and_then(|activity| activity.mark_stop_retained(retained_at));
-        if let Some(notice) = self.retention_notice.take() {
-            notice();
-        }
-        self.retain_current_event(event_pointer, event_site, &event, pause_deadline)?;
-        self.state.vm_paused = false;
-        self.state.confirm_retained_provider_stop(targets)?;
+            let deadline = Instant::now() + Duration::from_millis(u64::from(DEBUG_WAIT));
+            let (event_pointer, event) =
+                self.wait_for_owned_event(targets, event_site, deadline)?;
+            // The callback is held as soon as the owned breakpoint returns. Start the absolute
+            // budget before any retention cleanup, including a pending Hyper-V transition join.
+            let retained_at = Instant::now();
+            let pause_deadline = self
+                .state
+                .wait_activity
+                .as_ref()
+                .and_then(|activity| activity.mark_stop_retained(retained_at));
+            if let Some(notice) = self.retention_notice.take() {
+                notice();
+            }
+            self.retain_current_event(event_pointer, event_site, &event, pause_deadline)?;
+            self.state.vm_paused = false;
+            self.state.confirm_retained_provider_stop(targets)?;
+            (event, pause_deadline)
+        };
         let memory = self
             .state
             .memory
@@ -3743,6 +4036,22 @@ impl VmwpDispatcher<'_> {
             // recovery completes the callback, detaches, and joins the helper in that order.
             return self.state.confirm_retained_provider_stop(targets);
         }
+        // A debugger-held vmwp blocks Suspend-VM, and a trace still armed can raise an event at
+        // any instant, so recovery from a running arm has the same two safe endings as a disarm:
+        // an owned event held under the installed breakpoint, or a pause proved while vmwp runs.
+        // Pausing from here with vmwp stopped was the 60 s VMMS hang measured on 2026-10-24
+        // (M7.1a run 20261024T210251). A pause the failed disarm already asked for is reused.
+        if self.state.attached
+            && self.state.breakpoint.is_some()
+            && matches!(
+                self.state.phase,
+                DispatcherPhase::ReadyForStop | DispatcherPhase::ReadyForStopInterrupted
+            )
+        {
+            return self
+                .pause_or_hold_running_target(targets, deadline)
+                .map(|_| ());
+        }
         // A wait may fail while its asynchronous Resume-VM is still outstanding. With no retained
         // event, join that helper before a fresh Suspend-VM proves recovery quiescence. An incomplete
         // callback whose exact thread was not retained remains fail-closed.
@@ -3906,48 +4215,8 @@ impl VmwpDispatcher<'_> {
         let _activity = activity.as_ref().map(WaitActivity::enter).transpose()?;
         loop {
             self.run_to_current_breakpoint(deadline)?;
-            if self.engine.instruction_pointer().map_err(debugger)? != event_site {
-                bail!("debugger stopped away from the owned dispatcher breakpoint");
-            }
-            let message_type = self.register("rcx")?;
-            let event_pointer = self.register("r14")?;
-            let context = self.read_u64(
-                event_pointer
-                    .checked_add(u64::from(self.state.profile.layout.event_context))
-                    .context("event context address overflowed")?,
-            )?;
-            let vp = self.read_u32(
-                event_pointer
-                    .checked_add(u64::from(self.state.profile.layout.event_vp))
-                    .context("event VP address overflowed")?,
-            )?;
-            let vector = self
-                .state
-                .handler_contexts
-                .iter()
-                .find(|registered| registered.context == context)
-                .map(|registered| registered.vector);
-            if message_type == EVENT_TYPE_VECTOR
-                && let Some(vector @ (DEBUG_VECTOR | BREAKPOINT_VECTOR)) = vector
-                && let Some(target) = targets.iter().find(|target| target.vp == vp)
-            {
-                return Ok((
-                    event_pointer,
-                    HeldEvent {
-                        message_type: HexU64(EVENT_TYPE_VECTOR),
-                        vector,
-                        vp: target.vp,
-                        vtl: target.vtl,
-                        cpl: 0,
-                        dispatcher_context: HexU64(context),
-                        advance_instruction_pointer: false,
-                        reason: if vector == DEBUG_VECTOR {
-                            StopReason::DebugException
-                        } else {
-                            StopReason::BreakpointException
-                        },
-                    },
-                ));
+            if let Some(owned) = self.classify_event_at_site(targets, event_site)? {
+                return Ok(owned);
             }
             let deadline_expired = self
                 .state
@@ -3959,6 +4228,59 @@ impl VmwpDispatcher<'_> {
                 bail!("too many unrelated dispatcher events before an owned exception event");
             }
         }
+    }
+
+    /// Read the native event vmwp holds at the event site and decide whether this adapter owns it:
+    /// a vector event for a selected VP through one of its registered handler contexts.
+    fn classify_event_at_site(
+        &self,
+        targets: &[TargetIdentity],
+        event_site: u64,
+    ) -> Result<Option<(u64, HeldEvent)>> {
+        if self.engine.instruction_pointer().map_err(debugger)? != event_site {
+            bail!("debugger stopped away from the owned dispatcher breakpoint");
+        }
+        let message_type = self.register("rcx")?;
+        let event_pointer = self.register("r14")?;
+        let context = self.read_u64(
+            event_pointer
+                .checked_add(u64::from(self.state.profile.layout.event_context))
+                .context("event context address overflowed")?,
+        )?;
+        let vp = self.read_u32(
+            event_pointer
+                .checked_add(u64::from(self.state.profile.layout.event_vp))
+                .context("event VP address overflowed")?,
+        )?;
+        let vector = self
+            .state
+            .handler_contexts
+            .iter()
+            .find(|registered| registered.context == context)
+            .map(|registered| registered.vector);
+        if message_type == EVENT_TYPE_VECTOR
+            && let Some(vector @ (DEBUG_VECTOR | BREAKPOINT_VECTOR)) = vector
+            && let Some(target) = targets.iter().find(|target| target.vp == vp)
+        {
+            return Ok(Some((
+                event_pointer,
+                HeldEvent {
+                    message_type: HexU64(EVENT_TYPE_VECTOR),
+                    vector,
+                    vp: target.vp,
+                    vtl: target.vtl,
+                    cpl: 0,
+                    dispatcher_context: HexU64(context),
+                    advance_instruction_pointer: false,
+                    reason: if vector == DEBUG_VECTOR {
+                        StopReason::DebugException
+                    } else {
+                        StopReason::BreakpointException
+                    },
+                },
+            )));
+        }
+        Ok(None)
     }
 
     fn retain_current_event(
@@ -3988,6 +4310,7 @@ impl VmwpDispatcher<'_> {
             event: event.clone(),
             validation_complete: false,
             release_eligible: false,
+            adoptable: false,
         });
         let advance = self.read_u8(
             event_pointer
@@ -5925,15 +6248,20 @@ struct VmTransition {
     cancel: mpsc::Sender<()>,
     result: mpsc::Receiver<Result<()>>,
     thread: Option<thread::JoinHandle<()>>,
+    /// The single action an immediate transition performs; `None` for the delayed completion kick,
+    /// which pauses and then resumes.
+    action: Option<VmAction>,
 }
 
 impl VmTransition {
     fn immediate(vm_id: String, action: VmAction) -> Self {
-        Self::spawn(vm_id, Duration::ZERO, move |vm_id, cancel| {
+        let mut transition = Self::spawn(vm_id, Duration::ZERO, move |vm_id, cancel| {
             run_vm_query_inner(vm_id, action, POWERSHELL_WAIT, Some(cancel))?;
             trace_vm_action(vm_id, action);
             Ok(())
-        })
+        });
+        transition.action = Some(action);
+        transition
     }
 
     fn completion_kick(vm_id: String) -> Self {
@@ -5961,7 +6289,26 @@ impl VmTransition {
             cancel: cancel_tx,
             result: result_rx,
             thread: Some(thread),
+            action: None,
         }
+    }
+
+    /// The helper's verdict if it has reported one, without waiting for it. `None` while it is
+    /// still running; afterwards the transition is finished and must not be joined again.
+    fn try_finish(&mut self) -> Option<Result<()>> {
+        let result = match self.result.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return None,
+            Err(mpsc::TryRecvError::Disconnected) => Err(anyhow!(
+                "Hyper-V transition helper exited without reporting its result"
+            )),
+        };
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            return Some(Err(anyhow!("Hyper-V transition helper panicked")));
+        }
+        Some(result)
     }
 
     fn finish_until(&mut self, deadline: Option<Instant>) -> Result<()> {
@@ -6013,6 +6360,7 @@ impl VmTransition {
             cancel,
             result: result_rx,
             thread: None,
+            action: None,
         }
     }
 }
@@ -7121,22 +7469,154 @@ mod tests {
     }
 
     #[test]
-    fn running_disarm_preserves_a_request_owned_debugger_stop() {
+    fn running_disarm_pumps_unless_the_vm_is_already_paused() {
         assert_eq!(
             DispatcherPhase::ReadyForStop.running_disarm_preparation(false),
-            Some(RunningDisarmPreparation::SettleNativeExecution)
+            Some(RunningDisarmPreparation::PumpUntilPausedOrHeld)
         );
         assert_eq!(
             DispatcherPhase::ReadyForStop.running_disarm_preparation(true),
-            Some(RunningDisarmPreparation::AlreadyInterrupted)
+            Some(RunningDisarmPreparation::AlreadyPaused)
         );
+        // A request-owned debugger stop leaves the trace armed and the VP running exactly as an
+        // ordinary wait expiry does, so it takes the same pump rather than detaching first.
         assert_eq!(
             DispatcherPhase::ReadyForStopInterrupted.running_disarm_preparation(false),
-            Some(RunningDisarmPreparation::AlreadyInterrupted)
+            Some(RunningDisarmPreparation::PumpUntilPausedOrHeld)
+        );
+        assert_eq!(
+            DispatcherPhase::ReadyForStopInterrupted.running_disarm_preparation(true),
+            Some(RunningDisarmPreparation::AlreadyPaused)
         );
         assert_eq!(
             DispatcherPhase::Detached.running_disarm_preparation(true),
             None
+        );
+    }
+
+    /// Measured 2026-10-24 (M7.1a run 20261024T210251): with the trace armed, the stop path ran a
+    /// settle that accepted only its own deadline, and the event that arrived inside it faulted the
+    /// session. An arrival is the disarm point whatever else the slice reports.
+    #[test]
+    fn an_event_arriving_during_the_disarm_is_the_disarm_point_not_a_fault() {
+        let deadline = Interruption::Deadline { after_ms: 250 };
+        for cut_short in [None, Some(&Interruption::OnRequest), Some(&deadline)] {
+            for pause in [None, Some(true), Some(false)] {
+                assert_eq!(
+                    disarm_pump_step(cut_short, true, pause),
+                    DisarmPumpStep::HoldEvent,
+                    "{cut_short:?} {pause:?}"
+                );
+            }
+        }
+        assert_eq!(
+            disarm_pump_step(Some(&deadline), false, None),
+            DisarmPumpStep::KeepPumping
+        );
+        assert_eq!(
+            disarm_pump_step(Some(&deadline), false, Some(true)),
+            DisarmPumpStep::Paused
+        );
+        assert_eq!(
+            disarm_pump_step(Some(&Interruption::OnRequest), false, None),
+            DisarmPumpStep::Interrupted
+        );
+        assert_eq!(
+            disarm_pump_step(None, false, None),
+            DisarmPumpStep::UnownedStop
+        );
+        assert_eq!(
+            disarm_pump_step(None, false, Some(true)),
+            DisarmPumpStep::UnownedStop
+        );
+    }
+
+    #[test]
+    fn a_pending_transition_is_polled_without_blocking() {
+        let mut delayed = VmTransition::spawn("vm".into(), Duration::from_secs(60), |_, _| Ok(()));
+        assert!(delayed.try_finish().is_none());
+        assert!(!delayed.finished());
+        let _ = delayed.cancel.send(());
+        let bound = Instant::now() + Duration::from_secs(5);
+        let verdict = loop {
+            if let Some(verdict) = delayed.try_finish() {
+                break verdict;
+            }
+            assert!(
+                Instant::now() < bound,
+                "a cancelled transition reports promptly"
+            );
+            thread::sleep(Duration::from_millis(5));
+        };
+        verdict.unwrap();
+        assert!(delayed.finished());
+
+        let mut completed = VmTransition::completed_for_test(Ok(()));
+        completed.try_finish().unwrap().unwrap();
+        assert!(matches!(
+            VmTransition::immediate("vm".into(), VmAction::Pause).action,
+            Some(VmAction::Pause)
+        ));
+    }
+
+    /// The running disarm keeps vmwp attached with the event-site breakpoint installed for its
+    /// whole pump, asks Hyper-V to pause before the first slice, and never runs the settle that
+    /// refuses an arrival. Recovery from a running arm takes the same path instead of pausing a
+    /// debugger-held vmwp.
+    #[test]
+    fn the_running_disarm_pumps_under_its_breakpoint_instead_of_settling() {
+        let source = include_str!("skdispatch.rs").replace("\r\n", "\n");
+        let disarm = source
+            .split_once("    fn begin_disarm_inner(\n")
+            .expect("the running disarm exists")
+            .1
+            .split_once("    fn pause_or_hold_running_target(\n")
+            .expect("the pump follows the disarm")
+            .0;
+        assert!(disarm.contains("pause_or_hold_running_target(targets, deadline)"));
+        assert!(!disarm.contains("settle_native_completion"));
+
+        let pump = source
+            .split_once("    fn pause_or_hold_running_target(\n")
+            .expect("the pump exists")
+            .1
+            .split_once("    fn hold_event_at_site(\n")
+            .expect("the hold follows the pump")
+            .0;
+        let pause = pump
+            .find("VmTransition::immediate(")
+            .expect("the pump asks Hyper-V to pause");
+        let first_slice = pump
+            .find("execute_and_wait(\"g\"")
+            .expect("the pump runs vmwp");
+        assert!(
+            pause < first_slice,
+            "the pause is asked for before vmwp first runs"
+        );
+        assert!(!pump.contains("remove_owned_breakpoint"));
+        assert!(!pump.contains("detach_handled"));
+        assert!(!pump.contains("settle_native_completion"));
+        assert!(
+            !pump.contains("run_vm_action"),
+            "the pump never blocks on a VMMS call"
+        );
+
+        let recovery = source
+            .split_once("    fn establish_recovery_pause_inner(\n")
+            .expect("recovery quiescence exists")
+            .1
+            .split_once("    fn recover_inner(\n")
+            .expect("recovery follows its pause")
+            .0;
+        let pump_route = recovery
+            .find("pause_or_hold_running_target(targets, deadline)")
+            .expect("recovery from a running arm pumps");
+        let join = recovery
+            .find("finish_completion_kick_until(deadline)")
+            .expect("recovery joins a pending transition");
+        assert!(
+            pump_route < join,
+            "a pending pause is reused by the pump rather than joined with vmwp held"
         );
     }
 
@@ -7198,6 +7678,7 @@ mod tests {
             event,
             validation_complete: true,
             release_eligible: true,
+            adoptable: false,
         });
         let mut selected = target();
         selected.vp = 1;
@@ -7239,6 +7720,7 @@ mod tests {
             event,
             validation_complete: true,
             release_eligible: true,
+            adoptable: false,
         });
 
         state.retained_event.take().unwrap();
@@ -7272,6 +7754,7 @@ mod tests {
             event,
             validation_complete: false,
             release_eligible: false,
+            adoptable: false,
         });
 
         let error = state.refuse_unsafe_recovery().unwrap_err();

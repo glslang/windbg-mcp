@@ -222,10 +222,16 @@ pub(crate) trait EventDispatcher {
     fn verify_software_breakpoint_scope_until(&mut self, _deadline: Instant) -> Result<()> {
         bail!("this dispatcher cannot prove software-breakpoint VP coverage")
     }
-    /// Detach before pausing an armed target that produced no event, then reattach while paused so
-    /// provider state and the registered handler can be removed without deadlocking Hyper-V.
-    fn begin_disarm(&mut self, targets: &[TargetIdentity]) -> Result<()>;
-    fn begin_disarm_until(&mut self, targets: &[TargetIdentity], _deadline: Instant) -> Result<()> {
+    /// Bring a running armed target to provider-write quiescence so it can be disarmed: either
+    /// Hyper-V pauses the VM with no event outstanding, or an owned event arrives first and is
+    /// held. Either ending quiesces the VP. An arrival is the disarm point rather than a fault,
+    /// because the trace stays armed while the stop is wanted and may fire at any instant.
+    fn begin_disarm(&mut self, targets: &[TargetIdentity]) -> Result<Disarmed>;
+    fn begin_disarm_until(
+        &mut self,
+        targets: &[TargetIdentity],
+        _deadline: Instant,
+    ) -> Result<Disarmed> {
         self.begin_disarm(targets)
     }
     fn finish_arm(&mut self) -> Result<()>;
@@ -369,6 +375,18 @@ pub(crate) enum ReleaseMode {
     ArmNextStop,
     /// Complete the event and detach it as handled so `vmwp` and the guest really resume.
     Resume,
+}
+
+/// How a running disarm reached provider-write quiescence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Disarmed {
+    /// Hyper-V paused the VM while the event-site breakpoint stayed installed; no VP can raise an
+    /// event, and the dispatcher is attached and armed as before.
+    Paused,
+    /// An owned VTL1 event arrived while the stop was wanted and is retained: the disarm point.
+    /// The controller restores the baseline under it; the next wait adopts it as its stop, and a
+    /// close completes it into the pause teardown needs.
+    Held(HeldEvent),
 }
 
 /// Original bytes at one build-specific vmwp stop site. The adapter verifies them after every
@@ -1888,9 +1906,12 @@ impl<P: ControlProvider> LiveControl<P> {
             .set_outer_deadline(Some(deadline));
         self.state = State::Arming;
         let result = (|| {
-            dispatcher.begin_disarm_until(&targets, deadline)?;
+            let disarmed = dispatcher.begin_disarm_until(&targets, deadline)?;
             if !dispatcher.provider_writes_quiesced() {
                 bail!("the dispatcher did not prove quiescence for a break request");
+            }
+            if let Disarmed::Held(_) = disarmed {
+                return Ok(None);
             }
             self.providers[active].provider.begin_arm()?;
             self.providers[active].provider_phase = ProviderPhase::Arming;
@@ -1954,14 +1975,29 @@ impl<P: ControlProvider> LiveControl<P> {
             self.providers[active].provider.finish_arm()?;
             self.providers[active].provider_phase = ProviderPhase::Running;
             dispatcher.finish_arm()?;
-            Ok((slot, transient))
+            Ok(Some((slot, transient)))
         })();
         self.providers[active].provider.set_outer_deadline(None);
-        let (slot, transient) = match result {
-            Ok(result) => result,
+        let armed = match result {
+            Ok(armed) => armed,
             Err(error) => {
                 return Err(self.enter_fault_inner(dispatcher, error, None, Some(deadline)));
             }
+        };
+        let Some((slot, transient)) = armed else {
+            // A natural event arrived while the break was wanted and the dispatcher holds it. The
+            // armed slots and the natural expectation stand untouched: the next wait adopts that
+            // event as its hardware stop, which is the stop the caller asked for.
+            self.active_provider = None;
+            self.dispatcher_event = None;
+            self.state = State::Running;
+            tracing::info!(
+                target: "windbg_mcp::secure_kernel_mutation",
+                vm_id = %self.providers[active].target.vm_id,
+                vp = self.providers[active].target.vp,
+                "live Secure Kernel control took a natural VTL1 event in place of its break request"
+            );
+            return Ok(self.commit_epoch(next_epoch));
         };
         self.breakpoints
             .retain(|breakpoint| breakpoint.slot != transient.slot);
@@ -2602,10 +2638,10 @@ impl<P: ControlProvider> LiveControl<P> {
                     {
                         bail!("the armed session has no breakpoint guards");
                     }
-                    match deadline {
+                    let disarmed = match deadline {
                         Some(deadline) => dispatcher.begin_disarm_until(&targets, deadline)?,
                         None => dispatcher.begin_disarm(&targets)?,
-                    }
+                    };
                     if !dispatcher.provider_writes_quiesced() {
                         bail!("the dispatcher did not prove quiescence for disarming providers");
                     }
@@ -2626,7 +2662,26 @@ impl<P: ControlProvider> LiveControl<P> {
                         self.providers[index].provider.finish_arm()?;
                         self.providers[index].provider_phase = ProviderPhase::Running;
                     }
-                    dispatcher.finish_arm()?;
+                    match disarmed {
+                        Disarmed::Paused => dispatcher.finish_arm()?,
+                        Disarmed::Held(event) => {
+                            // The baseline is restored under the event that arrived during the
+                            // disarm. Completing it into a proved VM pause keeps a busy VTL1 from
+                            // enqueueing another while the handler is removed, as a stopped close
+                            // does.
+                            match deadline {
+                                Some(deadline) => dispatcher
+                                    .release_event_and_pause_until(&event, &targets, deadline)?,
+                                None => dispatcher.release_event_and_pause(&event, &targets)?,
+                            }
+                            if !dispatcher.provider_writes_quiesced() {
+                                bail!(
+                                    "close did not prove a VM pause after completing the event \
+                                     held by the disarm"
+                                );
+                            }
+                        }
+                    }
                     Ok(())
                 })();
                 for provider in &mut self.providers {
@@ -3815,6 +3870,8 @@ mod tests {
         retained_recovery_deadline: Option<Instant>,
         recovery_deadlines: Vec<Option<Instant>>,
         teardown_deadlines: Vec<Option<Instant>>,
+        /// An owned event that arrives while the disarm pumps; the next wait adopts it.
+        disarm_holds: Option<HeldEvent>,
     }
 
     impl FakeDispatcher {
@@ -3844,6 +3901,7 @@ mod tests {
                 retained_recovery_deadline: None,
                 recovery_deadlines: Vec::new(),
                 teardown_deadlines: Vec::new(),
+                disarm_holds: None,
             }
         }
     }
@@ -3874,28 +3932,18 @@ mod tests {
             Ok(())
         }
 
-        fn begin_disarm(&mut self, _targets: &[TargetIdentity]) -> Result<()> {
+        fn begin_disarm(&mut self, _targets: &[TargetIdentity]) -> Result<Disarmed> {
             self.disarm_deadlines.push(None);
-            self.actions.push(Action::BeginDisarm);
-            self.provider_writes_quiesced = true;
-            if let Some(reason) = self.fail_begin {
-                bail!("{reason}");
-            }
-            Ok(())
+            self.disarm_inner()
         }
 
         fn begin_disarm_until(
             &mut self,
             _targets: &[TargetIdentity],
             deadline: Instant,
-        ) -> Result<()> {
+        ) -> Result<Disarmed> {
             self.disarm_deadlines.push(Some(deadline));
-            self.actions.push(Action::BeginDisarm);
-            self.provider_writes_quiesced = true;
-            if let Some(reason) = self.fail_begin {
-                bail!("{reason}");
-            }
-            Ok(())
+            self.disarm_inner()
         }
 
         fn finish_arm(&mut self) -> Result<()> {
@@ -4121,6 +4169,23 @@ mod tests {
     }
 
     impl FakeDispatcher {
+        fn disarm_inner(&mut self) -> Result<Disarmed> {
+            self.actions.push(Action::BeginDisarm);
+            self.provider_writes_quiesced = true;
+            if let Some(reason) = self.fail_begin {
+                bail!("{reason}");
+            }
+            if let Some(event) = self.disarm_holds.take() {
+                // The live adapter's next wait adopts the event it held during the disarm.
+                self.stops.push_front(ObservedStop {
+                    event: event.clone(),
+                    instructions: vec![instruction()],
+                });
+                return Ok(Disarmed::Held(event));
+            }
+            Ok(Disarmed::Paused)
+        }
+
         fn teardown_inner(&mut self) -> Result<()> {
             self.actions.push(Action::Teardown);
             if let Some(reason) = self.fail_teardown {
@@ -6019,6 +6084,85 @@ mod tests {
                 Action::BeginDisarm,
                 Action::FinishArm,
                 Action::Teardown,
+            ]
+        );
+    }
+
+    /// Measured 2026-10-24 (M7.1a run 20261024T210251): a stop requested while the natural trace
+    /// ran found the next event arriving inside the disarm, and the adapter called that stop
+    /// unexpected. An armed trace fires; the event is the disarm point, restored under and then
+    /// completed into the pause teardown needs.
+    #[test]
+    fn close_while_running_completes_the_event_held_by_the_disarm_into_the_pause() {
+        let baseline = register_values(BASE_RIP, 0xffff_0ff0, 0x400, 0x46);
+        let mut dispatcher = FakeDispatcher::new([]);
+        dispatcher.disarm_holds = Some(event(StopReason::DebugException));
+        let mut control = LiveControl::open(FakeProvider::new()).unwrap();
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Natural)
+            .unwrap();
+
+        control.close(&mut dispatcher).unwrap();
+
+        assert_eq!(control.phase(), LivePhase::Closed);
+        assert!(control.providers[0].baseline.is_none());
+        let provider = control.test_provider();
+        assert_eq!(provider.registers, baseline);
+        assert_eq!(provider.phase, FakePhase::Running);
+        assert_eq!(
+            dispatcher.actions,
+            vec![
+                Action::BeginArm,
+                Action::FinishArm,
+                Action::BeginDisarm,
+                Action::ReleaseAndPause,
+                Action::Teardown,
+            ]
+        );
+    }
+
+    /// A break requested while the trace runs reaches the dispatcher as a running disarm. When a
+    /// natural event arrives inside it, that event is the stop the caller wanted: no transient slot
+    /// is written over the armed state, and the next wait adopts it as a hardware stop.
+    #[test]
+    fn break_on_demand_adopts_the_event_held_by_the_disarm_as_its_hardware_stop() {
+        let mut dispatcher = FakeDispatcher::new([]);
+        dispatcher.disarm_holds = Some(event(StopReason::DebugException));
+        let mut control = LiveControl::open(FakeProvider::new()).unwrap();
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Natural)
+            .unwrap();
+        let armed = control.test_provider().registers.clone();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+
+        control
+            .request_break_until(&mut dispatcher, deadline)
+            .unwrap();
+
+        assert_eq!(control.phase(), LivePhase::Running);
+        assert!(matches!(
+            control.expected_stop,
+            Some(ExpectedStop::Hardware)
+        ));
+        assert_eq!(
+            control.test_provider().registers,
+            armed,
+            "no transient slot may be written over a held natural event"
+        );
+        let stop = control.wait_for_stop(&mut dispatcher).unwrap();
+        assert_eq!(control.phase(), LivePhase::Stopped);
+        assert!(matches!(
+            stop.event.reason,
+            StopReason::HardwareBreakpoint { .. }
+        ));
+        assert_eq!(dispatcher.disarm_deadlines, [Some(deadline)]);
+        assert_eq!(
+            dispatcher.actions,
+            vec![
+                Action::BeginArm,
+                Action::FinishArm,
+                Action::BeginDisarm,
+                Action::Wait,
             ]
         );
     }
