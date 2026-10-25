@@ -390,6 +390,23 @@ completion one watchdog-bounded run slice before the handled detach. The delayed
 helper is joined only after detach, so its pause request cannot deadlock on a debugger-stopped
 `vmwp`.
 
+A stop wanted while the VP runs — a break request, a service-trace stop or a close of an armed
+session — is a running disarm, and since 2026-10-25 it is a pump rather than a settle. The trace
+stays armed until the VP is quiescent, Hyper-V cannot pause a VM whose `vmwp` is debugger-stopped,
+and the event-site breakpoint cannot stay installed across a detach, so the adapter asks for the
+pause from a helper thread and pumps `vmwp` in 250 ms slices under the installed breakpoint until
+either the pause is reported complete at a watchdog break, after which no VP can raise an event, or
+an owned event arrives and is retained exactly as a wait retains one. That event is the disarm
+point: the controller restores the baseline under it, the next wait adopts it as its hardware stop
+(a break request takes it in place of a transient slot), and a close completes it into the pause
+teardown needs. Recovery from a running arm takes the same path. The M7.1a nested run
+`20261024T210251` measured the shape this replaced: a one-second settle that accepted only its own
+deadline while the trace stayed armed, the next event faulting the session, and recovery pausing a
+debugger-held `vmwp` for 60 s. The same ordering means no intercept reaches `vmwp`'s handler with
+nothing watching it; what the native handler would do with a VTL1 `#DB` nobody is waiting for is
+unmeasured and stays that way. The multi-provider stop keeps its earlier ordering, which completes
+the winner before the pause with its slots still armed.
+
 All debugger commands are fixed internal operations with validated numeric substitutions. Software
 breakpoints are created and removed through the typed DbgEng API, and their original bytes are read
 back after removal. The adapter uses `.detach /h` at the pending native breakpoint, because the
