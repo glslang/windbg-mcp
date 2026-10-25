@@ -29,10 +29,13 @@ controller or the investigation.
   guarded `vmwp` dispatcher hook.
 - A live controller session owns one disposable VM and one worker. DbgEng stays on that worker's
   engine thread; the supervisor never touches it.
-- Hardware execution breakpoints remain the primary VTL1 mutation primitive. M3 proved guarded,
-  one-shot software breakpoints for the single-vCPU Secure Kernel controller, and M5 separately
-  proved DbgEng-owned software breakpoints in the hypervisor. Neither result authorizes general KD
-  memory writes, multiprocessor patching or reuse of one layer's restoration proof in another.
+- Hardware execution breakpoints remain the primary VTL1 mutation primitive, and VTL1 is the only
+  layer that holds them (decided 2026-10-25 under M7.1a: DR0-DR6 are shared between VTLs on a VP,
+  so a VTL0 hardware breakpoint and a VTL1 one collide). M4 and M5 arm DbgEng-owned software
+  breakpoints. M3 proved guarded, one-shot software breakpoints for the single-vCPU Secure Kernel
+  controller, and M5 separately proved DbgEng-owned software breakpoints in the hypervisor. Neither
+  result authorizes general KD memory writes, multiprocessor patching or reuse of one layer's
+  restoration proof in another.
 - Every stop and transition is tied to an opaque epoch, exact instruction bytes, VM identity,
   partition, VP, VTL and CR3. Stale coordinates are refusals, not best-effort operations.
 - The 2026-10-18 `g` qualification is a failed facade gate: after WinDbg armed
@@ -287,6 +290,12 @@ unreadable hit. Those calls covered ten service numbers and callers including `V
 All three guest invocations completed create/load/initialize/terminate/delete, `stop: true`
 removed the owned breakpoint, detach terminated the worker, guest boot identity and `vmwp` PID
 were unchanged, heartbeat stayed healthy, and no process was retained.
+
+On 2026-10-25 the breakpoint became a DbgEng-owned software breakpoint, the kind M5 arms. The
+processor execution breakpoint occupied DR0 on the traced VP, and DR0-DR6 are shared between VTL0
+and VTL1 on a VP, so the VTL1 layer's slot-0 arm overwrote it (M7.1a, run `20261024T212721`); the
+no-patch premise behind it had never been measured. The record above was taken with the processor
+breakpoint. The software breakpoint's first live record is the M7.1a coexistence rerun.
 
 ### M5 — hypervisor transition tracer
 
@@ -579,10 +588,12 @@ nested L2 workload under K3, and the nested-parent provider is qualified: the re
 write, arm/restore and natural held-event controls, the provider-death control and the complete
 positive sequence on three clean child boots all passed. The admitted-topology coexistence driver
 exists and opened and armed all three layers once; the live coexistence exit gate is blocked on
-two findings from the reruns under the inverted arm order: M6's running-trace stop faults within
-a second of a VTL1 event and its recovery hangs on VMMS, and the child VP's DR0-DR6 are shared
-between VTLs, so M4's hardware breakpoint and M6's slot-0 breakpoint cannot both be armed on it.
-Both are recorded under M7.1a, so M7.2 remains closed.
+two findings from the reruns under the inverted arm order: M6's stop of a running trace asserts
+that no event arrives during its settle run and its recovery hangs on VMMS, and the child VP's
+DR0-DR6 are shared between VTLs, so M4's hardware breakpoint and M6's slot-0 breakpoint cannot
+both be armed on it. The second is decided: only VTL1 holds hardware breakpoints and M4 arms a
+software breakpoint. The first is a server fix still to make. Both are recorded under M7.1a, so
+M7.2 remains closed.
 
 Join M4–M6 without putting two targets in one DbgEng process. The coordinator owns session ids and
 lifecycles, not engines: each layer remains in its existing worker and contributes an immutable
@@ -913,27 +924,39 @@ Continuation order from this checkpoint:
    disturb. The cap stays as it is: on an idle child it is reached about 2 s after
    M5 is armed and becomes M5's drain point, and for M7.2 it is the latency budget inside which
    the workload must land, a measurement for that gate rather than a coexistence blocker.
-2. **Decide debug-register ownership on the child VP; this is a design decision, not a lab one.**
-   DR0-DR6 are shared between VTL0 and VTL1 on a VP and only DR7 is per VTL, as run
-   `20261024T212721` measured: M6's arm found M4's `nt!VslpEnterIumSecureMode` address in DR0 and
-   M4's B0 in DR6, overwrote both, and refused its first event. M4's trace is a processor
-   execution breakpoint on purpose, because that entry runs on the VTL-transition path and its
-   bytes must not be patched. The candidates are: M4 traces the same call from a caller site with
-   a software breakpoint; M6 takes a slot M4 does not use, masks its DR6 check to the slots it
-   owns and preserves the other slots' values at arm and restore; or the NT-side arguments are
-   read in VTL1 at service entry and M4 arms nothing. Each moves tool code and needs offline tests
-   before a live run, and the single-step bit that reached VTL1's first event after a VM resume
-   needs its path measured before any choice relies on DR6.
-3. **Fix M6's stop of a running natural trace under traffic, as its own item.** Run
-   `20261024T210251` measured the defect: the stop settles `vmwp` for `NATIVE_SETTLE_WAIT` before
-   it disarms, with the arrival breakpoint installed and DR7 armed, so an event inside that window
-   faults the session, and the fail-closed recovery then asks VMMS to pause a `vmwp` the
-   dispatcher itself holds stopped. The driver's half is done: `await_m6_quiescence` reads the
-   trace without stopping it until nothing has moved for three seconds. The server's half is that
-   the stop should pause, disarm and then settle, and that no recovery path may call VMMS while
-   the dispatcher holds `vmwp` stopped.
+2. **Decided 2026-10-25: only the VTL1 layer holds hardware breakpoints.** DR0-DR6 are shared
+   between VTL0 and VTL1 on a VP and only DR7 is per VTL, as run `20261024T212721` measured: M6's
+   arm found M4's `nt!VslpEnterIumSecureMode` address in DR0 and M4's B0 in DR6, overwrote both,
+   and refused its first event. M4's processor execution breakpoint rested on the premise that the
+   entry's bytes must not be patched, which no run ever measured, and M5 already arms DbgEng-owned
+   software breakpoints in the hypervisor. `sk_call_trace` therefore arms a DbgEng-owned software
+   breakpoint at the same entry; the source test pins the kind, and the runbook and changelog say
+   which record was taken with which kind. Its first live record is the rerun below. The
+   single-step bit that reached VTL1's first event after a VM resume still needs its path
+   measured; M6's exactly-one-slot check reads only the four B bits, so it does not count it.
+3. **Fix the stop of a running natural trace; the fault is the server's assertion, not the
+   traffic.** Run `20261024T210251` measured it: the last event's completion re-armed the trace,
+   arrival breakpoint installed and DR7 live, and 1.3 ms later the stop path ran
+   `settle_native_completion`, a 1 s `g` whose only accepted ending is its own deadline. The
+   armed trace fired at the arrival site, as an armed trace does, and the code called that
+   "unexpected"; the fail-closed recovery then asked VMMS to pause a `vmwp` the dispatcher itself
+   held stopped, which hung for 60 s. The assertion holds only while the trigger is idle, which
+   is a property of the guest's activity and not of the dispatcher's state, and the solo
+   qualification never exercised it because its drains ran long after the trigger went quiet. The
+   fix is in `skdispatch`: an event that arrives while a stop is wanted is the disarm point, not
+   a fault. Hold it, restore the VTL1 baseline at the hold (the per-event path already writes
+   DR6, DR7 and RFLAGS there), release it with `ReleaseMode::Resume` so nothing re-arms, and only
+   then settle, detach and pause for handler teardown; with DR7 clear, the settle's deadline is
+   the only ending left. The no-event path keeps its order but carries the same hazard in a worse
+   form: between `remove_owned_breakpoint`, detach and Suspend-VM an intercept would reach
+   `vmwp`'s handler with no dispatcher breakpoint and DR7 still armed, and what the native handler
+   does with a VTL1 `#DB` nobody is waiting for is unmeasured. No recovery path may call VMMS
+   while the dispatcher holds `vmwp` stopped. The driver's `await_m6_quiescence` makes the same
+   assumption with a longer window; it is a stopgap, not evidence for the gate, and comes out
+   once the server is fixed.
 4. Then rerun `run-m7-nested-coexistence.ps1`: open all three, arm M4 -> M6 -> M5, launch no
-   workload, drain M5 -> M6 -> M4, and repeat the relevant failure and timeout injections. The gate requires
+   workload, drain M5 -> M6 -> M4, and repeat the relevant failure and timeout injections. M4's
+   software breakpoint is first exercised live here. The gate requires
    unchanged identities and byte/register baselines, healthy parent and child, and no retained
    process. Any Hyper-V management query of the child while a layer holds its `vmwp` must be
    bounded, for the reason the provider-death control measured.

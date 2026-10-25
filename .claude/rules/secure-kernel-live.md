@@ -71,6 +71,13 @@ second session on the pinned image to do it.
 another one fires nothing, and the symptom is a wait that simply expires. On a guest with more than
 one VP, pin whatever is meant to be caught.
 
+**And on one VP they are shared between VTLs: DR0-DR6 are one set, only DR7 is per VTL.** Measured
+2026-10-24 on the M7 nested child (`docs/secure-kernel/skcall-debugging-roadmap.md`, M7.1a): a
+VTL1 slot-0 arm found the VTL0 kernel session's `ba` address in DR0 and its B0 bit in DR6, and
+overwrote both. So the VTL1 layer is the only one that holds hardware breakpoints — `sk_call_trace`
+and the hypervisor trace arm DbgEng software breakpoints, and a source test pins each kind — and a
+VTL1 stop's DR6 can carry bits a VTL0 debugger left there.
+
 **`sk_live_wait` carries its own deadline and takes no timeout argument.** It comes from the
 operation's budget, which is of the order of a minute — so anything timed to arrive later than that
 cannot be caught by it, and a delay chosen to give the arm headroom can quietly exceed it. Time

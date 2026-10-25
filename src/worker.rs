@@ -11171,15 +11171,14 @@ fn arm_sk_call_trace(
     let generation = SK_CALL_TRACE_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
     let trace_id = format!("skcall-{generation}");
     let marker = format!("$$ sk_call_trace {generation}");
-    // This entry runs on the VTL-transition path. Do not patch its protected instruction bytes:
-    // a processor execution breakpoint observes the same exact address without planting `int 3`.
-    let spec = BreakpointSpec::data(
-        BreakpointAt::Expression("nt!VslpEnterIumSecureMode".to_string()),
-        DataWatch {
-            access: DataAccess::Execute,
-            size: 1,
-        },
-    )
+    // One DbgEng-owned software breakpoint, the kind the hypervisor trace arms. Until 2026-10-25
+    // this was a one-byte processor execution breakpoint, on the never-measured premise that the
+    // entry's bytes must not be patched. That choice occupied DR0 on the traced VP, and DR0-DR6
+    // are shared between VTL0 and VTL1 on a VP, so the VTL1 layer's slot-0 arm overwrote it
+    // (M7.1a run 20261024T212721). Only the VTL1 layer holds hardware breakpoints.
+    let spec = BreakpointSpec::code(BreakpointAt::Expression(
+        "nt!VslpEnterIumSecureMode".to_string(),
+    ))
     .with_command(marker.clone());
     let timeout_ms = remaining.as_millis().clamp(1, u128::from(u32::MAX)) as u32;
     let armed = e
@@ -17143,9 +17142,9 @@ mod tests {
             "the trace no longer marks the breakpoint it owns"
         );
         assert!(
-            armed.contains("access: DataAccess::Execute") && armed.contains("size: 1"),
-            "the VTL-transition entry must use a one-byte processor execution breakpoint rather \
-             than patching its protected instruction bytes"
+            armed.contains("BreakpointSpec::code(") && !armed.contains("BreakpointSpec::data("),
+            "the VTL0 entry must use a DbgEng-owned software breakpoint; a processor execution \
+             breakpoint occupies a debug register the VP shares with the VTL1 layer"
         );
         assert!(
             armed.contains("recorder.owns(id, command.as_deref())"),
