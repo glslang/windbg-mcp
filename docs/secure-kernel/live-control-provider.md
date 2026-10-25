@@ -88,8 +88,9 @@ The protocol has seven required capabilities:
 software-breakpoint execution before mutation unless this capability and the dispatcher's separate
 vector-3 context are both present.
 
-`foreign_events` is optional too, and is what keeps a VTL1 session healthy beside a VTL0 kernel
-debugger on the same VP. The exception intercept the dispatcher installs for vectors 1 and 3 is
+`active_vtl` is optional too, and is what keeps a VTL1 session healthy beside a VTL0 kernel
+debugger on the same VP. It is named for its one operation and not for the foreign events it
+lets the worker recognise, because those are consumed, not preserved. The exception intercept the dispatcher installs for vectors 1 and 3 is
 installed for the partition, not for one VTL, so a VTL0 `int 3`, `ba` hit or trap-flag step
 raises through the controller's own handler context, and the user-side message VID builds says
 nothing about which VTL raised: `VidHandleExceptionIntercept` writes the vector, its software
@@ -103,12 +104,13 @@ VTL1 breakpoint, with `vsm_vp_status` read the same way naming that VTL in its l
 whereas read as a target VTL the status names the VTL asked about. The worker puts every event
 at the dispatcher's site to the controller before holding it; another VTL's event is carried
 through `vmwp`'s native completion and the site re-armed, so the session neither takes it as its
-own stop nor faults. That VTL loses the exception: the completion discards it, and handing it
-back from the root was measured not to work on this hypervisor (runs `20261025T115420` to
+own stop nor faults. That VTL loses the exception: the completion discards it, and the root-side
+ways tried to hand it back were measured not to work on this hypervisor (runs `20261025T115420` to
 `20261025T130540`: `HvRegisterPendingInterruption` refused with `HV_STATUS 0x0005` however the
 input VTL is written; `HvRegisterPendingEvent0` accepted and then consumed without a trap, armed
 before the completion or under an explicit suspension held across it, which also blocked VID's
-completion until something else moved the VM). The profile layout's `event_software` and
+completion until something else moved the VM); no root-side redelivery path has been
+demonstrated. The profile layout's `event_software` and
 `event_instruction_length` locate VID's two bytes for the record of what arrived; a provider
 without the capability keeps every event the controller's own, which is the behaviour before
 2026-10-25.

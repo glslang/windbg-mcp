@@ -610,10 +610,13 @@ break-in never reached the VTL0 kernel while M6's handler was registered. Built 
 every event at the dispatcher's site is put to the controller, whose provider reads the executing
 VTL from the hypervisor, and another VTL's exception is carried through the native completion
 with the site re-armed, so M6 stays armed and healthy beside the VTL0 debugger. Measured the same
-day across five runs: handing that exception back to VTL0 from the root does not work on this
-hypervisor, so the VTL0 debugger loses every break and breakpoint hit while M6's handler is
-registered, and M4 and M6 cannot share a VP in one window. M7.1's idle gate therefore needs M6
-closed between M4's windows, or M4 redesigned off hardware breakpoints; M7.2 remains closed.
+day across five runs: the root-side ways tried to hand that exception back to VTL0 do not work
+on this hypervisor and no root-side redelivery path has been demonstrated, so the VTL0 debugger
+loses every break and breakpoint hit while M6's handler is registered, and M4 and M6 cannot
+share a VP in one window with what exists. Decided 2026-10-25: M7.1's idle gate runs M6 and M4
+in alternation, a revision of its acceptance criterion recorded under M7.1; M7.2 is to be
+designed off M4's hardware breakpoints, with M6's entry data still to be proved against M4's
+fields; the in-`vmwp` redelivery stays a fallback. Both milestones remain open.
 
 Join M4–M6 without putting two targets in one DbgEng process. The coordinator owns session ids and
 lifecycles, not engines: each layer remains in its existing worker and contributes an immutable
@@ -686,6 +689,18 @@ an idle VM without a workload. Then choose and record one arm order; workload la
 until all three workers have acknowledged `armed`. Cleanup runs for every session that reached
 opening, in reverse successful-arm order, and never force-kills a worker that still owns a patch or
 retained VTL1 event.
+
+**Criterion revision, 2026-10-25.** "All three sessions coexist, arm and disarm" assumed the
+three could be armed at once. The VTL1 dispatcher's exception intercept is per partition and no
+root-side way to hand a VTL0 exception back has been demonstrated (M7.1a, continuation item 2),
+so the idle gate is revised: M6 is armed, drained and **closed** before M4 opens, M4 is drained
+and closed before M6 reopens, and M5 keeps its place last. Each switch carries transition checks
+the harness proves before the next layer opens: M6's exception handler fully unregistered, read
+from `vmwp` (the dispatcher's deferred cleanup reached and its scratch freed), no VTL1 slot
+enabled, and no exception or trap-flag state pending on the child's VP read from K3
+(`pending_event0` and `pending_interruption` clear, `rflags.TF` clear in both VTLs). The
+same-window arm of all three is not claimed by M7.1 any more; it is what M7.2's join would need
+and is open there.
 
 Offline transaction tests inject failure and timeout at every state and for every worker. They
 assert that unopened layers are untouched, opened layers are ended once, all restoration results
@@ -1027,7 +1042,7 @@ measurements along the way decide how the driver must behave:
   armed under an explicit suspension held across the completion (blocks VID's completion,
   consumed without a trap). What re-delivers an exception nobody claims is `vmwp`'s own
   handler writing through VID's deferred VP-state path, flushed in the completion's own
-  hypercall, and nothing outside `vmwp` can join that batch.
+  hypercall; no root-side path into that batch has been demonstrated.
 
 Continuation order from this checkpoint:
 
@@ -1103,24 +1118,28 @@ Continuation order from this checkpoint:
    VTL1's while VP0 was held at the bootstrap breakpoint, with `vsm_vp_status` read the same way
    at `0x30010` and `0x30001`; read as a target VTL (`0x10 | vtl`) the status names the VTL asked
    about, which is why the provider's reading never discriminated. What stays in the tree is
-   triage and carry: the provider gained `foreign_events` with `active_vtl`, the dispatcher puts
+   triage and carry: the provider gained the `active_vtl` capability and operation, the dispatcher puts
    every event at its site to the controller's `EventTriage` before holding it, in a wait and in
    the running disarm's pump, and a foreign event is carried natively with the site re-armed,
    so M6 neither takes it as its own stop nor faults; the profile layout locates VID's two
    bytes for the record. Offline: a foreign event is carried and the wait continues, a provider
    without the capability keeps every event, and the running disarm carries one before its
    pause; each pinned against the mutation it is for. **The conclusion, 2026-10-25:** with the
-   intercept per partition and no way from the root to hand the exception back, the VTL0
-   debugger loses every break-in, breakpoint hit and single step while M6's handler is
-   registered, and the slot partition does not change that. The options are the user's: (a)
-   alternate at session level, closing M6 between M4's windows, which serves M7.1's idle gate
-   and not M7.2's same-call join; (b) re-deliver from inside `vmwp` through VID's own deferred
-   VP-state path, which `WorkerExceptionHandler::Notify` reaches through a VND VP-state vtable
-   (`+0x1b8`) and the dispatcher would reach by calling it on the callback thread as it calls
-   the handler registration, a reverse-engineering and call-marshalling task with its own live
-   proof still to run, and with every M4 `ba` hit then costing a `vmwp` round trip; (c) take
-   M4 off hardware breakpoints and off the shared VP's exception path altogether, reading the
-   NT-side arguments from M6's entry phase, which is what M7.2 needs anyway. Two smaller
+   intercept per partition and no demonstrated root-side path to hand the exception back (the
+   runs rule out the pending-interruption and pending-event registers written from the root on
+   this build, not every conceivable path), the VTL0 debugger loses every break-in, breakpoint
+   hit and single step while M6's handler is registered, and the slot partition does not change
+   that. **Decided the same day:** (a) alternate at session level, closing M6 between M4's
+   windows, as the interim containment for M7.1's idle gate; this revises that gate's acceptance
+   criterion and is recorded under M7.1 with the transition checks each switch must prove. (c)
+   Design M7.2 off M4's hardware breakpoints and off the shared VP's exception path, reading the
+   NT-side arguments from M6's entry phase; before adopting it, prove field by field that M6's
+   entry data preserves every required M4 field or name the replacement, recorded under M7.2.
+   (b) Re-delivering from inside `vmwp` through VID's own deferred VP-state path, which
+   `WorkerExceptionHandler::Notify` reaches through a VND VP-state vtable (`+0x1b8`) and the
+   dispatcher would reach by calling it on the callback thread as it calls the handler
+   registration, stays a fallback: a brittle private-ABI dependency inside `vmwp`, with its own
+   live proof still to run and every M4 `ba` hit then costing a `vmwp` round trip. Two smaller
    facts from the same runs, both unmeasured further: after a lost break-in `vmwp` saw a VND
    message of type `0x1` on VP 0 about every 64 ms, and recovery's pump once refused a stop at
    `ntdll!DbgBreakPoint` as not its own.
@@ -1209,6 +1228,14 @@ Within the admitted one-VP capture, assign a `call_id` only when the observed or
 ```text
 M4 VTL0 entry -> M5 vtl_call -> M6 entry -> M6 selected dispatch -> M6 return -> M5 vtl_return
 ```
+
+**Open before the chain can start from M6, 2026-10-25.** The chain begins with an M4 VTL0 entry
+event, and M7.1a's continuation item 2 decided to design M7.2 off M4's hardware breakpoints.
+Replacing the first stage with M6's entry phase is sound only if M6's entry data preserves every
+required M4 field or names its replacement: the VTL0 PID and TID, the caller's provenance (return
+address and module) and the raw argument block M4 reads at `nt!VslpEnterIumSecureMode`. Until
+that equality is demonstrated field by field, M6's values are VTL1-observed copies of the NT
+arguments and the chain's first stage is unproven.
 
 Use per-layer sequence numbers, direction, the selected service, VTLs and non-overlapping clock
 intervals. Pair nesting with a stack, not nearest-timestamp matching. If zero or more than one
