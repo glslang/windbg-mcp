@@ -84,6 +84,12 @@ pub(crate) trait ControlProvider {
     fn set_outer_deadline(&mut self, _deadline: Option<Instant>) {}
     fn write_registers(&mut self, writes: Vec<RegisterWrite>) -> Result<Vec<RegisterValue>>;
     fn release(&mut self) -> Result<()>;
+    /// Which VTL the target VP is executing, asked while the controller's own VTL runs about an
+    /// exception held at the dispatcher's site. Only a provider advertising `ForeignEvents` can
+    /// answer; the default refuses, which keeps every such event the controller's own.
+    fn active_vtl(&mut self) -> Result<u8> {
+        bail!("this provider does not report the VP's active VTL")
+    }
 }
 
 impl<R: std::io::BufRead, W: std::io::Write> ControlProvider for ControlSession<R, W> {
@@ -121,6 +127,10 @@ impl<R: std::io::BufRead, W: std::io::Write> ControlProvider for ControlSession<
 
     fn release(&mut self) -> Result<()> {
         ControlSession::release(self)
+    }
+
+    fn active_vtl(&mut self) -> Result<u8> {
+        ControlSession::active_vtl(self)
     }
 }
 
@@ -172,6 +182,10 @@ impl ControlProvider for ControlProcess {
     fn release(&mut self) -> Result<()> {
         ControlProcess::release(self)
     }
+
+    fn active_vtl(&mut self) -> Result<u8> {
+        ControlProcess::active_vtl(self)
+    }
 }
 
 /// What the worker's build-specific debugger adapter observed while `vmwp` is stopped.
@@ -180,6 +194,72 @@ pub(crate) struct ObservedStop {
     pub(crate) event: HeldEvent,
     /// A second read of every exact instruction selected when the breakpoints were armed.
     pub(crate) instructions: Vec<InstructionGuard>,
+}
+
+/// An exception vmwp holds at the dispatcher's event site, before anyone knows which VTL raised
+/// it. The intercept the dispatcher installs is per partition, not per VTL, so a selected VP's
+/// other VTL raises through the same handler context (measured 2026-10-25).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SiteEvent {
+    pub(crate) vp: u32,
+    pub(crate) vector: u8,
+    /// VID's software-exception flag on the message body, when the profile layout locates it.
+    pub(crate) software: Option<bool>,
+    /// The raising instruction's length for a software exception, when the layout locates it.
+    pub(crate) instruction_length: Option<u8>,
+    /// Seen while the running disarm pumps toward a Hyper-V pause rather than in a wait.
+    pub(crate) during_disarm: bool,
+}
+
+/// What the controller decided about an event at the site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Triage {
+    /// The controller's own VTL raised it: retain it as the stop.
+    Own,
+    /// Another VTL raised it: the dispatcher completes the native event and keeps waiting. The
+    /// exception is lost to that VTL; handing it back is not built (see the M7 roadmap).
+    Foreign { vtl: u8 },
+}
+
+/// The controller's side of the question the dispatcher cannot answer on its own: whose event is
+/// this? It owns the providers, which can ask the hypervisor which VTL is executing.
+pub(crate) trait EventTriage {
+    fn triage(&mut self, event: &SiteEvent) -> Result<Triage>;
+}
+
+/// Triage through the controller's providers: the one bound to the event's VP says which VTL is
+/// executing.
+struct ProviderTriage<'a, P> {
+    providers: &'a mut [VpControl<P>],
+}
+
+impl<P: ControlProvider> EventTriage for ProviderTriage<'_, P> {
+    fn triage(&mut self, event: &SiteEvent) -> Result<Triage> {
+        let control = self
+            .providers
+            .iter_mut()
+            .find(|control| control.target.vp == event.vp)
+            .context("an event at the dispatcher site names a VP no provider is bound to")?;
+        if !control.supports_foreign_events {
+            return Ok(Triage::Own);
+        }
+        let vtl = control.provider.active_vtl()?;
+        if vtl == control.target.vtl {
+            return Ok(Triage::Own);
+        }
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            vm_id = %control.target.vm_id,
+            vp = event.vp,
+            vtl,
+            vector = event.vector,
+            software = ?event.software,
+            instruction_length = ?event.instruction_length,
+            during_disarm = event.during_disarm,
+            "live Secure Kernel control carries another VTL's exception natively; that VTL loses it"
+        );
+        Ok(Triage::Foreign { vtl })
+    }
 }
 
 /// The request reader woke the exact in-flight live wait so the engine thread can service a
@@ -226,13 +306,18 @@ pub(crate) trait EventDispatcher {
     /// Hyper-V pauses the VM with no event outstanding, or an owned event arrives first and is
     /// held. Either ending quiesces the VP. An arrival is the disarm point rather than a fault,
     /// because the trace stays armed while the stop is wanted and may fire at any instant.
-    fn begin_disarm(&mut self, targets: &[TargetIdentity]) -> Result<Disarmed>;
+    fn begin_disarm(
+        &mut self,
+        targets: &[TargetIdentity],
+        triage: &mut dyn EventTriage,
+    ) -> Result<Disarmed>;
     fn begin_disarm_until(
         &mut self,
         targets: &[TargetIdentity],
         _deadline: Instant,
+        triage: &mut dyn EventTriage,
     ) -> Result<Disarmed> {
-        self.begin_disarm(targets)
+        self.begin_disarm(targets, triage)
     }
     fn finish_arm(&mut self) -> Result<()>;
     /// Whether every provider whose registers may be accessed is currently quiesced.
@@ -306,10 +391,13 @@ pub(crate) trait EventDispatcher {
         self.retained_pause_deadline()
     }
     /// Return an owned event only after every provider whose registers may be accessed is quiesced.
+    /// Every event at the site is put to `triage` first; one another VTL raised is carried
+    /// natively after the controller has armed its redelivery, and the wait goes on.
     fn wait_for_stop(
         &mut self,
         targets: &[TargetIdentity],
         instructions: &[InstructionGuard],
+        triage: &mut dyn EventTriage,
     ) -> Result<ObservedStop>;
     /// Rebind live virtual-memory translation to the CR3 proved by the held register snapshot.
     fn bind_stop_cr3(&mut self, cr3: u64) -> Result<()>;
@@ -411,6 +499,15 @@ pub(crate) struct DispatcherLayout {
     pub(crate) event_context: u32,
     /// VP index in the exact-build native vector-event record.
     pub(crate) event_vp: u32,
+    /// VID's software-exception flag byte in that record: the exception came from an instruction
+    /// (`INT3`, `INT1`) rather than a hardware condition. Needed, with the length below, to hand an
+    /// exception another VTL raised back to it; a profile without them keeps every event the
+    /// controller's own (`VidHandleExceptionIntercept`, measured 2026-10-25).
+    #[serde(default)]
+    pub(crate) event_software: Option<u32>,
+    /// The raising instruction's length byte in that record, valid for a software exception.
+    #[serde(default)]
+    pub(crate) event_instruction_length: Option<u32>,
     pub(crate) exchange_advance: u32,
     pub(crate) callback_pointer: u32,
     pub(crate) callback_flags: u32,
@@ -731,6 +828,20 @@ impl DispatcherProfile {
             bail!(
                 "dispatcher field offset event_vp is unaligned or exceeds the bounded record window"
             );
+        }
+        for (name, offset) in [
+            ("event_software", self.layout.event_software),
+            (
+                "event_instruction_length",
+                self.layout.event_instruction_length,
+            ),
+        ] {
+            if offset.is_some_and(|offset| offset > 0x1000) {
+                bail!("dispatcher field offset {name} exceeds the bounded record window");
+            }
+        }
+        if self.layout.event_software.is_some() != self.layout.event_instruction_length.is_some() {
+            bail!("event_software and event_instruction_length are located together or not at all");
         }
         for (name, offset) in [
             ("register_stack_handler", self.layout.register_stack_handler),
@@ -1211,6 +1322,7 @@ struct VpControl<P> {
     baseline: Option<RegisterSnapshot>,
     observed_cr3: Option<u64>,
     supports_breakpoint_events: bool,
+    supports_foreign_events: bool,
 }
 
 /// One-VM coordinator for selected VPs and up to four execution breakpoints per VP. The dispatcher
@@ -1315,6 +1427,9 @@ impl<P: ControlProvider> LiveControl<P> {
                 supports_breakpoint_events: capabilities
                     .capabilities
                     .contains(&Capability::BreakpointEvents),
+                supports_foreign_events: capabilities
+                    .capabilities
+                    .contains(&Capability::ForeignEvents),
             });
         }
         Ok(Self {
@@ -1782,7 +1897,13 @@ impl<P: ControlProvider> LiveControl<P> {
                 vec![self.providers[active].target.clone()]
             }
         };
-        let observed = match dispatcher.wait_for_stop(&targets, &expected_instructions) {
+        let observed = match dispatcher.wait_for_stop(
+            &targets,
+            &expected_instructions,
+            &mut ProviderTriage {
+                providers: &mut self.providers,
+            },
+        ) {
             Ok(observed) => observed,
             Err(error) if is_break_wake(&error) => return Err(error),
             Err(error) => return Err(self.enter_fault(dispatcher, error, None)),
@@ -1996,7 +2117,13 @@ impl<P: ControlProvider> LiveControl<P> {
             .set_outer_deadline(Some(deadline));
         self.state = State::Arming;
         let result = (|| {
-            let disarmed = dispatcher.begin_disarm_until(&targets, deadline)?;
+            let disarmed = dispatcher.begin_disarm_until(
+                &targets,
+                deadline,
+                &mut ProviderTriage {
+                    providers: &mut self.providers,
+                },
+            )?;
             if !dispatcher.provider_writes_quiesced() {
                 bail!("the dispatcher did not prove quiescence for a break request");
             }
@@ -2728,9 +2855,14 @@ impl<P: ControlProvider> LiveControl<P> {
                     {
                         bail!("the armed session has no breakpoint guards");
                     }
+                    let mut triage = ProviderTriage {
+                        providers: &mut self.providers,
+                    };
                     let disarmed = match deadline {
-                        Some(deadline) => dispatcher.begin_disarm_until(&targets, deadline)?,
-                        None => dispatcher.begin_disarm(&targets)?,
+                        Some(deadline) => {
+                            dispatcher.begin_disarm_until(&targets, deadline, &mut triage)?
+                        }
+                        None => dispatcher.begin_disarm(&targets, &mut triage)?,
                     };
                     if !dispatcher.provider_writes_quiesced() {
                         bail!("the dispatcher did not prove quiescence for disarming providers");
@@ -3635,6 +3767,8 @@ mod tests {
         deadline_updates: Vec<Option<Instant>>,
         write_deadlines: Vec<Option<Instant>>,
         release_deadlines: Vec<Option<Instant>>,
+        /// What `active_vtl` answers, in order; empty means the question is a scripting error.
+        active_vtls: VecDeque<u8>,
     }
 
     impl FakeProvider {
@@ -3660,7 +3794,13 @@ mod tests {
                 deadline_updates: Vec::new(),
                 write_deadlines: Vec::new(),
                 release_deadlines: Vec::new(),
+                active_vtls: VecDeque::new(),
             }
+        }
+
+        fn with_active_vtls(mut self, vtls: impl IntoIterator<Item = u8>) -> Self {
+            self.active_vtls = vtls.into_iter().collect();
+            self
         }
 
         fn with_hardware_rip(mut self, rip: u64) -> Self {
@@ -3904,6 +4044,12 @@ mod tests {
             self.outer_deadline = deadline;
             self.deadline_updates.push(deadline);
         }
+
+        fn active_vtl(&mut self) -> Result<u8> {
+            self.active_vtls
+                .pop_front()
+                .context("no scripted active VTL")
+        }
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3955,6 +4101,10 @@ mod tests {
         teardown_deadlines: Vec<Option<Instant>>,
         /// An owned event that arrives while the disarm pumps; the next wait adopts it.
         disarm_holds: Option<HeldEvent>,
+        /// Events at the site put to the controller's triage before the next scripted stop or
+        /// disarm ending; what it decided is recorded in `triaged`.
+        site_events: VecDeque<SiteEvent>,
+        triaged: Vec<Triage>,
     }
 
     impl FakeDispatcher {
@@ -3985,7 +4135,21 @@ mod tests {
                 recovery_deadlines: Vec::new(),
                 teardown_deadlines: Vec::new(),
                 disarm_holds: None,
+                site_events: VecDeque::new(),
+                triaged: Vec::new(),
             }
+        }
+
+        /// Put the scripted site events to the controller until it claims one as its own.
+        fn triage_site_events(&mut self, triage: &mut dyn EventTriage) -> Result<()> {
+            while let Some(event) = self.site_events.pop_front() {
+                let decision = triage.triage(&event)?;
+                self.triaged.push(decision);
+                if decision == Triage::Own {
+                    break;
+                }
+            }
+            Ok(())
         }
     }
 
@@ -4015,18 +4179,23 @@ mod tests {
             Ok(())
         }
 
-        fn begin_disarm(&mut self, _targets: &[TargetIdentity]) -> Result<Disarmed> {
+        fn begin_disarm(
+            &mut self,
+            _targets: &[TargetIdentity],
+            triage: &mut dyn EventTriage,
+        ) -> Result<Disarmed> {
             self.disarm_deadlines.push(None);
-            self.disarm_inner()
+            self.disarm_inner(triage)
         }
 
         fn begin_disarm_until(
             &mut self,
             _targets: &[TargetIdentity],
             deadline: Instant,
+            triage: &mut dyn EventTriage,
         ) -> Result<Disarmed> {
             self.disarm_deadlines.push(Some(deadline));
-            self.disarm_inner()
+            self.disarm_inner(triage)
         }
 
         fn finish_arm(&mut self) -> Result<()> {
@@ -4129,8 +4298,10 @@ mod tests {
             &mut self,
             targets: &[TargetIdentity],
             instructions: &[InstructionGuard],
+            triage: &mut dyn EventTriage,
         ) -> Result<ObservedStop> {
             self.actions.push(Action::Wait);
+            self.triage_site_events(triage)?;
             self.wait_targets
                 .push(targets.iter().map(|target| target.vp).collect());
             self.wait_instructions.push(instructions.to_vec());
@@ -4252,8 +4423,9 @@ mod tests {
     }
 
     impl FakeDispatcher {
-        fn disarm_inner(&mut self) -> Result<Disarmed> {
+        fn disarm_inner(&mut self, triage: &mut dyn EventTriage) -> Result<Disarmed> {
             self.actions.push(Action::BeginDisarm);
+            self.triage_site_events(triage)?;
             self.provider_writes_quiesced = true;
             if let Some(reason) = self.fail_begin {
                 bail!("{reason}");
@@ -6207,6 +6379,102 @@ mod tests {
     /// A break requested while the trace runs reaches the dispatcher as a running disarm. When a
     /// natural event arrives inside it, that event is the stop the caller wanted: no transient slot
     /// is written over the armed state, and the next wait adopts it as a hardware stop.
+    /// A kernel debugger on the VP's other VTL breaks in through the same intercept the
+    /// controller installed. The event is nobody's fault: the provider says which VTL raised it,
+    /// the dispatcher carries it natively, and the wait goes on to the controller's own stop.
+    #[test]
+    fn another_vtls_exception_at_the_site_is_carried_and_the_wait_continues() {
+        let mut dispatcher = FakeDispatcher::new([observed(StopReason::DebugException)]);
+        dispatcher.site_events = VecDeque::from([
+            SiteEvent {
+                vp: 0,
+                vector: 3,
+                software: Some(true),
+                instruction_length: Some(1),
+                during_disarm: false,
+            },
+            SiteEvent {
+                vp: 0,
+                vector: 1,
+                software: Some(false),
+                instruction_length: Some(0),
+                during_disarm: false,
+            },
+        ]);
+        let mut control = LiveControl::open(FakeProvider::new().with_active_vtls([0, 1])).unwrap();
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Natural)
+            .unwrap();
+
+        let stop = control.wait_for_stop(&mut dispatcher).unwrap();
+
+        assert_eq!(control.phase(), LivePhase::Stopped);
+        assert!(matches!(
+            stop.event.reason,
+            StopReason::HardwareBreakpoint { .. }
+        ));
+        assert_eq!(
+            dispatcher.triaged,
+            [Triage::Foreign { vtl: 0 }, Triage::Own],
+            "the foreign event is carried and the controller's own event is the stop"
+        );
+        assert!(
+            control.test_provider().active_vtls.is_empty(),
+            "the VTL was asked for both events"
+        );
+    }
+
+    #[test]
+    fn a_provider_without_foreign_events_keeps_every_event_at_the_site_as_its_own() {
+        let mut dispatcher = FakeDispatcher::new([observed(StopReason::DebugException)]);
+        dispatcher.site_events = VecDeque::from([SiteEvent {
+            vp: 0,
+            vector: 3,
+            software: Some(true),
+            instruction_length: Some(1),
+            during_disarm: false,
+        }]);
+        let mut provider = FakeProvider::new().with_active_vtls([0]);
+        provider
+            .capabilities
+            .capabilities
+            .retain(|capability| *capability != Capability::ForeignEvents);
+        let mut control = LiveControl::open(provider).unwrap();
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Natural)
+            .unwrap();
+
+        control.wait_for_stop(&mut dispatcher).unwrap();
+
+        assert_eq!(dispatcher.triaged, [Triage::Own]);
+        assert_eq!(
+            control.test_provider().active_vtls.len(),
+            1,
+            "the VTL was never asked"
+        );
+    }
+
+    #[test]
+    fn a_foreign_event_during_the_running_disarm_is_carried_and_the_pause_proceeds() {
+        let mut dispatcher = FakeDispatcher::new([]);
+        dispatcher.site_events = VecDeque::from([SiteEvent {
+            vp: 0,
+            vector: 1,
+            software: Some(false),
+            instruction_length: Some(0),
+            during_disarm: true,
+        }]);
+        let mut control = LiveControl::open(FakeProvider::new().with_active_vtls([0])).unwrap();
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Natural)
+            .unwrap();
+
+        control.close(&mut dispatcher).unwrap();
+
+        assert_eq!(dispatcher.triaged, [Triage::Foreign { vtl: 0 }]);
+        assert_eq!(control.phase(), LivePhase::Closed);
+    }
+
     #[test]
     fn break_on_demand_adopts_the_event_held_by_the_disarm_as_its_hardware_stop() {
         let mut dispatcher = FakeDispatcher::new([]);
@@ -7003,6 +7271,8 @@ mod tests {
                 callback_mirror: 0x30,
                 event_context: 8,
                 event_vp: 0x10,
+                event_software: Some(0x21),
+                event_instruction_length: Some(0x22),
                 exchange_advance: 0x148,
                 callback_pointer: 0x80,
                 callback_flags: 0x88,
@@ -7249,6 +7519,7 @@ mod tests {
                 Capability::WriteRegisters,
                 Capability::Release,
                 Capability::BreakpointEvents,
+                Capability::ForeignEvents,
             ],
             readable_registers: SNAPSHOT_REGISTERS.to_vec(),
             writable_registers: WRITTEN_REGISTERS.to_vec(),

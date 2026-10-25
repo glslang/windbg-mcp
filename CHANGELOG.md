@@ -48,6 +48,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arms them in the lowest free slots and its decoder maps each stop back to its site. M7 reserves
   slot 0 for M4's processor breakpoint and arms M6 before M4.
 
+- **A VTL1 live-control session no longer faults on another VTL's debug exception.** The
+  exception intercept the dispatcher installs for vectors 1 and 3 is per partition, not per
+  VTL, so a kernel debugger on the same VP's VTL0 raises through the controller's handler
+  context: measured 2026-10-25 in the M7.1a nested lab, where M4's break-in reached M6's
+  dispatcher, M6 took it as its own stop, faulted, and native completion suppressed the break.
+  The user-side message VID builds carries no VTL (`VidHandleExceptionIntercept` writes vector,
+  software flag, instruction length, error code and parameter; `VidMessageBufferPrep` type, VP
+  and context), so every event at the site is now put to the controller before it is held: a
+  provider advertising `foreign_events` answers `active_vtl`, read from the hypervisor with the
+  `HV_INPUT_VTL` byte clear, which tracks the executing VTL (measured in run `20261025T113332`:
+  VTL0's CR3 and RIP at idle, VTL1's at a held VTL1 breakpoint), and another VTL's event is
+  carried through the native completion with the site re-armed, in a wait and in the running
+  disarm's pump alike, so the VTL1 session stays armed and healthy. That VTL still loses the
+  exception: handing it back from the root was measured not to work (a pending interruption is
+  refused; a pending event is consumed without a trap, armed before the completion or under an
+  explicit suspension held across it), so M4 and M6 cannot yet share a VP in one window. The
+  profile layout gains `event_software` and `event_instruction_length` for the record of what
+  arrived; a provider without the capability keeps every event the controller's own, as before.
+
 - **M7.0 adds the cross-layer identity and clock admission contract without adding a debugger
   role or MCP tool.** M4, M5 and M6 arm/read envelopes and events now retain optional raw Windows
   performance-counter samples while preserving the older millisecond field. A standalone,

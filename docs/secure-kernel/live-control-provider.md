@@ -88,6 +88,31 @@ The protocol has seven required capabilities:
 software-breakpoint execution before mutation unless this capability and the dispatcher's separate
 vector-3 context are both present.
 
+`foreign_events` is optional too, and is what keeps a VTL1 session healthy beside a VTL0 kernel
+debugger on the same VP. The exception intercept the dispatcher installs for vectors 1 and 3 is
+installed for the partition, not for one VTL, so a VTL0 `int 3`, `ba` hit or trap-flag step
+raises through the controller's own handler context, and the user-side message VID builds says
+nothing about which VTL raised: `VidHandleExceptionIntercept` writes the vector, its software
+flag, the raising instruction's length, the error code and the parameter, and
+`VidMessageBufferPrep` the type, VP and context (`Vid.sys` 10.0.26100, decompiled 2026-10-25).
+A provider advertising the capability answers `active_vtl` in the running phase, which holds no
+epoch and changes none: the VTL the selected VP is executing, read with `HvGetVpRegisters` and
+the `HV_INPUT_VTL` byte clear. The M7.1a run `20261025T113332` measured that encoding tracking
+the executing VTL (VTL0's CR3, RIP and RSP in three idle samples, VTL1's while VP0 was held at a
+VTL1 breakpoint, with `vsm_vp_status` read the same way naming that VTL in its low bits),
+whereas read as a target VTL the status names the VTL asked about. The worker puts every event
+at the dispatcher's site to the controller before holding it; another VTL's event is carried
+through `vmwp`'s native completion and the site re-armed, so the session neither takes it as its
+own stop nor faults. That VTL loses the exception: the completion discards it, and handing it
+back from the root was measured not to work on this hypervisor (runs `20261025T115420` to
+`20261025T130540`: `HvRegisterPendingInterruption` refused with `HV_STATUS 0x0005` however the
+input VTL is written; `HvRegisterPendingEvent0` accepted and then consumed without a trap, armed
+before the completion or under an explicit suspension held across it, which also blocked VID's
+completion until something else moved the VM). The profile layout's `event_software` and
+`event_instruction_length` locate VID's two bytes for the record of what arrived; a provider
+without the capability keeps every event the controller's own, which is the behaviour before
+2026-10-25.
+
 The ordering on the last operation is load-bearing. Once native completion runs, the next vector-1
 event may arrive immediately, so the provider must already accept a new `publish_stop`. The worker's
 outer state machine remains in `releasing` between the provider transition and native completion;
@@ -406,7 +431,9 @@ either the pause is reported complete at a watchdog break, after which no VP can
 an owned event arrives and is retained exactly as a wait retains one. That event is the disarm
 point: the controller restores the baseline under it, the next wait adopts it as its hardware stop
 (a break request takes it in place of a transient slot), and a close completes it into the pause
-teardown needs. Recovery from a running arm takes the same path. The M7.1a nested run
+teardown needs. An event another VTL raised during the pump is carried natively under the
+pending pause, and the pump goes on. Recovery from a running arm takes the same path, triaging
+nothing. The M7.1a nested run
 `20261024T210251` measured the shape this replaced: a one-second settle that accepted only its own
 deadline while the trace stayed armed, the next event faulting the session, and recovery pausing a
 debugger-held `vmwp` for 60 s. The same ordering means no intercept reaches `vmwp`'s handler with
