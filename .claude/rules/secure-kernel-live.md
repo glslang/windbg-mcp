@@ -122,8 +122,10 @@ however the input VTL is written; and `HvRegisterPendingEvent0`, accepted and co
 trap whether armed before the completion or under an explicit suspension held across it, which
 also blocks VID's completion until something else moves the VM. What re-delivers an exception
 nobody claims is `vmwp`'s own handler writing through VID's deferred VP-state path, flushed in
-the completion's own hypercall; nothing outside `vmwp` can join that batch. So M4 and M6 cannot
-share a VP in one window; the M7 roadmap has the options.
+the completion's own hypercall; no root-side path into that batch has been demonstrated. So M4
+and M6 cannot share a VP in one window with what exists; the M7 roadmap records the decision:
+M7.1's idle gate runs M6 and M4 in alternation (a criterion revision), M7.2 is to be designed
+off M4's hardware breakpoints, and the in-`vmwp` redelivery stays a fallback.
 
 **`sk_live_wait` carries its own deadline and takes no timeout argument.** It comes from the
 operation's budget, which is of the order of a minute — so anything timed to arrive later than that

@@ -85,7 +85,7 @@ pub(crate) trait ControlProvider {
     fn write_registers(&mut self, writes: Vec<RegisterWrite>) -> Result<Vec<RegisterValue>>;
     fn release(&mut self) -> Result<()>;
     /// Which VTL the target VP is executing, asked while the controller's own VTL runs about an
-    /// exception held at the dispatcher's site. Only a provider advertising `ForeignEvents` can
+    /// exception held at the dispatcher's site. Only a provider advertising `ActiveVtl` can
     /// answer; the default refuses, which keeps every such event the controller's own.
     fn active_vtl(&mut self) -> Result<u8> {
         bail!("this provider does not report the VP's active VTL")
@@ -240,7 +240,7 @@ impl<P: ControlProvider> EventTriage for ProviderTriage<'_, P> {
             .iter_mut()
             .find(|control| control.target.vp == event.vp)
             .context("an event at the dispatcher site names a VP no provider is bound to")?;
-        if !control.supports_foreign_events {
+        if !control.supports_active_vtl {
             return Ok(Triage::Own);
         }
         let vtl = control.provider.active_vtl()?;
@@ -1322,7 +1322,7 @@ struct VpControl<P> {
     baseline: Option<RegisterSnapshot>,
     observed_cr3: Option<u64>,
     supports_breakpoint_events: bool,
-    supports_foreign_events: bool,
+    supports_active_vtl: bool,
 }
 
 /// One-VM coordinator for selected VPs and up to four execution breakpoints per VP. The dispatcher
@@ -1427,9 +1427,7 @@ impl<P: ControlProvider> LiveControl<P> {
                 supports_breakpoint_events: capabilities
                     .capabilities
                     .contains(&Capability::BreakpointEvents),
-                supports_foreign_events: capabilities
-                    .capabilities
-                    .contains(&Capability::ForeignEvents),
+                supports_active_vtl: capabilities.capabilities.contains(&Capability::ActiveVtl),
             });
         }
         Ok(Self {
@@ -6425,7 +6423,7 @@ mod tests {
     }
 
     #[test]
-    fn a_provider_without_foreign_events_keeps_every_event_at_the_site_as_its_own() {
+    fn a_provider_without_active_vtl_keeps_every_event_at_the_site_as_its_own() {
         let mut dispatcher = FakeDispatcher::new([observed(StopReason::DebugException)]);
         dispatcher.site_events = VecDeque::from([SiteEvent {
             vp: 0,
@@ -6438,7 +6436,7 @@ mod tests {
         provider
             .capabilities
             .capabilities
-            .retain(|capability| *capability != Capability::ForeignEvents);
+            .retain(|capability| *capability != Capability::ActiveVtl);
         let mut control = LiveControl::open(provider).unwrap();
         control
             .arm(&mut dispatcher, breakpoints(), ArmMode::Natural)
@@ -7519,7 +7517,7 @@ mod tests {
                 Capability::WriteRegisters,
                 Capability::Release,
                 Capability::BreakpointEvents,
-                Capability::ForeignEvents,
+                Capability::ActiveVtl,
             ],
             readable_registers: SNAPSHOT_REGISTERS.to_vec(),
             writable_registers: WRITTEN_REGISTERS.to_vec(),

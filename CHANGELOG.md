@@ -56,14 +56,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The user-side message VID builds carries no VTL (`VidHandleExceptionIntercept` writes vector,
   software flag, instruction length, error code and parameter; `VidMessageBufferPrep` type, VP
   and context), so every event at the site is now put to the controller before it is held: a
-  provider advertising `foreign_events` answers `active_vtl`, read from the hypervisor with the
+  provider advertising `active_vtl` answers that question, read from the hypervisor with the
   `HV_INPUT_VTL` byte clear, which tracks the executing VTL (measured in run `20261025T113332`:
   VTL0's CR3 and RIP at idle, VTL1's at a held VTL1 breakpoint), and another VTL's event is
   carried through the native completion with the site re-armed, in a wait and in the running
   disarm's pump alike, so the VTL1 session stays armed and healthy. That VTL still loses the
-  exception: handing it back from the root was measured not to work (a pending interruption is
-  refused; a pending event is consumed without a trap, armed before the completion or under an
-  explicit suspension held across it), so M4 and M6 cannot yet share a VP in one window. The
+  exception: the root-side ways tried to hand it back were measured not to work (a pending
+  interruption is refused; a pending event is consumed without a trap, armed before the
+  completion or under an explicit suspension held across it), and no root-side redelivery path
+  has been demonstrated, so M4 and M6 cannot yet share a VP in one window. The
   profile layout gains `event_software` and `event_instruction_length` for the record of what
   arrived; a provider without the capability keeps every event the controller's own, as before.
 

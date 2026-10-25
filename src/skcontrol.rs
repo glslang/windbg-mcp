@@ -259,13 +259,13 @@ pub(crate) enum Capability {
     /// The provider can retain and echo raw vector-3 events produced by owned `INT3` patches.
     BreakpointEvents,
     /// The provider can say which VTL a selected VP is executing while the controller's own VTL
-    /// runs. The hypervisor's exception intercept is installed for the partition rather than for
-    /// one VTL, so another VTL's vector-1 and vector-3 exceptions reach the dispatcher's site
-    /// through the controller's own handler context; with this the controller carries them
-    /// natively instead of taking them as its own stops and faulting (measured 2026-10-25).
-    /// Handing them back to that VTL is not built: a pending event armed from the root is
-    /// consumed without delivery, measured the same day.
-    ForeignEvents,
+    /// runs (`active_vtl`). The hypervisor's exception intercept is installed for the partition
+    /// rather than for one VTL, so another VTL's vector-1 and vector-3 exceptions reach the
+    /// dispatcher's site through the controller's own handler context; with this the controller
+    /// carries them natively instead of taking them as its own stops and faulting (measured
+    /// 2026-10-25). It is named for its one operation and not for those events, which are
+    /// consumed, not preserved: no root-side way to hand them back has been demonstrated.
+    ActiveVtl,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -787,7 +787,7 @@ impl<R: BufRead, W: Write> ControlSession<R, W> {
     /// runs, about an exception the dispatcher holds at its site before anyone knows whose it
     /// is, so it is the one register question allowed in the running phase.
     pub(crate) fn active_vtl(&mut self) -> Result<u8> {
-        self.require_capability(Capability::ForeignEvents)?;
+        self.require_capability(Capability::ActiveVtl)?;
         let response = self.exchange(Operation::ActiveVtl)?;
         let ReplyValue::ActiveVtl { vtl } = response else {
             bail!("provider returned the wrong reply to active_vtl")
@@ -1703,7 +1703,7 @@ mod tests {
                 Capability::ReadRegisters,
                 Capability::WriteRegisters,
                 Capability::Release,
-                Capability::ForeignEvents,
+                Capability::ActiveVtl,
             ],
             writable_registers: readable_registers
                 .iter()
@@ -1795,7 +1795,7 @@ mod tests {
         let mut advertised = capabilities();
         advertised
             .capabilities
-            .retain(|capability| *capability != Capability::ForeignEvents);
+            .retain(|capability| *capability != Capability::ActiveVtl);
         let lines = vec![response(
             1,
             EPOCH_RUNNING,
@@ -1807,9 +1807,7 @@ mod tests {
         let error = session.active_vtl().unwrap_err();
 
         assert!(
-            error
-                .to_string()
-                .contains("did not advertise ForeignEvents"),
+            error.to_string().contains("did not advertise ActiveVtl"),
             "{error:#}"
         );
     }
@@ -1823,8 +1821,8 @@ mod tests {
         let reply: ReplyValue = serde_json::from_str(r#"{"kind":"active_vtl","vtl":1}"#).unwrap();
         assert_eq!(reply, ReplyValue::ActiveVtl { vtl: 1 });
         assert_eq!(
-            serde_json::to_string(&Capability::ForeignEvents).unwrap(),
-            r#""foreign_events""#
+            serde_json::to_string(&Capability::ActiveVtl).unwrap(),
+            r#""active_vtl""#
         );
     }
 
