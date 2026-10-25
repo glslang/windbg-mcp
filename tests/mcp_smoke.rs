@@ -180,11 +180,13 @@ fn m7_identity() -> Value {
     })
 }
 
-#[test]
-fn m7_transaction_protocol_owns_order_and_reverse_cleanup() {
+/// Drive the engine-free M7 coordinator with the answers an idle run would give, and return the
+/// `operation:layer` sequence it asked for with its final report.
+fn drive_idle_m7(extra_args: &[&str]) -> (Vec<String>, Value) {
     let identity = m7_identity();
     let mut child = Command::new(EXE)
         .args(["--m7-transaction-protocol", "--m7-max-skew-ticks=1000"])
+        .args(extra_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -250,6 +252,24 @@ fn m7_transaction_protocol_owns_order_and_reverse_cleanup() {
                 })
             }
             "end_session" => json!({"ended": true, "retained_processes": 0}),
+            "transition" => {
+                let closed = request["window_closed"]
+                    .as_array()
+                    .expect("a transition names the window that closed");
+                assert!(
+                    request["window_opening"].as_array().is_some(),
+                    "a transition names the window opening next"
+                );
+                let closed_vtl1 = closed.iter().any(|layer| layer == "m6_vtl1");
+                json!({
+                    "handler_unregistered": closed_vtl1.then_some(true),
+                    "vtl1_enabled_slots": [],
+                    "vtl0_enabled_slots": [],
+                    "pending_clear": true,
+                    "trap_flag_clear": true,
+                    "engine_workers": 0,
+                })
+            }
             other => panic!("unexpected idle M7 operation {other}"),
         };
         let response = json!({
@@ -267,9 +287,16 @@ fn m7_transaction_protocol_owns_order_and_reverse_cleanup() {
         "M7 coordinator failed: {}",
         String::from_utf8_lossy(&completed.stderr)
     );
+    (operations, report)
+}
+
+#[test]
+fn m7_transaction_protocol_owns_order_and_reverse_cleanup() {
+    let (operations, report) = drive_idle_m7(&[]);
     assert_eq!(report["verdict"], "pass");
     assert_eq!(report["state"], "closed");
     assert_eq!(report["clock"]["value"]["mode"], "point");
+    assert_eq!(report["transitions"], json!([]));
     assert_eq!(
         operations,
         [
@@ -285,6 +312,44 @@ fn m7_transaction_protocol_owns_order_and_reverse_cleanup() {
             "drain:m6_vtl1",
             "end_session:m5_hypervisor",
             "end_session:m4_vtl0",
+            "end_session:m6_vtl1",
+        ]
+    );
+}
+
+#[test]
+fn m7_transaction_protocol_alternates_windows_through_transition_checks() {
+    let (operations, report) = drive_idle_m7(&["--m7-alternate"]);
+    assert_eq!(report["verdict"], "pass", "{}", report["issues"]);
+    assert_eq!(report["state"], "closed");
+    assert_eq!(report["workload"]["mode"], "skipped_idle");
+    assert_eq!(
+        report["windows"],
+        json!([["m6_vtl1"], ["m4_vtl0", "m5_hypervisor"], ["m6_vtl1"]])
+    );
+    assert_eq!(report["transitions"].as_array().unwrap().len(), 2);
+    assert_eq!(report["window_reports"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        operations,
+        [
+            "preflight:",
+            "open:m6_vtl1",
+            "arm:m6_vtl1",
+            "drain:m6_vtl1",
+            "end_session:m6_vtl1",
+            "transition:",
+            "open:m4_vtl0",
+            "open:m5_hypervisor",
+            "arm:m4_vtl0",
+            "arm:m5_hypervisor",
+            "drain:m5_hypervisor",
+            "drain:m4_vtl0",
+            "end_session:m5_hypervisor",
+            "end_session:m4_vtl0",
+            "transition:",
+            "open:m6_vtl1",
+            "arm:m6_vtl1",
+            "drain:m6_vtl1",
             "end_session:m6_vtl1",
         ]
     );

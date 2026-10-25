@@ -127,6 +127,21 @@ and M6 cannot share a VP in one window with what exists; the M7 roadmap records 
 M7.1's idle gate runs M6 and M4 in alternation (a criterion revision), M7.2 is to be designed
 off M4's hardware breakpoints, and the in-`vmwp` redelivery stays a fallback.
 
+**The alternating plan is `--m7-alternate` on the transaction coordinator** (`ALTERNATING_WINDOWS`
+in `src/skcorrelate.rs`: M6 alone, then M4 with M5, then M6 again; passed live 2026-10-25, run
+`20261025T145507`). Between windows it asks the adapter for a `transition`, and opens the next
+window only if every field of the `TransitionAck` reads clean: the VTL1 handler verified
+unregistered when a VTL1 window closed, no slot enabled in either VTL's DR7, no pending event or
+interruption, the trap flag clear in both VTLs, no engine worker. Two readings a driver gets
+wrong first, both measured that day: the dispatcher registers **two** handlers per session
+(vectors 1 and 3) and its clean release logs **one** `dispatcher verified handler unregistration
+and callback scratch release` line per session, after the last context's deferred cleanup, so
+that line is the count and the per-context free line is not written on that path; and a kernel
+debugger's `ba` reaches the processor's DR7 **with the continue** that resumes the target (the KD
+control set carries DR7), so a reading taken while the target is stopped at the arm shows no slot
+(`0x400`), and the slot is measured once the bounded run is under way. After M4's detach VTL0's
+DR0 still held its address with the enable clear; a switch reads enabled slots, not values.
+
 **`sk_live_wait` carries its own deadline and takes no timeout argument.** It comes from the
 operation's budget, which is of the order of a minute — so anything timed to arrive later than that
 cannot be caught by it, and a delay chosen to give the arm headroom can quietly exceed it. Time
