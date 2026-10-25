@@ -175,3 +175,16 @@ bytes VTL0 returned.
 Each answer must name the requested GPA. The tier does not bind the two sessions to a boot ID;
 its paired observations support protection only with an independent audit excluding a reboot
 between them. A reboot could make the saved GPA absent, so the tier alone makes no such claim.
+
+**The M7.2 join decides nothing a capture cannot prove, and three of its readings surprise.**
+`windbg-mcp --m7-join` (`src/skjoin.rs`) joins the three drained traces offline;
+`target/codex-m7/join-m7-run.py` runs it over a run directory. In the nested lab the admission is
+`interval_only`, because M6's worker samples K3's counter, so every M5 stage comes back ambiguous
+with all round trips as candidates however clean the run, and only the M4 stage can pair, by
+rank, when one window certainly contains the other and both traces are complete runs of the same
+length. A trace that reached its capacity is not a complete run, so the three K3 qualification
+records, all at capacity, pair nothing. And a round trip with no recorded return bounds nothing
+when its trace was capped or still armed: the trace stopping says nothing about where the VP was,
+and the first draft let a capped hypervisor trace's last open call enclose every later VTL1 phase
+(caught by the capped-trace test, 2026-10-25). Zero VTL1 records is `incomplete`, never a vacuous
+pass. The roadmap's M7.2 result has the rules and the first-stage field table.

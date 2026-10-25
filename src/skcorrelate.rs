@@ -579,7 +579,7 @@ pub(crate) enum Layer {
 impl Layer {
     const ALL: [Self; 3] = [Self::M4Vtl0, Self::M5Hypervisor, Self::M6Vtl1];
 
-    fn wire_name(self) -> &'static str {
+    pub(crate) fn wire_name(self) -> &'static str {
         match self {
             Self::M4Vtl0 => "m4_vtl0",
             Self::M5Hypervisor => "m5_hypervisor",

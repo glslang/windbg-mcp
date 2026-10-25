@@ -21,8 +21,8 @@ adding the debugger tier takes it to ~60s, most of it two tests waiting out real
 grace, and a call staying silent long enough to have to report that it is still running.
 
 **The pass count is the same either way**, because each gate is inside its own test: `cargo test
---test mcp_smoke` reports the same number passed with the tier off as with it on — 150 on
-2026-10-13 (114 on 2026-09-17), against ~7s and ~66s respectively, but it moves whenever a test is
+--test mcp_smoke` reports the same number passed with the tier off as with it on — 159 on
+2026-10-25 (150 on 2026-10-13, 114 on 2026-09-17), against ~7s and ~66s respectively, but it moves whenever a test is
 added, so re-derive it rather than reading it here. (A plain `cargo test` runs the unit tests beside it and prints a
 result line per binary, so it is this harness's own line to read.) The runtime is what tells the two
 runs apart, and `--nocapture` is what prints the `SKIPPED` reason — a run that reports every test

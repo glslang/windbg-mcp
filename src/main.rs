@@ -18,6 +18,8 @@
 //! before either a debugger engine or the MCP runtime exists.
 //! [`skcorrelate::TRANSACTION_PROTOCOL_FLAG`] drives the M7 three-worker lifecycle over a typed
 //! line protocol; the adapter owns public MCP calls while this engine-free role owns policy.
+//! [`skjoin::JOIN_FLAG`] is M7.2's deterministic join of three drained traces into one versioned
+//! capture record, a pure function of its input file that likewise exits before either exists.
 //! [`skinspect::INSPECT_FLAG`] reads a Hyper-V saved state's VTL1 and reports what is in it
 //! (`FOLLOWUPS.md` item 103); it speaks no MCP, and with `--symbols` it *does* load DbgEng — **one**
 //! target, and that target is a **file**: an image opened for its symbols, with no process behind it
@@ -64,6 +66,7 @@ mod skcontrol;
 mod skcorrelate;
 mod skdispatch;
 mod skinspect;
+mod skjoin;
 mod sklive;
 mod skpolicy;
 mod skservice;
@@ -154,6 +157,11 @@ fn main() -> Result<()> {
         .any(|arg| arg == skcorrelate::TRANSACTION_PROTOCOL_FLAG)
     {
         return skcorrelate::run_transaction_protocol(&args);
+    }
+    if args.iter().any(|arg| arg == skjoin::JOIN_FLAG) {
+        // M7.2's join is a pure function of three trace reads and the capture envelope; it
+        // speaks no MCP and constructs no engine.
+        return skjoin::run_join(&args);
     }
     if is_worker {
         // The rest of the command line is the worker's half of the protocol channel — two

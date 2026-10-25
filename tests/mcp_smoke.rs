@@ -420,6 +420,233 @@ fn m7_transaction_protocol_ends_a_timed_out_open_when_it_has_a_handle() {
     );
 }
 
+/// M7.2's join is a pure function of one file: the engine-free `--m7-join` role reads the three
+/// drained traces with the capture envelope and writes the joined record, or its table. This
+/// drives the real binary over one point-mode chain in the public wire shapes and reads the
+/// verdict back from both outputs; the decision rules themselves are the `skjoin` unit tests.
+#[test]
+fn m7_join_role_joins_one_chain_and_renders_its_table() {
+    const FREQUENCY: u64 = 10_000_000;
+    let qpc = |tick: u64| json!({"tick": tick, "frequency": FREQUENCY});
+    let bracket = |layer: &str, operation: &str, at: u64| {
+        json!({
+            "layer": layer,
+            "operation": operation,
+            "coordinator_before": qpc(at),
+            "worker": qpc(at + 5),
+            "coordinator_after": qpc(at + 10),
+        })
+    };
+    let brackets = [
+        bracket("m6_vtl1", "arm", 900),
+        bracket("m4_vtl0", "arm", 910),
+        bracket("m5_hypervisor", "arm", 920),
+        bracket("m5_hypervisor", "drain", 5_000),
+        bracket("m4_vtl0", "drain", 5_010),
+        bracket("m6_vtl1", "drain", 5_020),
+    ];
+    let block = format!("{:0<16}{}{:0<176}", "", "8402004001000000", "");
+    assert_eq!(block.len(), 208, "0x68 bytes of VTL0 argument block");
+    let request = format!("02002F0000000000{}", &block[16..128]);
+    let site = |tick: u64, epoch: u64| {
+        json!({
+            "epoch": format!("control-smoke-stopped-{epoch:016x}"),
+            "host_qpc": qpc(tick),
+            "host_monotonic_us": tick / 10,
+            "host_elapsed_us": tick,
+            "coordinate": {"address": "0xfffff803876cd7f0", "rva": 79856, "symbol": "securekernel!IumInvokeSecureService"},
+        })
+    };
+    let transition = |sequence: u64, tick: u64, call: bool| {
+        json!({
+            "sequence": sequence,
+            "host_qpc": qpc(tick),
+            "host_monotonic_us": tick / 10,
+            "host_elapsed_us": tick,
+            "kind": if call { "vtl_call" } else { "vtl_return" },
+            "processor": 0,
+            "vp_index": 0,
+            "source_vtl": if call { 0 } else { 1 },
+            "target_vtl": if call { 1 } else { 0 },
+            "control": if call { "0x0" } else { "0x1" },
+            "provenance": {"measured": ["kind"], "exact_build_derived": [], "architectural": [], "inferred": [], "read_failures": []},
+        })
+    };
+    // Hoisted out of the literal below: nested one level deeper, `json!` runs past the macro
+    // recursion limit.
+    let m6_record = json!({
+        "schema": "windbg-mcp.sk-service-call.v1",
+        "trace_id": "sktrace-smoke-1",
+        "label": "m7-smoke-idle",
+        "sequence": 1,
+        "manifest_id": "securekernel-10.0.26100.9457-service-47",
+        "complete": true,
+        "incomplete_reason": null,
+        "last_phase": "return",
+        "entry": {
+            "site": site(1_200, 0x10a),
+            "service": 47,
+            "caller": {"address": "0xfffff8038779f406", "rva": 939014, "symbol": "securekernel+0xe5406"},
+            "raw_arguments": {"rcx": "0xffff898075215e68", "rdx": "0xffff898075215ed0", "r8": "0xffff898075215ed0", "r9": "0xffffe787d7847080"},
+            "provenance": {"measured": ["entry.raw_arguments"], "exact_build_layout_derived": [], "inferred": [], "unavailable": []},
+        },
+        "dispatch": {
+            "site": site(1_300, 0x11a),
+            "handler": {"address": "0xfffff80387713990", "rva": 366992, "symbol": "securekernel!SkmmCreateEnclave"},
+            "request": "0xffff898075215e68",
+            "fields": [
+                {"name": "dispatch_mode", "offset": 0, "width": 1, "value": "0x0000000000000002"},
+                {"name": "completion", "offset": 1, "width": 1, "value": "0x0000000000000000"},
+                {"name": "service_number", "offset": 2, "width": 2, "value": "0x000000000000002f"},
+            ],
+            "buffers_before": [{
+                "name": "request.before", "address": "0xffff898075215e68",
+                "available_size": 64, "requested_size": 64,
+                "bytes": {"state": "measured", "data": request},
+            }],
+            "provenance": {"measured": ["dispatch.fields"], "exact_build_layout_derived": [], "inferred": [], "unavailable": []},
+        },
+        "returned": {
+            "site": site(1_400, 0x130),
+            "status": 0,
+            "buffers_after": [],
+            "provenance": {"measured": ["returned.status"], "exact_build_layout_derived": [], "inferred": [], "unavailable": []},
+        },
+    });
+    let input = json!({
+        "schema": "windbg-mcp.sk-correlation-join-input.v1",
+        "identity": m7_identity(),
+        "clock": {
+            "mode": "point",
+            "frequency": FREQUENCY,
+            "resolution_ns": 100,
+            "max_skew_ticks": 1000,
+            "reasons": [],
+            "brackets": brackets,
+        },
+        "selected_service": 47,
+        "expected_selected_calls": 1,
+        "workload_process_id": 4680,
+        "layers": {
+            "m4_vtl0": {
+                "arm": brackets[1],
+                "drain": brackets[4],
+                "trace": {
+                    "schema": "windbg-mcp.sk-call-trace.v1",
+                    "status": "ok",
+                    "trace_id": "skcall-1",
+                    "label": "m7-smoke-idle",
+                    "calls": [{
+                        "sequence": 0,
+                        "host_qpc": qpc(1_000),
+                        "host_monotonic_us": 100,
+                        "host_elapsed_us": 1_000,
+                        "transition_kind": 2,
+                        "service": 47,
+                        "call_context": 0,
+                        "argument_block": block,
+                        "caller_symbol": "nt!VslCreateEnclave",
+                        "process_id": 4680,
+                        "thread": "0xffffdb07dd4f2080",
+                        "processor": 0,
+                        "provenance": {"measured": ["service"], "symbol_derived": [], "inferred": [], "read_failures": []},
+                    }],
+                    "limit": 64, "full": false, "dropped": 0, "unreadable_hits": 0,
+                    "missing_breakpoint": false, "armed": false, "source_vtl": 0,
+                    "machine": "0x8664", "identity_gaps": [],
+                },
+            },
+            "m5_hypervisor": {
+                "arm": brackets[2],
+                "drain": brackets[3],
+                "trace": {
+                    "schema": "windbg-mcp.hv-transition-trace.v1",
+                    "status": "ok",
+                    "trace_id": "hvtransition-1",
+                    "label": "m7-smoke-idle",
+                    "transitions": [transition(0, 1_100, true), transition(1, 1_500, false)],
+                    "limit": 1024, "full": false, "dropped": 0, "unreadable_hits": 0,
+                    "missing_breakpoints": 0, "armed": false,
+                },
+            },
+            "m6_vtl1": {
+                "arm": brackets[0],
+                "drain": brackets[5],
+                "trace": {
+                    "schema": "windbg-mcp.sk-service-trace.v1",
+                    "status": "ok",
+                    "trace_id": "sktrace-smoke-1",
+                    "label": "m7-smoke-idle",
+                    "manifest_id": "securekernel-10.0.26100.9457-service-47",
+                    "selected_service": 47,
+                    "records": [m6_record],
+                    "limits": {"records": 64, "per_buffer_bytes": 64, "total_capture_bytes": 524288},
+                    "full": false, "dropped_records": 0, "dropped_capture_bytes": 0,
+                    "unreadable_fields": 0, "armed": false, "pending_phase": null,
+                },
+            },
+        },
+    });
+    let path = std::env::temp_dir().join(format!("windbg-mcp-m7-join-{}.json", std::process::id()));
+    std::fs::write(&path, serde_json::to_vec(&input).unwrap()).unwrap();
+
+    let output = Command::new(EXE)
+        .args(["--m7-join", path.to_str().unwrap()])
+        .output()
+        .expect("start the M7 join role");
+    assert!(
+        output.status.success(),
+        "M7 join failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let joined: Value =
+        serde_json::from_slice(&output.stdout).expect("the join role writes one JSON document");
+    assert_eq!(joined["schema"], "windbg-mcp.sk-correlation-join.v1");
+    assert_eq!(joined["verdict"], "complete", "{}", joined["reasons"]);
+    assert_eq!(joined["first_stage"]["source"], "m4_vtl0_entry");
+    let chain = &joined["chains"][0];
+    assert_eq!(chain["call_id"], "capture-smoke-0001:call:1");
+    assert_eq!(chain["verdict"], "complete");
+    assert_eq!(chain["stages"]["m4_entry"]["event"]["sequence"], 0);
+    assert_eq!(chain["stages"]["m5_vtl_call"]["event"]["sequence"], 0);
+    assert_eq!(chain["stages"]["m5_vtl_return"]["event"]["sequence"], 1);
+    assert_eq!(chain["nested_round_trips"], 0);
+    assert_eq!(chain["round_trips_before_entry"], 0);
+    assert!(
+        chain["cross_checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|check| check["result"]["result"] == "equal"),
+        "{}",
+        chain["cross_checks"]
+    );
+    // The sources ride along verbatim, so the record is self-contained.
+    assert_eq!(joined["sources"]["m6_vtl1"]["trace_id"], "sktrace-smoke-1");
+
+    let table = Command::new(EXE)
+        .args(["--m7-join", path.to_str().unwrap(), "--m7-join-table"])
+        .output()
+        .expect("start the M7 join role for its table");
+    assert!(table.status.success());
+    let table = String::from_utf8(table.stdout).unwrap();
+    assert!(table.starts_with("M7.2 join capture-smoke-0001"), "{table}");
+    assert!(
+        table.contains("capture-smoke-0001:call:1 | 1 | 0 | 0 |"),
+        "{table}"
+    );
+    assert!(table.contains("| Complete"), "{table}");
+
+    // A file that is not a join input is a refusal, not a verdict.
+    std::fs::write(&path, b"{\"schema\": \"nothing\"}").unwrap();
+    let refused = Command::new(EXE)
+        .args(["--m7-join", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    let _ = std::fs::remove_file(&path);
+}
+
 /// Per-request budget for protocol-tier calls. Generous enough that a loaded CI runner never
 /// trips it, bounded so a regression fails instead of hanging the suite.
 const STEP: Duration = Duration::from_secs(60);
