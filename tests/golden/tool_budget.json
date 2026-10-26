@@ -370,6 +370,15 @@
       "wire": 13951
     },
     {
+      "annotations": 127,
+      "description": 405,
+      "inputSchema": 2360,
+      "modelVisible": 2822,
+      "name": "open_sk_debugger",
+      "outputSchema": 4702,
+      "wire": 7682
+    },
+    {
       "annotations": 121,
       "description": 266,
       "inputSchema": 2360,
@@ -794,15 +803,15 @@
     }
   ],
   "totals": {
-    "annotations": 9909,
-    "description": 51002,
-    "inputSchema": 80834,
+    "annotations": 10036,
+    "description": 51407,
+    "inputSchema": 83194,
     "instructions": 2022,
-    "modelVisible": 136592,
-    "outputSchema": 256799,
-    "payload": 405887,
-    "tools": 88,
-    "wire": 405788,
+    "modelVisible": 139414,
+    "outputSchema": 261501,
+    "payload": 413570,
+    "tools": 89,
+    "wire": 413470,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10296
   }

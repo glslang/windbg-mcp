@@ -257,6 +257,22 @@ that untouched peer to publish its exact `quit:` record and exit successfully on
 the server side. Kernel process state supplies the exit observation because `Child::try_wait` can
 lag a Windows process exit. The harness then runs the bounded external audit and requires three
 healthy same-PID samples, no enabled debug-register breakpoint and unchanged Secure Kernel text.
+A third ignored test on the same config,
+`a_managed_secure_kernel_kd_session_is_driven_by_this_servers_own_kernel_attach`, launches no
+kd. It calls `open_sk_debugger`, which owns the managed facade and this server's kernel attach as
+one composite session under `--tools all`, and drives the Secure Kernel through the generic tools: `set_breakpoint` on
+the config's `breakpoint` expression (default `securekernel!IumInvokeSecureService`, after
+`set_symbol_path` when `symbol_path` is given), `continue_async`, the optional `trigger` command
+array (host-side, run after `continue_async` reports `running`; an idle guest reaches that entry rarely),
+`wait_for_stop`, `registers`, `backtrace`, `disassemble`, `step_into`, then `clear_breakpoints`,
+a second `continue_async` with nothing armed, `break_in` and `wait_for_stop`. It requires the
+facade log to show the three routes taken, ends the one public session through MCP (which detaches
+DbgEng before releasing the hidden controller), and runs the
+`post_release_audit` with the same DR7 check. It is the first live probe of M8.0's routing; a pass
+is one run of each route on one boot and not M8.2's gate. It passed on 2026-10-26 on the same K3
+nested bench against Secure Kernel 26100.9457: the post-release audit reported DR0–DR3 zero, DR7
+`0x400`, TF/RF clear, unchanged state, zero engine workers and heartbeat OK. The runner removed the
+durable guest trigger after composite release and needed no forced recovery.
 The separate ignored test
 `a_managed_secure_kernel_kd_session_resolves_symbols_and_unwinds_a_natural_stop`
 requires `symbol_path` naming a prepared local symbol cache and `arm_mode: "natural"`. It forces a

@@ -657,28 +657,7 @@ impl Session {
                 .bind_with_retention_notice(engine, &mut retained);
             control.wait_for_stop(&mut dispatcher)
         })();
-        if activity.retained_since().is_some()
-            && let (Some(service_deadline), Some(recovery_deadline)) =
-                (activity.pause_deadline(), activity.recovery_deadline())
-        {
-            let retained = PauseWindow {
-                service_deadline,
-                recovery_deadline,
-            };
-            self.pause_window = Some(match self.pause_window {
-                Some(original) => PauseWindow {
-                    service_deadline: original.service_deadline.min(retained.service_deadline),
-                    recovery_deadline: original.recovery_deadline.min(retained.recovery_deadline),
-                },
-                None => retained,
-            });
-            self.dispatcher.recovery_deadline = Some(
-                self.dispatcher
-                    .recovery_deadline
-                    .map(|deadline| deadline.min(recovery_deadline))
-                    .unwrap_or(recovery_deadline),
-            );
-        }
+        self.retain_pause_window(&activity);
         activity.finish();
         self.dispatcher.wait_activity = None;
         if result.as_ref().is_err_and(is_break_wake) {
@@ -733,9 +712,44 @@ impl Session {
             let mut dispatcher = self.dispatcher.bind(engine);
             control.wait_for_stop(&mut dispatcher)
         };
+        self.retain_pause_window(activity);
         activity.finish();
         self.dispatcher.wait_activity = None;
         result
+    }
+
+    /// Adopt one retained stop's absolute service and recovery deadlines.
+    ///
+    /// Both ordinary live-control waits and the KD facade's externally interruptible wait enter
+    /// through the same dispatcher retention boundary. Keeping this in one helper prevents the
+    /// facade from holding a real stop that stopped work cannot service or release because only
+    /// the caller-facing timestamp was recorded.
+    fn retain_pause_window(&mut self, activity: &WaitActivity) {
+        if activity.retained_since().is_none() {
+            return;
+        }
+        let (Some(service_deadline), Some(recovery_deadline)) =
+            (activity.pause_deadline(), activity.recovery_deadline())
+        else {
+            return;
+        };
+        let retained = PauseWindow {
+            service_deadline,
+            recovery_deadline,
+        };
+        self.pause_window = Some(match self.pause_window {
+            Some(original) => PauseWindow {
+                service_deadline: original.service_deadline.min(retained.service_deadline),
+                recovery_deadline: original.recovery_deadline.min(retained.recovery_deadline),
+            },
+            None => retained,
+        });
+        self.dispatcher.recovery_deadline = Some(
+            self.dispatcher
+                .recovery_deadline
+                .map(|deadline| deadline.min(recovery_deadline))
+                .unwrap_or(recovery_deadline),
+        );
     }
 
     pub(crate) fn step(
@@ -768,6 +782,27 @@ impl Session {
         })
     }
 
+    pub(crate) fn step_retained_breakpoint_until(
+        &mut self,
+        engine: &DebugEngine,
+        epoch: &crate::skcontrol::StopEpoch,
+        guard: crate::sklive::StepGuard,
+        deadline: Instant,
+    ) -> Result<LiveTransition> {
+        self.ensure_preparation_succeeded()?;
+        let control = self
+            .control
+            .as_mut()
+            .context("live Secure Kernel control has not completed target discovery")?;
+        let mut dispatcher = self.dispatcher.bind(engine);
+        let epoch =
+            control.step_retained_breakpoint_until(&mut dispatcher, epoch, guard, deadline)?;
+        Ok(LiveTransition {
+            phase: control.phase(),
+            epoch,
+        })
+    }
+
     pub(crate) fn continue_to_breakpoints(
         &mut self,
         engine: &DebugEngine,
@@ -786,6 +821,30 @@ impl Session {
         // The retained event has been completed. A later stop starts a fresh bounded pause window
         // in `wait_for_stop`; carrying this one across guest execution would spend that budget
         // while the target is running and could make the next stop impossible to service.
+        self.pause_window = None;
+        Ok(LiveTransition {
+            phase: control.phase(),
+            epoch,
+        })
+    }
+
+    /// A debugger's `g` with no breakpoint: release the retained stop with every slot clear and
+    /// let the VP run until a break request, teardown or the wait's recovery deadline.
+    pub(crate) fn continue_running(
+        &mut self,
+        engine: &DebugEngine,
+        epoch: &crate::skcontrol::StopEpoch,
+    ) -> Result<LiveTransition> {
+        let deadline = self.stopped_service_deadline()?;
+        self.ensure_preparation_succeeded()?;
+        let control = self
+            .control
+            .as_mut()
+            .context("live Secure Kernel control has not completed target discovery")?;
+        let mut dispatcher = self.dispatcher.bind(engine);
+        let epoch = control.continue_running_until(&mut dispatcher, epoch, deadline)?;
+        // As for continue-to-breakpoints: the retained event is complete, and the next stop
+        // starts its own pause window.
         self.pause_window = None;
         Ok(LiveTransition {
             phase: control.phase(),
@@ -2473,7 +2532,7 @@ impl WaitActivity {
         );
     }
 
-    fn break_requested(&self) -> bool {
+    pub(crate) fn break_requested(&self) -> bool {
         self.0.wake.load(Ordering::Acquire) == WAKE_BREAK
     }
 
@@ -7511,6 +7570,20 @@ mod tests {
             .split_once("pub(crate) fn wait_for_stop_interruptible(")
             .expect("the interruptible wait follows it")
             .0;
+        let interruptible_wait = source
+            .split_once("pub(crate) fn wait_for_stop_interruptible(")
+            .expect("the interruptible wait exists")
+            .1
+            .split_once("fn retain_pause_window(")
+            .expect("the shared pause-window retention follows it")
+            .0;
+        let retained_window = source
+            .split_once("fn retain_pause_window(")
+            .expect("the shared pause-window retention exists")
+            .1
+            .split_once("pub(crate) fn step(")
+            .expect("step follows pause-window retention")
+            .0;
         let step = source
             .split_once("pub(crate) fn step_until(\n")
             .expect("the ordinary step exists")
@@ -7522,9 +7595,21 @@ mod tests {
             .split_once("pub(crate) fn continue_to_breakpoints(\n")
             .expect("continue-to-breakpoints exists")
             .1
+            .split_once("pub(crate) fn continue_running(\n")
+            .expect("the free run follows it")
+            .0;
+        let free_run = source
+            .split_once("pub(crate) fn continue_running(\n")
+            .expect("the free run exists")
+            .1
             .split_once("pub(crate) fn continue_to_software_breakpoints(\n")
             .expect("continue-to-software-breakpoints follows it")
             .0;
+        assert!(
+            free_run.contains("self.pause_window = None")
+                && free_run.contains("continue_running_until(&mut dispatcher, epoch, deadline)"),
+            "a free run completes the retained event, ends its pause window and is bounded: {free_run}"
+        );
         let software = source
             .split_once("pub(crate) fn continue_to_software_breakpoints(\n")
             .expect("continue-to-software-breakpoints exists")
@@ -7542,8 +7627,17 @@ mod tests {
 
         assert!(
             wait.contains("WaitActivity::for_kd_until(")
-                && wait.contains("self.pause_window = Some("),
-            "a wait after step must reuse and retain the original absolute pause window: {wait}"
+                && wait.contains("self.retain_pause_window(&activity)"),
+            "an ordinary wait after step must reuse and retain the original absolute pause window: {wait}"
+        );
+        assert!(
+            interruptible_wait.contains("self.retain_pause_window(activity)"),
+            "the KD facade's interruptible wait must retain its stop's pause window: {interruptible_wait}"
+        );
+        assert!(
+            retained_window.contains("self.pause_window = Some(")
+                && retained_window.contains("self.dispatcher.recovery_deadline = Some("),
+            "both waits must adopt service and recovery deadlines through one helper: {retained_window}"
         );
         assert!(
             !step.contains("self.pause_window = None"),

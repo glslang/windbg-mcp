@@ -1076,6 +1076,12 @@ pub(crate) struct StepGuard {
     pub(crate) expected_rips: Vec<HexU64>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StepInstructionProof {
+    Refresh,
+    RetainedBreakpoint,
+}
+
 impl StepGuard {
     pub(crate) fn validate(&self) -> Result<()> {
         if let Some(instruction) = &self.instruction {
@@ -2025,7 +2031,7 @@ impl<P: ControlProvider> LiveControl<P> {
                 .filter(|provider| provider.baseline.is_some())
                 .count()
                 > 1;
-            if multi_provider_stop || software_stop {
+            if multi_provider_stop {
                 // The retained event is a barrier for the winner only. Return that provider to
                 // running before native completion, complete the callback, and prove a VM-wide
                 // pause before beginning any transition on a losing provider.
@@ -2045,11 +2051,14 @@ impl<P: ControlProvider> LiveControl<P> {
                 }
                 self.providers[active].provider.begin_arm()?;
                 self.providers[active].provider_phase = ProviderPhase::Arming;
-                if !software_stop {
-                    self.restore_inactive_providers(active)?;
-                }
+                self.restore_inactive_providers(active)?;
             }
-            Ok((stop, multi_provider_stop || software_stop))
+            // A software stop is restricted to a Hyper-V-proved sole VP. Its retained vector-3
+            // event is therefore the execution barrier after every INT3 byte has been restored
+            // and RIP normalized. Keep that event: converting it to a VM pause requires native
+            // completion and permits the restored instruction to execute before Suspend-VM can
+            // finish, so the exposed register snapshot would no longer name a debugger stop.
+            Ok((stop, multi_provider_stop))
         })();
         for provider in &mut self.providers {
             provider.provider.set_outer_deadline(None);
@@ -2148,6 +2157,8 @@ impl<P: ControlProvider> LiveControl<P> {
                 bail!("break on demand requires the paused TF and RF state to be clear");
             }
 
+            // A free run (`continue_running_until`) holds no breakpoint at all, so the fallback
+            // to the lowest owned slot can find nothing; that is a refusal, not an invariant.
             let slot = self
                 .breakpoints
                 .iter()
@@ -2159,13 +2170,13 @@ impl<P: ControlProvider> LiveControl<P> {
                             && !self.breakpoints.iter().any(|bp| bp.slot == *slot)
                     })
                 })
-                .unwrap_or_else(|| {
+                .or_else(|| {
                     self.breakpoints
                         .iter()
                         .map(|breakpoint| breakpoint.slot)
                         .min()
-                        .expect("a naturally armed session has a breakpoint")
-                });
+                })
+                .context("no hardware slot is free or owned for a break request")?;
             let transient = BreakpointGuard { slot, instruction };
             let register = transient.register();
             let current_dr7 = current.low(RegisterName::Dr7)?;
@@ -2245,7 +2256,13 @@ impl<P: ControlProvider> LiveControl<P> {
         epoch: &StopEpoch,
         guard: StepGuard,
     ) -> Result<StopEpoch> {
-        self.step_inner(dispatcher, epoch, guard, None)
+        self.step_inner(
+            dispatcher,
+            epoch,
+            guard,
+            None,
+            StepInstructionProof::Refresh,
+        )
     }
 
     pub(crate) fn step_until(
@@ -2255,7 +2272,37 @@ impl<P: ControlProvider> LiveControl<P> {
         guard: StepGuard,
         deadline: Instant,
     ) -> Result<StopEpoch> {
-        self.step_inner(dispatcher, epoch, guard, Some(deadline))
+        self.step_inner(
+            dispatcher,
+            epoch,
+            guard,
+            Some(deadline),
+            StepInstructionProof::Refresh,
+        )
+    }
+
+    /// Execute the original instruction whose breakpoint produced the retained stop.
+    ///
+    /// For INT3, stop acceptance restored the byte and read it back while retaining vector 3. For
+    /// an execution slot, the stopped instruction is the guard proved before DR0-DR3 was armed and
+    /// the retained vector-1 event prevents it from executing after the slot is disabled. Both
+    /// bind this exact instruction under the stopped CR3 with no intervening guest execution.
+    /// Rewalking every table is therefore redundant and weaker: an unrelated unreadable table can
+    /// refuse DbgEng's mandatory displacement even though its instruction remains proved.
+    pub(crate) fn step_retained_breakpoint_until(
+        &mut self,
+        dispatcher: &mut impl EventDispatcher,
+        epoch: &StopEpoch,
+        guard: StepGuard,
+        deadline: Instant,
+    ) -> Result<StopEpoch> {
+        self.step_inner(
+            dispatcher,
+            epoch,
+            guard,
+            Some(deadline),
+            StepInstructionProof::RetainedBreakpoint,
+        )
     }
 
     fn step_inner(
@@ -2264,6 +2311,7 @@ impl<P: ControlProvider> LiveControl<P> {
         epoch: &StopEpoch,
         guard: StepGuard,
         deadline: Option<Instant>,
+        instruction_proof: StepInstructionProof,
     ) -> Result<StopEpoch> {
         let stop = self.require_stop_epoch(epoch)?.clone();
         let (instruction, expected_rips) = guard.resolve(&stop)?;
@@ -2293,13 +2341,30 @@ impl<P: ControlProvider> LiveControl<P> {
         } else {
             None
         };
-        // This read has no target-side effect. A bad caller guard leaves the current stop and
-        // epoch intact so it can be corrected or continued safely. For a CR3 write this is the
-        // source guard through the old root; no destination read is attempted until the new root
-        // has been accepted.
-        match deadline {
-            Some(deadline) => dispatcher.verify_instruction_until(&instruction, deadline)?,
-            None => dispatcher.verify_instruction(&instruction)?,
+        match instruction_proof {
+            StepInstructionProof::Refresh => {
+                // This read has no target-side effect. A bad caller guard leaves the current stop
+                // and epoch intact so it can be corrected or continued safely. For a CR3 write
+                // this is the source guard through the old root; no destination read is attempted
+                // until the new root has been accepted.
+                match deadline {
+                    Some(deadline) => {
+                        dispatcher.verify_instruction_until(&instruction, deadline)?
+                    }
+                    None => dispatcher.verify_instruction(&instruction)?,
+                }
+            }
+            StepInstructionProof::RetainedBreakpoint => {
+                if !matches!(
+                    stop.event.reason,
+                    StopReason::SoftwareBreakpoint { .. } | StopReason::HardwareBreakpoint { .. }
+                ) || instruction != stop.instruction
+                {
+                    bail!(
+                        "a displaced breakpoint step requires the exact instruction from the retained stop"
+                    );
+                }
+            }
         }
         let next_epoch = self.next_epoch("running")?;
         let dispatcher_event = self.dispatcher_event.clone();
@@ -2547,6 +2612,31 @@ impl<P: ControlProvider> LiveControl<P> {
         deadline: Option<Instant>,
     ) -> Result<StopEpoch> {
         validate_breakpoints(&breakpoints, ArmMode::Natural)?;
+        self.continue_with_breakpoints_inner(dispatcher, epoch, breakpoints, deadline)
+    }
+
+    /// Release the retained stop with no hardware breakpoint armed. The VP then runs until a
+    /// break request, teardown or the wait's recovery deadline: the session stays in natural arm
+    /// mode with an empty slot set, which is the state [`Self::request_break_until`] needs, so a
+    /// debugger's `g` with no breakpoint is a bounded running wait rather than an infinite
+    /// resume. It is a distinct operation rather than an empty breakpoint list on the other,
+    /// because an arm with nothing to stop at is otherwise a caller's mistake and is refused.
+    pub(crate) fn continue_running_until(
+        &mut self,
+        dispatcher: &mut impl EventDispatcher,
+        epoch: &StopEpoch,
+        deadline: Instant,
+    ) -> Result<StopEpoch> {
+        self.continue_with_breakpoints_inner(dispatcher, epoch, Vec::new(), Some(deadline))
+    }
+
+    fn continue_with_breakpoints_inner(
+        &mut self,
+        dispatcher: &mut impl EventDispatcher,
+        epoch: &StopEpoch,
+        breakpoints: Vec<BreakpointGuard>,
+        deadline: Option<Instant>,
+    ) -> Result<StopEpoch> {
         self.require_unreserved(&breakpoints)?;
         let stop = self.require_stop_epoch(epoch)?.clone();
         if self.providers.len() != 1 {
@@ -2662,13 +2752,22 @@ impl<P: ControlProvider> LiveControl<P> {
         self.dispatcher_event = None;
         self.expected_stop = Some(ExpectedStop::Hardware);
         self.state = State::Running;
-        tracing::info!(
-            target: "windbg_mcp::secure_kernel_mutation",
-            vm_id = %self.providers[active].target.vm_id,
-            vp = self.providers[active].target.vp,
-            breakpoint_count = self.breakpoints.len(),
-            "live Secure Kernel control replaced execution breakpoints and resumed"
-        );
+        if self.breakpoints.is_empty() {
+            tracing::info!(
+                target: "windbg_mcp::secure_kernel_mutation",
+                vm_id = %self.providers[active].target.vm_id,
+                vp = self.providers[active].target.vp,
+                "live Secure Kernel control released every execution breakpoint and resumed; only a break request, teardown or the recovery deadline stops this run"
+            );
+        } else {
+            tracing::info!(
+                target: "windbg_mcp::secure_kernel_mutation",
+                vm_id = %self.providers[active].target.vm_id,
+                vp = self.providers[active].target.vp,
+                breakpoint_count = self.breakpoints.len(),
+                "live Secure Kernel control replaced execution breakpoints and resumed"
+            );
+        }
         Ok(self.commit_epoch(next_epoch))
     }
 
@@ -4579,12 +4678,18 @@ mod tests {
             .iter()
             .rposition(|action| *action == Action::ReleaseAndPause)
             .unwrap();
-        assert!(restored < released, "{:?}", dispatcher.actions);
+        assert!(released < restored, "{:?}", dispatcher.actions);
+        assert_eq!(control.providers[0].provider_phase, ProviderPhase::Stopped);
+        assert!(control.dispatcher_event.is_some());
 
         control
             .continue_from(&mut dispatcher, &stopped.epoch)
             .unwrap();
         assert_eq!(control.phase(), LivePhase::Running);
+        assert_eq!(
+            dispatcher.actions.last(),
+            Some(&Action::Release(ReleaseMode::Resume))
+        );
     }
 
     #[test]
@@ -4623,6 +4728,134 @@ mod tests {
             TARGET_RIP
         );
         assert!(dispatcher.actions.contains(&Action::RestoreSoftware));
+    }
+
+    #[test]
+    fn displaced_software_breakpoint_step_reuses_only_the_exact_restoration_proof() {
+        let mut dispatcher = FakeDispatcher::new([
+            observed(StopReason::HardwareBreakpoint { slot: 0 }),
+            observed_software(),
+        ]);
+        let mut control = LiveControl::open(FakeProvider::new()).unwrap();
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Redirect)
+            .unwrap();
+        let hardware = control.wait_for_stop(&mut dispatcher).unwrap();
+        control
+            .continue_to_software_breakpoints_until(
+                &mut dispatcher,
+                &hardware.epoch,
+                vec![instruction()],
+                Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+        dispatcher.retained_recovery_deadline =
+            Some(Instant::now() + std::time::Duration::from_secs(1));
+        let software = control.wait_for_stop(&mut dispatcher).unwrap();
+        let verifications = dispatcher
+            .actions
+            .iter()
+            .filter(|action| matches!(action, Action::Verify(_)))
+            .count();
+        dispatcher.fail_verify = Some("a redundant page-table refresh failed");
+
+        let error = control
+            .step_retained_breakpoint_until(
+                &mut dispatcher,
+                &software.epoch,
+                StepGuard {
+                    instruction: Some(InstructionGuard {
+                        address: software.instruction.address,
+                        bytes: vec![0x91],
+                    }),
+                    expected_rips: Vec::new(),
+                },
+                Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exact instruction from the retained stop")
+        );
+        assert_eq!(control.phase(), LivePhase::Stopped);
+
+        control
+            .step_retained_breakpoint_until(
+                &mut dispatcher,
+                &software.epoch,
+                StepGuard {
+                    instruction: Some(software.instruction),
+                    expected_rips: Vec::new(),
+                },
+                Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+
+        assert_eq!(control.phase(), LivePhase::Running);
+        assert_eq!(
+            dispatcher
+                .actions
+                .iter()
+                .filter(|action| matches!(action, Action::Verify(_)))
+                .count(),
+            verifications,
+            "the exact instruction was already restored and verified while accepting the stop"
+        );
+        assert_eq!(
+            dispatcher
+                .actions
+                .iter()
+                .filter(|action| **action == Action::ReleaseAndPause)
+                .count(),
+            1,
+            "only the hardware stop is converted to the pause used to arm INT3"
+        );
+        assert_eq!(
+            dispatcher.actions.last(),
+            Some(&Action::Release(ReleaseMode::ArmNextStop)),
+            "the displaced instruction is released from its retained vector-3 event"
+        );
+    }
+
+    #[test]
+    fn displaced_hardware_breakpoint_step_reuses_the_retained_instruction_proof() {
+        let mut dispatcher =
+            FakeDispatcher::new([observed(StopReason::HardwareBreakpoint { slot: 0 })]);
+        let mut control = LiveControl::open(FakeProvider::new()).unwrap();
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Redirect)
+            .unwrap();
+        let hardware = control.wait_for_stop(&mut dispatcher).unwrap();
+        let verifications = dispatcher
+            .actions
+            .iter()
+            .filter(|action| matches!(action, Action::Verify(_)))
+            .count();
+        dispatcher.fail_verify = Some("a redundant page-table refresh failed");
+
+        control
+            .step_retained_breakpoint_until(
+                &mut dispatcher,
+                &hardware.epoch,
+                StepGuard {
+                    instruction: Some(hardware.instruction),
+                    expected_rips: Vec::new(),
+                },
+                Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+
+        assert_eq!(control.phase(), LivePhase::Running);
+        assert_eq!(
+            dispatcher
+                .actions
+                .iter()
+                .filter(|action| matches!(action, Action::Verify(_)))
+                .count(),
+            verifications,
+            "the retained hardware stop already binds the exact guarded instruction"
+        );
     }
 
     #[test]
@@ -4963,6 +5196,77 @@ mod tests {
         let stop = control.wait_for_stop(&mut dispatcher).unwrap();
         assert_eq!(stop.event.reason, StopReason::BreakRequest { slot: 1 });
         assert_eq!(stop.registers.low(RegisterName::Rip).unwrap(), BASE_RIP);
+    }
+
+    #[test]
+    fn a_free_run_arms_nothing_and_a_break_request_is_what_stops_it() {
+        // The fake VP does not move after its stop, so the paused RIP the break request samples
+        // is the hardware stop's own address, not the arm-time one.
+        let transient = InstructionGuard {
+            address: HexU64(TARGET_RIP),
+            bytes: vec![0x90],
+        };
+        let mut dispatcher = FakeDispatcher::new([
+            observed(StopReason::HardwareBreakpoint { slot: 0 }),
+            ObservedStop {
+                event: event(StopReason::DebugException),
+                instructions: vec![transient.clone()],
+            },
+        ]);
+        let mut control = LiveControl::open(FakeProvider::new()).unwrap();
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Natural)
+            .unwrap();
+        let stop = control.wait_for_stop(&mut dispatcher).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+
+        // The explicit operation is the only way to run with nothing armed: the ordinary
+        // continue still treats an empty set as the mistake it usually is.
+        let refused = control
+            .continue_to_breakpoints_until(&mut dispatcher, &stop.epoch, Vec::new(), deadline)
+            .unwrap_err();
+        assert!(refused.to_string().contains("1..=4"), "{refused:#}");
+        assert_eq!(control.phase(), LivePhase::Stopped);
+
+        let running = control
+            .continue_running_until(&mut dispatcher, &stop.epoch, deadline)
+            .unwrap();
+        assert!(running.to_string().contains("running"));
+        assert_eq!(control.phase(), LivePhase::Running);
+        assert!(control.breakpoints.is_empty());
+        assert_eq!(control.arm_mode, Some(ArmMode::Natural));
+        let register = |name: RegisterName| {
+            control
+                .test_provider()
+                .registers
+                .iter()
+                .find(|value| value.name == name)
+                .map(|value| value.low.0)
+                .unwrap()
+        };
+        assert_eq!(register(RegisterName::Dr7) & DR7_ENABLE_MASK, 0);
+        assert_eq!(register(RegisterName::Dr0), 0);
+        assert!(
+            dispatcher
+                .actions
+                .contains(&Action::Release(ReleaseMode::ArmNextStop))
+        );
+
+        // A break request finds a free slot even though the session owns none, and the next
+        // wait retains its transient stop.
+        control
+            .request_break_until(&mut dispatcher, deadline)
+            .unwrap();
+        assert_eq!(
+            control.breakpoints,
+            vec![BreakpointGuard {
+                slot: 0,
+                instruction: transient,
+            }]
+        );
+        let stop = control.wait_for_stop(&mut dispatcher).unwrap();
+        assert_eq!(stop.event.reason, StopReason::BreakRequest { slot: 0 });
+        assert_eq!(stop.registers.low(RegisterName::Rip).unwrap(), TARGET_RIP);
     }
 
     #[test]

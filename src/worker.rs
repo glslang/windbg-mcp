@@ -2000,6 +2000,18 @@ fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
                 } else {
                     false
                 };
+                // This engine owns only the client half of the composite's private KD pipe. On
+                // supervisor loss its paired controller worker independently runs the proved
+                // VTL1 close (or retains fail-closed). Native KD's `qd` has no detach encoding
+                // the facade can distinguish from `g`, so invoking it here would wait forever.
+                if held.managed_secure_kernel_peer {
+                    KERNEL_SAFETY.released();
+                    tracing::info!(
+                        "worker: managed Secure Kernel DbgEng peer is closing with its supervisor; the paired controller owns target release"
+                    );
+                    let _ = ack.send(true);
+                    continue;
+                }
                 // The attach's leftover break-ins are spent inside this call, by dbgscope's
                 // `quit_and_detach_target` — so this path gets it without asking, which is why
                 // there is nothing here to go with it. Nothing on this path came from a caller,
@@ -3435,6 +3447,9 @@ fn apply_symbol_path(e: &DebugEngine, setting: &SymbolPathSetting) -> Result<(),
 /// that thread.
 #[derive(Default)]
 struct HeldBetweenOps {
+    /// Whether this kernel engine is only the DbgEng peer of a managed Secure Kernel facade.
+    /// The paired controller proves target restoration after this worker closes its KD pipe.
+    managed_secure_kernel_peer: bool,
     /// The Secure Kernel capture this worker holds, if its session is one -- `FOLLOWUPS.md` item 103
     /// gate S3. The provider's handles are raw pointers, and every call on them is made from here.
     sk: Option<crate::sksession::Session>,
@@ -3471,6 +3486,7 @@ fn execute(
     held: &mut HeldBetweenOps,
 ) -> Result<Output, Failed> {
     let HeldBetweenOps {
+        managed_secure_kernel_peer,
         sk,
         sk_live,
         pool_trace,
@@ -3621,37 +3637,41 @@ fn execute(
         EngineOp::AttachKernel {
             connection,
             experimental_break_on_connect,
-        } => open(
-            e,
-            id,
-            |commit| {
-                // `_begin` takes the connection; the KD link is dialed and the break-in awaited
-                // in `wait`. Committing between them is what stops a failed wait from looking
-                // like "nothing happened" — re-dialing a live link is not a clean retry.
-                //
-                // This `wait` is the one that can never return: `SetInterrupt` cannot reach a
-                // wait still establishing the link, so a guest that never dials in parks here
-                // for good. It parks *this process*, which the supervisor can kill.
-                // Unwrap only for the typed attach call; never log the exposed connection.
-                //
-                // What this path leaves behind for the teardown to undo — the break-ins an
-                // `INITIAL_BREAK` attach still owes — is recorded and spent inside dbgscope,
-                // beside the `qd` that would otherwise lose the target's only continue to one.
-                // Nothing is bookkept here: this server cannot see which of the two calls below
-                // armed what, and a flag it kept would be a second copy of an answer the engine
-                // already holds.
-                let pending = if experimental_break_on_connect {
-                    e.attach_kernel_announcement_begin(connection.expose())
-                } else {
-                    e.attach_kernel_begin(connection.expose())
-                }
-                .map_err(es)?;
-                KERNEL_SAFETY.committed();
-                commit();
-                pending.wait().map_err(es)
-            },
-            || kernel_report(e),
-        ),
+            managed_secure_kernel_peer: managed_peer,
+        } => {
+            *managed_secure_kernel_peer = managed_peer;
+            open(
+                e,
+                id,
+                |commit| {
+                    // `_begin` takes the connection; the KD link is dialed and the break-in awaited
+                    // in `wait`. Committing between them is what stops a failed wait from looking
+                    // like "nothing happened" — re-dialing a live link is not a clean retry.
+                    //
+                    // This `wait` is the one that can never return: `SetInterrupt` cannot reach a
+                    // wait still establishing the link, so a guest that never dials in parks here
+                    // for good. It parks *this process*, which the supervisor can kill.
+                    // Unwrap only for the typed attach call; never log the exposed connection.
+                    //
+                    // What this path leaves behind for the teardown to undo — the break-ins an
+                    // `INITIAL_BREAK` attach still owes — is recorded and spent inside dbgscope,
+                    // beside the `qd` that would otherwise lose the target's only continue to one.
+                    // Nothing is bookkept here: this server cannot see which of the two calls below
+                    // armed what, and a flag it kept would be a second copy of an answer the engine
+                    // already holds.
+                    let pending = if experimental_break_on_connect {
+                        e.attach_kernel_announcement_begin(connection.expose())
+                    } else {
+                        e.attach_kernel_begin(connection.expose())
+                    }
+                    .map_err(es)?;
+                    KERNEL_SAFETY.committed();
+                    commit();
+                    pending.wait().map_err(es)
+                },
+                || kernel_report(e),
+            )
+        }
 
         EngineOp::AttachProcess { pid } => open(
             e,
@@ -4510,6 +4530,15 @@ fn execute(
                     Some(true),
                 ));
             }
+            if *managed_secure_kernel_peer {
+                query::invalidate_allocator_caches();
+                return Ok(Output::released(
+                    "Session ended. The managed Secure Kernel DbgEng peer is closing its private \
+                     KD pipe; the paired controller now owns authoritative VTL1 restoration and \
+                     release.",
+                    Some(true),
+                ));
+            }
             // Read *before* the teardown, which is the only moment it is still true: ending a
             // session is what clears it. And it is worth saying at all because the two endings
             // are opposite and neither is visible from the caller's side — a process this server
@@ -5237,18 +5266,24 @@ fn stop_report(
     )
 }
 
-/// The register set, as `r` renders it and as values beside it.
+/// The register set, rendered from the same typed values carried beside it.
 ///
-/// Two reads of the same context rather than one parsed twice — and they cannot disagree, because
-/// this is one indivisible job on the engine thread, so nothing can move the target between them.
+/// Do not run the debugger's textual `r` command here. At a live-kernel code breakpoint DbgEng can
+/// use that command boundary to begin its deferred breakpoint displacement: it restores the KD
+/// breakpoint, sends `Continue2`, and leaves the target running until another event pump. A tool
+/// whose contract is a read must not advance the target. `IDebugRegisters` supplies the complete
+/// bank without that execution side effect, so it is both the value source and the text source.
 ///
 /// `all` decides how much of the bank travels. The integer registers are what `r` prints and what
 /// nearly every question is about; the x87/vector registers and the subregister views are several
 /// hundred more entries, and including them unasked would put ~20x the payload on every call for
 /// `rsp`.
 fn registers(e: &DebugEngine, all: bool) -> Result<Output, Failed> {
-    let text = e.registers().map_err(failed)?;
     let registers = e.register_values().map_err(failed)?;
+    let text = render_integer_registers(&registers);
+    let instruction_pointer = instruction_pointer_in_bank(&registers)
+        .or_else(|| e.instruction_pointer().ok())
+        .map(structured::addr);
     let selected: Vec<structured::RegisterInfo> = registers
         .iter()
         .filter(|register| all || plain_integer(register))
@@ -5259,17 +5294,39 @@ fn registers(e: &DebugEngine, all: bool) -> Result<Output, Failed> {
         })
         .collect();
     Ok(Output::typed(
-        // DbgEng prints nothing for `r` when there is no live thread context (a module-load
-        // break, or a bare `goto_position` to the very start of a trace). The explanation is the
-        // supervisor's to add — it is advice about which tool to call next — so the text crosses
-        // as the engine gave it.
+        // An empty bank renders as empty text, matching the old `r` path at a stop with no live
+        // thread context. The supervisor still owns any user-facing explanation of that state.
         text,
         structured::RegisterSet {
-            instruction_pointer: e.instruction_pointer().ok().map(structured::addr),
+            instruction_pointer,
             registers: selected,
             all_registers: all,
         },
     ))
+}
+
+/// A compact `r`-shaped view of the integer bank. The structured result remains the authoritative
+/// typed answer; this is the human-readable half and deliberately stays on the same engine read.
+fn render_integer_registers(registers: &[dbgscope::dbgeng::Register]) -> String {
+    let cells: Vec<String> = registers
+        .iter()
+        .filter(|register| plain_integer(register))
+        .filter_map(|register| match register.value {
+            dbgscope::dbgeng::RegisterValue::Int(value) => {
+                Some(format!("{}={value:016x}", register.name))
+            }
+            _ => None,
+        })
+        .collect();
+    let mut text = cells
+        .chunks(3)
+        .map(|row| row.join(" "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    text
 }
 
 /// Whether a register belongs in the **default** answer: the integer registers a caller means by
@@ -5298,6 +5355,24 @@ fn plain_integer(register: &dbgscope::dbgeng::Register) -> bool {
     !register.subregister
         && matches!(register.value, dbgscope::dbgeng::RegisterValue::Int(_))
         && !register.name.contains('/')
+}
+
+/// The architecture's program counter from a bank [`DebugEngine::register_values`] returned.
+///
+/// DbgEng exposes `rip`/`eip` as ordinary integer registers even at a managed-KD stop where its
+/// separate `GetInstructionOffset` path returns `E_INVALIDARG`. `pc` covers architectures whose
+/// engine spelling is neither x86 form. A subregister never wins even if an engine ever grows a
+/// view with one of those names.
+fn instruction_pointer_in_bank(registers: &[dbgscope::dbgeng::Register]) -> Option<u64> {
+    registers.iter().find_map(|register| {
+        let is_pc = ["rip", "eip", "pc"]
+            .iter()
+            .any(|name| register.name.eq_ignore_ascii_case(name));
+        match (&register.value, register.subregister, is_pc) {
+            (dbgscope::dbgeng::RegisterValue::Int(value), false, true) => Some(*value),
+            _ => None,
+        }
+    })
 }
 
 /// A module row with the PDB identity the engine has for it, where it has one.
@@ -6712,9 +6787,17 @@ fn disassemble(e: &DebugEngine, address: Option<&str>, count: usize) -> Result<O
         Some(expr) => {
             resolve(e, expr).ok_or_else(|| format!("could not resolve address `{expr}`"))?
         }
-        // Not an error worth dressing up: a target with no register context has no current
-        // instruction, and the engine says so better than a guess here would.
-        None => e.instruction_pointer().map_err(failed)?,
+        // The scalar query is cheap and remains the ordinary path. Managed KD exposes one DbgEng
+        // edge where it refuses that query after restoring a hit breakpoint while the typed bank
+        // still carries the exact `rip`; use that value, not a guessed or cached address.
+        None => match e.instruction_pointer() {
+            Ok(ip) => ip,
+            Err(ip_error) => e
+                .register_values()
+                .ok()
+                .and_then(|registers| instruction_pointer_in_bank(&registers))
+                .ok_or_else(|| failed(ip_error))?,
+        },
     };
     let decoded = e.disassemble(start, count).map_err(failed)?;
 
@@ -16364,6 +16447,42 @@ mod tests {
         );
     }
 
+    /// A composite peer must not enter native KD's quit-and-detach path. Its private target has
+    /// no detach message distinct from an ordinary continue; closing the worker drops that pipe,
+    /// and the paired controller then performs the proved VTL1 release.
+    #[test]
+    fn a_managed_secure_kernel_peer_closes_before_the_generic_qd_path() {
+        let source = include_str!("worker.rs").replace("\r\n", "\n");
+        let teardown = source
+            .split_once("EngineOp::EndSession => {\n")
+            .expect("the teardown arm exists")
+            .1
+            .split_once("\n        }\n    }\n}\n\n/// What a caller is told")
+            .expect("the teardown arm has its documented boundary")
+            .0;
+        let managed = teardown
+            .find("if *managed_secure_kernel_peer")
+            .expect("the managed peer has an explicit teardown path");
+        let generic = teardown
+            .find("let ended = e")
+            .expect("ordinary live kernels retain the generic qd path");
+        assert!(managed < generic, "{teardown}");
+        assert!(
+            teardown[managed..generic].contains("return Ok(Output::released"),
+            "the managed arm must leave before generic qd: {teardown}"
+        );
+
+        let supervisor_loss = source
+            .split_once("if held.managed_secure_kernel_peer {\n")
+            .expect("supervisor loss has the same managed-peer exception")
+            .1
+            .split_once("let result = catch_unwind(AssertUnwindSafe(|| engine.end_session()))")
+            .expect("ordinary supervisor-loss teardown still reaches DbgEng")
+            .0;
+        assert!(supervisor_loss.contains("ack.send(true)"));
+        assert!(supervisor_loss.contains("continue;"));
+    }
+
     /// **The worker names no tool**, per `FOLLOWUPS.md` item 43: it is built where the client's
     /// surface is unknown. `qd` is a debugger command and is fine; a tool name would not be.
     #[test]
@@ -18413,6 +18532,7 @@ mod tests {
                 EngineOp::AttachKernel {
                     connection: crate::kdconn::Connection::new("net:port=50000,key=1.2.3.4"),
                     experimental_break_on_connect: false,
+                    managed_secure_kernel_peer: false,
                 },
                 Some(TargetOrigin::Kernel),
             ),
@@ -21002,6 +21122,74 @@ mod tests {
         assert!(
             !plain_integer(&reg("xmm0/0", Engine::Int(0), false)),
             "the rule decides the default only"
+        );
+    }
+
+    #[test]
+    fn register_text_is_rendered_from_the_typed_integer_bank() {
+        use dbgscope::dbgeng::{Register, RegisterValue};
+        let registers = [
+            Register {
+                name: "rax".into(),
+                value: RegisterValue::Int(0x12),
+                subregister: false,
+            },
+            Register {
+                name: "eax".into(),
+                value: RegisterValue::Int(0x12),
+                subregister: true,
+            },
+            Register {
+                name: "xmm0".into(),
+                value: RegisterValue::Bytes(vec![0; 16]),
+                subregister: false,
+            },
+            Register {
+                name: "rip".into(),
+                value: RegisterValue::Int(0xffff_f807_2aa2_d7f0),
+                subregister: false,
+            },
+        ];
+
+        assert_eq!(
+            render_integer_registers(&registers),
+            "rax=0000000000000012 rip=fffff8072aa2d7f0\n"
+        );
+        assert_eq!(
+            instruction_pointer_in_bank(&registers),
+            Some(0xffff_f807_2aa2_d7f0)
+        );
+    }
+
+    #[test]
+    fn only_a_full_integer_program_counter_is_used_as_the_typed_ip() {
+        use dbgscope::dbgeng::{Register, RegisterValue};
+        let register = |name: &str, value, subregister| Register {
+            name: name.into(),
+            value,
+            subregister,
+        };
+
+        assert_eq!(
+            instruction_pointer_in_bank(&[register(
+                "RIP",
+                RegisterValue::Int(0xffff_f800_0000_1234),
+                false,
+            )]),
+            Some(0xffff_f800_0000_1234)
+        );
+        assert_eq!(
+            instruction_pointer_in_bank(&[
+                register("eip", RegisterValue::Int(0x0040_1234), false,)
+            ]),
+            Some(0x0040_1234)
+        );
+        assert_eq!(
+            instruction_pointer_in_bank(&[
+                register("rip", RegisterValue::Int(1), true),
+                register("pc", RegisterValue::Unavailable, false),
+            ]),
+            None
         );
     }
 

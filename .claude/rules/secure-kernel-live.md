@@ -176,6 +176,21 @@ Each answer must name the requested GPA. The tier does not bind the two sessions
 its paired observations support protection only with an independent audit excluding a reboot
 between them. A reboot could make the saved GPA absent, so the tier alone makes no such claim.
 
+**The KD facade's `g` is two controller paths, and which one a Ctrl+Break can reach is decided
+before the wait begins.** A non-trace continue with slots installed is `continue_to_breakpoints`;
+with none it is `continue_running` (`LiveControl::continue_running_until`), a free run that arms
+nothing and that only `request_break_until`, teardown or the recovery deadline ends. The facade's
+`WaitWaker::begin(activity, breakable)` takes `!trace`: for a `g` a Ctrl+Break sets the
+activity's break request *before* the scoped interrupt is spawned, which is the only way the
+dispatcher's interrupted wait answers `BreakWake` and the engine thread runs `break_on_demand`;
+for a `t` it never sets it, so the break-in stays a cancellation into recovery, because a trace
+step's expected stop is its own successor and break-on-demand needs a natural running arm.
+Mutation-verified 2026-10-25: removing the flag from `request` fails
+`a_break_in_during_a_go_requests_the_rendezvous_before_it_interrupts`. Both routes are coded
+against the qualified direct M1/M2 paths and unmeasured live through the facade; the ignored
+`..._is_driven_by_this_servers_own_kernel_attach` is the probe, and it is `--tools all`
+because `open_sk_kd` is `extra` and `attach_kernel` is ordinary.
+
 **The M7.2 join decides nothing a capture cannot prove, and three of its readings surprise.**
 `windbg-mcp --m7-join` (`src/skjoin.rs`) joins the three drained traces offline;
 `target/codex-m7/join-m7-run.py` runs it over a run directory. In the nested lab the admission is

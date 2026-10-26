@@ -2,7 +2,7 @@
   "schemaDialects": [
     "https://json-schema.org/draft/2020-12/schema"
   ],
-  "toolCount": 88,
+  "toolCount": 89,
   "tools": [
     {
       "hints": {
@@ -1325,6 +1325,56 @@
         "image"
       ],
       "title": "Open a Secure Kernel capture"
+    },
+    {
+      "hints": {
+        "destructive": true,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "open_sk_debugger",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/OpenedSession",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/OpenFailure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
+      "params": [
+        "arm_mode: ref(#/$defs/ArmMode)",
+        "connect_timeout_ms: integer|null/uint64",
+        "control_transport: string",
+        "dispatcher_vnd: string|null",
+        "expected_cr3: string|null",
+        "idle_timeout_ms: integer|null/uint64",
+        "live_transport: string",
+        "partition_id: string|null",
+        "profile: string",
+        "vm_id: string",
+        "vmwp_pid: integer|null/uint32",
+        "vp: integer|null/uint32"
+      ],
+      "required": [
+        "control_transport",
+        "live_transport",
+        "profile",
+        "vm_id"
+      ],
+      "title": "Open Secure Kernel debugger"
     },
     {
       "hints": {

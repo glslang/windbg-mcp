@@ -31,9 +31,11 @@ use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
-use crate::kdapi::{Amd64Context, Amd64ContextValues, ManipulateRequest, Version64};
+use crate::kdapi::{
+    Amd64Context, Amd64ContextValues, ManipulateRequest, StateChangeException, Version64,
+};
 use crate::kdwire::{Decoder, Frame, TargetLink};
-use crate::skcontrol::{RegisterName, RegisterValue};
+use crate::skcontrol::{RegisterName, RegisterValue, StopReason};
 use crate::skdispatch::service_pause_bound;
 use crate::sklive::{ArmMode, BreakpointGuard, InstructionGuard, StepGuard, StopRecord};
 
@@ -45,6 +47,7 @@ const DEFAULT_MAX_PAUSE: Duration = Duration::from_secs(600);
 pub(crate) const MAX_MANAGED_TIMEOUT_MS: u64 = 3_600_000;
 const MAX_PIPE_NAME: usize = 128;
 const MAX_INSTRUCTION_BYTES: u32 = 15;
+const KD_INSTRUCTION_STREAM_BYTES: u32 = 16;
 const COMPATIBILITY_PAGE_BYTES: u64 = 0x1000;
 const CODE_BACKSCAN_BYTES: u64 = 0x2b;
 const CODE_LOOKAHEAD_BYTES: u64 = 0x80;
@@ -121,6 +124,41 @@ impl fmt::Display for WaitWakeReason {
 struct ActiveWait {
     activity: crate::skdispatch::WaitActivity,
     reason: Option<WaitWakeReason>,
+    break_in: BreakInPolicy,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BreakInPolicy {
+    /// A user `g` owns a naturally running arm, so Ctrl+Break requests the M2 rendezvous.
+    Rendezvous,
+    /// A user trace has its own expected successor; Ctrl+Break cancels that wait into recovery.
+    Cancel,
+    /// DbgEng is invisibly displacing one of its own breakpoints. Its protocol-internal break-in
+    /// must wait for the resulting single-step state change rather than interrupting that step.
+    Defer,
+}
+
+/// A hit breakpoint DbgEng removed before issuing its private one-instruction continue.
+#[derive(Clone, Debug)]
+enum DisplacedBreakpoint {
+    /// M3 already restored and re-read the original byte while retaining the vector-3 event.
+    Software(InstructionGuard),
+    /// The owned debug-register slot was disabled while the vector-1 event remained retained.
+    Hardware(InstructionGuard),
+}
+
+#[derive(Clone, Debug)]
+struct ReportedInstruction {
+    guard: InstructionGuard,
+    stream: Vec<u8>,
+}
+
+impl DisplacedBreakpoint {
+    fn instruction(&self) -> &InstructionGuard {
+        match self {
+            Self::Software(instruction) | Self::Hardware(instruction) => instruction,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -133,10 +171,29 @@ impl WaitWakeState {
     fn begin(
         &mut self,
         activity: crate::skdispatch::WaitActivity,
+        break_in: BreakInPolicy,
     ) -> Option<crate::skdispatch::WaitActivity> {
+        if break_in == BreakInPolicy::Defer
+            && matches!(self.pending.front(), Some(WaitWakeReason::BreakIn))
+        {
+            self.active = Some(ActiveWait {
+                activity,
+                reason: None,
+                break_in,
+            });
+            return None;
+        }
         let reason = self.pending.pop_front();
+        if break_in == BreakInPolicy::Rendezvous && matches!(reason, Some(WaitWakeReason::BreakIn))
+        {
+            activity.request_break();
+        }
         let wake = reason.as_ref().map(|_| activity.clone());
-        self.active = Some(ActiveWait { activity, reason });
+        self.active = Some(ActiveWait {
+            activity,
+            reason,
+            break_in,
+        });
         wake
     }
 
@@ -159,6 +216,15 @@ impl WaitWakeState {
             || wait.reason.is_some()
         {
             return None;
+        }
+        if wait.break_in == BreakInPolicy::Defer && matches!(reason, WaitWakeReason::BreakIn) {
+            self.pending.push_back(reason);
+            return None;
+        }
+        // Marked before the interrupt is spawned: the dispatcher reads the flag at the instant
+        // the wait is cut short and answers `BreakWake` only if it is already set.
+        if wait.break_in == BreakInPolicy::Rendezvous && matches!(reason, WaitWakeReason::BreakIn) {
+            wait.activity.request_break();
         }
         wait.reason = Some(reason);
         Some(wait.activity.clone())
@@ -186,6 +252,33 @@ impl WaitWakeState {
     }
 }
 
+/// A stopped target cannot report a second state change until the first is acknowledged. Preserve
+/// a break-in that arrives in that interval so the next continue consumes it before execution.
+#[derive(Debug, Default)]
+struct StoppedBreakIn {
+    deferred: bool,
+}
+
+impl StoppedBreakIn {
+    /// Returns whether the retained stop can be resent immediately.
+    fn receive(&mut self, packet_awaiting_acknowledgement: bool) -> bool {
+        if packet_awaiting_acknowledgement {
+            self.deferred = true;
+            false
+        } else {
+            true
+        }
+    }
+
+    fn take_for_continue(&mut self) -> bool {
+        std::mem::take(&mut self.deferred)
+    }
+
+    fn reset(&mut self) {
+        self.deferred = false;
+    }
+}
+
 #[derive(Clone)]
 struct WaitWaker {
     interrupt: Arc<InterruptHandle>,
@@ -200,12 +293,12 @@ impl WaitWaker {
         }
     }
 
-    fn begin(&self, activity: crate::skdispatch::WaitActivity) {
+    fn begin(&self, activity: crate::skdispatch::WaitActivity, break_in: BreakInPolicy) {
         let wake = self
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .begin(activity);
+            .begin(activity, break_in);
         if let Some(activity) = wake {
             self.spawn_interrupt(activity);
         }
@@ -319,6 +412,10 @@ pub(crate) struct ManagedRequest {
     pub(crate) connect_timeout_ms: u64,
     pub(crate) idle_timeout_ms: u64,
     pub(crate) max_pause_ms: u64,
+    /// Select M3's guarded one-shot INT3 implementation for KD WriteBreakpoint handles. False
+    /// maps them onto the controller's owned hardware slots instead.
+    #[serde(default)]
+    pub(crate) software_breakpoints: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -331,6 +428,7 @@ pub(crate) struct ManagedOptions {
     connect_timeout: Duration,
     idle_timeout: Duration,
     max_pause: Duration,
+    software_breakpoints: bool,
 }
 
 impl ManagedRequest {
@@ -480,6 +578,7 @@ impl ManagedRequest {
             connect_timeout_ms: connect_timeout.as_millis() as u64,
             idle_timeout_ms: idle_timeout.as_millis() as u64,
             max_pause_ms: max_pause.as_millis() as u64,
+            software_breakpoints: false,
         })
     }
 }
@@ -545,6 +644,7 @@ pub(crate) fn open_managed(
             connect_timeout: Duration::from_millis(request.connect_timeout_ms),
             idle_timeout: Duration::from_millis(request.idle_timeout_ms),
             max_pause: Duration::from_millis(request.max_pause_ms),
+            software_breakpoints: request.software_breakpoints,
         },
         skipped,
     ))
@@ -894,7 +994,8 @@ async fn run_async(
         stopped_deadline,
     )?;
     let (mut values, mut context) = read_context(session, &stop, stopped_deadline)?;
-    let mut reported_instruction = read_instruction_guard(session, values.rip, stopped_deadline)?;
+    let mut reported_instruction =
+        read_reported_instruction(session, values.rip, stopped_deadline)?;
 
     let path = format!(r"\\.\pipe\{}", options.pipe);
     let mut reconnecting = false;
@@ -970,19 +1071,26 @@ async fn run_async(
             return Err(error);
         }
         compatibility.reset_peer_probes();
+        let mut breakpoints = BTreeMap::<u32, BreakpointGuard>::new();
+        let mut reported_exception =
+            state_change_exception(&stop.event.reason, values.rip, &breakpoints);
         send_stop(
             &mut writer,
             &mut link,
-            &reported_instruction.bytes,
-            &values,
-            stop.target.vp,
+            ReportedStop {
+                instruction: &reported_instruction.stream,
+                values: &values,
+                stop: &stop,
+                exception: reported_exception,
+            },
             stopped_since,
             service_pause,
         )
         .await?;
         eprintln!("initial KD state change sent");
 
-        let mut breakpoints = BTreeMap::<u32, BreakpointGuard>::new();
+        let mut displaced_breakpoint = None::<DisplacedBreakpoint>;
+        let mut stopped_break_in = StoppedBreakIn::default();
         loop {
             let frame_wait =
                 bounded_pause_wait(options.idle_timeout, stopped_since, service_pause)?;
@@ -1018,22 +1126,49 @@ async fn run_async(
                 bail!("KD peer exceeded the consecutive framing-error bound: {error}");
             }
             if break_in {
-                tracing::warn!(
-                    "Secure Kernel KD break-in is unsupported while the target is already stopped; \
-                     the retained stop was left unchanged"
+                // A break-in received while a stop is in flight cannot mint another state-change
+                // packet yet: KD admits only one unacknowledged data packet. Keep it pending for
+                // the peer's next continue instead. That is also the shape DbgEng's INITIAL_BREAK
+                // attach expects: its artifact-drain `g` is acknowledged and immediately sees the
+                // retained stop again, without VTL1 executing an instruction.
+                if !stopped_break_in.receive(link.awaiting_acknowledgement()) {
+                    tracing::info!(
+                        "Secure Kernel KD break-in while a stop is awaiting acknowledgement; deferring it until continue"
+                    );
+                    continue;
+                }
+                tracing::info!(
+                    "Secure Kernel KD break-in while the target is already stopped; resending the retained stop"
                 );
-                flush_stopped_pipe(&mut writer, stopped_since, service_pause).await?;
+                send_stop(
+                    &mut writer,
+                    &mut link,
+                    ReportedStop {
+                        instruction: &reported_instruction.stream,
+                        values: &values,
+                        stop: &stop,
+                        exception: reported_exception,
+                    },
+                    stopped_since,
+                    service_pause,
+                )
+                .await?;
                 continue;
             }
             if peer_reset {
                 compatibility.reset_peer_probes();
                 breakpoints.clear();
+                displaced_breakpoint = None;
+                stopped_break_in.reset();
                 send_stop(
                     &mut writer,
                     &mut link,
-                    &reported_instruction.bytes,
-                    &values,
-                    stop.target.vp,
+                    ReportedStop {
+                        instruction: &reported_instruction.stream,
+                        values: &values,
+                        stop: &stop,
+                        exception: reported_exception,
+                    },
                     stopped_since,
                     service_pause,
                 )
@@ -1071,7 +1206,7 @@ async fn run_async(
                     kernel_base = format_args!("{kernel_base:#x}"),
                     debugger_data_list = format_args!("{:#x}", metadata.debugger_data_list),
                     loaded_module_list = format_args!("{:#x}", metadata.loaded_module_list),
-                    compatibility_fields = "major=15,protocol=6,flags=NOMM|PTR64|HSS,machine=AMD64,max_packet=12,max_state_change=3,max_manipulate=0x36",
+                    compatibility_fields = "major=15,protocol=6,secondary=AMD64_CONTEXT(2),flags=NOMM|PTR64|HSS,machine=AMD64,max_packet=12,max_state_change=3,max_manipulate=0x36",
                     "serving synthesized Secure Kernel KD version record"
                 );
                 request.get_version_response(Version64 {
@@ -1089,7 +1224,7 @@ async fn run_async(
                     count,
                     values.gpr[4],
                     values.rip,
-                    reported_instruction.bytes.len(),
+                    reported_instruction.guard.bytes.len(),
                 ) {
                     request.read_virtual_memory_response(&bytes)?
                 } else {
@@ -1102,7 +1237,10 @@ async fn run_async(
                             request.read_virtual_memory_response(&decode_hex(&read_result.data)?)?
                         }
                         Err(error) => {
-                            eprintln!("KD virtual read at {:#x} failed: {error:#}", read.address);
+                            eprintln!(
+                                "KD virtual read {:#x}+{count:#x} failed: {error:#}",
+                                read.address,
+                            );
                             request.failure_response()
                         }
                     }
@@ -1119,7 +1257,8 @@ async fn run_async(
                         selector = format_args!("{:#x}", read.address),
                         count = read.count,
                         guest_fields = "cr3,dr0,dr1,dr2,dr3,dr6,dr7",
-                        zero_filled = "cr0,cr2,cr4,gdtr,idtr,tr,ldtr,mxcsr,debug_control,branch_records,cr8,msrs,xcr0",
+                        compatibility_fields = "gdtr=synthetic_amd64_gdt",
+                        zero_filled = "cr0,cr2,cr4,idtr,tr,ldtr,mxcsr,debug_control,branch_records,cr8,msrs,xcr0",
                         "serving synthesized AMD64 KSPECIAL_REGISTERS with unavailable fields zeroed"
                     );
                     request.read_control_space_response(&special[..read.count as usize])?
@@ -1174,20 +1313,55 @@ async fn run_async(
                     }
                 }
             } else if let Some(handle) = request.restore_breakpoint_handle() {
-                breakpoints.remove(&handle);
+                let removed = breakpoints.remove(&handle);
+                let displacement = removed.as_ref().and_then(|guard| match &stop.event.reason {
+                    StopReason::SoftwareBreakpoint { address }
+                        if address.0 == guard.instruction.address.0 =>
+                    {
+                        Some(DisplacedBreakpoint::Software(guard.instruction.clone()))
+                    }
+                    StopReason::HardwareBreakpoint { .. }
+                        if values.rip == guard.instruction.address.0 =>
+                    {
+                        Some(DisplacedBreakpoint::Hardware(guard.instruction.clone()))
+                    }
+                    _ => None,
+                });
+                if let Some(displacement) = displacement {
+                    let kind = match &displacement {
+                        DisplacedBreakpoint::Software(_) => "software",
+                        DisplacedBreakpoint::Hardware(_) => "hardware",
+                    };
+                    eprintln!(
+                        "KD restored the hit {kind}-breakpoint handle {handle} at {:#x}; the next go executes its displaced instruction",
+                        displacement.instruction().address.0
+                    );
+                    displaced_breakpoint = Some(displacement);
+                } else {
+                    eprintln!(
+                        "KD restored breakpoint handle {handle}{}",
+                        removed
+                            .as_ref()
+                            .map(|guard| format!(" at {:#x}", guard.instruction.address.0))
+                            .unwrap_or_else(|| " (not present)".to_string())
+                    );
+                }
                 request.success_response()
             } else if let Some(trace) = request.continue_trace() {
                 eprintln!("KD Continue api={:#x} trace={trace}", request.api_number());
-                if !trace {
-                    eprintln!(
-                        "KD continue-to-breakpoint refused; current held stop preserved: live qualification reset the target"
+                if stopped_break_in.take_for_continue() {
+                    tracing::info!(
+                        "consuming the deferred Secure Kernel KD break-in without resuming VTL1"
                     );
                     send_stop(
                         &mut writer,
                         &mut link,
-                        &reported_instruction.bytes,
-                        &values,
-                        stop.target.vp,
+                        ReportedStop {
+                            instruction: &reported_instruction.stream,
+                            values: &values,
+                            stop: &stop,
+                            exception: reported_exception,
+                        },
                         stopped_since,
                         service_pause,
                     )
@@ -1201,35 +1375,124 @@ async fn run_async(
                     options.max_pause,
                     managed_job,
                 );
-                wait_waker.begin(activity.clone());
-                let resume = stopped_low(&stop, RegisterName::Rip).and_then(|rip| {
-                    read_instruction_guard(session, rip, stopped_deadline)
-                        .and_then(fallthrough_step_guard)
-                        .and_then(|guard| {
-                            session
-                                .step_until(engine, &stop.epoch, guard, stopped_deadline)
-                                .map(|_| ())
-                        })
-                });
+                let displaced_step = (!trace).then(|| displaced_breakpoint.clone()).flatten();
+                // Begun before the transition, so a Ctrl+Break or disconnect that lands while the
+                // registers are being changed is held for the wait that follows rather than lost.
+                // DbgEng emits a protocol-internal break-in while it invisibly displaces a code
+                // breakpoint; interrupting that one-instruction wait races its valid #DB.
+                let break_in = if displaced_step.is_some() {
+                    BreakInPolicy::Defer
+                } else if trace {
+                    BreakInPolicy::Cancel
+                } else {
+                    BreakInPolicy::Rendezvous
+                };
+                wait_waker.begin(activity.clone(), break_in);
+                let resume = if trace {
+                    stopped_low(&stop, RegisterName::Rip).and_then(|rip| {
+                        read_instruction_guard(session, rip, stopped_deadline)
+                            .and_then(fallthrough_step_guard)
+                            .and_then(|guard| {
+                                session
+                                    .step_until(engine, &stop.epoch, guard, stopped_deadline)
+                                    .map(|_| ())
+                            })
+                    })
+                } else if let Some(displacement) = displaced_step.clone() {
+                    let instruction = displacement.instruction().clone();
+                    eprintln!(
+                        "KD go executes the displaced breakpoint instruction at {:#x} under a one-instruction guard",
+                        instruction.address.0
+                    );
+                    fallthrough_step_guard(instruction).and_then(|guard| {
+                        session
+                            .step_retained_breakpoint_until(
+                                engine,
+                                &stop.epoch,
+                                guard,
+                                stopped_deadline,
+                            )
+                            .map(|_| ())
+                    })
+                } else {
+                    // A facade configured for memory writes uses M3's guarded INT3 path for
+                    // DbgEng WriteBreakpoint handles. The composite debugger deliberately maps
+                    // them to M1 hardware slots so its ordinary read/step surface never patches
+                    // VTL1 code. With no breakpoint, `g` is the bounded free run that only M2
+                    // break-on-demand, teardown or recovery can end.
+                    let guards: Vec<BreakpointGuard> = breakpoints.values().cloned().collect();
+                    if guards.is_empty() {
+                        eprintln!(
+                            "KD go with no breakpoint: every slot released; Ctrl+Break, teardown or the recovery deadline ends this run"
+                        );
+                        session.continue_running(engine, &stop.epoch).map(|_| ())
+                    } else if options.software_breakpoints {
+                        eprintln!(
+                            "KD go to {} software breakpoint(s) at {}",
+                            guards.len(),
+                            guards
+                                .iter()
+                                .map(|guard| format!("{:#x}", guard.instruction.address.0))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                        session
+                            .continue_to_software_breakpoints(
+                                engine,
+                                &stop.epoch,
+                                guards.into_iter().map(|guard| guard.instruction).collect(),
+                            )
+                            .map(|_| ())
+                    } else {
+                        eprintln!(
+                            "KD go to {} hardware breakpoint(s) at {}",
+                            guards.len(),
+                            guards
+                                .iter()
+                                .map(|guard| format!("{:#x}", guard.instruction.address.0))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                        session
+                            .continue_to_breakpoints(engine, &stop.epoch, guards)
+                            .map(|_| ())
+                    }
+                };
                 if let Err(error) = resume {
                     activity.finish();
                     wait_waker.finish();
                     if session.phase() != crate::sklive::LivePhase::Stopped {
+                        eprintln!(
+                            "KD {} transition faulted the controller before a running wait began: {error:#}",
+                            if trace { "trace" } else { "go" }
+                        );
                         return Err(error);
                     }
                     report_managed_phase(managed_job, crate::proto::SecureKernelKdPhase::Stopped);
-                    eprintln!("KD trace refused; current held stop preserved: {error:#}");
+                    eprintln!(
+                        "KD {} refused; current held stop preserved: {error:#}",
+                        if trace { "trace" } else { "go" }
+                    );
                     send_stop(
                         &mut writer,
                         &mut link,
-                        &reported_instruction.bytes,
-                        &values,
-                        stop.target.vp,
+                        ReportedStop {
+                            instruction: &reported_instruction.stream,
+                            values: &values,
+                            stop: &stop,
+                            exception: reported_exception,
+                        },
                         stopped_since,
                         service_pause,
                     )
                     .await?;
                     continue;
+                }
+                // A user trace from a just-restored breakpoint is itself the one-instruction
+                // displacement. Once that guarded transition succeeds, the retained source
+                // instruction is stale just as it is after DbgEng's private non-trace continue.
+                if displaced_step.is_some() || trace {
+                    displaced_breakpoint = None;
                 }
                 *cleanup_deadline = None;
                 wait_waker.start_idle_watchdog(activity.clone());
@@ -1245,7 +1508,7 @@ async fn run_async(
                     return Err(error);
                 }
                 let waited = session.wait_for_stop_interruptible(engine, &activity);
-                let retained_since =
+                let mut retained_since =
                     record_cleanup_deadline(&activity, options.max_pause, cleanup_deadline)?;
                 let wake = wait_waker.finish();
                 if crate::worker::kd_teardown_requested() {
@@ -1253,6 +1516,32 @@ async fn run_async(
                 }
                 stop = match (waited, wake) {
                     (Ok(stop), _) => stop,
+                    (Err(error), Some(WaitWakeReason::BreakIn))
+                        if crate::sklive::is_break_wake(&error) =>
+                    {
+                        // The wait left on the Ctrl+Break with the controller's running arm
+                        // intact. The M2 rendezvous runs here, on the engine thread: a proved VM
+                        // pause, a transient execute breakpoint at the paused RIP, and the
+                        // ordinary owned wait for it. A natural stop that won the race arrived
+                        // as `Ok` above and keeps its own reason.
+                        eprintln!(
+                            "KD break-in woke the running wait; running the target-side break rendezvous"
+                        );
+                        let mut retained_at = None;
+                        let stop = session
+                            .break_on_demand(engine, || retained_at = Some(Instant::now()))
+                            .context("the Ctrl+Break rendezvous did not retain a stop")?;
+                        if crate::worker::kd_teardown_requested() {
+                            return Err(ManagedTeardown.into());
+                        }
+                        let since = retained_at.unwrap_or_else(Instant::now);
+                        *cleanup_deadline =
+                            Some(since.checked_add(options.max_pause).context(
+                                "the absolute Secure Kernel cleanup deadline overflowed",
+                            )?);
+                        retained_since = Some(since);
+                        stop
+                    }
                     (Err(_), Some(WaitWakeReason::Disconnected)) => return Err(Disconnected.into()),
                     (Err(error), Some(reason)) => return Err(error.context(reason.to_string())),
                     (Err(error), None) => return Err(error),
@@ -1262,15 +1551,20 @@ async fn run_async(
                     .context("the Secure Kernel wait did not record when it retained the stop")?;
                 stopped_deadline = pause_deadline(stopped_since, service_pause)?;
                 (values, context) = read_context(session, &stop, stopped_deadline)?;
+                reported_exception =
+                    state_change_exception(&stop.event.reason, values.rip, &breakpoints);
                 reported_instruction =
-                    read_instruction_guard(session, values.rip, stopped_deadline)?;
+                    read_reported_instruction(session, values.rip, stopped_deadline)?;
                 compatibility.on_execution_stop();
                 send_stop(
                     &mut writer,
                     &mut link,
-                    &reported_instruction.bytes,
-                    &values,
-                    stop.target.vp,
+                    ReportedStop {
+                        instruction: &reported_instruction.stream,
+                        values: &values,
+                        stop: &stop,
+                        exception: reported_exception,
+                    },
                     stopped_since,
                     service_pause,
                 )
@@ -1528,31 +1822,66 @@ fn queue_transport(
     }
 }
 
+struct ReportedStop<'a> {
+    instruction: &'a [u8],
+    values: &'a Amd64ContextValues,
+    stop: &'a StopRecord,
+    exception: StateChangeException,
+}
+
 async fn send_stop<W: AsyncWrite + Unpin>(
     writer: &mut W,
     link: &mut TargetLink,
-    instruction: &[u8],
-    values: &Amd64ContextValues,
-    guest_vp: u32,
+    reported: ReportedStop<'_>,
     stopped_since: Instant,
     max_pause: Duration,
 ) -> Result<()> {
+    let ReportedStop {
+        instruction,
+        values,
+        stop,
+        exception,
+    } = reported;
     tracing::info!(
         processor = 0u16,
         number_processors = 1u32,
-        guest_vp,
+        guest_vp = stop.target.vp,
         synthetic_thread = format_args!("{:#x}", crate::kdapi::SYNTHETIC_THREAD),
-        compatibility_fields = "processor_level=15,first_chance=true,exception=STATUS_SINGLE_STEP",
+        compatibility_fields = match exception {
+            StateChangeException::Breakpoint => {
+                "processor_level=6,first_chance=true,exception=STATUS_BREAKPOINT"
+            }
+            StateChangeException::SingleStep => {
+                "processor_level=6,first_chance=true,exception=STATUS_SINGLE_STEP"
+            }
+        },
         rip = format_args!("{:#x}", values.rip),
         "serving synthesized Secure Kernel KD state change; processor 0 maps to guest_vp"
     );
-    let state = crate::kdapi::breakpoint_state_change(values, instruction)?;
+    let state = crate::kdapi::breakpoint_state_change(values, instruction, exception)?;
     let packet = link
         .send(crate::kdwire::PACKET_TYPE_STATE_CHANGE64, &state)
         .map_err(anyhow::Error::msg)?;
     write_stopped_pipe(writer, &packet, stopped_since, max_pause).await?;
     flush_stopped_pipe(writer, stopped_since, max_pause).await?;
     Ok(())
+}
+
+fn state_change_exception(
+    reason: &StopReason,
+    rip: u64,
+    breakpoints: &BTreeMap<u32, BreakpointGuard>,
+) -> StateChangeException {
+    if matches!(reason, StopReason::SoftwareBreakpoint { .. })
+        || matches!(reason, StopReason::HardwareBreakpoint { .. })
+            && breakpoints
+                .values()
+                .any(|breakpoint| breakpoint.instruction.address.0 == rip)
+    {
+        StateChangeException::Breakpoint
+    } else {
+        StateChangeException::SingleStep
+    }
 }
 
 fn log_context_shape(offset: u32, count: u32) {
@@ -1709,6 +2038,65 @@ fn read_instruction_guard(
     })
 }
 
+fn read_reported_instruction(
+    session: &crate::skdispatch::Session,
+    address: u64,
+    deadline: Instant,
+) -> Result<ReportedInstruction> {
+    let bytes_in_page = COMPATIBILITY_PAGE_BYTES - (address & (COMPATIBILITY_PAGE_BYTES - 1));
+    let first_count =
+        u32::try_from(bytes_in_page.min(u64::from(KD_INSTRUCTION_STREAM_BYTES))).unwrap();
+    let mut stream = decode_hex(
+        &session
+            .read_memory_until(address, first_count, deadline)?
+            .data,
+    )?;
+    if first_count < KD_INSTRUCTION_STREAM_BYTES {
+        let continuation_address = address
+            .checked_add(u64::from(first_count))
+            .context("instruction-stream address overflowed at the page boundary")?;
+        match session.read_memory_until(
+            continuation_address,
+            KD_INSTRUCTION_STREAM_BYTES - first_count,
+            deadline,
+        ) {
+            Ok(continuation) => stream.extend(decode_hex(&continuation.data)?),
+            Err(error) if instruction_length(&stream, address).is_some() => {
+                tracing::warn!(
+                    address = format_args!("{address:#x}"),
+                    bytes = stream.len(),
+                    "KD instruction stream ended at an unreadable page boundary: {error:#}"
+                );
+            }
+            Err(error) => {
+                return Err(error.context(
+                    "reading the next page for a KD instruction stream that did not yet decode",
+                ));
+            }
+        }
+    }
+    reported_instruction(address, stream)
+}
+
+fn reported_instruction(address: u64, stream: Vec<u8>) -> Result<ReportedInstruction> {
+    if stream.is_empty() || stream.len() > KD_INSTRUCTION_STREAM_BYTES as usize {
+        bail!(
+            "the KD instruction stream at {address:#x} has invalid length {}",
+            stream.len()
+        );
+    }
+    let decode_bytes = &stream[..stream.len().min(MAX_INSTRUCTION_BYTES as usize)];
+    let length = instruction_length(decode_bytes, address)
+        .context("the stopped VTL1 bytes do not decode as one AMD64 instruction")?;
+    Ok(ReportedInstruction {
+        guard: InstructionGuard {
+            address: crate::skcontrol::HexU64(address),
+            bytes: stream[..length].to_vec(),
+        },
+        stream,
+    })
+}
+
 fn instruction_length(bytes: &[u8], address: u64) -> Option<usize> {
     let mut decoder = InstructionDecoder::with_ip(64, bytes, address, DecoderOptions::NONE);
     let instruction = decoder.decode();
@@ -1842,10 +2230,10 @@ fn validate_debugger_metadata(
 /// exact null-page reads. Four exact KUSER reads cover shared-data probes made during startup.
 /// WinDbg also probes the reported RSP as an NT trap frame and disassembles backwards across bytes
 /// preceding the current instruction. Neither assumption holds for this redirected Secure Kernel
-/// stop: the selected NOP follows embedded data, and the backscan changes WinDbg's current address
-/// to a 16-bit `CS:IP`. Only the initial redirected stop permits these stack/code probes. Subsequent
-/// execution stops always read real stack and code, including after a peer reset or reconnect.
-/// Each startup probe is served at most once until the peer resets or reconnects.
+/// stop: the selected NOP follows embedded data. Only the initial redirected stop permits these
+/// stack/code probes. Subsequent execution stops always read real stack and code, including after a
+/// peer reset or reconnect. Each startup probe is served at most once until the peer resets or
+/// reconnects.
 struct CompatibilityMemory {
     mode: ArmMode,
     stack_bookkeeping: bool,
@@ -1897,7 +2285,7 @@ impl CompatibilityMemory {
                 && u64::from(count) <= COMPATIBILITY_PAGE_BYTES
         };
         if inside(crate::kdapi::SYNTHETIC_THREAD) {
-            return Some(compatibility_zeros("synthetic_thread", address, count));
+            return Some(synthetic_thread_memory(address, count));
         }
         if let Some((index, _)) = NULL_STARTUP_PROBES
             .iter()
@@ -1953,6 +2341,36 @@ impl CompatibilityMemory {
     }
 }
 
+fn synthetic_thread_memory(address: u64, count: u32) -> Vec<u8> {
+    // These descriptors describe the selectors already carried by the synthesized AMD64 context:
+    // ring-0 long code (CS 0x10), ring-0 data (SS 0x18), and ring-3 data (DS/ES/GS 0x2b and
+    // FS 0x53). DbgEng otherwise treats the zero GDTR that the provider cannot report as a
+    // real-mode table and truncates RIP to CS:IP while disassembling.
+    const LONG_CODE: u64 = 0x00af_9a00_0000_ffff;
+    const KERNEL_DATA: u64 = 0x00cf_9200_0000_ffff;
+    const USER_DATA: u64 = 0x00cf_f200_0000_ffff;
+    let mut page = [0u8; COMPATIBILITY_PAGE_BYTES as usize];
+    for (selector, descriptor) in [
+        (0x10usize, LONG_CODE),
+        (0x18, KERNEL_DATA),
+        (0x28, USER_DATA),
+        (0x50, USER_DATA),
+    ] {
+        let at = (crate::kdapi::SYNTHETIC_GDT - crate::kdapi::SYNTHETIC_THREAD) as usize + selector;
+        page[at..at + 8].copy_from_slice(&descriptor.to_le_bytes());
+    }
+    let at = (address - crate::kdapi::SYNTHETIC_THREAD) as usize;
+    let end = at + count as usize;
+    tracing::info!(
+        shape = "synthetic_thread_and_gdt",
+        address = format_args!("{address:#x}"),
+        count,
+        gdt = format_args!("{:#x}", crate::kdapi::SYNTHETIC_GDT),
+        "serving synthesized Secure Kernel KD compatibility memory"
+    );
+    page[at..end].to_vec()
+}
+
 fn compatibility_zeros(shape: &'static str, address: u64, count: u32) -> Vec<u8> {
     tracing::info!(
         shape,
@@ -2002,6 +2420,10 @@ mod tests {
         assert_eq!(
             memory.read(crate::kdapi::SYNTHETIC_THREAD + 8, 16, 0x8000, 0x9000, 5),
             Some(vec![0; 16])
+        );
+        assert_eq!(
+            memory.read(crate::kdapi::SYNTHETIC_GDT + 0x10, 8, 0x8000, 0x9000, 5),
+            Some(0x00af_9a00_0000_ffffu64.to_le_bytes().to_vec())
         );
         for (address, count) in NULL_STARTUP_PROBES {
             assert_eq!(
@@ -2138,6 +2560,19 @@ mod tests {
     }
 
     #[test]
+    fn kd_report_keeps_the_full_stream_separate_from_the_step_guard() {
+        let stream = [
+            0x48, 0x89, 0xc8, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+            0x90, 0x90,
+        ];
+
+        let reported = reported_instruction(0xffff_f807_2aa2_d7f0, stream.to_vec()).unwrap();
+
+        assert_eq!(reported.guard.bytes, [0x48, 0x89, 0xc8]);
+        assert_eq!(reported.stream, stream);
+    }
+
+    #[test]
     fn single_step_rejects_linear_instructions_that_defer_the_debug_trap() {
         let guard = |bytes: &[u8]| InstructionGuard {
             address: crate::skcontrol::HexU64(0x1000),
@@ -2250,7 +2685,7 @@ mod tests {
         assert!(state.request(None, WaitWakeReason::Disconnected).is_none());
 
         let activity = crate::skdispatch::WaitActivity::new(Duration::from_secs(1));
-        assert!(state.begin(activity).is_some());
+        assert!(state.begin(activity, BreakInPolicy::Rendezvous).is_some());
         assert_eq!(state.finish(), Some(WaitWakeReason::Disconnected));
     }
 
@@ -2262,8 +2697,257 @@ mod tests {
         state.consume_frame(&Frame::BreakIn);
 
         let activity = crate::skdispatch::WaitActivity::new(Duration::from_secs(1));
-        assert!(state.begin(activity).is_some());
+        assert!(state.begin(activity, BreakInPolicy::Rendezvous).is_some());
         assert_eq!(state.finish(), Some(WaitWakeReason::Disconnected));
+    }
+
+    /// M8.0: a running Ctrl+Break binds to the exact wait and asks for the M2 rendezvous. The
+    /// dispatcher answers `BreakWake` only if the activity's flag is set when the wait is cut
+    /// short, so the flag has to be set before the interrupt is spawned, whether the break-in
+    /// arrives during the wait or was queued before it began.
+    #[test]
+    fn a_break_in_during_a_go_requests_the_rendezvous_before_it_interrupts() {
+        let mut state = WaitWakeState::default();
+        let activity = crate::skdispatch::WaitActivity::new(Duration::from_secs(1));
+        assert!(
+            state
+                .begin(activity.clone(), BreakInPolicy::Rendezvous)
+                .is_none()
+        );
+        assert!(!activity.break_requested());
+
+        let woken = state.request(None, WaitWakeReason::BreakIn);
+        assert!(woken.is_some_and(|woken| woken.same_wait(&activity)));
+        assert!(activity.break_requested());
+        assert_eq!(state.finish(), Some(WaitWakeReason::BreakIn));
+
+        let mut queued = WaitWakeState::default();
+        assert!(queued.request(None, WaitWakeReason::BreakIn).is_none());
+        let activity = crate::skdispatch::WaitActivity::new(Duration::from_secs(1));
+        assert!(
+            queued
+                .begin(activity.clone(), BreakInPolicy::Rendezvous)
+                .is_some()
+        );
+        assert!(activity.break_requested());
+    }
+
+    #[test]
+    fn an_attach_break_in_is_deferred_until_continue() {
+        let mut link = TargetLink::new();
+        let initial = link
+            .send(crate::kdwire::PACKET_TYPE_STATE_CHANGE64, &[0x30, 0x30])
+            .unwrap();
+        assert!(link.awaiting_acknowledgement());
+
+        let mut stopped_break_in = StoppedBreakIn::default();
+        let break_in = link.receive(Frame::BreakIn);
+        assert!(break_in.break_in);
+        assert!(break_in.writes.is_empty());
+        assert!(!stopped_break_in.receive(link.awaiting_acknowledgement()));
+        assert!(link.awaiting_acknowledgement());
+
+        let acknowledged = link.receive(Frame::Control {
+            packet_type: crate::kdwire::PACKET_TYPE_ACKNOWLEDGE,
+            id: crate::kdwire::INITIAL_PACKET_ID,
+        });
+        assert!(acknowledged.writes.is_empty());
+        assert!(!link.awaiting_acknowledgement());
+        assert!(stopped_break_in.take_for_continue());
+        assert!(!stopped_break_in.take_for_continue());
+        assert_ne!(
+            initial,
+            link.send(crate::kdwire::PACKET_TYPE_STATE_CHANGE64, &[0x31])
+                .unwrap()
+        );
+    }
+
+    /// A trace step's expected stop is its own successor, so break-on-demand has nothing to
+    /// bind to; a Ctrl+Break during a `t` stays a cancellation and never raises the flag.
+    #[test]
+    fn a_break_in_during_a_trace_step_requests_no_rendezvous() {
+        let mut state = WaitWakeState::default();
+        let activity = crate::skdispatch::WaitActivity::new(Duration::from_secs(1));
+        assert!(
+            state
+                .begin(activity.clone(), BreakInPolicy::Cancel)
+                .is_none()
+        );
+        assert!(state.request(None, WaitWakeReason::BreakIn).is_some());
+        assert!(!activity.break_requested());
+        assert_eq!(state.finish(), Some(WaitWakeReason::BreakIn));
+
+        let mut queued = WaitWakeState::default();
+        queued.request(None, WaitWakeReason::BreakIn);
+        let activity = crate::skdispatch::WaitActivity::new(Duration::from_secs(1));
+        assert!(
+            queued
+                .begin(activity.clone(), BreakInPolicy::Cancel)
+                .is_some()
+        );
+        assert!(!activity.break_requested());
+    }
+
+    /// DbgEng sends a break-in as part of its invisible software-breakpoint displacement. The
+    /// facade already owns the exact one-instruction #DB expected next, so waking that wait would
+    /// race the real stop. Keep the break-in queued for the stopped protocol loop instead.
+    #[test]
+    fn a_break_in_during_breakpoint_displacement_waits_for_the_step_stop() {
+        let mut state = WaitWakeState::default();
+        let activity = crate::skdispatch::WaitActivity::new(Duration::from_secs(1));
+        assert!(
+            state
+                .begin(activity.clone(), BreakInPolicy::Defer)
+                .is_none()
+        );
+
+        assert!(state.request(None, WaitWakeReason::BreakIn).is_none());
+        assert!(!activity.break_requested());
+        assert_eq!(state.finish(), None);
+        assert!(matches!(
+            state.pending.front(),
+            Some(WaitWakeReason::BreakIn)
+        ));
+
+        state.consume_frame(&Frame::BreakIn);
+        assert!(state.pending.is_empty());
+    }
+
+    /// The facade's continue arm routes the three M8.0 rows to the controller operations that
+    /// own them, and a stopped Ctrl+Break resends the stop instead of only flushing.
+    #[test]
+    fn the_continue_arm_routes_go_to_the_proved_controller_paths() {
+        let source = include_str!("kdtarget.rs").replace("\r\n", "\n");
+        let arm = source
+            .split_once("} else if let Some(trace) = request.continue_trace() {\n")
+            .expect("the continue arm exists")
+            .1
+            .split_once("} else {\n                eprintln!(\"KD API {:#x} is not implemented\"")
+            .expect("the unimplemented-API arm follows it")
+            .0;
+        assert!(arm.contains("BreakInPolicy::Defer"));
+        assert!(arm.contains("BreakInPolicy::Cancel"));
+        assert!(arm.contains("BreakInPolicy::Rendezvous"));
+        assert!(arm.contains("wait_waker.begin(activity.clone(), break_in);"));
+        assert!(arm.contains("session.continue_running(engine, &stop.epoch)"));
+        assert!(arm.contains(".continue_to_software_breakpoints("));
+        assert!(arm.contains(".continue_to_breakpoints(engine, &stop.epoch, guards)"));
+        assert!(arm.contains("if crate::sklive::is_break_wake(&error) =>"));
+        assert!(arm.contains(".break_on_demand(engine, || retained_at = Some(Instant::now()))"));
+        assert!(
+            !arm.contains("live qualification reset the target"),
+            "the 2026-10-18 refusal is retired; M8.2's gate is where the route is qualified"
+        );
+        let stopped_break_in = source
+            .split_once("            if break_in {\n")
+            .expect("the stopped break-in arm exists")
+            .1
+            .split_once("            if peer_reset {\n")
+            .expect("the peer-reset arm follows it")
+            .0;
+        assert!(
+            stopped_break_in.contains("send_stop("),
+            "a stopped Ctrl+Break resends the retained stop: {stopped_break_in}"
+        );
+    }
+
+    #[test]
+    fn a_slot_backed_kd_code_breakpoint_reports_breakpoint_semantics() {
+        let breakpoints = BTreeMap::from([(
+            7,
+            BreakpointGuard {
+                slot: 0,
+                instruction: InstructionGuard {
+                    address: crate::skcontrol::HexU64(0x1234),
+                    bytes: vec![0x90],
+                },
+            },
+        )]);
+
+        assert_eq!(
+            state_change_exception(
+                &StopReason::HardwareBreakpoint { slot: 0 },
+                0x1234,
+                &breakpoints,
+            ),
+            StateChangeException::Breakpoint
+        );
+        assert_eq!(
+            state_change_exception(
+                &StopReason::HardwareBreakpoint { slot: 0 },
+                0x1235,
+                &breakpoints,
+            ),
+            StateChangeException::SingleStep
+        );
+        assert_eq!(
+            state_change_exception(&StopReason::SingleStep, 0x1234, &breakpoints),
+            StateChangeException::SingleStep
+        );
+        assert_eq!(
+            state_change_exception(
+                &StopReason::SoftwareBreakpoint {
+                    address: crate::skcontrol::HexU64(0x2000),
+                },
+                0x2000,
+                &BTreeMap::new(),
+            ),
+            StateChangeException::Breakpoint
+        );
+    }
+
+    /// DbgEng recovers a just-hit code breakpoint by removing its software patch or hardware
+    /// slot, issuing an ordinary Continue2, consuming the resulting single-step, and then
+    /// reinserting the breakpoint. The target must not mistake either private Continue2 for the
+    /// user's `g`.
+    #[test]
+    fn restoring_a_hit_breakpoint_arms_one_mode_appropriate_displacement_step() {
+        let source = include_str!("kdtarget.rs").replace("\r\n", "\n");
+        let restore = source
+            .split_once("} else if let Some(handle) = request.restore_breakpoint_handle() {\n")
+            .expect("the restore-breakpoint arm exists")
+            .1
+            .split_once("} else if let Some(trace) = request.continue_trace() {\n")
+            .expect("the continue arm follows restore")
+            .0;
+        assert!(
+            restore.contains("StopReason::SoftwareBreakpoint { address }")
+                && restore.contains("DisplacedBreakpoint::Software(guard.instruction.clone())")
+                && restore.contains("StopReason::HardwareBreakpoint { .. }")
+                && restore.contains("DisplacedBreakpoint::Hardware(guard.instruction.clone())")
+                && restore.contains("displaced_breakpoint = Some(displacement)"),
+            "only restoring the breakpoint responsible for this stop may arm displacement: {restore}"
+        );
+
+        let continue_arm = source
+            .split_once("} else if let Some(trace) = request.continue_trace() {\n")
+            .expect("the continue arm exists")
+            .1
+            .split_once("} else {\n                eprintln!(\"KD API {:#x} is not implemented\"")
+            .expect("the unimplemented-API arm follows it")
+            .0;
+        let displaced = continue_arm
+            .find("KD go executes the displaced breakpoint instruction")
+            .expect("ordinary go recognizes the displaced instruction");
+        let free_run = continue_arm
+            .find("KD go with no breakpoint")
+            .expect("ordinary go retains its no-breakpoint path");
+        assert!(
+            displaced < free_run
+                && continue_arm.contains("fallthrough_step_guard(instruction)")
+                && continue_arm.contains(".step_retained_breakpoint_until("),
+            "both breakpoint modes must take their proved retained-stop route before free run: {continue_arm}"
+        );
+        let cleared = continue_arm
+            .find("displaced_breakpoint = None;")
+            .expect("a successful displacement consumes the pending instruction");
+        let failed = continue_arm
+            .find("if let Err(error) = resume")
+            .expect("transition failure is handled explicitly");
+        assert!(
+            cleared > failed && continue_arm.contains("if displaced_step.is_some() || trace"),
+            "a failed transition must retain the displaced instruction for a safe retry: {continue_arm}"
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -60,13 +60,16 @@ serves the serial KD packet stream to WinDbg while MCP retains lifecycle and rec
 standalone `windbg-mcp --sk-kd-target` role remains for compatibility and diagnostics. The facade
 translates the requests it understands — context, virtual reads, hardware-breakpoint bookkeeping,
 a fall-through single step and quit — into the same guarded controller operations
-([#463](https://github.com/glslang/windbg-mcp/pull/463)). Non-trace continue remains refused after
-the 2026-10-18 live qualification reset K3. The direct M1/M2 controller gates now pass; the
-roadmap's packet-race and recovery qualification in M8 decides when the facade refusal can be
-removed. It is a facade for the debugger over the root-driven controller, not a KD transport inside
+([#463](https://github.com/glslang/windbg-mcp/pull/463)). Since 2026-10-25 a non-trace continue
+is routed onto the controller's qualified M1 path, or onto a bounded free run when no breakpoint
+is installed, and a running Ctrl+Break onto its M2 rendezvous; the roadmap's M8.2 gate is where
+those routes are live-qualified, and a failure there brings the earlier refusal back. It is a facade for the debugger over the root-driven controller, not a KD transport inside
 the guest: Secure Kernel still ships none, which is gate S5a below. What it can do, what WinDbg is
 told that the guest never held, and the one live run it rests on are in
 [`kd-facade.md`](kd-facade.md).
+`open_sk_debugger` is the MCP-native route over the same facade: it owns a hidden controller worker
+plus an ordinary DbgEng worker as one session and makes the generic debugger tools available on
+the returned handle. Ending it detaches DbgEng before releasing the controller.
 
 ## The answer so far
 
@@ -212,7 +215,7 @@ Read them in this order; each assumes the one before it.
 | 7 | [Inbox device initialization probe](vdev-initialization-probe.md) | K1.1's guarded six-device contract and live result: guest emulation, BIOS, RTC, IOAPIC, VMBus, and SynthStor independently initialize and tear down outside `vmwp`; the build-bound JSON records every dependency and minimum configuration. |
 | 8 | [Inbox device graph probe](vdev-graph-probe.md) | K1.2's result: the six devices share one owned partition and the measured two-span 4 GiB Windows RAM map for three clean initialization, RAM-complete, reverse-teardown, memory-destruction, and partition-deletion cycles. Firmware and VP start remain open. |
 | 9 | [Diskless inbox firmware preflight](vdev-firmware-probe.md) | K1.3's result: the inbox BIOS builds five exact-readback UEFI memory regions and 19 VP0 state records, five diskless devices cold-power successfully, and the state applies cleanly in three fresh partitions. The boot-memory callback uses byte ranges; a private execution check reaches DXE. VP0 remains outside the tracked acceptance run; storage and the owner-side completion dispatcher remain open. |
-| 10 | [The Secure Kernel KD facade](kd-facade.md) | `open_sk_kd`: a server-managed, authenticated local WinDbg session over the live controller. The measured managed gate covers validated live debugger metadata, `lm m securekernel`, `t`, `r`, `q`, MCP release and an independent 60-second audit; four hardware breakpoints, symbol loading, stack walking, asynchronous break-in and writes remain bounded as the page describes. |
+| 10 | [The Secure Kernel KD facade](kd-facade.md) | `open_sk_kd`: a server-managed, authenticated local WinDbg session over the live controller. `open_sk_debugger`: the same target exposed as one ordinary MCP DbgEng session with an internal facade companion. The measured gates cover validated live debugger metadata, modules, symbols, stack, x64 disassembly, one hardware `bp`/`g`, one fall-through `t`, a bounded free `g`, asynchronous break-in, ordered MCP release and an independent state audit. Repetition, multi-VP and writes remain bounded as the page describes. |
 
 Two older side-investigations, kept because they are about the same binary:
 

@@ -2768,7 +2768,12 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// **M7.0 costs no model-visible bytes** (2026-10-24). Optional QPC samples and typed VMCS-value
 /// availability change only the existing output schemas, so the surface stays at 136,123 B and
 /// this ceiling stays fixed.
-const MODEL_VISIBLE_CEILING: usize = 138_000;
+///
+/// **138,000 -> 142,000 for the M8 composite opener** (2026-10-25). `open_sk_debugger` adds
+/// 2,822 B and moves the surface to 139,414 B across 89 tools. Its input intentionally repeats
+/// the facade's guarded admission contract; what it removes is the user's second attach and
+/// second lifecycle handle. The new ceiling leaves 2,586 B (1.9%).
+const MODEL_VISIBLE_CEILING: usize = 142_000;
 
 /// Ceiling on the whole `tools/list` payload — the serialized result, not the sum of its tools, so
 /// the array's own punctuation and every result-level field are inside it. 216,839 bytes as of
@@ -2960,7 +2965,11 @@ const MODEL_VISIBLE_CEILING: usize = 138_000;
 /// **M7.0 stays under the 410,000 wire ceiling** (2026-10-24). Optional QPC samples on all six
 /// M4-M6 arm/read results plus typed VMCS-value availability add 2,729 B, moving the payload to
 /// 405,418 B. The fixed ceiling leaves 4,582 B (1.1%).
-const WIRE_CEILING: usize = 410_000;
+///
+/// **410,000 -> 420,000 for the M8 composite opener** (2026-10-25). The payload moves to
+/// 413,570 B. The new tool owns the increase: its output reuses the ordinary open contract and
+/// its input is the managed-facade admission contract. The new ceiling leaves 6,430 B (1.6%).
+const WIRE_CEILING: usize = 420_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,296
 /// bytes (2026-10-14), because its `inputSchema` pulls the whole `StepAction`/`Check` vocabulary
@@ -4013,6 +4022,18 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
         // providers, or a named pipe can be created on an unconfigured test host.
         (
             "open_sk_kd",
+            json!({
+                "profile": "Z:\\no\\such-profile.json",
+                "control_transport": "provider-that-must-not-start",
+                "live_transport": "memory-provider-that-must-not-start",
+                "vm_id": "00000000-0000-0000-0000-000000000001",
+            }),
+            "error",
+        ),
+        // The composite opener shares the same pre-discovery policy gate. This reaches that
+        // refusal before either its hidden facade or its public DbgEng worker can be created.
+        (
+            "open_sk_debugger",
             json!({
                 "profile": "Z:\\no\\such-profile.json",
                 "control_transport": "provider-that-must-not-start",
@@ -5305,7 +5326,7 @@ fn a_listener_serves_the_narrowed_surface_it_was_started_with() {
     // was typed — `session` is added whatever it said.
     let log = listener.stderr();
     assert!(
-        log.contains("serving 13 of 88 tools (session, crash)"),
+        log.contains("serving 13 of 89 tools (session, crash)"),
         "the listener does not report the surface it ended up with: {log}"
     );
 }
@@ -5337,7 +5358,7 @@ fn two_clients_on_one_listener_are_served_two_surfaces() {
     let local_token = server.token.clone();
     assert!(
         server.wait_for_stderr(
-            "serving 20 of 88 tools (session, inspect) — except bench serves 13 of 88 tools \
+            "serving 20 of 89 tools (session, inspect) — except bench serves 13 of 89 tools \
              (session, crash)",
             Duration::from_secs(30)
         ),
@@ -23226,6 +23247,357 @@ fn managed_secure_kernel_kd_lifecycle_script_does_not_require_symbols() {
         );
         assert!(managed_secure_kernel_kd_script(true).contains(command));
     }
+}
+
+struct ConfiguredCommand {
+    child: Option<Child>,
+    what: String,
+}
+
+impl ConfiguredCommand {
+    fn wait(mut self, within: Duration) -> std::process::Output {
+        let deadline = Instant::now() + within;
+        loop {
+            if self
+                .child
+                .as_mut()
+                .expect("configured command still owns its process")
+                .try_wait()
+                .expect("query the command")
+                .is_some()
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let mut child = self
+                    .child
+                    .take()
+                    .expect("configured command owns a process");
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{} exceeded {within:?}", self.what);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        self.child
+            .take()
+            .expect("configured command owns a process")
+            .wait_with_output()
+            .expect("collect the command's output")
+    }
+}
+
+impl Drop for ConfiguredCommand {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Start a configured host-side command without requiring the target call it makes to return.
+fn spawn_configured_command(command: &Value, what: &str) -> ConfiguredCommand {
+    let command = command
+        .as_array()
+        .unwrap_or_else(|| panic!("{what} is a command array"));
+    let program = command
+        .first()
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("{what} names a program"));
+    let child = Command::new(program)
+        .args(
+            command[1..]
+                .iter()
+                .map(|argument| argument.as_str().expect("command arguments are strings")),
+        )
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| panic!("launching {what}: {error}"));
+    ConfiguredCommand {
+        child: Some(child),
+        what: what.to_string(),
+    }
+}
+
+/// Run a configured host-side command array to completion and return its output.
+fn run_configured_command(command: &Value, what: &str, within: Duration) -> std::process::Output {
+    spawn_configured_command(command, what).wait(within)
+}
+
+/// M8's demonstration: the Secure Kernel driven end to end through this server's **own**
+/// debugger tools. `open_sk_debugger` creates the hidden managed KD facade and attaches an
+/// ordinary kernel worker to it, and from then on the generic tools do the work: a breakpoint at
+/// the configured Secure Kernel symbol, `continue_async` to it, the configured guest trigger,
+/// registers, stack and disassembly at the stop, a single step, then a run with no breakpoint
+/// broken in by `break_in`, whose stop is the controller's M2 rendezvous. The composite is ended
+/// through its one public handle and the configured external audit must pass afterwards.
+///
+/// The config is the managed KD tier's, plus optional `breakpoint` (an expression; default
+/// `securekernel!IumInvokeSecureService`), `symbol_path`, and `trigger` (a host-side command
+/// array that makes the guest reach the breakpoint; without one the wait relies on ambient
+/// Secure Kernel traffic, which an idle guest does not produce in a minute).
+#[test]
+#[ignore = "controls one explicitly disposable VBS VM; needs WINDBG_MCP_SMOKE_SK_KD and the startup policy, then run alone"]
+fn a_managed_secure_kernel_kd_session_is_driven_by_this_servers_own_kernel_attach() {
+    let Some(config) = secure_kernel_kd_tier() else {
+        return;
+    };
+    let required = |name: &str| {
+        config
+            .get(name)
+            .unwrap_or_else(|| panic!("Secure Kernel KD config omits `{name}`"))
+            .clone()
+    };
+    for forbidden in [
+        "vmwp_pid",
+        "dispatcher_vnd",
+        "partition_id",
+        "expected_cr3",
+        "kernel_base",
+    ] {
+        assert!(
+            config.get(forbidden).is_none(),
+            "the managed gate must discover `{forbidden}`, not accept it from its config"
+        );
+    }
+    let breakpoint = config
+        .get("breakpoint")
+        .and_then(Value::as_str)
+        .unwrap_or("securekernel!IumInvokeSecureService")
+        .to_string();
+    let symbol_path = config
+        .get("symbol_path")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    let open = json!({
+        "profile": required("profile"),
+        "control_transport": required("control_transport"),
+        "live_transport": required("live_transport"),
+        "vm_id": required("vm_id"),
+        "vp": config.get("vp").cloned().unwrap_or(json!(0)),
+        "arm_mode": config.get("arm_mode").cloned().unwrap_or(json!("natural")),
+        "connect_timeout_ms": 60000,
+        // A `g` is silent on the wire, so the running idle bound is what a run may last.
+        "idle_timeout_ms": 180000
+    });
+    // `all`: the composite opener is in the `extra` group and its public half uses the ordinary
+    // debugger surface.
+    let mut server = Server::started_with_args(&[], &["--tools", "all"]);
+    let opened_response = server.call_tool("open_sk_debugger", open, TARGET_STEP);
+    assert_no_error(&opened_response, "tools/call open_sk_debugger");
+    let opened = opened_response["result"]["structuredContent"].clone();
+    assert_eq!(
+        opened["status"],
+        "ok",
+        "`open_sk_debugger` did not succeed: {}\n--- server stderr ---\n{}",
+        text_of(&opened_response["result"]),
+        server.stderr()
+    );
+    let kd = opened["session_id"]
+        .as_str()
+        .expect("the Secure Kernel debugger opener mints one public session handle")
+        .to_string();
+    let run = catch_unwind(AssertUnwindSafe(|| {
+        eprintln!("--- composite Secure Kernel debugger open ---\n{opened}");
+        if let Some(path) = &symbol_path {
+            // `set_symbol_path` predates the structured tool contract; success is its ordinary
+            // text result, while the generic tools exercised below carry structured content.
+            let symbols = server.tool_text(
+                "set_symbol_path",
+                json!({ "session_id": &kd, "path": path, "reload": "/f securekernel.exe" }),
+                TARGET_STEP,
+            );
+            eprintln!("--- client symbols ---\n{symbols}");
+        }
+        let modules = server.tool_data("modules", json!({ "session_id": &kd }), TARGET_STEP);
+        assert!(
+            modules.to_string().contains("securekernel"),
+            "the client did not see the live securekernel image: {modules}"
+        );
+
+        // M8.0 row one: `bp` arrives as WriteBreakpoint and the composite maps it to one of M1's
+        // guarded execution slots. DbgEng still sees its ordinary code-breakpoint handle.
+        let armed = server.tool_data(
+            "set_breakpoint",
+            json!({ "session_id": &kd, "expression": &breakpoint }),
+            TARGET_STEP,
+        );
+        eprintln!("--- client breakpoint ---\n{armed}");
+        let started = server.tool_data(
+            "continue_async",
+            json!({ "session_id": &kd, "max_run_ms": 120000 }),
+            TARGET_STEP,
+        );
+        assert_eq!(started["running"], json!(true), "{started}");
+        let execution = started["execution"]
+            .as_str()
+            .expect("a started run mints a handle")
+            .to_string();
+        // The triggering secure call cannot return while its entry breakpoint is held. Keep the
+        // host command alive across inspection and collect it only after the second `g` resumes
+        // the call. The guard kills it on any intervening assertion failure.
+        let trigger = config
+            .get("trigger")
+            .map(|trigger| spawn_configured_command(trigger, "trigger"));
+        let stopped = server.tool_data(
+            "wait_for_stop",
+            json!({ "session_id": &kd, "execution": &execution, "timeout_ms": 120000 }),
+            TARGET_STEP,
+        );
+        eprintln!("--- client stop at the breakpoint ---\n{stopped}");
+        let stop = &stopped["stop"];
+        assert!(
+            !stop.is_null(),
+            "the run did not reach {breakpoint}: {stopped}\n--- stderr ---\n{}",
+            server.stderr()
+        );
+        let stopped_at = stop["stopped_at"]
+            .as_str()
+            .expect("a stop names where it stopped")
+            .to_string();
+        eprintln!("stopped at {stopped_at}");
+
+        // Inspection through the generic tools at a natural Secure Kernel stop.
+        let registers = server.tool_data("registers", json!({ "session_id": &kd }), TARGET_STEP);
+        eprintln!("--- client registers ---\n{registers}");
+        let stack = server.tool_data(
+            "backtrace",
+            json!({ "session_id": &kd, "frames": 8 }),
+            TARGET_STEP,
+        );
+        eprintln!("--- client stack ---\n{stack}");
+        let code = server.call_tool(
+            "disassemble",
+            json!({ "session_id": &kd, "count": 8 }),
+            TARGET_STEP,
+        );
+        eprintln!("--- client disassembly ---\n{code}");
+
+        // M8.0 trace row: `t` is the guarded fall-through step.
+        let stepped = server.tool_data("step_into", json!({ "session_id": &kd }), TARGET_STEP);
+        eprintln!("--- client step ---\n{stepped}");
+        assert_ne!(
+            stepped["stopped_at"],
+            json!(stopped_at),
+            "the step did not move: {stepped}"
+        );
+
+        // M8.0 rows two and four: `g` with no breakpoint is a bounded run, and a running
+        // break-in is M2's rendezvous.
+        server.tool_data(
+            "clear_breakpoints",
+            json!({ "session_id": &kd, "all": true }),
+            TARGET_STEP,
+        );
+        let started = server.tool_data(
+            "continue_async",
+            json!({ "session_id": &kd, "max_run_ms": 120000 }),
+            TARGET_STEP,
+        );
+        let execution = started["execution"]
+            .as_str()
+            .expect("a started run mints a handle")
+            .to_string();
+        let trigger_output = if let Some(trigger) = trigger {
+            let output = trigger.wait(Duration::from_secs(120));
+            eprintln!(
+                "--- trigger ({}) ---\n{}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Some(output)
+        } else {
+            std::thread::sleep(Duration::from_secs(3));
+            None
+        };
+        let asked = server.tool_data(
+            "break_in",
+            json!({ "session_id": &kd, "execution": &execution }),
+            TARGET_STEP,
+        );
+        assert_eq!(asked["requested"], json!(true), "{asked}");
+        let broken = server.tool_data(
+            "wait_for_stop",
+            json!({ "session_id": &kd, "execution": &execution, "timeout_ms": 120000 }),
+            TARGET_STEP,
+        );
+        eprintln!("--- client stop from the break-in ---\n{broken}");
+        assert!(
+            !broken["stop"].is_null(),
+            "the break-in produced no stop: {broken}\n--- stderr ---\n{}",
+            server.stderr()
+        );
+        let registers = server.tool_data("registers", json!({ "session_id": &kd }), TARGET_STEP);
+        eprintln!("--- client registers after the break-in ---\n{registers}");
+        // A trigger transport failure must not strand a running target: prove and collect the
+        // explicit break-in first, then report the external command's failure.
+        if let Some(output) = trigger_output {
+            assert!(output.status.success(), "the configured trigger failed");
+        }
+
+        let stderr = server.stderr();
+        for expected in [
+            "KD go to 1 hardware breakpoint(s)",
+            "KD restored the hit hardware-breakpoint handle",
+            "KD go with no breakpoint",
+            "KD break-in woke the running wait",
+        ] {
+            assert!(
+                stderr.contains(expected),
+                "the facade did not log {expected:?}\n--- stderr ---\n{stderr}"
+            );
+        }
+    }));
+
+    // One public end detaches DbgEng first, then releases the hidden facade/controller.
+    let ended = server.call_tool("end_session", json!({ "session_id": &kd }), TARGET_STEP);
+    eprintln!("--- composite session end ---\n{ended}");
+    eprintln!("--- managed KD server audit ---\n{}", server.stderr());
+    if let Err(panic) = run {
+        resume_unwind(panic);
+    }
+    assert_no_error(&ended, "tools/call end_session");
+    let ended = &ended["result"]["structuredContent"];
+    assert_eq!(ended["status"], "ok", "{ended}");
+    assert_eq!(ended["released"], true, "{ended}");
+    assert_eq!(ended["target_left_running"], true, "{ended}");
+
+    let audit = run_configured_command(
+        &required("post_release_audit"),
+        "post-release audit",
+        Duration::from_secs(120),
+    );
+    assert!(
+        audit.status.success(),
+        "post-release audit exited {}:\n{}",
+        audit.status,
+        String::from_utf8_lossy(&audit.stderr)
+    );
+    let audit_stdout = String::from_utf8(audit.stdout).expect("audit output is UTF-8");
+    let audit_json = audit_stdout
+        .find('{')
+        .map(|at| &audit_stdout[at..])
+        .unwrap_or_else(|| panic!("post-release audit omitted JSON: {audit_stdout}"));
+    let audit: Value = serde_json::from_str(audit_json)
+        .unwrap_or_else(|error| panic!("invalid post-release audit JSON: {error}\n{audit_json}"));
+    eprintln!("--- post-release audit ---\n{audit}");
+    assert_eq!(audit["result"], "pass", "{audit}");
+    let dr7 = audit["debug_registers"]["dr7"]["low"]
+        .as_str()
+        .and_then(|value| value.strip_prefix("0x"))
+        .and_then(|value| u64::from_str_radix(value, 16).ok())
+        .expect("audit reports DR7");
+    assert_eq!(
+        dr7 & 0xff,
+        0,
+        "a hardware breakpoint remained armed: {audit}"
+    );
 }
 
 fn managed_secure_kernel_kd_gate(symbol_gate: bool) {

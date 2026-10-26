@@ -62,6 +62,10 @@ pub enum EngineOp {
         connection: Connection,
         #[serde(default)]
         experimental_break_on_connect: bool,
+        /// This worker is the DbgEng half of the server-managed Secure Kernel KD composite.
+        /// Its paired controller, not native KD's `qd`, owns target restoration and release.
+        #[serde(default)]
+        managed_secure_kernel_peer: bool,
     },
     AttachProcess {
         pid: u32,
@@ -1174,17 +1178,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn kernel_announcement_option_survives_the_worker_wire() {
+    fn kernel_attach_options_survive_the_worker_wire() {
         for enabled in [false, true] {
-            let op = EngineOp::AttachKernel {
-                connection: Connection::new("net:port=50000,key=1.2.3.4"),
-                experimental_break_on_connect: enabled,
-            };
-            let encoded = serde_json::to_value(&op).unwrap();
-            let decoded: EngineOp = serde_json::from_value(encoded).unwrap();
-            assert!(
-                matches!(decoded, EngineOp::AttachKernel { experimental_break_on_connect, .. } if experimental_break_on_connect == enabled)
-            );
+            for managed_peer in [false, true] {
+                let op = EngineOp::AttachKernel {
+                    connection: Connection::new("net:port=50000,key=1.2.3.4"),
+                    experimental_break_on_connect: enabled,
+                    managed_secure_kernel_peer: managed_peer,
+                };
+                let encoded = serde_json::to_value(&op).unwrap();
+                let decoded: EngineOp = serde_json::from_value(encoded).unwrap();
+                assert!(matches!(
+                    decoded,
+                    EngineOp::AttachKernel {
+                        experimental_break_on_connect,
+                        managed_secure_kernel_peer,
+                        ..
+                    } if experimental_break_on_connect == enabled
+                        && managed_secure_kernel_peer == managed_peer
+                ));
+            }
         }
     }
 
