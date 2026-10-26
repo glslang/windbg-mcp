@@ -169,6 +169,32 @@ exact connection string:
 kd -k com:pipe,port=\\.\pipe\<generated-name>,resets=0 -cf <commands.txt>
 ```
 
+The success result also carries that generated string as the typed `connection` field; clients do
+not need to parse it back out of `target`. `open_sk_debugger` deliberately omits the field because
+its pipe is private to the supervisor-owned composite.
+
+For an interactive external debugger, build the release binary and use the checked-in launcher
+from any working directory. Its JSON file is exactly the `open_sk_kd` argument object; the startup
+policy remains in the inherited environment and neither it nor the provider commands are copied
+onto a child command line:
+
+```powershell
+$env:WINDBG_MCP_SK_LIVE_POLICY = 'D:\private\sk-live-policy.json'
+& 'C:\src\windbg-mcp\tools\launch_sk_kd.ps1' `
+  -Frontend Classic `
+  -ConfigPath 'D:\private\sk-kd-open.json'
+
+& 'C:\src\windbg-mcp\tools\launch_sk_kd.ps1' `
+  -Frontend WinDbgX `
+  -ConfigPath 'D:\private\sk-kd-open.json'
+```
+
+Supply `-ServerPath` or `-DebuggerPath` for an unpacked build. The launcher initializes a private
+stdio MCP client, opens the facade, starts the selected debugger with only the generated local pipe,
+waits for it to exit, and sends `end_session` in a `finally`-equivalent lifecycle. It also attempts
+that cleanup when debugger startup fails or an open failure carries a recovery handle. The JSON
+must not include smoke-harness fields such as `kd`, `trigger` or `post_release_audit`.
+
 `session_status` reports `discovering`, `arming`, `waiting_for_peer`, `stopped`, `running`,
 `reconnecting`, `releasing`, `released` or `recovery_required`. A peer disconnect while stopped
 enters a bounded reconnect window. `end_session` cancels a connect or active wait, then runs the
@@ -234,8 +260,10 @@ The private bench plan's limits, re-derived against `src/kdtarget.rs`, `src/kdap
 which single steps are refused, and what every other request is answered with:
 
 - **Named-pipe serial KD only.** No KDNET network transport.
-- **One selected VTL1 VP, and four hardware execute breakpoints.** A `bp` arrives as
-  `WriteBreakpoint` and takes a DR slot; a fifth is refused. `StateChange64` reports one processor
+- **One selected VTL1 VP, and at most four debugger breakpoint handles.** A `bp` arrives as
+  `WriteBreakpoint`. The composite debugger and a read-only standalone policy map it to a DR slot;
+  a write-authorized standalone facade maps it to M3's guarded one-shot INT3 path. A fifth handle
+  is refused in either mode. `StateChange64` reports one processor
   at index 0. The pipe banner and every state-change audit record identify the guest VP represented
   by that index; `SwitchProcessor` remains refused.
 - **The version record still says `NOMM`, but its module and debugger-data pointers are live.** The
@@ -365,9 +393,10 @@ docs/smoke-test.md has the runbook.
 | `r` | Values live measured; display diagnostic remains | Real stopped general, segment, flag, CR3 and debug-register values; unavailable special-register fields are zero |
 | `t` over a fall-through instruction | Live measured | Real TF step and returned VTL1 vector-1 event |
 | Virtual instruction reads/disassembly | Live measured | Real VTL1 virtual memory, plus narrowly scoped compatibility addresses |
-| `bp`/`g` to one of four hardware slots | One server-owned DbgEng composite pass; repeated M8.2 qualification remains | Guarded VTL1 DR state and retained dispatcher event |
+| `bp`/`g`, hardware-slot mapping | One server-owned DbgEng composite pass; repeated M8.2 qualification remains | Guarded VTL1 DR state and retained dispatcher event |
+| `bp`/`g`, guarded INT3 mapping | Implemented for a write-authorized standalone facade; M8.2 qualification remains | M3 byte guard, proved pause and restoration |
 | `g` with no breakpoint | One bounded server-owned run stopped by `break_in`; repeated M8.2 qualification remains | Every slot released; ends only at a break-in, teardown or the recovery deadline |
-| Software breakpoints or memory/register writes | Refused | No safe patch owner; `SetContext` accepts only an unchanged prefix |
+| Arbitrary memory/register writes | Refused | The standalone write-authorized facade owns only M3's guarded breakpoint byte; `SetContext` accepts only an unchanged prefix |
 | `lm m securekernel` module discovery | Live measured | Validated live debugger-data head, `KDBG` block and loaded-module list |
 | PDB symbol resolution and bounded stack walking | Live measured at a natural timer stop | Prepared PDB cache, live module range, real stack/code; two Secure Kernel frames |
 | Asynchronous break-in during a `g` | One server-owned DbgEng composite pass; repeated M8.2 qualification remains | A proved VM pause and a transient execute breakpoint at the paused RIP |

@@ -2969,6 +2969,9 @@ const MODEL_VISIBLE_CEILING: usize = 142_000;
 /// **410,000 -> 420,000 for the M8 composite opener** (2026-10-25). The payload moves to
 /// 413,570 B. The new tool owns the increase: its output reuses the ordinary open contract and
 /// its input is the managed-facade admission contract. The new ceiling leaves 6,430 B (1.6%).
+/// M8.1's typed generated connection adds 40 B to each of the nine ordinary opener schemas,
+/// moving the payload to 413,930 B and leaving 6,070 B (1.4%). Only `open_sk_kd` populates it;
+/// paying the small shared-schema cost keeps the launcher from parsing a human target label.
 const WIRE_CEILING: usize = 420_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,296
@@ -23483,6 +23486,38 @@ fn configured_command_drop_detaches_a_blocked_output_reader() {
     );
 }
 
+#[test]
+fn secure_kernel_kd_launcher_obeys_its_cleanup_contract() {
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tools")
+        .join("test_launch_sk_kd.ps1");
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(&script)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the Secure Kernel KD launcher contract tests");
+    assert!(
+        output.status.success(),
+        "launcher contract test exited {}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Secure Kernel KD launcher tests passed."),
+        "launcher contract test omitted its completion marker: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
 /// M8's demonstration: the Secure Kernel driven end to end through this server's **own**
 /// debugger tools. `open_sk_debugger` creates the hidden managed KD facade and attaches an
 /// ordinary kernel worker to it, and from then on the generic tools do the work: a breakpoint at
@@ -23826,14 +23861,10 @@ fn managed_secure_kernel_kd_gate(symbol_gate: bool) {
         .as_str()
         .expect("the KD opener mints a session handle")
         .to_string();
-    let target = opened["target"]
+    let connection = opened["connection"]
         .as_str()
-        .expect("the KD opener reports its generated pipe");
-    let pipe = target
-        .rsplit_once(" KD pipe ")
-        .map(|(_, pipe)| pipe)
-        .unwrap_or_else(|| panic!("the KD target omitted its generated pipe: {target}"));
-    let connection = format!(r"com:pipe,port=\\.\pipe\{pipe},resets=0");
+        .expect("the KD opener reports its typed generated connection")
+        .to_string();
 
     let state = |server: &mut Server| -> String {
         let status = server.tool_data("session_status", json!({ "session_id": id }), TARGET_STEP);
