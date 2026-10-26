@@ -1315,11 +1315,18 @@ fn drive_service_trace(
         // Provider reads stay outside the shared recorder lock. The decoded observation then
         // crosses the same one-lock boundary as a reader-side stop request: whichever wins is
         // authoritative, and a stop that arrived during the reads discards the observation.
-        let decoded = decoder.decode(&stop, per_buffer_bytes, |address, size| {
+        let observed = match decoder.decode(&stop, per_buffer_bytes, |address, size| {
             runtime.read_trace_memory(address, size)
-        });
-        let observed =
-            decoded.and_then(|decoded| shared.observe(move |recorder| decoded.apply(recorder)));
+        }) {
+            Ok(decoded) => match shared.observe(move |recorder| decoded.apply(recorder)) {
+                Ok(_) => Ok(()),
+                Err(crate::skservicetrace::ObservationError::StopRequested) => {
+                    return finish_service_trace(runtime, &stop.epoch, shared);
+                }
+                Err(error) => Err(error.to_string()),
+            },
+            Err(error) => Err(error),
+        };
         if let Err(error) = observed {
             let restored = finish_service_trace(runtime, &stop.epoch, shared);
             return match restored {
@@ -6726,6 +6733,7 @@ mod tests {
         stops: VecDeque<Result<StopRecord, &'static str>>,
         memory: HashMap<u64, u8>,
         actions: Vec<String>,
+        stop_during_read: Option<(crate::skservicetrace::SharedTrace, String)>,
         fail_complete: bool,
         fail_rearm: bool,
         fail_restore: bool,
@@ -6751,6 +6759,7 @@ mod tests {
                 stops: stops.into_iter().collect(),
                 memory,
                 actions: Vec::new(),
+                stop_during_read: None,
                 fail_complete: false,
                 fail_rearm: false,
                 fail_restore: false,
@@ -6761,6 +6770,10 @@ mod tests {
             for (offset, byte) in service.to_le_bytes().into_iter().enumerate() {
                 self.memory.insert(TRACE_REQUEST + 2 + offset as u64, byte);
             }
+        }
+
+        fn request_stop_during_next_read(&mut self, shared: &crate::skservicetrace::SharedTrace) {
+            self.stop_during_read = Some((shared.clone(), shared.armed().trace_id));
         }
     }
 
@@ -6785,6 +6798,12 @@ mod tests {
         }
 
         fn read_trace_memory(&mut self, address: u64, size: u32) -> Result<Vec<u8>, String> {
+            if let Some((shared, trace_id)) = self.stop_during_read.take() {
+                assert_eq!(
+                    shared.request_stop(&trace_id).unwrap(),
+                    crate::skservicetrace::StopRequest::First
+                );
+            }
             (0..u64::from(size))
                 .map(|offset| {
                     self.memory
@@ -7306,6 +7325,26 @@ mod tests {
             Some(&format!("restore:{stopped_epoch}"))
         );
         assert!(!shared.snapshot("sktrace-rearm-failure").unwrap().armed);
+    }
+
+    #[test]
+    fn reader_stop_that_wins_during_decode_finishes_the_completed_prefix() {
+        let manifest = crate::skservice::service_manifest().unwrap();
+        let stopped = trace_stop(&manifest, "dispatch", 65);
+        let stopped_epoch = stopped.epoch.clone();
+        let mut runtime = FakeTraceRuntime::new([Ok(stopped)]);
+        let (shared, mut decoder, breakpoints) = trace_parts("sktrace-stop-during-decode", 8);
+        runtime.request_stop_during_next_read(&shared);
+
+        let trace =
+            drive_service_trace(&mut runtime, &shared, &mut decoder, &breakpoints, 16).unwrap();
+
+        assert!(trace.records.is_empty());
+        assert!(!trace.armed);
+        assert_eq!(
+            runtime.actions,
+            ["wait".to_string(), format!("restore:{stopped_epoch}")]
+        );
     }
 
     #[test]

@@ -1066,6 +1066,25 @@ pub(crate) enum StopRequest {
     Finished,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ObservationError {
+    StopRequested,
+    Sealed,
+    Recorder(String),
+}
+
+impl std::fmt::Display for ObservationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StopRequested => {
+                formatter.write_str("service trace stop was linearized before this observation")
+            }
+            Self::Sealed => formatter.write_str("service trace is already sealed"),
+            Self::Recorder(error) => formatter.write_str(error),
+        }
+    }
+}
+
 impl SharedTrace {
     pub(crate) fn new(recorder: Recorder) -> Self {
         Self {
@@ -1106,15 +1125,15 @@ impl SharedTrace {
     pub(crate) fn observe<T>(
         &self,
         observe: impl FnOnce(&mut Recorder) -> Result<T, String>,
-    ) -> Result<T, String> {
+    ) -> Result<T, ObservationError> {
         let mut state = self.state();
         if state.stop_requested {
-            return Err("service trace stop was linearized before this observation".into());
+            return Err(ObservationError::StopRequested);
         }
         if state.recorder.sealed {
-            return Err("service trace is already sealed".into());
+            return Err(ObservationError::Sealed);
         }
-        observe(&mut state.recorder)
+        observe(&mut state.recorder).map_err(ObservationError::Recorder)
     }
 
     pub(crate) fn capacity_reached(&self) -> bool {
@@ -2858,7 +2877,7 @@ mod tests {
         let error = shared
             .observe(|recorder| recorder.observe_entry(target().expected_cr3, entry()))
             .unwrap_err();
-        assert!(error.contains("linearized before"), "{error}");
+        assert!(error.to_string().contains("linearized before"), "{error}");
         let trace = shared.finish().unwrap();
         assert!(trace.records.is_empty());
         assert_eq!(trace.pending_phase, None);
@@ -2885,7 +2904,7 @@ mod tests {
         let error = shared
             .observe(|recorder| decoded.apply(recorder))
             .unwrap_err();
-        assert!(error.contains("linearized before"), "{error}");
+        assert!(error.to_string().contains("linearized before"), "{error}");
         let trace = shared.finish().unwrap();
         assert!(trace.records.is_empty());
         assert_eq!(trace.pending_phase, None);

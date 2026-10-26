@@ -298,6 +298,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Stopping an M6 service trace while its worker is decoding the current stop returns the
+  completed prefix.** The stop-vs-observation lock now reports that linearized outcome separately
+  from decoder and recorder failures, so successful restoration cannot leave the trace job
+  faulted merely because its reader won the race.
+
+- **Unreadable M4 transition or service fields remain conservative M7 join candidates.** A
+  time-compatible hit can no longer be filtered out strongly enough to make another hit look
+  unique, and interval-only rank matching is withheld while any candidate's classification is
+  unproved.
+
 - **Guarded Secure Kernel write bytes reject non-ASCII input before byte-pair parsing.** A
   multibyte character with an even UTF-8 byte length could previously pass the length check and
   panic when the MCP handler sliced through the character; malformed input now returns the same

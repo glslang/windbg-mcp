@@ -328,8 +328,11 @@ pub(crate) struct M4Event {
     pub(crate) host_monotonic_us: u64,
     pub(crate) transition_kind: Option<u8>,
     pub(crate) service: Option<u16>,
-    /// A secure-service entry of the selected service: the only M4 events a chain may start from.
+    /// A fully classified secure-service entry of the selected service.
     pub(crate) selected: bool,
+    /// Whether unreadable classification fields leave this hit able to be the selected service.
+    #[serde(skip)]
+    candidate: bool,
     pub(crate) process_id: Option<u32>,
     pub(crate) thread: Option<String>,
     pub(crate) caller_symbol: Option<String>,
@@ -1170,6 +1173,12 @@ fn normalize_m4(
             service: call.service,
             selected: call.transition_kind == Some(secure_call_kind)
                 && call.service == Some(selected_service),
+            candidate: call
+                .transition_kind
+                .is_none_or(|kind| kind == secure_call_kind)
+                && call
+                    .service
+                    .is_none_or(|service| service == selected_service),
             process_id: call.process_id,
             thread: call.thread,
             caller_symbol: call.caller_symbol,
@@ -1557,7 +1566,7 @@ struct Ctx<'a> {
     m5: Option<(&'a LayerSummary, &'a [RoundTrip])>,
     m6: &'a LayerSummary,
     m6_entries: usize,
-    m4_selected: Vec<usize>,
+    m4_candidates: Vec<usize>,
 }
 
 impl Ctx<'_> {
@@ -1607,7 +1616,7 @@ fn decide_m4(
         };
     };
     let pool: Vec<&M4Event> = ctx
-        .m4_selected
+        .m4_candidates
         .iter()
         .map(|index| &events[*index])
         .filter(|event| !claimed.contains(&event.sequence))
@@ -1632,31 +1641,34 @@ fn decide_m4(
                 reason: "the VTL1 entry carries no clock sample on the admitted frequency".into(),
             };
         };
-        let mut strict = Vec::new();
-        let mut undecided = Vec::new();
+        let mut strict: Vec<&M4Event> = Vec::new();
+        let mut undecided: Vec<&M4Event> = Vec::new();
         for event in &pool {
             match ctx.clock.tick(event.host_qpc) {
-                None => undecided.push(event.sequence),
+                None => undecided.push(event),
                 Some(tick) if tick < entry_tick && lower.is_none_or(|lower| tick > lower) => {
-                    strict.push(event.sequence)
+                    strict.push(event)
                 }
-                Some(tick) if tick == entry_tick || lower == Some(tick) => {
-                    undecided.push(event.sequence)
-                }
+                Some(tick) if tick == entry_tick || lower == Some(tick) => undecided.push(event),
                 Some(_) => {}
             }
         }
-        return match (strict.len(), undecided.is_empty()) {
-            (1, true) => Decision::Matched {
-                event: m4_event_id(strict[0]),
+        return match (strict.as_slice(), undecided.is_empty()) {
+            ([event], true) if event.selected => Decision::Matched {
+                event: m4_event_id(event.sequence),
                 rule: "the one selected VTL0 entry after the previous VTL1 record and before this VTL1 entry".into(),
             },
-            (0, true) => Decision::Unmatched {
+            ([], true) => Decision::Unmatched {
                 reason: "no selected VTL0 entry lies after the previous VTL1 record and before this VTL1 entry".into(),
             },
             _ => Decision::Ambiguous {
-                candidates: Candidates::new(Stage::M4Entry, strict.into_iter().chain(undecided)),
-                reason: if strict_len_hint(&pool, entry_tick, lower, &ctx.clock) > 1 {
+                candidates: Candidates::new(
+                    Stage::M4Entry,
+                    strict.iter().chain(&undecided).map(|event| event.sequence),
+                ),
+                reason: if strict.iter().chain(&undecided).any(|event| !event.selected) {
+                    "a time-compatible VTL0 hit has unreadable classification fields, so it cannot be excluded or uniquely matched".into()
+                } else if strict.len() > 1 {
                     "several selected VTL0 entries lie between the previous VTL1 record and this VTL1 entry".into()
                 } else {
                     "a candidate's tick equals a boundary or carries no comparable sample, so its order is unproved".into()
@@ -1669,12 +1681,16 @@ fn decide_m4(
     // one contains the other and both are complete runs of equal length, the k-th selected entry
     // is the k-th record. Anything less leaves a range.
     let relation = ctx.m4_m6_relation();
-    let n4 = ctx.m4_selected.len();
+    let n4 = ctx.m4_candidates.len();
     let n6 = ctx.m6_entries;
     let all = || Candidates::new(Stage::M4Entry, pool.iter().map(|event| event.sequence));
     match relation {
         WindowRelation::Disjoint => Decision::Unmatched {
             reason: "the VTL0 and VTL1 traces recorded disjoint windows, so no call was seen by both".into(),
+        },
+        _ if pool.iter().any(|event| !event.selected) => Decision::Ambiguous {
+            candidates: all(),
+            reason: "a potentially selected VTL0 hit has unreadable classification fields, so interval-only rank matching is not proved".into(),
         },
         WindowRelation::Contains | WindowRelation::ContainedBy
             if summary.complete_run() && ctx.m6.complete_run() =>
@@ -1701,7 +1717,7 @@ fn decide_m4(
             }
             let slack = container_count - contained_count;
             if slack == 0 {
-                let sequence = events[ctx.m4_selected[entry_rank]].sequence;
+                let sequence = events[ctx.m4_candidates[entry_rank]].sequence;
                 return Decision::Matched {
                     event: m4_event_id(sequence),
                     rule: "rank: one complete run contains the other and both recorded the same number of selected calls".into(),
@@ -1716,7 +1732,7 @@ fn decide_m4(
             };
             let candidates = (first..=last)
                 .filter(|rank| *rank < n4)
-                .map(|rank| events[ctx.m4_selected[rank]].sequence)
+                .map(|rank| events[ctx.m4_candidates[rank]].sequence)
                 .filter(|sequence| !claimed.contains(sequence));
             Decision::Ambiguous {
                 candidates: Candidates::new(Stage::M4Entry, candidates),
@@ -1738,16 +1754,6 @@ fn decide_m4(
             reason: "no arm and drain brackets relate the two windows, and the clock admits no point order".into(),
         },
     }
-}
-
-fn strict_len_hint(pool: &[&M4Event], entry_tick: u64, lower: Option<u64>, clock: &Clock) -> usize {
-    pool.iter()
-        .filter(|event| {
-            clock
-                .tick(event.host_qpc)
-                .is_some_and(|tick| tick < entry_tick && lower.is_none_or(|lower| tick > lower))
-        })
-        .count()
 }
 
 fn m5_event_id(sequence: u64, stage: Stage) -> EventId {
@@ -1993,13 +1999,13 @@ pub(crate) fn join(input: &JoinInput) -> anyhow::Result<JoinedCapture> {
         .map(|(_, events)| pair_round_trips(events, &clock, &mut marks, &mut unmatched))
         .unwrap_or_default();
 
-    let m4_selected: Vec<usize> = m4
+    let m4_candidates: Vec<usize> = m4
         .as_ref()
         .map(|(_, events)| {
             events
                 .iter()
                 .enumerate()
-                .filter(|(_, event)| event.selected)
+                .filter(|(_, event)| event.candidate)
                 .map(|(index, _)| index)
                 .collect()
         })
@@ -2017,7 +2023,7 @@ pub(crate) fn join(input: &JoinInput) -> anyhow::Result<JoinedCapture> {
             .iter()
             .filter(|event| event.entry.is_some())
             .count(),
-        m4_selected,
+        m4_candidates,
     };
 
     let mut windows = Vec::new();
@@ -2289,14 +2295,18 @@ pub(crate) fn join(input: &JoinInput) -> anyhow::Result<JoinedCapture> {
     }
 
     if let Some((_, events)) = ctx.m4 {
-        for index in &ctx.m4_selected {
+        for index in &ctx.m4_candidates {
             let event = &events[*index];
             if !claimed.contains(&event.sequence) {
                 unmatched.push(Unmatched {
                     m6_sequence: None,
                     stage: Some(Stage::M4Entry),
                     event: Some(m4_event_id(event.sequence)),
-                    reason: "no VTL1 record claimed this selected VTL0 entry".into(),
+                    reason: if event.selected {
+                        "no VTL1 record claimed this selected VTL0 entry".into()
+                    } else {
+                        "no VTL1 record claimed this potentially selected VTL0 entry whose classification was unreadable".into()
+                    },
                 });
             }
         }
@@ -3450,6 +3460,79 @@ mod tests {
             .marks
             .iter()
             .any(|mark| mark.kind == MarkKind::SequenceGap && mark.layer == Some(Layer::M6Vtl1)));
+    }
+
+    #[test]
+    fn unclassified_m4_hits_remain_candidates_but_never_become_unique_matches() {
+        let base = fixture(31, 8, true);
+        let truth = base.truth.last().unwrap().clone();
+        let mut alongside = base.input.clone();
+        let unknown_sequence = {
+            let calls = calls_mut(&mut alongside);
+            let mut unknown = calls
+                .iter()
+                .find(|call| call["sequence"] == json!(truth.m4_sequence))
+                .unwrap()
+                .clone();
+            let sequence = calls
+                .iter()
+                .filter_map(|call| call["sequence"].as_u64())
+                .max()
+                .unwrap()
+                + 1;
+            unknown["sequence"] = json!(sequence);
+            unknown["transition_kind"] = Value::Null;
+            unknown["service"] = Value::Null;
+            unknown["provenance"]["read_failures"] = json!(["transition_kind", "service"]);
+            calls.push(unknown);
+            sequence
+        };
+        alongside.layers.m4_vtl0.as_mut().unwrap().trace["unreadable_hits"] = json!(1);
+
+        let joined = join(&alongside).unwrap();
+        let chain = chain_for(&joined, truth.m6_sequence);
+        match &chain.stages.m4_entry {
+            Decision::Ambiguous { candidates, reason } => {
+                assert_eq!(candidates.count, 2);
+                let listed: Vec<u64> = candidates
+                    .sequence_ranges
+                    .iter()
+                    .flat_map(|range| range.first..=range.last)
+                    .collect();
+                assert!(listed.contains(&truth.m4_sequence));
+                assert!(listed.contains(&unknown_sequence));
+                assert!(reason.contains("unreadable classification"), "{reason}");
+            }
+            other => panic!("an unclassified time-compatible hit must stay ambiguous: {other:?}"),
+        }
+
+        let mut unknown_only = fixture(9, 1, true).input;
+        let only_sequence = calls_mut(&mut unknown_only)[0]["sequence"]
+            .as_u64()
+            .unwrap();
+        calls_mut(&mut unknown_only)[0]["service"] = Value::Null;
+        let point = join(&unknown_only).unwrap();
+        assert!(matches!(
+            &point.chains[0].stages.m4_entry,
+            Decision::Ambiguous { candidates, .. }
+                if candidates.count == 1
+                    && candidates.sequence_ranges[0].first == only_sequence
+        ));
+
+        unknown_only.clock.mode = ClockMode::IntervalOnly;
+        unknown_only.clock.frequency = None;
+        let m4 = unknown_only.layers.m4_vtl0.as_mut().unwrap();
+        m4.arm = Some(bracket(Layer::M4Vtl0, "arm", base.start - 400, FREQUENCY));
+        let end = m4.drain.as_ref().unwrap().coordinator_after.tick;
+        m4.drain = Some(bracket(Layer::M4Vtl0, "drain", end - 200, FREQUENCY));
+        let interval = join(&unknown_only).unwrap();
+        match &interval.chains[0].stages.m4_entry {
+            Decision::Ambiguous { candidates, reason } => {
+                assert_eq!(candidates.count, 1);
+                assert!(reason.contains("rank matching is not proved"), "{reason}");
+            }
+            other => panic!("an unclassified hit must not be rank-matched: {other:?}"),
+        }
     }
 
     #[test]
