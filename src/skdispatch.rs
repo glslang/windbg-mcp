@@ -1616,6 +1616,9 @@ pub(crate) fn parse_hex_bytes(text: &str) -> Result<Vec<u8>> {
     if compact.is_empty() || compact.len() > 30 || !compact.len().is_multiple_of(2) {
         bail!("--instruction-bytes must contain 1..=15 whole hexadecimal bytes");
     }
+    if !compact.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("--instruction-bytes contains a non-hexadecimal byte");
+    }
     (0..compact.len())
         .step_by(2)
         .map(|at| {
@@ -1909,8 +1912,8 @@ impl VmwpDispatcherState {
                 .memory
                 .as_ref()
                 .context("the live VTL1 memory source is absent during rollback")?;
-            memory.write_physical_until(write.gpa, &write.original, deadline)?;
-            memory.verify_virtual_until(
+            memory.write_physical_for_cleanup_until(write.gpa, &write.original, deadline)?;
+            memory.verify_virtual_for_cleanup_until(
                 write.address,
                 &write.original,
                 "guarded live VTL1 rollback read-back",
@@ -2013,11 +2016,11 @@ impl VmwpDispatcherState {
                 .memory
                 .as_ref()
                 .context("the live VTL1 memory source is absent during breakpoint restoration")?;
-            let current = memory.read_span_until(
+            let current = memory.read_span_for_cleanup_until(
                 sk::Gva(patch.address.0),
                 patch.original.len(),
                 "owned software breakpoint before restoration",
-                Some(deadline),
+                deadline,
             )?;
             if current == patch.original {
                 // A failed write reply is ambiguous. Proving the original is already present is a
@@ -2031,8 +2034,8 @@ impl VmwpDispatcherState {
                     patch.address.0
                 );
             }
-            memory.write_physical_until(patch.gpa, &patch.original, deadline)?;
-            memory.verify_virtual_until(
+            memory.write_physical_for_cleanup_until(patch.gpa, &patch.original, deadline)?;
+            memory.verify_virtual_for_cleanup_until(
                 patch.address,
                 &patch.original,
                 "software breakpoint restoration read-back",
@@ -2804,7 +2807,12 @@ struct DeadlineLiveSource<'a> {
     source: &'a crate::livesrc::LiveSource,
     operation: &'a str,
     deadline: Instant,
+    cancelled: fn() -> bool,
     expired: std::cell::Cell<bool>,
+}
+
+fn cleanup_not_cancelled() -> bool {
+    false
 }
 
 impl<'a> DeadlineLiveSource<'a> {
@@ -2817,10 +2825,33 @@ impl<'a> DeadlineLiveSource<'a> {
         operation: &'a str,
         outer_deadline: Instant,
     ) -> Self {
+        Self::new_until_with_cancel(
+            source,
+            operation,
+            outer_deadline,
+            crate::worker::kd_teardown_requested,
+        )
+    }
+
+    fn new_for_cleanup_until(
+        source: &'a crate::livesrc::LiveSource,
+        operation: &'a str,
+        outer_deadline: Instant,
+    ) -> Self {
+        Self::new_until_with_cancel(source, operation, outer_deadline, cleanup_not_cancelled)
+    }
+
+    fn new_until_with_cancel(
+        source: &'a crate::livesrc::LiveSource,
+        operation: &'a str,
+        outer_deadline: Instant,
+        cancelled: fn() -> bool,
+    ) -> Self {
         Self {
             source,
             operation,
             deadline: outer_deadline.min(Instant::now() + LIVE_MEMORY_WAIT),
+            cancelled,
             expired: std::cell::Cell::new(false),
         }
     }
@@ -2850,12 +2881,9 @@ impl RawSource for DeadlineLiveSource<'_> {
                 detail: format!("{} reached its deadline", self.operation),
             });
         }
-        let result = self.source.read_chunk_until_cancelled(
-            gpa,
-            out,
-            self.deadline,
-            crate::worker::kd_teardown_requested,
-        );
+        let result =
+            self.source
+                .read_chunk_until_cancelled(gpa, out, self.deadline, self.cancelled);
         if Instant::now() >= self.deadline {
             self.expired.set(true);
         }
@@ -3005,6 +3033,22 @@ impl LiveGuestMemory {
         result.map_err(|why| anyhow!("{why:?}"))
     }
 
+    fn read_span_for_cleanup_until(
+        &self,
+        at: sk::Gva,
+        size: usize,
+        operation: &str,
+        deadline: Instant,
+    ) -> Result<Vec<u8>> {
+        // Teardown is what asked for this rollback. It may bound cleanup, but it must not cancel
+        // the provider exchange whose only purpose is to restore bytes before execution resumes.
+        let source = DeadlineLiveSource::new_for_cleanup_until(&self.source, operation, deadline);
+        let reader = sk::Reader::new(&source);
+        let result = sk::Space::new(&reader, &self.space).read_span(at, size);
+        source.require_within_deadline()?;
+        result.map_err(|why| anyhow!("{why:?}"))
+    }
+
     fn read_guard_until(
         &self,
         guard: &InstructionGuard,
@@ -3124,6 +3168,20 @@ impl LiveGuestMemory {
         )
     }
 
+    fn write_physical_for_cleanup_until(
+        &self,
+        gpa: HexU64,
+        bytes: &[u8],
+        deadline: Instant,
+    ) -> Result<()> {
+        self.source.write_chunk_until_cancelled(
+            sk::Gpa(gpa.0),
+            bytes,
+            deadline,
+            cleanup_not_cancelled,
+        )
+    }
+
     fn verify_virtual_until(
         &self,
         address: HexU64,
@@ -3138,6 +3196,27 @@ impl LiveGuestMemory {
                 operation,
                 Some(deadline),
             )
+            .with_context(|| format!("reading live VTL1 at {:#x}", address.0))?;
+        if observed != expected {
+            bail!(
+                "{operation} mismatch at {:#x}: expected {}, observed {}",
+                address.0,
+                hex(expected),
+                hex(&observed)
+            );
+        }
+        Ok(())
+    }
+
+    fn verify_virtual_for_cleanup_until(
+        &self,
+        address: HexU64,
+        expected: &[u8],
+        operation: &str,
+        deadline: Instant,
+    ) -> Result<()> {
+        let observed = self
+            .read_span_for_cleanup_until(sk::Gva(address.0), expected.len(), operation, deadline)
             .with_context(|| format!("reading live VTL1 at {:#x}", address.0))?;
         if observed != expected {
             bail!(
@@ -7766,6 +7845,39 @@ mod tests {
     }
 
     #[test]
+    fn guarded_write_rollback_is_deadline_bounded_but_not_teardown_cancelled() {
+        let source = include_str!("skdispatch.rs").replace("\r\n", "\n");
+        let rollback = source
+            .split_once("    fn restore_memory_writes_until(")
+            .expect("the guarded-write rollback exists")
+            .1
+            .split_once("    fn arm_software_breakpoints_until(")
+            .expect("the guarded-write rollback ends before breakpoint arming")
+            .0;
+        assert!(
+            rollback.contains("write_physical_for_cleanup_until"),
+            "{rollback}"
+        );
+        assert!(
+            rollback.contains("verify_virtual_for_cleanup_until"),
+            "{rollback}"
+        );
+
+        let cleanup_write = source
+            .split_once("    fn write_physical_for_cleanup_until(")
+            .expect("the non-cancellable cleanup write exists")
+            .1
+            .split_once("    fn verify_virtual_until(")
+            .expect("the ordinary verification follows it")
+            .0;
+        assert!(cleanup_write.contains("deadline"), "{cleanup_write}");
+        assert!(
+            cleanup_write.contains("cleanup_not_cancelled"),
+            "{cleanup_write}"
+        );
+    }
+
+    #[test]
     fn dispatcher_completion_reuses_the_absolute_pause_deadline() {
         let deadline = Instant::now() + Duration::from_secs(10);
         assert_eq!(completion_wait_deadline(Some(deadline)), deadline);
@@ -7846,6 +7958,15 @@ mod tests {
         assert_eq!(request.open.dispatcher_vnd, None);
         assert_eq!(request.open.target.partition_id, None);
         assert_eq!(request.open.target.expected_cr3, None);
+    }
+
+    #[test]
+    fn instruction_bytes_reject_non_ascii_before_byte_pair_slicing() {
+        assert_eq!(parse_hex_bytes("0f 1f-00").unwrap(), [0x0f, 0x1f, 0x00]);
+        for bad in ["aéb", "€0", "0€", "éé"] {
+            let error = parse_hex_bytes(bad).unwrap_err().to_string();
+            assert!(error.contains("non-hexadecimal"), "{bad:?}: {error}");
+        }
     }
 
     #[test]

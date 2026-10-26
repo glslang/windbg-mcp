@@ -8,8 +8,9 @@ how much of that surface a run serves, and four behaviours the table has no room
 The default serves every ordinary group and omits the `securekernel` extra. Explicit `--tools all`
 serves all eighty-nine tools. Their definitions are paid before the model has asked anything, once
 per conversation. Every
-figure on this page is a measurement of 2026-10-25 rather than an invariant: any edit to a tool's
-description moves it, so re-derive before quoting one. The tables below are checked against a
+figure on this page reads `tests/golden/tool_budget.json` as recorded on 2026-10-26 by serving
+build `e441065`, rather than being an invariant: any edit to a tool's description moves it, so
+re-derive before quoting one. The tables below are checked against a
 running server by `every_documented_surface_figure_matches_the_served_surface`; this sentence is
 **not**, which is how it came to say 94,921 while the table beside it said 94,957. Seven
 tenths of that is the prose that tells a model how to drive them, so it cannot be trimmed without

@@ -44,7 +44,7 @@ already does the job.
 | TTD analysis | `ttd_calls`, `ttd_memory`, `ttd_events`, `index_trace`, `record_trace` |
 | Kernel pool | `pool_find_tag`, `pool_chunk`, `pool_census`, `pool_diagnostics`; live: `pool_trace`, `pool_trace_read` |
 | User Segment Heap | `heap_list`, `heap_allocations`, `heap_chunk`, `heap_census`, `heap_diagnostics` |
-| Secure Kernel | Capture: `open_sk_capture`, `sk_modules`, `sk_read_memory`, `sk_symbol`. Live control: `open_sk_live_control`, `sk_live_arm`, `sk_live_wait`, `sk_live_registers`, `sk_live_read_memory`, optional policy-gated `sk_live_write_memory`, `sk_live_step`, `sk_live_continue`. WinDbg facade: `open_sk_kd`. Each route has its own session and refuses ordinary debugger tools; `end_session` still applies |
+| Secure Kernel | Capture: `open_sk_capture`, `sk_modules`, `sk_read_memory`, `sk_symbol`. Live control opener: `open_sk_live_control`; ten operations: `sk_live_arm`, `sk_live_wait`, `sk_live_break`, `sk_live_registers`, `sk_live_read_memory`, optional policy-gated `sk_live_write_memory`, `sk_live_step`, `sk_live_continue_to_breakpoints`, `sk_live_continue_to_software_breakpoints`, `sk_live_continue`. WinDbg facade: `open_sk_kd`. Each route has its own session and refuses ordinary debugger tools; `end_session` still applies |
 | Server | `server_log` — the server's own records: the supervisor's, plus your own sessions' workers, tagged by session |
 | Raw | `execute` — run any debugger command, returns full text output |
 
@@ -210,7 +210,7 @@ where its stderr is not on your screen.
 - **Secure Kernel capture, live decode and live control are three distinct routes.** An
   `open_sk_capture` session reads a fixed Hyper-V checkpoint, so nothing executes. `--sk-live` is a
   command-line decode role using an operator-supplied memory transport, with no MCP session. The
-  ten live-control MCP tools instead bind operator-supplied register and memory providers plus an
+  live-control opener and ten MCP operations instead bind operator-supplied register and memory providers plus an
   exact-build `vmwp` adapter to one selected VP in a disposable VBS VM; they stop, inspect, step and
   resume through epoch-bound operations. All session routes refuse ordinary debugger tools and must
   be closed with `end_session`; an unresolved live-control teardown retains its worker and target

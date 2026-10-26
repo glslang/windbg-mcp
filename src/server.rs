@@ -10431,7 +10431,7 @@ mod tests {
             parse_guarded_write_bytes("expected", "48-8b 01"),
             Ok(vec![0x48, 0x8b, 0x01])
         );
-        for bad in ["€0", "0€", "éé"] {
+        for bad in ["aéb", "€0", "0€", "éé"] {
             let error = parse_guarded_write_bytes("expected", bad).unwrap_err();
             assert!(error.contains("non-hexadecimal"), "{bad:?}: {error}");
         }

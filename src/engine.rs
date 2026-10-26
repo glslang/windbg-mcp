@@ -1408,23 +1408,40 @@ impl Session {
         state.is_live().then_some(next)
     }
 
+    fn release_or_handoff_verified(&self) -> bool {
+        self.released.load(Ordering::SeqCst) || self.kernel_handoff_complete.load(Ordering::SeqCst)
+    }
+
+    /// Preserve a composite's recovery handle after its public worker is already terminal.
+    /// Ordinary state moves intentionally cannot resurrect `Closed`; this is the narrow exception
+    /// for a verified-gone DbgEng peer whose still-owned controller must remain reachable.
+    fn preserve_composite_controller(&self, why: String) {
+        let public_peer_gone = self.release_or_handoff_verified();
+        self.update_state(|state| {
+            (state.is_live() || (public_peer_gone && matches!(state, SessionState::Closed(_))))
+                .then_some(SessionState::LiveControlUnresolved(why))
+        });
+    }
+
     /// Replaces the dispatch-time reason for an explicit `end_session` with its final outcome.
     ///
     /// Conditional on the placeholder so another teardown that won the race keeps its own reason.
+    /// A verified-gone composite may also finish the recovery state that preserved its controller.
     fn finish_end(&self, reason: String) {
-        self.update_state(|state| match state {
-            SessionState::Closed(why) if why == END_SESSION_CLOSING => {
-                Some(SessionState::Closed(reason))
-            }
-            _ => None,
+        let public_peer_gone = self.release_or_handoff_verified();
+        self.update_state(|state| {
+            (matches!(state, SessionState::Closed(why) if why == END_SESSION_CLOSING)
+                || (public_peer_gone && matches!(state, SessionState::LiveControlUnresolved(_))))
+            .then_some(SessionState::Closed(reason))
         });
     }
 
     /// Recomputes the state *from itself*, under a single lock acquisition, and reports where it
-    /// ended up. `next` returns `None` to leave it alone. Settled states cannot move, with one
-    /// narrow exceptions: a `Closed` state may be refined to another `Closed` state so an
+    /// ended up. `next` returns `None` to leave it alone. Settled states move only through narrow
+    /// exceptions: a `Closed` state may be refined to another `Closed` state so an
     /// `end_session` marked closed at dispatch can later record how its teardown finished, and a
-    /// guarded controller whose release was not proved may enter its sticky unresolved state.
+    /// guarded controller whose release was not proved may enter its sticky unresolved state. A
+    /// verified-gone composite public peer may likewise expose its still-owned hidden controller.
     ///
     /// The atomicity is the whole point, and check-then-set through two acquisitions is not good
     /// enough: `pump` retires a session from another task the instant it forwards a
@@ -1464,6 +1481,14 @@ impl Session {
                     && matches!(proposed, Some(SessionState::KernelUnresolved(_))))
                 || (self.kind.is_secure_kernel_controller()
                     && !self.released.load(Ordering::SeqCst)
+                    && matches!(proposed, Some(SessionState::LiveControlUnresolved(_))))
+                // The public half of a composite is an ordinary kernel session. Once its worker
+                // is proved gone, a failed hidden controller still has to make that closed public
+                // handle recoverable; `preserve_composite_controller` is the only producer of
+                // this otherwise-forbidden terminal-to-unresolved transition.
+                || (self.kind == SessionKind::Kernel
+                    && self.release_or_handoff_verified()
+                    && matches!(state, SessionState::Closed(_))
                     && matches!(proposed, Some(SessionState::LiveControlUnresolved(_))))
                 || matches!(
                     (&*state, &proposed),
@@ -2055,6 +2080,12 @@ struct Slot {
     owner: crate::client::Client,
 }
 
+enum WorkerAdmission<'a> {
+    Public,
+    Hidden,
+    Composite { companion: &'a str },
+}
+
 impl Drop for Slot {
     fn drop(&mut self) {
         let mut registry = self.registry.lock().unwrap_or_else(|e| e.into_inner());
@@ -2601,10 +2632,6 @@ impl Sessions {
         }
     }
 
-    fn link_companion(&self, parent: &str, companion: &str) -> Result<(), String> {
-        self.registry().link_companion(parent, companion)
-    }
-
     fn companions_of(&self, session: &Session) -> Vec<Arc<Session>> {
         self.registry().companions_of(&session.id)
     }
@@ -2612,10 +2639,10 @@ impl Sessions {
     fn preserve_failed_companion(&self, companion: &Session, why: &str) {
         let parent = self.registry().parent_of(&companion.id);
         match parent {
-            Some(parent) => parent.set_state(SessionState::LiveControlUnresolved(format!(
+            Some(parent) => parent.preserve_composite_controller(format!(
                 "the internal Secure Kernel controller (worker pid {}) failed: {why}",
                 companion.pid
-            ))),
+            )),
             None => self.reveal_internal(&companion.id),
         }
     }
@@ -2948,7 +2975,7 @@ impl Sessions {
         op: EngineOp,
     ) -> Result<OpenReport, OpenError> {
         let slot = self.take_slot().map_err(OpenError::NoRoom)?;
-        self.open_reserved(kind, what, profile, op, Some(slot), false)
+        self.open_reserved(kind, what, profile, op, Some(slot), WorkerAdmission::Public)
             .await
     }
 
@@ -2960,9 +2987,14 @@ impl Sessions {
         profile: Option<crate::structured::ProfileFacts>,
         op: EngineOp,
         slot: Option<Slot>,
-        hidden: bool,
+        admission: WorkerAdmission<'_>,
     ) -> Result<OpenReport, OpenError> {
         debug_assert!(op.is_opener(), "open() needs an opener op");
+        let (hidden, companion) = match admission {
+            WorkerAdmission::Public => (false, None),
+            WorkerAdmission::Hidden => (true, None),
+            WorkerAdmission::Composite { companion } => (false, Some(companion)),
+        };
         // A default belongs to the moment an open starts. One changed while this worker is being
         // selected or spawned affects the next open, not a request already in flight.
         let startup_symbol_path = self.startup_symbol_path();
@@ -2994,7 +3026,7 @@ impl Sessions {
             // start must not cost the caller a target they already had.
             Err(why) => return Err(OpenError::Unavailable(why)),
         };
-        if let Err(why) = self.admit_as(&session, hidden) {
+        if let Err(why) = self.admit_with_companion(&session, hidden, companion) {
             // Refused *before* the opener was written, so this worker is `Ready` and holds
             // nothing at all — no dump, no trace, no attach. There is no target to release and so
             // nothing for its channel closing to accomplish; killing it is the whole teardown.
@@ -3178,7 +3210,7 @@ impl Sessions {
                 None,
                 EngineOp::OpenSecureKernelKd(Box::new(request)),
                 None,
-                true,
+                WorkerAdmission::Hidden,
             )
             .await;
         let controller = match controller {
@@ -3263,27 +3295,15 @@ impl Sessions {
                     managed_secure_kernel_peer: true,
                 },
                 Some(slot),
-                false,
+                WorkerAdmission::Composite {
+                    companion: &controller.id,
+                },
             )
             .await;
 
-        let debugger_id = match &debugger {
-            Ok(opened) => Some(opened.id.as_str()),
-            Err(error) => open_error_id(error),
-        };
-        if let Some(debugger_id) = debugger_id {
-            if let Err(error) = self.link_companion(debugger_id, &controller.id) {
-                self.reveal_internal(&controller.id);
-                return Err(OpenError::RecoveryRequired {
-                    id: debugger_id.to_string(),
-                    message: format!(
-                        "the debugger peer opened but its Secure Kernel controller could not be \
-                         joined to the same lifecycle: {error}. The controller was revealed as \
-                         session `{}` for recovery.",
-                        controller.id
-                    ),
-                });
-            }
+        // Admission linked the two workers under the registry lock, before AttachKernel was
+        // submitted. Any result carrying a public handle therefore already has one lifecycle.
+        if debugger.is_ok() || debugger.as_ref().err().and_then(open_error_id).is_some() {
             return debugger;
         }
 
@@ -3767,7 +3787,7 @@ impl Sessions {
                  (worker pid {}) still requires recovery: {why}",
                 companion.pid
             );
-            session.set_state(SessionState::LiveControlUnresolved(why.clone()));
+            session.preserve_composite_controller(why.clone());
             return Ok(Output::typed(
                 why,
                 crate::structured::SessionEnded {
@@ -3898,6 +3918,7 @@ impl Sessions {
         // companion; sending another request to the gone kernel worker would only recreate an
         // unresolved-kernel verdict in front of the recovery that is still possible.
         let peer_gone = !companions.is_empty()
+            && session.release_or_handoff_verified()
             && session
                 .child
                 .lock()
@@ -3931,11 +3952,11 @@ impl Sessions {
                     _ => None,
                 })
         {
-            session.set_state(SessionState::LiveControlUnresolved(format!(
+            session.preserve_composite_controller(format!(
                 "the debugger peer was released, but its internal Secure Kernel controller \
                  (worker pid {}) still requires recovery: {why}",
                 companion.pid
-            )));
+            ));
         }
         (primary, released)
     }
@@ -3998,7 +4019,7 @@ impl Sessions {
                          controller (worker pid {}) still requires recovery: {why}",
                         companion.pid
                     );
-                    session.set_state(SessionState::LiveControlUnresolved(why.clone()));
+                    session.preserve_composite_controller(why.clone());
                     return Ok(Output::typed(
                         why,
                         crate::structured::SessionEnded {
@@ -4580,7 +4601,17 @@ impl Sessions {
         self.admit_as(session, false)
     }
 
+    #[cfg(test)]
     fn admit_as(&self, session: &Arc<Session>, hidden: bool) -> Result<(), String> {
+        self.admit_with_companion(session, hidden, None)
+    }
+
+    fn admit_with_companion(
+        &self,
+        session: &Arc<Session>,
+        hidden: bool,
+        companion: Option<&str>,
+    ) -> Result<(), String> {
         let mut registry = self.registry();
         if registry.closing {
             return Err(shutting_down());
@@ -4629,6 +4660,13 @@ impl Sessions {
         registry.all.push_back(Arc::clone(session));
         if hidden {
             registry.hidden.insert(session.id.clone());
+        }
+        if let Some(companion) = companion
+            && let Err(error) = registry.link_companion(&session.id, companion)
+        {
+            registry.all.retain(|held| held.id != session.id);
+            registry.hidden.remove(&session.id);
+            return Err(error);
         }
         registry.trim();
         Ok(())
@@ -9123,13 +9161,12 @@ mod tests {
         controller.kind = SessionKind::SecureKernelKd;
         let controller = Arc::new(controller);
 
-        sessions.admit(&debugger).expect("the public half admits");
         sessions
             .admit_as(&controller, true)
             .expect("the internal half admits");
         sessions
-            .link_companion(&debugger.id, &controller.id)
-            .expect("the halves link");
+            .admit_with_companion(&debugger, false, Some(&controller.id))
+            .expect("the public half admits and links atomically");
 
         let snapshot = sessions.snapshot();
         assert_eq!(snapshot.len(), 1, "the internal worker is not a session");
@@ -9220,10 +9257,9 @@ mod tests {
         controller.kind = SessionKind::SecureKernelKd;
         controller.kernel_endpoint = None;
         let controller = Arc::new(controller);
-        sessions.admit(&debugger).unwrap();
         sessions.admit_as(&controller, true).unwrap();
         sessions
-            .link_companion(&debugger.id, &controller.id)
+            .admit_with_companion(&debugger, false, Some(&controller.id))
             .unwrap();
 
         let roots = sessions.registry().owning_workers();
@@ -10860,6 +10896,37 @@ mod tests {
             failed.state(),
             SessionState::Failed("never opened".to_string()),
             "the closed-to-closed exception must not settle a different terminal state"
+        );
+    }
+
+    #[test]
+    fn a_verified_gone_composite_peer_can_publish_and_finish_controller_recovery() {
+        let mut session = Arc::into_inner(dormant(
+            "composite",
+            SessionState::Closed(END_SESSION_CLOSING.to_string()),
+        ))
+        .unwrap();
+        session.kind = SessionKind::Kernel;
+        let session = Arc::new(session);
+
+        session.preserve_composite_controller("controller still owned".into());
+        assert!(matches!(session.state(), SessionState::Closed(_)));
+        assert!(
+            !session.release_or_handoff_verified(),
+            "an absent child handle alone is not proof that the public peer exited"
+        );
+
+        session.released.store(true, Ordering::SeqCst);
+        session.preserve_composite_controller("controller still owned".into());
+        assert_eq!(
+            session.state(),
+            SessionState::LiveControlUnresolved("controller still owned".into())
+        );
+
+        session.finish_end("composite release completed".into());
+        assert_eq!(
+            session.state(),
+            SessionState::Closed("composite release completed".into())
         );
     }
 

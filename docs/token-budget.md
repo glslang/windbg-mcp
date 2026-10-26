@@ -342,7 +342,8 @@ None of these is a bug. They are recorded because they were invisible, and
    and, since item 41, for the sentences the tools it keeps used to spend on pointing at them.
    Where the bytes sit, and what each profile costs:
 
-   Both tables are measurements of **2026-10-22** and move with any edit to a description. The
+   Both tables read [`tests/golden/tool_budget.json`](../tests/golden/tool_budget.json) as recorded
+   on **2026-10-26** by serving build `e441065`; they move with any edit to a description. The
    `securekernel` row is an extra group: the absent spec omits it, while `all` includes it.
 
    | group | tools | bytes | share |
@@ -414,11 +415,12 @@ None of these is a bug. They are recorded because they were invisible, and
    ceilings therefore remain fixed, with 1,877 B (1.4%) and 4,582 B (1.1%) headroom respectively.
 
    M8's `open_sk_debugger` adds one composite opener over the existing facade contract. It moves
-   the complete surface to **89 tools and 139,414 B** and the payload to **413,570 B**. Its 2,822
-   model-visible bytes buy the one-handle session boundary rather than another debugger operation:
-   the hidden facade and public DbgEng worker share capacity, status and ordered teardown. The
-   model and wire ceilings move deliberately to **142,000 B** and **420,000 B**, leaving 2,586 B
-   (1.9%) and 6,430 B (1.6%) respectively.
+   the complete surface to **89 tools and 139,414 B** and the payload to **413,570 B**. The total
+   model-visible increase is **3,291 B**: 2,822 B is the opener's own golden row and 469 B is the
+   surrounding instruction/cross-reference update. It buys the one-handle session boundary rather
+   than another debugger operation: the hidden facade and public DbgEng worker share capacity,
+   status and ordered teardown. The model and wire ceilings move deliberately to **142,000 B** and
+   **420,000 B**, leaving 2,586 B (1.9%) and 6,430 B (1.6%) respectively.
 
    **The two tables do not reconcile, and that is the point of item 41.** The first is each group's
    share of the whole surface; the second is what a spec actually serves, which is less — `crash`
