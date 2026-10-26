@@ -1387,6 +1387,9 @@ fn parse_guarded_write_bytes(name: &str, text: &str) -> Result<Vec<u8>, String> 
             "{name} must contain 1..=64 whole hexadecimal bytes"
         ));
     }
+    if !compact.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!("{name} contains a non-hexadecimal byte"));
+    }
     (0..compact.len())
         .step_by(2)
         .map(|at| {
@@ -10419,6 +10422,18 @@ mod tests {
                 err.starts_with("invalid number:"),
                 "unexpected error for {bad:?}: {err}"
             );
+        }
+    }
+
+    #[test]
+    fn guarded_write_bytes_reject_non_ascii_before_byte_pair_slicing() {
+        assert_eq!(
+            parse_guarded_write_bytes("expected", "48-8b 01"),
+            Ok(vec![0x48, 0x8b, 0x01])
+        );
+        for bad in ["€0", "0€", "éé"] {
+            let error = parse_guarded_write_bytes("expected", bad).unwrap_err();
+            assert!(error.contains("non-hexadecimal"), "{bad:?}: {error}");
         }
     }
 

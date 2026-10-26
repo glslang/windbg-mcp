@@ -298,6 +298,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Guarded Secure Kernel write bytes reject non-ASCII input before byte-pair parsing.** A
+  multibyte character with an even UTF-8 byte length could previously pass the length check and
+  panic when the MCP handler sliced through the character; malformed input now returns the same
+  typed non-hexadecimal argument error as other invalid bytes.
+
+- **A Secure Kernel service trace sealed by its record or capture-byte cap retains its terminal
+  host-clock sample.** Capacity completion now records the same QPC drain coordinate as an
+  explicit stop, so the M7 join does not lose point-order admission on a normal bounded trace.
+
 - **A reachability walk or IOCTL map held up by a cold module now stops at its deadline, give or
   take one instruction** ([dbgscope#149](https://github.com/glslang/dbgscope/issues/149)). Each
   function's `uf` already carried what was left of the caller's timeout, but the decodes under it
