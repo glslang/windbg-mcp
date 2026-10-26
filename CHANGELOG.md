@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`open_sk_debugger` exposes the Secure Kernel as one ordinary debugger session (M8.1).** The
+  supervisor opens the existing managed KD facade in an internal worker, attaches a second
+  worker's DbgEng kernel session to its generated pipe, and returns only that public handle, so
+  the generic symbol, module, stack, disassembly, breakpoint, execution and raw-command tools
+  apply without Secure-Kernel-specific copies. The pair spends one session slot and one status
+  entry. Teardown closes the managed DbgEng peer first and releases the controller second; it does
+  not send generic KD `qd`, because this facade sees its wire form as an ordinary continue. An
+  unresolved peer preserves the controller, controller failure is carried onto the public recovery
+  handle, and a facade that commits before its peer opens is revealed rather than stranded.
+  `open_sk_kd` remains the explicit external-WinDbg facade. Named-pipe kernel reservations now
+  conflict by pipe name rather than with every kernel endpoint. The first live composite gate
+  passed on 2026-10-26 against Secure Kernel 26100.9457 on the K3 nested bench: generic symbols,
+  modules, stack, x64 disassembly, a hardware `bp`/`g`, `t`, a free `g` and running break-in all
+  completed, followed by a clean release and independent state audit with no forced recovery. A
+  synthetic bounded GDT now defines the reported AMD64 selectors for DbgEng; without it, zero GDTR
+  made the engine decode the real long-mode bytes `40 55` as 16-bit `inc ax; push bp` instead of
+  `push rbp`.
+
+- **The Secure Kernel KD facade routes `g` and a running Ctrl+Break onto the qualified
+  controller paths (M8.0).** A non-trace continue with hardware breakpoints installed is M1's
+  continue-to-breakpoints; with none installed it is a new bounded free run,
+  `continue_running_until`, which releases every slot and can be stopped only by a break request,
+  teardown or the wait's recovery deadline. A Ctrl+Break during a `g` binds to that exact wait:
+  the reader marks the wait's break request before its scoped interrupt, the dispatcher answers a
+  break wake instead of a cancellation, and the engine thread runs M2's rendezvous; a natural stop
+  that wins the race keeps its reason. A Ctrl+Break while stopped resends the retained stop, and
+  one during a trace step remains a cancellation into recovery. The refusal added after the
+  2026-10-18 reset is retired; M8.2's live gate qualifies the routes, and the new ignored
+  `a_managed_secure_kernel_kd_session_is_driven_by_this_servers_own_kernel_attach` drives them
+  through this server's own kernel attach on the facade's pipe. A break request on a session that
+  owns no slot now finds a free one or refuses, where it would have panicked.
+
 - **M7.2 adds the deterministic join as an engine-free role, `--m7-join`.** `src/skjoin.rs`
   takes the three drained trace reads with the capture identity, the clock admission and each
   layer's arm and drain brackets, and writes one versioned record

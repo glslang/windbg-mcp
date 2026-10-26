@@ -82,8 +82,13 @@ const END_SESSION_TIMEOUT: Duration = Duration::from_secs(20);
 /// before the supervisor preserves the worker as unresolved.
 const SECURE_KERNEL_LIVE_END_SESSION_TIMEOUT: Duration = Duration::from_secs(35);
 
+/// The public DbgEng peer first drains pending kernel breaks and closes its private pipe, then its
+/// hidden facade restores the controller. One M2 break rendezvous took 12.6 seconds on the nested bench, so the
+/// ordinary kernel grace cannot bound both stages.
+const SECURE_KERNEL_DEBUGGER_END_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
+
 fn end_session_timeout(kind: SessionKind) -> Duration {
-    if kind == SessionKind::SecureKernelLive {
+    if kind.is_secure_kernel_controller() {
         SECURE_KERNEL_LIVE_END_SESSION_TIMEOUT
     } else {
         END_SESSION_TIMEOUT
@@ -122,6 +127,12 @@ const LAUNCH_ENDED: &str = " The process this session launched did not outlive i
 /// *request reader*, which does no debugging and is by construction never blocked behind the engine
 /// — so it is short, and a wait that reaches it means the worker has stopped reading altogether.
 const INTERRUPT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often the composite Secure Kernel opener checks whether its hidden facade has created the
+/// named pipe. The worker reports `WaitingForPeer` only after `CreateNamedPipeW` succeeds, so that
+/// milestone is the synchronization primitive; probing the pipe from the supervisor would race
+/// DbgEng for the facade's one admitted client.
+const SECURE_KERNEL_KD_READY_POLL: Duration = Duration::from_millis(10);
 
 /// The same grace, but at shutdown, where it competes with the client's expectation that closing
 /// stdin ends the process promptly.
@@ -1384,7 +1395,7 @@ impl Session {
     /// been released. `None` leaves the state alone.
     fn ordinary_move(&self, state: &SessionState, next: SessionState) -> Option<SessionState> {
         if matches!(
-            state,
+            &state,
             SessionState::KernelUnresolved(_) | SessionState::LiveControlUnresolved(_)
         ) && !self.released.load(Ordering::SeqCst)
             && !matches!(
@@ -2024,6 +2035,15 @@ pub enum OpenError {
     RecoveryRequired { id: String, message: String },
 }
 
+fn open_error_id(error: &OpenError) -> Option<&str> {
+    match error {
+        OpenError::PostCommit { id, .. }
+        | OpenError::Timeout { id, .. }
+        | OpenError::RecoveryRequired { id, .. } => Some(id),
+        OpenError::Unavailable(_) | OpenError::NoRoom(_) | OpenError::Clean(_) => None,
+    }
+}
+
 /// A slot taken for an open that has not registered its session yet.
 ///
 /// Exists so the capacity check can see opens that are still in flight, and releases the slot on
@@ -2074,6 +2094,13 @@ struct Registry {
     /// Every session this server has held, oldest first: the live ones plus a bounded tail of
     /// closed ones, kept so a caller can still ask what became of a handle.
     all: VecDeque<Arc<Session>>,
+    /// Workers that are implementation details of another public session. They remain in the
+    /// registry so reservations, shutdown and recovery still see them, but no client can route a
+    /// tool to them or spend a second session slot on them.
+    hidden: std::collections::HashSet<String>,
+    /// Public session -> internal workers, and the reverse edge used to find teardown roots.
+    companions: HashMap<String, Vec<String>>,
+    parents: HashMap<String, String>,
     /// Opens that have taken a slot but have not registered a session yet.
     ///
     /// Without this the capacity check is blind to opens already in flight, and two of them can
@@ -2102,7 +2129,9 @@ impl Registry {
         self.all
             .iter()
             .rev()
-            .find(|s| s.state().accepts_default() && &s.owner == owner)
+            .find(|s| {
+                !self.hidden.contains(&s.id) && s.state().accepts_default() && &s.owner == owner
+            })
             .cloned()
     }
 
@@ -2110,10 +2139,14 @@ impl Registry {
         self.all.iter().find(|s| s.id == id).cloned()
     }
 
+    fn find_visible(&self, id: &str) -> Option<Arc<Session>> {
+        (!self.hidden.contains(id)).then(|| self.find(id)).flatten()
+    }
+
     fn live(&self) -> Vec<Arc<Session>> {
         self.all
             .iter()
-            .filter(|s| s.state().is_live())
+            .filter(|s| s.state().is_live() && !self.parents.contains_key(&s.id))
             .cloned()
             .collect()
     }
@@ -2127,7 +2160,7 @@ impl Registry {
     fn live_for(&self, owner: &crate::client::Client) -> Vec<Arc<Session>> {
         self.all
             .iter()
-            .filter(|s| s.state().is_live() && &s.owner == owner)
+            .filter(|s| !self.hidden.contains(&s.id) && s.state().is_live() && &s.owner == owner)
             .cloned()
             .collect()
     }
@@ -2143,9 +2176,63 @@ impl Registry {
     fn owning_workers(&self) -> Vec<Arc<Session>> {
         self.all
             .iter()
-            .filter(|s| s.child.lock().unwrap_or_else(|e| e.into_inner()).is_some())
+            .filter(|s| {
+                !self.parents.contains_key(&s.id)
+                    && (s.child.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+                        || self.companions_of(&s.id).iter().any(|companion| {
+                            companion
+                                .child
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .is_some()
+                        }))
+            })
             .cloned()
             .collect()
+    }
+
+    fn companions_of(&self, id: &str) -> Vec<Arc<Session>> {
+        self.companions
+            .get(id)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.find(id))
+            .collect()
+    }
+
+    fn parent_of(&self, id: &str) -> Option<Arc<Session>> {
+        self.parents.get(id).and_then(|parent| self.find(parent))
+    }
+
+    fn tree_busy(&self, session: &Session) -> bool {
+        session.busy()
+            || self
+                .companions_of(&session.id)
+                .iter()
+                .any(|companion| companion.busy())
+    }
+
+    fn reveal(&mut self, id: &str) {
+        self.hidden.remove(id);
+    }
+
+    fn link_companion(&mut self, parent: &str, companion: &str) -> Result<(), String> {
+        if self.hidden.contains(parent) || !self.hidden.contains(companion) {
+            return Err("a composite session requires a public parent and hidden companion".into());
+        }
+        if self.find(parent).is_none() || self.find(companion).is_none() {
+            return Err("a composite session member left the registry before it was linked".into());
+        }
+        if self.parents.contains_key(companion) {
+            return Err("an internal worker is already linked to a public session".into());
+        }
+        self.parents
+            .insert(companion.to_string(), parent.to_string());
+        self.companions
+            .entry(parent.to_string())
+            .or_default()
+            .push(companion.to_string());
+        Ok(())
     }
 
     /// Drops the oldest settled sessions once a client's history bound is exceeded. Live sessions
@@ -2165,6 +2252,27 @@ impl Registry {
     /// on its own rather than being asked properly, which is the weaker of the two guarantees a
     /// halted kernel can be given.
     fn trim(&mut self) {
+        // Internal workers have no client-visible history. Once their process is gone, the public
+        // parent is the durable record of the composite session and keeping this Arc would only
+        // make each completed composite leak one registry entry.
+        self.all.retain(|session| {
+            !self.hidden.contains(&session.id)
+                || session.state().is_live()
+                || session
+                    .child
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_some()
+        });
+        let held: std::collections::HashSet<String> =
+            self.all.iter().map(|session| session.id.clone()).collect();
+        self.hidden.retain(|id| held.contains(id));
+        self.parents
+            .retain(|child, parent| held.contains(child) && held.contains(parent));
+        self.companions.retain(|parent, companions| {
+            companions.retain(|companion| held.contains(companion));
+            held.contains(parent) && !companions.is_empty()
+        });
         let mut owners: Vec<crate::client::Client> = Vec::new();
         for session in &self.all {
             if !owners.contains(&session.owner) {
@@ -2172,7 +2280,11 @@ impl Registry {
             }
         }
         for owner in owners {
-            while self.all.iter().filter(|s| s.owner == owner).count()
+            while self
+                .all
+                .iter()
+                .filter(|s| s.owner == owner && !self.hidden.contains(&s.id))
+                .count()
                 > CLOSED_HISTORY + MAX_SESSIONS
             {
                 let evictable = self.all.iter().position(|s| {
@@ -2379,7 +2491,7 @@ impl Sessions {
             crate::record::routed_to(&current.id);
             return Ok(current);
         };
-        match registry.find(want) {
+        match registry.find_visible(want) {
             // **Another client's handle is not "refused", it is unknown.** Saying "that session
             // belongs to someone else" would confirm the handle exists and leak that a second
             // client is here, and there is nothing this caller could do with the answer. The
@@ -2411,12 +2523,23 @@ impl Sessions {
     /// their own failure to read.
     pub fn visible_session_ids(&self) -> Vec<String> {
         let caller = crate::client::current();
-        self.registry()
+        let registry = self.registry();
+        let public: Vec<_> = registry
             .all
             .iter()
-            .filter(|s| s.owner == caller)
-            .map(|s| s.id.clone())
-            .collect()
+            .filter(|s| s.owner == caller && !registry.hidden.contains(&s.id))
+            .collect();
+        let mut visible = Vec::new();
+        for session in public {
+            visible.push(session.id.clone());
+            visible.extend(
+                registry
+                    .companions_of(&session.id)
+                    .into_iter()
+                    .map(|companion| companion.id.clone()),
+            );
+        }
+        visible
     }
 
     /// How many live sessions one client holds, **named rather than inferred**.
@@ -2460,7 +2583,41 @@ impl Sessions {
 
     /// The session a just-finished open minted, for the one correction an opener can make to it.
     pub fn held(&self, id: &str) -> Option<Arc<Session>> {
+        self.registry().find_visible(id)
+    }
+
+    fn held_internal(&self, id: &str) -> Option<Arc<Session>> {
         self.registry().find(id)
+    }
+
+    fn reveal_internal(&self, id: &str) {
+        let session = {
+            let mut registry = self.registry();
+            registry.reveal(id);
+            registry.find(id)
+        };
+        if let Some(session) = session.filter(|session| session.state().is_live()) {
+            self.reconcile_capacity(&session);
+        }
+    }
+
+    fn link_companion(&self, parent: &str, companion: &str) -> Result<(), String> {
+        self.registry().link_companion(parent, companion)
+    }
+
+    fn companions_of(&self, session: &Session) -> Vec<Arc<Session>> {
+        self.registry().companions_of(&session.id)
+    }
+
+    fn preserve_failed_companion(&self, companion: &Session, why: &str) {
+        let parent = self.registry().parent_of(&companion.id);
+        match parent {
+            Some(parent) => parent.set_state(SessionState::LiveControlUnresolved(format!(
+                "the internal Secure Kernel controller (worker pid {}) failed: {why}",
+                companion.pid
+            ))),
+            None => self.reveal_internal(&companion.id),
+        }
     }
 
     pub fn snapshot(&self) -> Vec<SessionSnapshot> {
@@ -2473,7 +2630,7 @@ impl Sessions {
         registry
             .all
             .iter()
-            .filter(|s| s.owner == caller)
+            .filter(|s| s.owner == caller && !registry.hidden.contains(&s.id))
             .rev()
             .map(|s| SessionSnapshot {
                 id: s.id.clone(),
@@ -2790,14 +2947,25 @@ impl Sessions {
         profile: Option<crate::structured::ProfileFacts>,
         op: EngineOp,
     ) -> Result<OpenReport, OpenError> {
+        let slot = self.take_slot().map_err(OpenError::NoRoom)?;
+        self.open_reserved(kind, what, profile, op, Some(slot), false)
+            .await
+    }
+
+    /// Opens one worker under a capacity reservation owned by a larger logical session.
+    async fn open_reserved(
+        &self,
+        kind: SessionKind,
+        what: String,
+        profile: Option<crate::structured::ProfileFacts>,
+        op: EngineOp,
+        slot: Option<Slot>,
+        hidden: bool,
+    ) -> Result<OpenReport, OpenError> {
         debug_assert!(op.is_opener(), "open() needs an opener op");
         // A default belongs to the moment an open starts. One changed while this worker is being
         // selected or spawned affects the next open, not a request already in flight.
         let startup_symbol_path = self.startup_symbol_path();
-        // Take a slot before doing anything expensive, but do **not** reclaim anything yet — see
-        // `take_slot` and `reconcile_capacity` for why those are separate.
-        let slot = self.take_slot().map_err(OpenError::NoRoom)?;
-
         let id = mint_session_id();
         // Read before the worker exists, because the architecture of the target decides which
         // process that worker's engine lives in — see `worker::TARGET_FLAG`.
@@ -2826,7 +2994,7 @@ impl Sessions {
             // start must not cost the caller a target they already had.
             Err(why) => return Err(OpenError::Unavailable(why)),
         };
-        if let Err(why) = self.admit(&session) {
+        if let Err(why) = self.admit_as(&session, hidden) {
             // Refused *before* the opener was written, so this worker is `Ready` and holds
             // nothing at all — no dump, no trace, no attach. There is no target to release and so
             // nothing for its channel closing to accomplish; killing it is the whole teardown.
@@ -2898,7 +3066,9 @@ impl Sessions {
                 // *other* sessions' workers, each up to `END_SESSION_TIMEOUT`, and serially when
                 // the overage is more than one. The caller is owed the handle for a target that
                 // is already open.
-                self.reconcile_capacity(&session);
+                if !hidden {
+                    self.reconcile_capacity(&session);
+                }
                 Ok(OpenReport {
                     id,
                     report: report.text,
@@ -2937,7 +3107,9 @@ impl Sessions {
                     if settle_uncommitted(&session, &message) {
                         // Retired: a queued command owns that worker now, so it keeps its slot
                         // and has to pay for it.
-                        self.reconcile_capacity(&session);
+                        if !hidden {
+                            self.reconcile_capacity(&session);
+                        }
                     }
                     Err(OpenError::Clean(message))
                 } else if !state.is_live() {
@@ -2963,7 +3135,9 @@ impl Sessions {
                     // its slot. Skipping this is how the limit stops being one: the sessions
                     // retained this way are idle, so they go on satisfying the capacity check for
                     // the *next* open, and the count climbs.
-                    self.reconcile_capacity(&session);
+                    if !hidden {
+                        self.reconcile_capacity(&session);
+                    }
                     Err(OpenError::PostCommit {
                         id,
                         message,
@@ -2977,6 +3151,160 @@ impl Sessions {
         // reconciliation can close it in the gap, and this returns a handle that is already dead.
         session.delivered.store(true, Ordering::Release);
         outcome
+    }
+
+    /// Opens the two workers that make one MCP-visible Secure Kernel debugger session.
+    ///
+    /// The controller is registered first and kept hidden. The ordinary kernel worker is then
+    /// attached to its private KD pipe and becomes the public session. If the first half commits
+    /// but the second cannot be made recoverable, the controller is revealed instead of leaving
+    /// a live VTL1 owner with no handle.
+    pub async fn open_secure_kernel_debugger(
+        &self,
+        public_what: String,
+        controller_what: String,
+        pipe: String,
+        request: crate::kdtarget::ManagedRequest,
+    ) -> Result<OpenReport, OpenError> {
+        let pipe_ready_timeout = Duration::from_millis(request.connect_timeout_ms);
+        // One logical session spends one slot even though it deliberately owns two workers. Keep
+        // the reservation across the seam so another opener cannot spend it after the hidden
+        // controller has registered but before its public DbgEng peer does.
+        let slot = self.take_slot().map_err(OpenError::NoRoom)?;
+        let controller = self
+            .open_reserved(
+                SessionKind::SecureKernelKd,
+                controller_what,
+                None,
+                EngineOp::OpenSecureKernelKd(Box::new(request)),
+                None,
+                true,
+            )
+            .await;
+        let controller = match controller {
+            Ok(opened) => opened,
+            Err(error) => {
+                if let Some(id) = open_error_id(&error) {
+                    self.reveal_internal(id);
+                }
+                return Err(error);
+            }
+        };
+        let Some(controller_session) = self.held_internal(&controller.id) else {
+            self.reveal_internal(&controller.id);
+            return Err(OpenError::RecoveryRequired {
+                id: controller.id,
+                message: "the Secure Kernel controller opened but left the registry before its \
+                          debugger peer could be attached"
+                    .into(),
+            });
+        };
+
+        let serving_session = Arc::clone(&controller_session);
+        let serving_sessions = self.clone();
+        tokio::spawn(async move {
+            if let Err(error) = serving_sessions
+                .serve_secure_kernel_kd(&serving_session)
+                .await
+            {
+                tracing::error!(
+                    "session {}: background target service failed: {error}",
+                    serving_session.id
+                );
+                let why = serving_session.preserve_live_control(&format!(
+                    "the managed KD service failed before it released its live controller: \
+                     {error}"
+                ));
+                serving_sessions.preserve_failed_companion(&serving_session, &why);
+            }
+        });
+
+        // `SkKdServe` first captures and validates the initial VTL1 stop, then creates its named
+        // pipe. Starting DbgEng before that milestone makes its serial transport fail immediately
+        // with ERROR_FILE_NOT_FOUND. Wait on the worker's phase rather than probing the pipe: a
+        // probe would itself consume the single allowed client connection. The configured
+        // connection bound is also the synchronous composite-startup bound; redirect arming is
+        // the deterministic way to make the initial stop arrive inside it.
+        if let Err(message) =
+            wait_for_secure_kernel_kd_pipe(&controller_session, pipe_ready_timeout).await
+        {
+            let release = self
+                .release(
+                    &controller_session,
+                    Call::supervisor(EngineOp::EndSession),
+                    end_session_timeout(controller_session.kind),
+                )
+                .await;
+            note_release(
+                "Secure Kernel facade readiness failure",
+                &controller_session,
+                &release,
+            );
+            if let Release::Preserved(why) = release {
+                self.reveal_internal(&controller.id);
+                return Err(OpenError::RecoveryRequired {
+                    id: controller.id,
+                    message: format!("{message}. {why}"),
+                });
+            }
+            return Err(OpenError::Clean(message));
+        }
+
+        let connection =
+            crate::kdconn::Connection::new(format!(r"com:pipe,port=\\.\pipe\{pipe},resets=0"));
+        let debugger = self
+            .open_reserved(
+                SessionKind::Kernel,
+                public_what,
+                None,
+                EngineOp::AttachKernel {
+                    connection,
+                    experimental_break_on_connect: false,
+                    managed_secure_kernel_peer: true,
+                },
+                Some(slot),
+                false,
+            )
+            .await;
+
+        let debugger_id = match &debugger {
+            Ok(opened) => Some(opened.id.as_str()),
+            Err(error) => open_error_id(error),
+        };
+        if let Some(debugger_id) = debugger_id {
+            if let Err(error) = self.link_companion(debugger_id, &controller.id) {
+                self.reveal_internal(&controller.id);
+                return Err(OpenError::RecoveryRequired {
+                    id: debugger_id.to_string(),
+                    message: format!(
+                        "the debugger peer opened but its Secure Kernel controller could not be \
+                         joined to the same lifecycle: {error}. The controller was revealed as \
+                         session `{}` for recovery.",
+                        controller.id
+                    ),
+                });
+            }
+            return debugger;
+        }
+
+        // No public handle was created. Release the controller rather than leaving a hidden
+        // target behind, and reveal it if that release cannot prove restoration.
+        let release = self
+            .release(
+                &controller_session,
+                Call::supervisor(EngineOp::EndSession),
+                end_session_timeout(controller_session.kind),
+            )
+            .await;
+        if matches!(release, Release::Preserved(_)) {
+            self.reveal_internal(&controller.id);
+        }
+        note_release(
+            "failed composite Secure Kernel open",
+            &controller_session,
+            &release,
+        );
+        debugger
     }
 
     /// Ctrl+Breaks whatever a session's engine is running, leaving the session and its target
@@ -3411,10 +3739,35 @@ impl Sessions {
         let call = Call::new(EngineOp::EndSession)
             .releasing(named)
             .closing(END_SESSION_CLOSING);
-        let outcome = self
-            .release(session, call, end_session_timeout(session.kind))
-            .await;
+        let grace = self.release_timeout(session);
+        let (outcome, companions) = self.release_tree(session, call, grace).await;
         if let Release::Preserved(why) = outcome {
+            return Ok(Output::typed(
+                why,
+                crate::structured::SessionEnded {
+                    session_id: session.id.clone(),
+                    released: false,
+                    worker_terminated: false,
+                    waited_ms: None,
+                    target_left_running: None,
+                    recovery_required: true,
+                },
+            ));
+        }
+        if let Some((companion, why)) =
+            companions
+                .iter()
+                .find_map(|(companion, outcome)| match outcome {
+                    Release::Preserved(why) => Some((companion, why)),
+                    _ => None,
+                })
+        {
+            let why = format!(
+                "the debugger peer was released, but its internal Secure Kernel controller \
+                 (worker pid {}) still requires recovery: {why}",
+                companion.pid
+            );
+            session.set_state(SessionState::LiveControlUnresolved(why.clone()));
             return Ok(Output::typed(
                 why,
                 crate::structured::SessionEnded {
@@ -3528,6 +3881,73 @@ impl Sessions {
         Ok(Output::typed(message, ended))
     }
 
+    /// Releases a public worker before the internal workers whose service it consumes.
+    ///
+    /// Dropping the facade first severs the KD pipe under DbgEng and turns an orderly detach into
+    /// an ambiguous kernel failure. A preserved public controller therefore preserves the whole
+    /// tree; only a peer that is confirmed gone permits the provider/controller half to unwind.
+    async fn release_tree(
+        &self,
+        session: &Arc<Session>,
+        call: Call,
+        grace: Duration,
+    ) -> (Release, Vec<(Arc<Session>, Release)>) {
+        let companions = self.companions_of(session);
+        // A prior attempt may have verified or completed the public worker's exit but preserved
+        // its controller companion for recovery. Retrying `end_session` must then reach that
+        // companion; sending another request to the gone kernel worker would only recreate an
+        // unresolved-kernel verdict in front of the recovery that is still possible.
+        let peer_gone = !companions.is_empty()
+            && session
+                .child
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_none();
+        let primary = if peer_gone {
+            Release::AlreadyGone
+        } else {
+            self.release(session, call, grace).await
+        };
+        if matches!(primary, Release::Preserved(_) | Release::Stale(_)) {
+            return (primary, Vec::new());
+        }
+        let mut released = Vec::with_capacity(companions.len());
+        for companion in companions {
+            let outcome = self
+                .release(
+                    &companion,
+                    Call::supervisor(EngineOp::EndSession),
+                    end_session_timeout(companion.kind),
+                )
+                .await;
+            note_release("composite session teardown", &companion, &outcome);
+            released.push((companion, outcome));
+        }
+        if let Some((companion, why)) =
+            released
+                .iter()
+                .find_map(|(companion, outcome)| match outcome {
+                    Release::Preserved(why) => Some((companion, why)),
+                    _ => None,
+                })
+        {
+            session.set_state(SessionState::LiveControlUnresolved(format!(
+                "the debugger peer was released, but its internal Secure Kernel controller \
+                 (worker pid {}) still requires recovery: {why}",
+                companion.pid
+            )));
+        }
+        (primary, released)
+    }
+
+    fn release_timeout(&self, session: &Session) -> Duration {
+        if session.kind == SessionKind::Kernel && !self.companions_of(session).is_empty() {
+            SECURE_KERNEL_DEBUGGER_END_SESSION_TIMEOUT
+        } else {
+            end_session_timeout(session.kind)
+        }
+    }
+
     /// Explicit operator handoff, not a detach. Keep the reservation until process exit is verified.
     pub async fn kernel_handoff(
         &self,
@@ -3548,6 +3968,8 @@ impl Sessions {
         };
         // The process handle AND final state belong to this task, even if the caller cancels.
         let session = Arc::clone(session);
+        let sessions = self.clone();
+        let composite = !self.companions_of(&session).is_empty();
         tokio::spawn(async move {
             if let Err(e) = child.kill().await {
                 *session.child.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
@@ -3555,6 +3977,41 @@ impl Sessions {
             }
             session.kernel_handoff_complete.store(true, Ordering::SeqCst);
             session.fail_outstanding("explicit kernel recovery handoff; target state remains unknown");
+            if composite {
+                let (_, companions) = sessions
+                    .release_tree(
+                        &session,
+                        Call::supervisor(EngineOp::EndSession),
+                        end_session_timeout(session.kind),
+                    )
+                    .await;
+                if let Some((companion, why)) =
+                    companions
+                        .iter()
+                        .find_map(|(companion, outcome)| match outcome {
+                            Release::Preserved(why) => Some((companion, why)),
+                            _ => None,
+                        })
+                {
+                    let why = format!(
+                        "the DbgEng peer's exit was verified, but its internal Secure Kernel \
+                         controller (worker pid {}) still requires recovery: {why}",
+                        companion.pid
+                    );
+                    session.set_state(SessionState::LiveControlUnresolved(why.clone()));
+                    return Ok(Output::typed(
+                        why,
+                        crate::structured::SessionEnded {
+                            session_id: session.id.clone(),
+                            released: false,
+                            worker_terminated: true,
+                            waited_ms: None,
+                            target_left_running: None,
+                            recovery_required: true,
+                        },
+                    ));
+                }
+            }
             session.update_state(|_| Some(SessionState::Closed("explicit kernel recovery handoff; NOT a confirmed detach".into())));
             session.rec.write(crate::record::Event::SessionEnd {
                 session: session.id.clone(), released: false, worker_terminated: true, waited_ms: None,
@@ -3753,8 +4210,8 @@ impl Sessions {
             // The supervisor's own teardown rather than a caller's call, so it runs past the gate
             // the claim just closed — and orderly, because a live kernel that is merely killed is
             // left halted.
-            let outcome = self
-                .release(
+            let (outcome, _) = self
+                .release_tree(
                     &session.clone(),
                     Call::supervisor(EngineOp::EndSession),
                     end_session_timeout(session.kind),
@@ -3924,8 +4381,8 @@ impl Sessions {
                 if session.kind != SessionKind::Kernel {
                     session.set_state(SessionState::Closed(teardown.state_reason().to_string()));
                 }
-                let outcome = sessions
-                    .release(
+                let (outcome, _) = sessions
+                    .release_tree(
                         &session,
                         Call::supervisor(EngineOp::EndSession),
                         SHUTDOWN_RELEASE_TIMEOUT,
@@ -3973,12 +4430,16 @@ impl Sessions {
         // opens in flight is what stops two of them spending the same idle session: the first
         // needs one reclaimable, the second needs two.
         let needed = (live.len() + in_flight_for_caller + 1).saturating_sub(MAX_SESSIONS);
-        let reclaimable = live.iter().filter(|s| !s.busy()).count();
+        let reclaimable = live.iter().filter(|s| !registry.tree_busy(s)).count();
         if needed > reclaimable {
             let listed: Vec<String> = live
                 .iter()
                 .map(|s| {
-                    let busy = if s.busy() { " — busy" } else { " — idle" };
+                    let busy = if registry.tree_busy(s) {
+                        " — busy"
+                    } else {
+                        " — idle"
+                    };
                     format!("  {} — {} ({}){busy}", s.id, s.kind.label(), s.what)
                 })
                 .collect();
@@ -4060,8 +4521,8 @@ impl Sessions {
                 // Released the same way `end_session` releases one, so a live debuggee is let go
                 // cleanly rather than dying with its debugger. As the supervisor's own teardown
                 // rather than a caller's call, it runs past the gate the claim already closed.
-                let outcome = sessions
-                    .release(
+                let (outcome, _) = sessions
+                    .release_tree(
                         &victim,
                         Call::supervisor(EngineOp::EndSession),
                         end_session_timeout(victim.kind),
@@ -4090,7 +4551,9 @@ impl Sessions {
         if live.len() <= MAX_SESSIONS {
             return None;
         }
-        let idle = live.iter().find(|s| s.id != keeping.id && !s.busy())?;
+        let idle = live
+            .iter()
+            .find(|s| s.id != keeping.id && !registry.tree_busy(s))?;
         idle.set_state(SessionState::Closed(format!(
             "reclaimed to make room for a new session — this server holds at most \
              {MAX_SESSIONS} at once, and this was the oldest idle one"
@@ -4112,7 +4575,12 @@ impl Sessions {
     /// open is on one side or the other of the moment `closing` is set: it either registers first
     /// and is found by the snapshot, or is refused here. There is no interleaving in which a
     /// worker holding a target goes unseen.
+    #[cfg(test)]
     fn admit(&self, session: &Arc<Session>) -> Result<(), String> {
+        self.admit_as(session, false)
+    }
+
+    fn admit_as(&self, session: &Arc<Session>, hidden: bool) -> Result<(), String> {
         let mut registry = self.registry();
         if registry.closing {
             return Err(shutting_down());
@@ -4159,6 +4627,9 @@ impl Sessions {
             return Err("This Secure Kernel VM or vmwp process is already reserved by a controller. No second live session was opened. Resolve the existing controller before retrying.".into());
         }
         registry.all.push_back(Arc::clone(session));
+        if hidden {
+            registry.hidden.insert(session.id.clone());
+        }
         registry.trim();
         Ok(())
     }
@@ -4591,6 +5062,72 @@ enum ShutdownNote<'a> {
     Unreleased(&'static str),
     /// There was nothing to tear down.
     Settled(&'a str),
+}
+
+/// Waits for the worker milestone that proves the facade pipe exists without connecting to it.
+async fn wait_for_secure_kernel_kd_pipe(session: &Session, within: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + within;
+    let mut recovery_since = None;
+    loop {
+        let state = session.state();
+        if matches!(
+            state,
+            SessionState::SecureKernelKd(
+                SecureKernelKdPhase::WaitingForPeer | SecureKernelKdPhase::Reconnecting
+            )
+        ) {
+            return Ok(());
+        }
+        // `Releasing` is cleanup in progress after a service-side failure. Do not race a second
+        // teardown into it: its terminal phase, or the background call's preserved error, says
+        // whether ownership was actually released. `RecoveryRequired` precedes that preserved
+        // error by one cross-task handoff, so give it one poll before using its generic detail.
+        if matches!(
+            &state,
+            SessionState::SecureKernelKd(SecureKernelKdPhase::Releasing)
+        ) {
+            recovery_since = None;
+        } else if matches!(
+            &state,
+            SessionState::SecureKernelKd(SecureKernelKdPhase::RecoveryRequired)
+        ) {
+            let since = recovery_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= SECURE_KERNEL_KD_READY_POLL {
+                return Err(format!(
+                    "the managed Secure Kernel KD facade stopped before creating its pipe (state {})",
+                    state.name()
+                ));
+            }
+        } else {
+            recovery_since = None;
+        }
+        if !state.is_live()
+            || matches!(
+                &state,
+                SessionState::KernelUnresolved(_)
+                    | SessionState::LiveControlUnresolved(_)
+                    | SessionState::SecureKernelKd(SecureKernelKdPhase::Released)
+            )
+        {
+            let detail = state
+                .detail()
+                .map(|why| format!(": {why}"))
+                .unwrap_or_default();
+            return Err(format!(
+                "the managed Secure Kernel KD facade stopped before creating its pipe (state {}{detail})",
+                state.name()
+            ));
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(format!(
+                "the managed Secure Kernel KD facade did not create its pipe within {} ms (state {})",
+                within.as_millis(),
+                state.name()
+            ));
+        }
+        tokio::time::sleep(SECURE_KERNEL_KD_READY_POLL.min(deadline - now)).await;
+    }
 }
 
 /// Logs what a **supervisor-initiated** teardown did to one session's target.
@@ -8576,6 +9113,126 @@ mod tests {
 
     // ---- the registry (no workers involved) ---------------------------------------
 
+    #[test]
+    fn a_composite_session_exposes_only_its_dbgeng_worker() {
+        let sessions = Sessions::new(Duration::from_secs(300));
+        let mut debugger = Arc::into_inner(dormant("debugger", SessionState::Open)).unwrap();
+        debugger.kind = SessionKind::Kernel;
+        let debugger = Arc::new(debugger);
+        let mut controller = Arc::into_inner(dormant("controller", SessionState::Open)).unwrap();
+        controller.kind = SessionKind::SecureKernelKd;
+        let controller = Arc::new(controller);
+
+        sessions.admit(&debugger).expect("the public half admits");
+        sessions
+            .admit_as(&controller, true)
+            .expect("the internal half admits");
+        sessions
+            .link_companion(&debugger.id, &controller.id)
+            .expect("the halves link");
+
+        let snapshot = sessions.snapshot();
+        assert_eq!(snapshot.len(), 1, "the internal worker is not a session");
+        assert_eq!(snapshot[0].id, debugger.id);
+        assert_eq!(sessions.live_count_for(&debugger.owner), 1);
+        assert!(sessions.resolve(Some(&debugger.id)).is_ok());
+        assert!(sessions.resolve(Some(&controller.id)).is_err());
+        assert_eq!(
+            sessions.visible_session_ids().len(),
+            2,
+            "unfiltered server_log may show both workers that belong to the caller"
+        );
+        assert_eq!(sessions.companions_of(&debugger).len(), 1);
+        assert_eq!(
+            sessions.release_timeout(&debugger),
+            SECURE_KERNEL_DEBUGGER_END_SESSION_TIMEOUT,
+            "the public detach and hidden-controller release share one longer composite grace"
+        );
+        assert!(
+            sessions
+                .registry()
+                .live()
+                .iter()
+                .all(|s| s.id != controller.id),
+            "a teardown sweep reaches the controller through its parent, not as a second root"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_composite_attach_waits_until_the_facade_has_created_its_pipe() {
+        let controller = dormant("controller", SessionState::Open);
+        let reporting = Arc::clone(&controller);
+        let report = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            reporting.set_state(SessionState::SecureKernelKd(
+                crate::proto::SecureKernelKdPhase::WaitingForPeer,
+            ));
+        });
+
+        let started = Instant::now();
+        wait_for_secure_kernel_kd_pipe(&controller, Duration::from_secs(1))
+            .await
+            .expect("the pipe-created milestone makes the facade ready");
+        report.await.unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_millis(20),
+            "the attach raced ahead of the facade's pipe-created milestone"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_composite_pipe_wait_reports_a_facade_that_failed_first() {
+        let controller = dormant(
+            "controller",
+            SessionState::SecureKernelKd(crate::proto::SecureKernelKdPhase::RecoveryRequired),
+        );
+
+        let error = wait_for_secure_kernel_kd_pipe(&controller, Duration::from_secs(1))
+            .await
+            .expect_err("a failed facade cannot own a ready pipe");
+        assert!(error.contains("recovery_required"), "{error}");
+    }
+
+    #[test]
+    fn an_unjoined_internal_controller_can_be_revealed_for_recovery() {
+        let sessions = Sessions::new(Duration::from_secs(300));
+        let controller = dormant("controller", SessionState::Open);
+        sessions
+            .admit_as(&controller, true)
+            .expect("the internal half admits");
+        assert!(sessions.resolve(Some(&controller.id)).is_err());
+
+        sessions.reveal_internal(&controller.id);
+
+        assert!(sessions.resolve(Some(&controller.id)).is_ok());
+        assert_eq!(sessions.snapshot().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_composites_public_root_remains_owned_while_only_its_companion_has_a_worker() {
+        let sessions = Sessions::new(Duration::from_secs(300));
+        let debugger = dormant("debugger", SessionState::Open);
+        let mut controller = Arc::into_inner(kernel_with_child_in(
+            "controller",
+            SessionState::SecureKernelKd(crate::proto::SecureKernelKdPhase::Stopped),
+        ))
+        .unwrap();
+        controller.kind = SessionKind::SecureKernelKd;
+        controller.kernel_endpoint = None;
+        let controller = Arc::new(controller);
+        sessions.admit(&debugger).unwrap();
+        sessions.admit_as(&controller, true).unwrap();
+        sessions
+            .link_companion(&debugger.id, &controller.id)
+            .unwrap();
+
+        let roots = sessions.registry().owning_workers();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].id, debugger.id);
+
+        controller.kill();
+    }
+
     /// A revoked credential cannot register a session, and a name given back can again.
     ///
     /// **The window this closes is the one a lease expiry does not have.** An expiry fires only
@@ -9025,6 +9682,7 @@ mod tests {
                 Call::new(EngineOp::AttachKernel {
                     connection: kdconn::Connection::new("net:port=50194,key=1.2.3.4"),
                     experimental_break_on_connect: true,
+                    managed_secure_kernel_peer: false,
                 }),
                 Duration::from_millis(1),
                 OPENER_JOB,
@@ -9100,6 +9758,7 @@ mod tests {
                     Call::new(EngineOp::AttachKernel {
                         connection: kdconn::Connection::new("net:port=50194,key=1.2.3.4"),
                         experimental_break_on_connect: false,
+                        managed_secure_kernel_peer: false,
                     }),
                     Duration::from_millis(1),
                     OPENER_JOB,
@@ -10791,8 +11450,9 @@ mod tests {
             if window.contains("note_release(") {
                 continue;
             }
-            // The caller-facing one: `end` builds a `SessionEnded` and a rendered message instead.
-            if window.contains(".release(session, call, end_session_timeout(session.kind))") {
+            // `release_tree` returns the primary outcome to `end`, or to a supervisor caller that
+            // records it after completing the rest of the composite teardown.
+            if window.contains("self.release(session, call, grace).await") {
                 continue;
             }
             unaccounted.push(line);
@@ -10809,10 +11469,12 @@ mod tests {
 
     #[test]
     fn live_control_release_outlasts_its_worker_cleanup_bound() {
-        assert_eq!(
-            end_session_timeout(SessionKind::SecureKernelLive),
-            SECURE_KERNEL_LIVE_END_SESSION_TIMEOUT
-        );
+        for kind in [SessionKind::SecureKernelLive, SessionKind::SecureKernelKd] {
+            assert_eq!(
+                end_session_timeout(kind),
+                SECURE_KERNEL_LIVE_END_SESSION_TIMEOUT
+            );
+        }
         assert!(SECURE_KERNEL_LIVE_END_SESSION_TIMEOUT > crate::skdispatch::CLEANUP_RESERVE);
         for kind in [
             SessionKind::Dump,
@@ -10822,7 +11484,6 @@ mod tests {
             SessionKind::Process,
             SessionKind::Launch,
             SessionKind::SecureKernel,
-            SessionKind::SecureKernelKd,
         ] {
             assert_eq!(end_session_timeout(kind), END_SESSION_TIMEOUT, "{kind:?}");
         }

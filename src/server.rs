@@ -2939,6 +2939,18 @@ impl WindbgServer {
         // it from the report the debugger printed.
         let target = what.clone();
         let outcome = self.sessions.open(kind, what, profile.clone(), op).await;
+        self.present_opened(kind, target, profile, shape, after_open, outcome)
+    }
+
+    fn present_opened(
+        &self,
+        kind: SessionKind,
+        target: String,
+        profile: Option<structured::ProfileFacts>,
+        shape: OpenShape,
+        after_open: Option<EngineOp>,
+        outcome: Result<OpenReport, OpenError>,
+    ) -> Result<CallToolResult, ErrorData> {
         // An opener does not route to a session, it *mints* one — and the transcript wants the
         // same field filled in either way, so the call that created a target can be joined to the
         // events about it.
@@ -3432,6 +3444,7 @@ impl WindbgServer {
             EngineOp::AttachKernel {
                 connection: selected.connection,
                 experimental_break_on_connect: args.experimental_break_on_connect,
+                managed_secure_kernel_peer: false,
             },
             OpenShape::Debuggee,
             None,
@@ -4722,6 +4735,36 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SkKdOpenArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        self.open_secure_kernel_kd(args, false).await
+    }
+
+    /// Open a Secure Kernel debugger as one ordinary MCP debug session. The supervisor owns a
+    /// hidden facade worker and attaches a second DbgEng worker to its private KD pipe; the
+    /// returned handle accepts the generic debugger tools, including symbols, stacks,
+    /// disassembly, breakpoints, stepping, continue and break-in. `end_session` first detaches
+    /// DbgEng and then restores and releases the hidden controller.
+    #[rmcp::tool(
+        annotations(
+            title = "Open Secure Kernel debugger",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<structured::OpenOutcome>()
+    )]
+    async fn open_sk_debugger(
+        &self,
+        Parameters(args): Parameters<SkKdOpenArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.open_secure_kernel_kd(args, true).await
+    }
+
+    async fn open_secure_kernel_kd(
+        &self,
+        args: SkKdOpenArgs,
+        attach_dbgeng_peer: bool,
+    ) -> Result<CallToolResult, ErrorData> {
         let connect_timeout_ms = args.connect_timeout_ms.unwrap_or(30_000);
         let idle_timeout_ms = args.idle_timeout_ms.unwrap_or(300_000);
         for (name, value) in [
@@ -4831,38 +4874,69 @@ impl WindbgServer {
         };
         let pipe_token = token.chars().take(32).collect::<String>();
         let pipe = format!("windbg-mcp-sk-{pipe_token}");
-        let what = format!("VM {} VTL1 VP {} KD pipe {}", target.vm_id, target.vp, pipe);
-        self.opened_as(
-            SessionKind::SecureKernelKd,
-            what,
-            None,
-            EngineOp::OpenSecureKernelKd(Box::new(crate::kdtarget::ManagedRequest {
-                open: crate::skdispatch::OpenRequest {
-                    profile: authorized.profile,
-                    control_transport: authorized.control_transport,
-                    live_transport: authorized.live_transport,
-                    vmwp_pid,
-                    dispatcher_vnd,
-                    target,
-                    max_pause_ms,
-                    allow_transition_cr3: false,
-                    allow_memory_writes: false,
-                    additional_vps: Vec::new(),
-                    reserved_hardware_slots: Vec::new(),
-                },
-                pipe,
-                kernel_base: None,
-                build: None,
-                initial: None,
-                arm_mode: args.arm_mode,
-                connect_timeout_ms,
-                idle_timeout_ms,
+        let controller_what = format!("VM {} VTL1 VP {} KD pipe {}", target.vm_id, target.vp, pipe);
+        let request = crate::kdtarget::ManagedRequest {
+            open: crate::skdispatch::OpenRequest {
+                profile: authorized.profile,
+                control_transport: authorized.control_transport,
+                live_transport: authorized.live_transport,
+                vmwp_pid,
+                dispatcher_vnd,
+                target,
                 max_pause_ms,
-            })),
+                allow_transition_cr3: false,
+                allow_memory_writes: authorized.allow_memory_writes,
+                additional_vps: Vec::new(),
+                reserved_hardware_slots: Vec::new(),
+            },
+            pipe: pipe.clone(),
+            kernel_base: None,
+            build: None,
+            initial: None,
+            arm_mode: args.arm_mode,
+            connect_timeout_ms,
+            idle_timeout_ms,
+            max_pause_ms,
+            // An ordinary DbgEng peer already models code breakpoints and tries to displace a
+            // reported STATUS_BREAKPOINT inside the first query made at the stop. The facade
+            // cannot make that private run visible to the worker's public wait surface. Use the
+            // controller's owned hardware slots for the composite debugger; retain the guarded
+            // INT3 path for the standalone facade where its caller owns that protocol behavior.
+            software_breakpoints: authorized.allow_memory_writes && !attach_dbgeng_peer,
+        };
+        if !attach_dbgeng_peer {
+            return self
+                .opened_as(
+                    SessionKind::SecureKernelKd,
+                    controller_what,
+                    None,
+                    EngineOp::OpenSecureKernelKd(Box::new(request)),
+                    OpenShape::Debuggee,
+                    Some(EngineOp::SkKdServe),
+                )
+                .await;
+        }
+        let public_what = format!(
+            "VM {} VTL1 VP {} through the managed KD facade",
+            request.open.target.vm_id, request.open.target.vp
+        );
+        let outcome = self
+            .sessions
+            .open_secure_kernel_debugger(
+                public_what.clone(),
+                controller_what,
+                pipe.clone(),
+                request,
+            )
+            .await;
+        self.present_opened(
+            SessionKind::Kernel,
+            public_what,
+            None,
             OpenShape::Debuggee,
-            Some(EngineOp::SkKdServe),
+            None,
+            outcome,
         )
-        .await
     }
 
     /// Save the VTL1 register baseline and arm up to four exact execution breakpoints. Redirect
@@ -8652,6 +8726,7 @@ mod tests {
             "go",
             "debug_batch",
             "open_sk_kd",
+            "open_sk_debugger",
         ] {
             assert_eq!(
                 ann(name).read_only_hint,

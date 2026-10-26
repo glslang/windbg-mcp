@@ -300,9 +300,12 @@ proved VM pause to keep provider state stable:
    one byte past it, so a stop is accepted only when RIP has exactly one of those two relationships
    to an owned patch; adjacent patch addresses are refused before mutation to keep that mapping
    unique. The worker uses that event on the Hyper-V-proved sole VP as an execution barrier,
-   restores and verifies all patches, normalizes RIP to the patch, then converts the
-   native event to a VM-wide pause before returning the stop. Timeout, validation failure and
-   teardown use the same restoration path and contain the VM if any original remains unproved.
+   restores and verifies all patches, normalizes RIP to the patch, and retains the event while
+   returning the stop. It must not convert this stop to a VM-wide pause: native completion permits
+   the restored instruction to execute before Suspend-VM can finish, invalidating the exposed
+   register snapshot and making debugger breakpoint displacement race guest progress. Timeout,
+   validation failure and teardown use the same restoration path and contain the VM if any
+   original remains unproved.
 10. `sk_live_continue` consumes that new epoch, restores and verifies the complete baseline, clears
    execution control and completes the owned event. The session can then be armed again.
 11. `end_session` restores any held state, removes every registered owned exception handler and

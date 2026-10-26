@@ -347,20 +347,20 @@ None of these is a bug. They are recorded because they were invisible, and
 
    | group | tools | bytes | share |
    |---|---:|---:|---:|
-   | `allocator` | 12 | 19,807 | 14.5% |
-   | `ioctl` | 11 | 16,088 | 11.8% |
-   | `securekernel` | 22 | 33,058 | 24.2% |
-   | `exec` | 10 | 15,087 | 11% |
-   | `session` | 10 | 14,208 | 10.4% |
-   | `inspect` | 10 | 13,485 | 9.9% |
-   | `batch` | 1 | 10,296 | 7.5% |
-   | `crash` | 3 | 7,473 | 5.5% |
-   | `ttd` | 9 | 7,090 | 5.2% |
+   | `allocator` | 12 | 19,807 | 14.2% |
+   | `ioctl` | 11 | 16,088 | 11.5% |
+   | `securekernel` | 23 | 35,880 | 25.7% |
+   | `exec` | 10 | 15,087 | 10.8% |
+   | `session` | 10 | 14,208 | 10.2% |
+   | `inspect` | 10 | 13,485 | 9.7% |
+   | `batch` | 1 | 10,296 | 7.4% |
+   | `crash` | 3 | 7,473 | 5.4% |
+   | `ttd` | 9 | 7,090 | 5.1% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
    | *(absent)* | 66 | 103,534 |
-   | `all` | 88 | 136,592 |
+   | `all` | 89 | 139,414 |
    | `session,inspect,exec,crash` | 33 | 49,332 |
    | `session,inspect,crash` | 23 | 34,092 |
    | `crash` | 13 | 20,515 |
@@ -412,6 +412,13 @@ None of these is a bug. They are recorded because they were invisible, and
    across the six existing output schemas: the surface remains **88 tools and 136,123 B** to the
    model while the payload moves **402,689 → 405,418 B**. The existing 138,000 and 410,000
    ceilings therefore remain fixed, with 1,877 B (1.4%) and 4,582 B (1.1%) headroom respectively.
+
+   M8's `open_sk_debugger` adds one composite opener over the existing facade contract. It moves
+   the complete surface to **89 tools and 139,414 B** and the payload to **413,570 B**. Its 2,822
+   model-visible bytes buy the one-handle session boundary rather than another debugger operation:
+   the hidden facade and public DbgEng worker share capacity, status and ordered teardown. The
+   model and wire ceilings move deliberately to **142,000 B** and **420,000 B**, leaving 2,586 B
+   (1.9%) and 6,430 B (1.6%) respectively.
 
    **The two tables do not reconcile, and that is the point of item 41.** The first is each group's
    share of the whole surface; the second is what a spec actually serves, which is less — `crash`

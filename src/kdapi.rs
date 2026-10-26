@@ -11,6 +11,7 @@ pub(crate) const MANIPULATE_BYTES: usize = 0x38;
 pub(crate) const WAIT_STATE_CHANGE64_BYTES: usize = 0xf0;
 pub(crate) const AMD64_CONTEXT_BYTES: usize = 0x4d0;
 pub(crate) const AMD64_SPECIAL_REGISTERS_BYTES: usize = 0xe0;
+pub(crate) const AMD64_PROCESSOR_LEVEL: u16 = 6;
 pub(crate) const AMD64_DEBUG_CONTROL_SPACE_KSPECIAL: u64 = 2;
 /// Protocol-only identity used where native KD expects an NT `KTHREAD` pointer.
 ///
@@ -18,6 +19,9 @@ pub(crate) const AMD64_DEBUG_CONTROL_SPACE_KSPECIAL: u64 = 2;
 /// compatibility page at this otherwise unused canonical address; it is never mapped into or
 /// written to the guest.
 pub(crate) const SYNTHETIC_THREAD: u64 = 0xffff_fffe_fffe_0000;
+/// Protocol-only GDT backing the selectors in the synthesized AMD64 context.
+pub(crate) const SYNTHETIC_GDT: u64 = SYNTHETIC_THREAD + 0x800;
+pub(crate) const SYNTHETIC_GDT_LIMIT: u16 = 0x57;
 
 pub(crate) const DBGKD_GET_VERSION_API: u32 = 0x3146;
 pub(crate) const DBGKD_READ_VIRTUAL_MEMORY_API: u32 = 0x3130;
@@ -34,6 +38,10 @@ pub(crate) const DBGKD_CONTINUE_API2: u32 = 0x313c;
 const STATUS_SUCCESS: u32 = 0;
 const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
 const DBGKD_64BIT_PROTOCOL_VERSION2: u8 = 6;
+// `WDBGEXTS.H` names 0 and 1 as the two obsolete AMD64 CONTEXT layouts. Current x64 targets
+// advertise 2; leaving this byte zero makes DbgEng truncate and interpret the modern CONTEXT as
+// the first obsolete form even though `MachineType` says AMD64.
+const KD_SECONDARY_VERSION_AMD64_CONTEXT: u8 = 2;
 const DBGKD_VERS_FLAG_PTR64: u16 = 0x0004;
 const DBGKD_VERS_FLAG_NOMM: u16 = 0x0008;
 const DBGKD_VERS_FLAG_HSS: u16 = 0x0010;
@@ -345,8 +353,10 @@ impl Amd64Context {
 /// Encodes the portion of AMD64 `KSPECIAL_REGISTERS` that the VTL1 provider can report.
 ///
 /// DbgEng reads this control-space record while assembling its register state even though the
-/// general and debug registers arrive in `CONTEXT`. Unknown descriptor-table, control-register,
-/// branch-record and MSR fields remain zero rather than being invented.
+/// general and debug registers arrive in `CONTEXT`. Secure Kernel's descriptor-table register is
+/// not in the provider contract, so GDTR points at the protocol-only GDT that describes the exact
+/// selectors and long mode already reported in that context. Other unavailable descriptor-table,
+/// control-register, branch-record and MSR fields remain zero.
 pub(crate) fn amd64_special_registers(
     values: &Amd64ContextValues,
     cr3: u64,
@@ -359,12 +369,30 @@ pub(crate) fn amd64_special_registers(
     {
         put_u64(&mut bytes, offset, value);
     }
+    put_u16(&mut bytes, 0x56, SYNTHETIC_GDT_LIMIT);
+    put_u64(&mut bytes, 0x58, SYNTHETIC_GDT);
     bytes
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StateChangeException {
+    Breakpoint,
+    SingleStep,
+}
+
+impl StateChangeException {
+    fn code(self) -> u32 {
+        match self {
+            Self::Breakpoint => 0x8000_0003,
+            Self::SingleStep => 0x8000_0004,
+        }
+    }
 }
 
 pub(crate) fn breakpoint_state_change(
     context: &Amd64ContextValues,
     instruction: &[u8],
+    exception: StateChangeException,
 ) -> Result<Vec<u8>, ApiError> {
     if instruction.is_empty() || instruction.len() > 16 {
         return Err(ApiError::InstructionLength {
@@ -373,7 +401,9 @@ pub(crate) fn breakpoint_state_change(
     }
     let mut state = vec![0; WAIT_STATE_CHANGE64_BYTES];
     put_u32(&mut state, 0, 0x3030);
-    put_u16(&mut state, 4, 0x000f);
+    // This is KeProcessorLevel (the x86 family), not DBGKD_GET_VERSION64.MajorVersion.
+    // The managed K3/L2 rig exposes an Intel Family 6 processor.
+    put_u16(&mut state, 4, AMD64_PROCESSOR_LEVEL);
     put_u16(&mut state, 6, 0);
     put_u32(&mut state, 8, 1);
     // WinDbg dereferences this field while preparing `t`. A null value is rejected, and pointing
@@ -381,10 +411,18 @@ pub(crate) fn breakpoint_state_change(
     // target serves a bounded zero-filled compatibility page at this protocol-only address.
     put_u64(&mut state, 0x10, SYNTHETIC_THREAD);
     put_u64(&mut state, 0x18, context.rip);
-    // Both hardware execute breakpoints and trap-flag steps arrive as vector 1. Reporting the
-    // matching status prevents WinDbg from applying the one-byte RIP adjustment used for `int 3`.
-    put_u32(&mut state, 0x20, 0x8000_0004);
+    // Trap-flag steps and controller-only execution slots arrive as vector 1 and use
+    // STATUS_SINGLE_STEP. A slot implementing a live KD WriteBreakpoint handle is deliberately
+    // reported as STATUS_BREAKPOINT, just like the guarded INT3 path: both restore their target
+    // mechanism before this packet is built, and the ordinary three-parameter BREAKPOINT_BREAK
+    // record is what lets DbgEng associate the stop with the handle it created.
+    put_u32(&mut state, 0x20, exception.code());
     put_u64(&mut state, 0x30, context.rip);
+    if exception == StateChangeException::Breakpoint {
+        // EXCEPTION_RECORD64.NumberParameters. The zero-filled information array already carries
+        // BREAKPOINT_BREAK (zero) in its first element and the two unused service arguments.
+        put_u32(&mut state, 0x38, 3);
+    }
     put_u32(&mut state, 0xb8, 1);
     put_u64(&mut state, 0xc0, context.debug[4]);
     put_u64(&mut state, 0xc8, context.debug[5]);
@@ -429,6 +467,7 @@ impl Version64 {
         out[0..2].copy_from_slice(&0x000fu16.to_le_bytes());
         out[2..4].copy_from_slice(&self.build.to_le_bytes());
         out[4] = DBGKD_64BIT_PROTOCOL_VERSION2;
+        out[5] = KD_SECONDARY_VERSION_AMD64_CONTEXT;
         out[6..8].copy_from_slice(
             &(DBGKD_VERS_FLAG_PTR64 | DBGKD_VERS_FLAG_NOMM | DBGKD_VERS_FLAG_HSS).to_le_bytes(),
         );
@@ -550,6 +589,7 @@ mod tests {
         assert_eq!(half(&response, 16), 0x000f);
         assert_eq!(half(&response, 18), 26_100);
         assert_eq!(response[20], DBGKD_64BIT_PROTOCOL_VERSION2);
+        assert_eq!(response[21], KD_SECONDARY_VERSION_AMD64_CONTEXT);
         assert_eq!(
             half(&response, 22),
             DBGKD_VERS_FLAG_PTR64 | DBGKD_VERS_FLAG_NOMM | DBGKD_VERS_FLAG_HSS
@@ -723,7 +763,9 @@ mod tests {
         assert_eq!(quad(&special, 0x38), 4);
         assert_eq!(quad(&special, 0x40), 6);
         assert_eq!(quad(&special, 0x48), 7);
-        assert!(special[0x50..].iter().all(|byte| *byte == 0));
+        assert_eq!(half(&special, 0x56), SYNTHETIC_GDT_LIMIT);
+        assert_eq!(quad(&special, 0x58), SYNTHETIC_GDT);
+        assert!(special[0x60..].iter().all(|byte| *byte == 0));
     }
 
     #[test]
@@ -742,15 +784,61 @@ mod tests {
             debug: [0, 0, 0, 0, 0x4000, 0x400],
             ..Amd64ContextValues::default()
         };
-        let state = breakpoint_state_change(&values, &[0xcc]).unwrap();
+        let state =
+            breakpoint_state_change(&values, &[0xcc], StateChangeException::SingleStep).unwrap();
         assert_eq!(state.len(), WAIT_STATE_CHANGE64_BYTES);
         assert_eq!(word(&state, 0), 0x3030);
+        assert_eq!(half(&state, 4), AMD64_PROCESSOR_LEVEL);
         assert_eq!(quad(&state, 0x10), SYNTHETIC_THREAD);
         assert_eq!(quad(&state, 0x18), values.rip);
         assert_eq!(word(&state, 0x20), 0x8000_0004);
         assert_eq!(quad(&state, 0x30), values.rip);
+        assert_eq!(word(&state, 0x38), 0);
         assert_eq!(word(&state, 0xb8), 1);
         assert_eq!(half(&state, 0xd4), 1);
         assert_eq!(state[0xd8], 0xcc);
+    }
+
+    #[test]
+    fn breakpoint_state_change_carries_the_whole_kd_instruction_stream() {
+        let values = Amd64ContextValues {
+            rip: 0xffff_f807_2aa2_d7f0,
+            ..Amd64ContextValues::default()
+        };
+        let instruction = [
+            0x48, 0x89, 0xc8, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+            0x90, 0x90,
+        ];
+
+        let state =
+            breakpoint_state_change(&values, &instruction, StateChangeException::SingleStep)
+                .unwrap();
+
+        assert_eq!(half(&state, 0xd4), 16);
+        assert_eq!(&state[0xd8..0xe8], &instruction);
+    }
+
+    #[test]
+    fn a_guarded_int3_stop_is_reported_as_a_breakpoint_exception() {
+        let values = Amd64ContextValues {
+            rip: 0xffff_f803_9e63_32cf,
+            ..Amd64ContextValues::default()
+        };
+
+        let state = breakpoint_state_change(
+            &values,
+            &[0x48, 0x89, 0x5c, 0x24, 0x08],
+            StateChangeException::Breakpoint,
+        )
+        .unwrap();
+
+        assert_eq!(word(&state, 0x20), 0x8000_0003);
+        assert_eq!(quad(&state, 0x18), values.rip);
+        assert_eq!(quad(&state, 0x30), values.rip);
+        assert_eq!(word(&state, 0x38), 3);
+        assert_eq!(quad(&state, 0x40), 0);
+        assert_eq!(quad(&state, 0x48), 0);
+        assert_eq!(quad(&state, 0x50), 0);
+        assert_eq!(word(&state, 0xb8), 1);
     }
 }

@@ -92,6 +92,7 @@ pub struct Connection(String);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Endpoint {
     Net(u16),
+    Pipe(String),
     Unknown,
 }
 
@@ -130,6 +131,26 @@ impl Connection {
 
     pub(crate) fn endpoint(&self) -> Endpoint {
         let parsed = Parsed::of(&self.0);
+        if parsed.prefix.eq_ignore_ascii_case("com:")
+            && parsed
+                .params
+                .iter()
+                .any(|param| param.name.eq_ignore_ascii_case("pipe") && param.value.is_none())
+        {
+            let ports: Vec<_> = parsed
+                .params
+                .iter()
+                .filter(|param| param.name.eq_ignore_ascii_case("port"))
+                .collect();
+            return match ports.as_slice() {
+                [port] => port
+                    .value
+                    .filter(|value| !value.is_empty())
+                    .map(|value| Endpoint::Pipe(value.to_ascii_lowercase()))
+                    .unwrap_or(Endpoint::Unknown),
+                _ => Endpoint::Unknown,
+            };
+        }
         if !parsed.prefix.eq_ignore_ascii_case("net:") {
             return Endpoint::Unknown;
         }
@@ -1554,6 +1575,24 @@ mod tests {
         ] {
             assert!(first.conflicts(&Connection::new(raw).endpoint()));
         }
+    }
+
+    #[test]
+    fn named_pipe_kernel_endpoints_reserve_only_their_pipe() {
+        use super::*;
+        let first =
+            Connection::new(r"com:pipe,port=\\.\pipe\windbg-mcp-sk-one,resets=0").endpoint();
+        assert_eq!(
+            first,
+            Connection::new(r"COM:PIPE,PORT=\\.\PIPE\WINDBG-MCP-SK-ONE,RESETS=0").endpoint()
+        );
+        assert!(!first.conflicts(
+            &Connection::new(r"com:pipe,port=\\.\pipe\windbg-mcp-sk-two,resets=0").endpoint()
+        ));
+        assert!(matches!(
+            Connection::new(r"com:pipe,resets=0").endpoint(),
+            Endpoint::Unknown
+        ));
     }
     use super::*;
 

@@ -12,6 +12,19 @@ with no tracked record, which `FOLLOWUPS.md` item 115 filed and this page closes
 session now owns the lifecycle, reservations and recovery state; the earlier `--sk-kd-target` role
 remains as a compatibility and diagnostic entry point.
 
+`open_sk_debugger` builds the ordinary MCP debugger on top of that facade. The supervisor keeps
+the facade worker internal, attaches a second worker's DbgEng kernel session to its private pipe,
+and returns only the DbgEng handle. Generic tools therefore operate on Secure Kernel directly:
+symbols, modules, stacks, disassembly, breakpoints, execution control and raw commands need no
+Secure-Kernel-specific duplicate. The two workers still obey the repository boundary — one
+DbgEng session per process, and no engine in the MCP-serving process — while `session_status`,
+capacity and teardown treat them as one composite session.
+
+The public worker is a protocol peer, not a second target owner. On `end_session` it closes its
+private pipe and exits without sending native KD's `qd`: the facade has no distinct detach packet,
+so `qd` is indistinguishable from an ordinary continue. The supervisor then asks the hidden
+controller worker to restore and release VTL1. Only that controller can claim target release.
+
 **What it is not.** It is not KDNET: there is no UDP discovery, no key exchange and no encryption,
 and the transport is a named pipe on the debugger host (`src/kdwire.rs` keeps the framing
 transport-neutral for a network envelope nobody has attempted). It is not EXDI, which the research
@@ -20,9 +33,10 @@ transport inside the guest. Secure Kernel still ships none — gate S5a's findin
 a host-side facade over the root-driven controller, and nothing here changes what the guest can do.
 MCP and WinDbg do not mutate one stop concurrently: WinDbg holds the execution lease, while MCP
 admits status, logs and teardown. While stopped, WinDbg can inspect the target and issue the
-supported execution commands. While running, use MCP `end_session` to recover and release the
-controller: WinDbg Ctrl+Break and MCP `interrupt` cannot preserve the KD lifecycle and are
-unavailable.
+supported execution commands. While running after a `g`, WinDbg's Ctrl+Break asks the controller
+for its M2 break rendezvous and the next stop is where the VP was paused; MCP `end_session`
+recovers and releases the controller from any state. MCP `interrupt` is not a route into the
+KD lifecycle.
 
 ## What has been measured
 
@@ -71,10 +85,24 @@ captures its initial stop **before** it creates the pipe. And `kd -c "r;t;t;r;q"
 five commands — it stranded kd at its prompt — so commands go in a `-cf` file, one per line.
 
 The earlier standalone run on 2026-10-05 established the same `t`, `r`, `q` route but ended with
-the now-fixed `GetContextState` error. The `g`-to-breakpoint path is coded and unit-tested against a fake
-dispatcher, and no run has installed a breakpoint from WinDbg and continued to it. The review that
+the now-fixed `GetContextState` error. At that point the `g`-to-breakpoint path was only coded and
+unit-tested against a fake dispatcher; no external WinDbg run had installed a breakpoint and
+continued to it. The review that
 filed items 115–119 read the facade and did not run it; the managed gates above are the later
 evidence against those findings.
+
+On 2026-10-26 the server-owned DbgEng composite passed its first live M8 route probe on the same K3
+nested bench. Through the ordinary MCP debugger tools it resolved the 26100.9457 PDB, enumerated
+`securekernel.exe`, installed `securekernel!IumInvokeSecureService` in a hardware slot, continued
+to a guest enclave call, read registers and a two-frame symbolized stack, disassembled the x64
+entry, and single-stepped its first instruction. It then cleared the slot, performed a bounded
+`g` with nothing armed, and stopped that run through `break_in` and M2's rendezvous. Composite
+release restored the controller baseline before resuming the child. The independent audit found
+DR0–DR3 zero, DR7 `0x400`, TF/RF clear, no engine workers, unchanged guarded text and a healthy
+heartbeat. K3 remained on its original boot, the child remained running, exact trigger artifacts
+were removed, both provider services were stopped, staging was removed, and the runner used no
+forced recovery. This is one pass of each route on one boot, not M8.2's repeated race matrix or an
+external WinDbg/WinDbgX qualification.
 
 ## Running the managed session
 
@@ -110,8 +138,17 @@ smallest window leaves 30 seconds for service and a 30-second controller-cleanup
 mandatory five-second unregister settle plus 25 seconds of headroom for the restoration, event
 completion, attach, unregister and deferred-cleanup work that precedes it.
 
-Call `open_sk_kd` with the exact-build dispatcher profile, the two provider command templates, VM
-GUID and selected VP. The profile carries the initial guarded instruction as a Secure Kernel RVA;
+Call `open_sk_debugger` with the exact-build dispatcher profile, the two provider command
+templates, VM GUID and selected VP when MCP is the debugger UI. It returns one ordinary kernel
+session handle; pass that handle to the generic debugger tools. `end_session` detaches that DbgEng
+peer first and only then restores and releases the hidden controller. Here "detaches" means closing
+the managed private-pipe peer, not sending generic KD `qd`, whose wire form the facade cannot
+distinguish from `g`. If the peer cannot be closed, the controller remains held for recovery rather
+than having its pipe removed underneath an unresolved engine. A controller-side recovery failure
+is surfaced on the same public handle.
+
+Call `open_sk_kd` with the same arguments when an installed WinDbg is the client. The profile
+carries the initial guarded instruction as a Secure Kernel RVA;
 the same required section carries the build-specific debugger-data list, block and loaded-module
 list RVAs. The worker resolves them from the provider-reported image base and validates their live
 links and identities before creating the pipe. It also reads the live AMD64 PE header and version
@@ -220,24 +257,32 @@ which single steps are refused, and what every other request is answered with:
   refused; so is a `rep`-prefixed string instruction, and anything that writes `ss` (`mov ss`,
   `pop ss`, `lss`), because the trap can land somewhere other than the successor. A decoded
   `mov cr3,r64` is carried to that successor with a temporary hardware breakpoint rather than TF;
-  the controller binds the resulting root and removes the slot before reporting the stop. `g` is
-  refused before the retained event is released, even when WinDbg has installed a hardware
-  breakpoint. A refusal resends the held stop, so the session survives it. The direct controller's
-  M1 run-to-breakpoint and M2 break-on-demand paths now pass independently; the call-debugging
-  roadmap's M8 gate owns their KD packet translation and race qualification. Until that passes,
-  the facade recognizes both the legacy continue request and `Continue2` but only `Continue2` with
-  its trace flag set may resume the target. Whatever WinDbg sends for `p` is handled by that same
-  trace arm.
+  the controller binds the resulting root and removes the slot before reporting the stop.
+  **`g` is routed since 2026-10-25 and passed its first server-owned live probe on 2026-10-26.** A non-trace
+  continue (legacy or `Continue2`) with hardware breakpoints installed is M1's proved
+  continue-to-breakpoints; with none installed it is a bounded free run in which every slot is
+  released and only a Ctrl+Break, teardown or the wait's recovery deadline can stop the VP, never
+  an infinite resume. A transition the controller refuses resends the held stop, so the session
+  survives it. The call-debugging roadmap's M8.2 gate owns the packet-race and recovery
+  qualification of both routes; the one-run probe is the ignored test
+  `a_managed_secure_kernel_kd_session_is_driven_by_this_servers_own_kernel_attach`, which drives
+  them through `open_sk_debugger`'s supervisor-owned composite. Whatever WinDbg sends for `p` is
+  handled by the trace arm.
 - **The proven redirected step is one five-byte NOP.** On that bench the next instruction used the
   interrupted context's RBX, so the acceptance takes one step and quits.
 - **`SetContext` succeeds only for WinDbg's unchanged compatibility write**; a changed byte is
   refused, as are all control-space writes. No guest memory is written and no general-purpose register is: the only writes are the
   controller's own — debug registers for a breakpoint, TF for a step — and the baseline restores
   them at release.
-- **Break-in is not yet routed to M2.** While stopped it is logged as unsupported and the retained
-  stop remains usable. While running it cancels the bounded wait into fail-closed recovery; it is
-  not reported as a stop that did not occur. M8 keeps that refusal until running, natural-stop and
-  teardown races pass through the packet facade itself.
+- **Break-in during a `g` is routed to M2 since 2026-10-25 and passed its first server-owned live
+  probe on 2026-10-26.** The serial break-in byte binds to the exact running wait: the reader marks the
+  wait's break request before it interrupts the owned DbgEng wait, the dispatcher answers that
+  interruption as a break wake rather than a cancellation, and the engine thread runs the M2
+  rendezvous, a proved VM pause, a transient execute breakpoint at the paused RIP and the ordinary
+  owned wait for it. A natural breakpoint that wins the race arrives as itself and keeps its
+  reason. While stopped, a break-in resends the retained stop. During a `t` it stays what it was,
+  a cancellation of the bounded wait into fail-closed recovery, because a trace step's expected
+  stop is its own successor and break-on-demand has no running arm to bind to.
 - **Everything else answers `0xC0000001`**: `WriteVirtual`, `ReadPhysical`, `SearchMemory`, MSR
   reads and writes, `SwitchProcessor`, `QueryMemory`, `SetContextEx`, `Reboot`, `CauseBugCheck`,
   control-space writes and control-space selectors other than the bounded AMD64 special-register
@@ -245,12 +290,15 @@ which single steps are refused, and what every other request is answered with:
   `GetContextEx` range now receive failure without losing the stop. Framing errors request resend;
   three consecutive framing errors enter recovery.
 
-The `g` refusal was tightened after a 2026-10-18 live qualification. WinDbg installed
-`securekernel!KiTimerInterrupt`, sent non-trace `Continue2`, and the controller released its
-retained event, but no VTL1 breakpoint stop returned; the disposable VM reset and the managed call
-timed out. Both that packet and WinDbgX's measured legacy continue packet are now refused before
-any guest execution state is changed. Hardware breakpoint insertion, listing and removal remain
-available only for protocol inspection, not as a claimed execution-control path.
+The `g` route has a history worth knowing before running it. A 2026-10-18 live qualification had
+WinDbg install `securekernel!KiTimerInterrupt`, send non-trace `Continue2`, and the controller
+release its retained event, after which no VTL1 breakpoint stop returned, the disposable VM reset
+and the managed call timed out; both continue packets were refused from then on. The direct
+controller then passed M1's 300 run-to-breakpoint cycles across three boots and M2's break races
+on 2026-10-20, at a deterministic site rather than the timer interrupt. On 2026-10-25 the refusal
+was retired in favour of routing both packets onto those proved paths, with the qualification
+left where M8.2 puts it: a reset, hang, ambiguous stop or unproved restoration in that gate fails
+it and brings the refusal back.
 
 ## What WinDbg reads that the guest never held
 
@@ -269,6 +317,14 @@ context and special-register replies identify which unavailable fields were zero
 records reach both stderr and MCP `server_log`. Native KD has no per-read provenance field, so
 WinDbg still displays compatibility bytes as memory; the audit is where an operator distinguishes
 those bytes from guest reads.
+
+The compatibility view also contains a synthetic GDT at `0xfffffffefffe0800`. Its bounded
+descriptors define the reported CS `0x10` as long-mode code, SS `0x18` as kernel data, DS/ES/GS
+`0x2b` as data and FS `0x53` as data; the AMD64 special-register reply points GDTR at it with limit
+`0x57`. These bytes carry no guest state. They tell DbgEng how to decode the real instruction
+stream: before that table existed, a zero GDTR made the engine treat CS `0x10` as 16-bit and render
+the real bytes `40 55` as `inc ax; push bp`. The 2026-10-26 gate rendered them correctly as
+`push rbp` and continued with the live x64 prologue.
 
 ## Pipe and host safety
 
@@ -309,11 +365,12 @@ docs/smoke-test.md has the runbook.
 | `r` | Values live measured; display diagnostic remains | Real stopped general, segment, flag, CR3 and debug-register values; unavailable special-register fields are zero |
 | `t` over a fall-through instruction | Live measured | Real TF step and returned VTL1 vector-1 event |
 | Virtual instruction reads/disassembly | Live measured | Real VTL1 virtual memory, plus narrowly scoped compatibility addresses |
-| `bp`/`g` to one of four hardware slots | Implemented, not live measured | Guarded VTL1 DR state and retained dispatcher event |
+| `bp`/`g` to one of four hardware slots | One server-owned DbgEng composite pass; repeated M8.2 qualification remains | Guarded VTL1 DR state and retained dispatcher event |
+| `g` with no breakpoint | One bounded server-owned run stopped by `break_in`; repeated M8.2 qualification remains | Every slot released; ends only at a break-in, teardown or the recovery deadline |
 | Software breakpoints or memory/register writes | Refused | No safe patch owner; `SetContext` accepts only an unchanged prefix |
 | `lm m securekernel` module discovery | Live measured | Validated live debugger-data head, `KDBG` block and loaded-module list |
 | PDB symbol resolution and bounded stack walking | Live measured at a natural timer stop | Prepared PDB cache, live module range, real stack/code; two Secure Kernel frames |
-| Asynchronous break-in | Unavailable | No running-state interrupt route has passed item 117 |
+| Asynchronous break-in during a `g` | One server-owned DbgEng composite pass; repeated M8.2 qualification remains | A proved VM pause and a transient execute breakpoint at the paused RIP |
 | `q` and MCP `end_session` | Live measured | Proved restore/release, followed by the external audit |
 
 `windbg-mcp --sk-kd-wire-probe --pipe <name>` is the transport-only fixture: one pipe, no VM, no
@@ -329,7 +386,8 @@ produced `Continue2` with the trace flag.
 The [item 119 capability record](../../DONE.md#119-windbg-mcp-what-a-vtl1-debugger-still-cannot-do--done-2026-10-07)
 holds the ordered ladder. The version record now names validated live debugger and module
 lists; module enumeration, PDB symbol resolution and one bounded natural stack walk have passed.
-Debugger display/write diagnostics, forced-disconnect behavior, facade-routed break-in,
-stepping over anything but a fall-through, facade-routed repeated run-break-run, more than one VP
-and writes are left, each behind a guard or an explicit refusal in `src/sklive.rs` and
-`src/kdtarget.rs`. The direct M1/M2 paths are qualified; M8 is the missing facade-specific proof.
+Debugger display/write diagnostics, forced-disconnect behavior, stepping over anything but a
+fall-through, more than one VP and writes are left, each behind a guard or an explicit refusal in
+`src/sklive.rs` and `src/kdtarget.rs`. Facade-routed `g` and break-in are coded against the
+qualified direct M1/M2 paths and passed one server-owned composite run. M8.2 still owns the
+three-boot repeated front-end and race qualification.

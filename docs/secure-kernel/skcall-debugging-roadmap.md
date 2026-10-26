@@ -40,8 +40,9 @@ controller or the investigation.
   partition, VP, VTL and CR3. Stale coordinates are refusals, not best-effort operations.
 - The 2026-10-18 `g` qualification is a failed facade gate: after WinDbg armed
   `securekernel!KiTimerInterrupt`, the next VTL1 stop was not observed and K3 reset. The KD facade
-  continues to refuse non-trace requests. M1 and M2 subsequently passed on the direct controller;
-  routing WinDbg onto those proved paths is M8 and requires its own packet-race and recovery gate.
+  refused non-trace requests from then until 2026-10-25, when M8.0's rows were routed onto the
+  M1 and M2 paths the direct controller had since passed; M8.2's packet-race and recovery gate is
+  still what qualifies them, and a failure there brings the refusal back.
 - Break-on-demand cannot be emulated by an arbitrary cross-thread DbgEng call. `SetInterrupt` is
   used only during the worker's explicitly scoped owned-event wait; target-side interruption needs
   a separate controller primitive.
@@ -240,8 +241,10 @@ absolute pause deadline, installs the `vmwp` event-site breakpoint, and only the
 A stop must report RIP at an owned patch or exactly one byte past it, the two forms VID exposes for
 an intercepted `INT3`; adjacent patch addresses are refused so the mapping is unique. The controller
 uses that retained event on the proved sole VP as an execution barrier, restores and verifies every
-patch, normalizes RIP to the patch, and converts the event to a VM-wide pause before exposing the
-stop. The patches are one-shot and must be explicitly rearmed. Write-enabled target preparation
+patch, normalizes RIP to the patch, and retains the vector-3 event while exposing the stop. Native
+completion cannot be used to manufacture a stopped snapshot here: the restored instruction may
+execute before Suspend-VM finishes. The patches are one-shot and must be explicitly rearmed.
+Write-enabled target preparation
 caches the Hyper-V processor count before target discovery can pause or debugger-stop `vmwp`; the
 software-breakpoint slice requires that
 cached count to prove a single-vCPU VM, so an unselected VP cannot consume an `INT3` without issuing
@@ -1263,8 +1266,23 @@ Continuation order from this checkpoint:
    trigger may still fire; a non-stopping trace read before the drain stays as a reading. The
    multi-provider stop keeps its pre-existing window (a winner completed before its pause with
    DR7 still armed); M7 selects one VP and that path is out of this item's scope. Run
-   `20261025T073515` never reached M6's arm (the child hung on M4's first hit, item 2), so this
-   is still unproven live.
+   `20261025T073515` never reached M6's arm (the child hung on M4's first hit, item 2), and this
+   paragraph said "still unproven live" until it was read against the later runs' listener logs
+   on 2026-10-25. **Both branches ran live that day.** The hold branch fired four times, once each
+   in `20261025T121217` and `20261025T145011` and twice in `20261025T145507`: in the last, at
+   14:57:00.98 the dispatcher asked Hyper-V to pause and pumped `vmwp` under its event-site
+   breakpoint, 13 ms later logged that it held a VTL1 event that arrived during the disarm as the
+   disarm point, the wait adopted it, and the controller retained it as a slot-1 hardware stop;
+   the third window repeated the sequence at 14:58:29.43, and the pending pause then completed
+   after the held event was carried (Hyper-V's pause verified at 14:58:30.28, the native
+   completion settled, the resume with the VTL1 baseline restored at 14:58:32.01). The
+   pause-proved branch, where the pump ends at a watchdog break with no event outstanding, fired
+   once, in `20261025T122621`. So the two things the rerun was to measure are measured. What has
+   not run live is narrower than the item: all four holds came through the arm's bootstrap break
+   request, whose wait adopts the event; the other consumer, a trace drain or close receiving a
+   held event and releasing it into a proved pause, has had no occasion, because every drain so
+   far ran with the trigger idle and zero records. The first M7.3 workload run drains while
+   events are in flight and exercises it without a dedicated control.
 4. Then rerun `run-m7-nested-coexistence.ps1`: open all three, arm M4 -> M6 -> M5, launch no
    workload, drain M5 -> M6 -> M4, and repeat the relevant failure and timeout injections. M4's
    software breakpoint is first exercised live here. The gate requires
@@ -1422,10 +1440,27 @@ the joined result and negative controls.
 
 ### M8 — debugger front ends
 
-Status: planned. M1 and M2 authorize implementation, but the facade keeps refusing ordinary `g`
-and running break-in until this milestone's own gate passes. M8 is independent of M6/M7's trace
-schema; it is scheduled after them so controller behavior is not changed underneath their live
-qualification.
+Status: in progress since 2026-10-25. M8.0's translation table is implemented in the facade: a
+non-trace continue with breakpoints is M1's continue-to-breakpoints, one with none is a bounded
+free run (`LiveControl::continue_running_until`, which arms nothing and stops only at a break
+request, teardown or the recovery deadline), a running Ctrl+Break binds to the exact wait and
+runs M2's rendezvous on the engine thread (the reader marks the wait's break request before its
+scoped interrupt, so the dispatcher answers a break wake rather than a cancellation; a natural
+stop that wins arrives as itself), a stopped Ctrl+Break resends the retained stop, and a
+Ctrl+Break during a trace step stays a cancellation. The facade's refusal of ordinary `g` is
+retired on that basis; the direct M1 and M2 gates authorize it and M8.2 qualifies it. Offline, the
+controller's free run and its break request are tested against the fake dispatcher, the wake
+ordering and the trace-step exclusion are unit tests, and a source ratchet pins the routing. The
+live probe is the ignored `a_managed_secure_kernel_kd_session_is_driven_by_this_servers_own_kernel_attach`.
+The new `open_sk_debugger` owns both workers as one supervisor composite, exposes only the ordinary
+DbgEng handle, and drives breakpoint, run, trigger, stop, registers, stack, step, free run,
+break-in and ordered release through the generic tools. The original `open_sk_kd` external-WinDbg
+facade remains available. That probe passed on 2026-10-26 against Secure Kernel 26100.9457 on the
+same K3 nested bench: all three execution routes completed, composite release restored the baseline,
+and the post-release audit found no enabled DR slot, no TF/RF, no engine worker, unchanged guarded
+text and a healthy child without forced recovery. This is the first single-run route proof, not the
+repeated M8.2 matrix. M8.1's launchers and M8.2's gate remain. M8 is independent of M6/M7's
+trace schema.
 
 #### M8.0 — packet-to-controller contract
 
@@ -1452,10 +1487,15 @@ The response must name whether execution moved, which epoch stopped and whether 
 
 #### M8.1 — facade integration and launchers
 
-Route the two continue forms through the direct controller without creating a second engine or a
-second session registry. Preserve one absolute pause/run deadline across packet handling, controller
-transition and wait. A rejected guard or stale epoch resends the old stop; a failure after release
-must recover or contain the VM and terminate the KD connection with the exact disposition.
+Expose the facade as an ordinary DbgEng kernel session without putting an engine in the supervisor
+or sharing one across sessions. The supervisor owns a composite: one hidden worker runs the facade
+and controller, and one public worker owns the DbgEng session attached to that private pipe. Only
+the public handle enters the session registry. Preserve one absolute pause/run deadline across
+packet handling, controller transition and wait. A rejected guard or stale epoch resends the old
+stop; a failure after release must recover or contain the VM and terminate the KD connection with
+the exact disposition. Both workers remain in the supervisor's internal registry, but only the
+public handle is visible and routable. Teardown closes the managed DbgEng peer first and lets only the hidden
+controller restore and release VTL1; generic KD `qd` cannot encode a distinct detach to this facade.
 
 Add PowerShell launchers for classic WinDbg and WinDbgX that resolve the executable and generated
 pipe from any working directory, keep credentials/keys off command lines and logs, and always end
