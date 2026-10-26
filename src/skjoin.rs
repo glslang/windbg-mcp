@@ -131,6 +131,8 @@ struct M4Trace {
     #[serde(default)]
     unreadable_hits: u64,
     #[serde(default)]
+    missing_breakpoint: bool,
+    #[serde(default)]
     armed: bool,
 }
 
@@ -170,6 +172,8 @@ struct M5Trace {
     full: bool,
     #[serde(default)]
     unreadable_hits: u64,
+    #[serde(default)]
+    missing_breakpoints: u64,
     #[serde(default)]
     armed: bool,
 }
@@ -698,6 +702,7 @@ pub(crate) fn first_stage_fields(
 #[serde(rename_all = "snake_case")]
 pub(crate) enum MarkKind {
     DroppedRecords,
+    MissingBreakpoints,
     CapacityReached,
     StillArmed,
     PendingPhase,
@@ -841,6 +846,8 @@ pub(crate) struct LayerSummary {
     pub(crate) dropped: u64,
     pub(crate) full: bool,
     pub(crate) unreadable: u64,
+    #[serde(default)]
+    pub(crate) missing_breakpoints: u64,
     pub(crate) armed_at_read: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) window: Option<Window>,
@@ -854,7 +861,11 @@ impl LayerSummary {
     /// Whether rank pairing may treat this layer's events as the complete run of what happened
     /// while it recorded.
     fn complete_run(&self) -> bool {
-        self.contiguous && self.dropped == 0 && !self.full && !self.armed_at_read
+        self.contiguous
+            && self.dropped == 0
+            && self.missing_breakpoints == 0
+            && !self.full
+            && !self.armed_at_read
     }
 }
 
@@ -1057,6 +1068,7 @@ fn check_sequences(layer: Layer, sequences: &[u64], marks: &mut Vec<Mark>) -> bo
 
 struct Counters {
     dropped: u64,
+    missing_breakpoints: u64,
     full: bool,
     unreadable: u64,
     armed: bool,
@@ -1083,6 +1095,28 @@ fn summarize(
             detail: format!(
                 "{} events were dropped after the retained ones",
                 counters.dropped
+            ),
+        });
+    }
+    if counters.missing_breakpoints > 0 {
+        marks.push(Mark {
+            layer: Some(layer),
+            kind: MarkKind::MissingBreakpoints,
+            sequence: None,
+            after_sequence: last,
+            detail: format!(
+                "{} trace breakpoint{} {} no longer held when read",
+                counters.missing_breakpoints,
+                if counters.missing_breakpoints == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+                if counters.missing_breakpoints == 1 {
+                    "was"
+                } else {
+                    "were"
+                },
             ),
         });
     }
@@ -1148,6 +1182,7 @@ fn summarize(
         dropped: counters.dropped,
         full: counters.full,
         unreadable: counters.unreadable,
+        missing_breakpoints: counters.missing_breakpoints,
         armed_at_read: counters.armed,
         window,
         restoration: source.restoration.clone(),
@@ -1197,6 +1232,7 @@ fn normalize_m4(
         &sequences,
         Counters {
             dropped: trace.dropped,
+            missing_breakpoints: u64::from(trace.missing_breakpoint),
             full: trace.full,
             unreadable: trace.unreadable_hits,
             armed: trace.armed,
@@ -1242,6 +1278,7 @@ fn normalize_m5(
         &sequences,
         Counters {
             dropped: trace.dropped,
+            missing_breakpoints: trace.missing_breakpoints,
             full: trace.full,
             unreadable: trace.unreadable_hits,
             armed: trace.armed,
@@ -1340,6 +1377,7 @@ fn normalize_m6(
         &sequences,
         Counters {
             dropped: trace.dropped_records,
+            missing_breakpoints: 0,
             full: trace.full,
             unreadable: trace.unreadable_fields,
             armed: trace.armed,
@@ -1505,8 +1543,9 @@ enum Placement {
 
 /// What a round trip with no recorded return bounds. A trace that ran to a clean end left the VP
 /// in VTL1 when it stopped, so its open trip encloses everything after its call up to the end of
-/// the layer's window; a trace that was capped, dropped events or was still armed stopped
-/// recording, which says nothing about where the VP was, so its open trip decides nothing.
+/// the layer's window; a trace that was capped, dropped events, lost a breakpoint or was still
+/// armed stopped recording, which says nothing about where the VP was, so its open trip decides
+/// nothing.
 #[derive(Clone, Copy)]
 enum OpenBound {
     Until(Option<u64>),
@@ -1743,7 +1782,7 @@ fn decide_m4(
         }
         WindowRelation::Contains | WindowRelation::ContainedBy => Decision::Ambiguous {
             candidates: all(),
-            reason: "one window contains the other but a trace is not a complete run (dropped, capped, gapped or still armed)".into(),
+            reason: "one window contains the other but a trace is not a complete run (dropped, capped, gapped, missing a breakpoint or still armed)".into(),
         },
         WindowRelation::Overlap => Decision::Ambiguous {
             candidates: all(),
@@ -3127,6 +3166,35 @@ mod tests {
     }
 
     #[test]
+    fn missing_m5_breakpoints_keep_an_open_round_trip_ambiguous() {
+        let fixture = fixture(9, 1, true);
+        let truth = fixture.truth[0].clone();
+        let mut open = fixture.input;
+        transitions_mut(&mut open)
+            .retain(|transition| transition["sequence"] != json!(truth.return_sequence));
+
+        let clean = join(&open).unwrap();
+        assert_eq!(
+            matched_sequence(&chain_for(&clean, truth.m6_sequence).stages.m5_vtl_call),
+            Some(truth.call_sequence),
+            "a cleanly read open trip is bounded by the trace window"
+        );
+
+        open.layers.m5_hypervisor.as_mut().unwrap().trace["missing_breakpoints"] = json!(1);
+        let joined = join(&open).unwrap();
+        let summary = joined.layers.m5_hypervisor.as_ref().unwrap();
+        assert_eq!(summary.missing_breakpoints, 1);
+        assert!(!summary.complete_run());
+        assert!(joined.marks.iter().any(|mark| {
+            mark.layer == Some(Layer::M5Hypervisor) && mark.kind == MarkKind::MissingBreakpoints
+        }));
+        assert!(matches!(
+            chain_for(&joined, truth.m6_sequence).stages.m5_vtl_call,
+            Decision::Ambiguous { .. }
+        ));
+    }
+
+    #[test]
     fn decisions_do_not_depend_on_arrival_order() {
         for seed in 1..=30 {
             let fixture = fixture(seed, 10, true);
@@ -3656,6 +3724,21 @@ mod tests {
         let mut capped = interval.clone();
         capped.layers.m4_vtl0.as_mut().unwrap().trace["full"] = json!(true);
         let joined = join(&capped).unwrap();
+        for chain in &joined.chains {
+            assert!(matches!(chain.stages.m4_entry, Decision::Ambiguous { .. }));
+        }
+
+        // A missing M4 breakpoint makes the retained events a prefix, not a complete run, even
+        // when its sequences and recording window otherwise support rank pairing.
+        let mut missing = interval.clone();
+        missing.layers.m4_vtl0.as_mut().unwrap().trace["missing_breakpoint"] = json!(true);
+        let joined = join(&missing).unwrap();
+        let summary = joined.layers.m4_vtl0.as_ref().unwrap();
+        assert_eq!(summary.missing_breakpoints, 1);
+        assert!(!summary.complete_run());
+        assert!(joined.marks.iter().any(|mark| {
+            mark.layer == Some(Layer::M4Vtl0) && mark.kind == MarkKind::MissingBreakpoints
+        }));
         for chain in &joined.chains {
             assert!(matches!(chain.stages.m4_entry, Decision::Ambiguous { .. }));
         }
