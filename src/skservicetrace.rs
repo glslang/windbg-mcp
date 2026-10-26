@@ -949,9 +949,15 @@ impl Recorder {
         {
             self.seal_pending(pending, None, IncompleteReason::Stopped)?;
         }
-        self.terminal_host_qpc = crate::hostclock::sample();
-        self.sealed = true;
+        self.seal_now();
         Ok(())
+    }
+
+    fn seal_now(&mut self) {
+        if !self.sealed {
+            self.terminal_host_qpc = crate::hostclock::sample();
+            self.sealed = true;
+        }
     }
 
     fn seal_pending(
@@ -1014,7 +1020,7 @@ impl Recorder {
         if event_full || byte_full {
             self.dropped_records += 1;
             self.dropped_capture_bytes += bytes;
-            self.sealed = true;
+            self.seal_now();
             return Ok(());
         }
         self.unreadable_fields += record.unreadable_fields();
@@ -1024,7 +1030,7 @@ impl Recorder {
             || (self.limits.total_capture_bytes > 0
                 && self.retained_capture_bytes == u64::from(self.limits.total_capture_bytes))
         {
-            self.sealed = true;
+            self.seal_now();
         }
         Ok(())
     }
@@ -2149,7 +2155,9 @@ mod tests {
     fn event_and_byte_capacity_account_for_whole_dropped_records() {
         let mut event_full = recorder(1, 1_024);
         complete(&mut event_full);
-        assert!(event_full.completed_prefix().full);
+        let trace = event_full.completed_prefix();
+        assert!(trace.full);
+        assert!(trace.host_qpc.is_some());
         event_full
             .observe_return(target().expected_cr3, returned_at(40))
             .unwrap();
@@ -2164,6 +2172,7 @@ mod tests {
         assert_eq!(trace.dropped_records, 1);
         assert_eq!(trace.dropped_capture_bytes, 128);
         assert!(trace.full);
+        assert!(trace.host_qpc.is_some());
     }
 
     #[test]
