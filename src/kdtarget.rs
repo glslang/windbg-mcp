@@ -257,6 +257,7 @@ impl WaitWakeState {
 #[derive(Debug, Default)]
 struct StoppedBreakIn {
     deferred: bool,
+    served_while_running: bool,
 }
 
 impl StoppedBreakIn {
@@ -274,8 +275,18 @@ impl StoppedBreakIn {
         std::mem::take(&mut self.deferred)
     }
 
+    fn served_while_running(&mut self) {
+        self.served_while_running = true;
+    }
+
+    /// Consume the transport frame whose wake already produced a running-target rendezvous.
+    fn take_served_frame(&mut self) -> bool {
+        std::mem::take(&mut self.served_while_running)
+    }
+
     fn reset(&mut self) {
         self.deferred = false;
+        self.served_while_running = false;
     }
 }
 
@@ -1126,6 +1137,16 @@ async fn run_async(
                 bail!("KD peer exceeded the consecutive framing-error bound: {error}");
             }
             if break_in {
+                // The reader both wakes a running wait and forwards the byte as a frame. Once the
+                // wake has already produced the retained stop, this is that same byte, not a new
+                // stopped-target break request. Consuming it here prevents the next `g` from
+                // inheriting a deferred break that the current stop already served.
+                if stopped_break_in.take_served_frame() {
+                    tracing::info!(
+                        "consuming the Secure Kernel KD break-in already served while running"
+                    );
+                    continue;
+                }
                 // A break-in received while a stop is in flight cannot mint another state-change
                 // packet yet: KD admits only one unacknowledged data packet. Keep it pending for
                 // the peer's next continue instead. That is also the shape DbgEng's INITIAL_BREAK
@@ -1531,6 +1552,7 @@ async fn run_async(
                         let stop = session
                             .break_on_demand(engine, || retained_at = Some(Instant::now()))
                             .context("the Ctrl+Break rendezvous did not retain a stop")?;
+                        stopped_break_in.served_while_running();
                         if crate::worker::kd_teardown_requested() {
                             return Err(ManagedTeardown.into());
                         }
@@ -2760,6 +2782,16 @@ mod tests {
             link.send(crate::kdwire::PACKET_TYPE_STATE_CHANGE64, &[0x31])
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn a_running_break_in_frame_is_consumed_without_poisoning_the_next_continue() {
+        let mut stopped_break_in = StoppedBreakIn::default();
+        stopped_break_in.served_while_running();
+
+        assert!(stopped_break_in.take_served_frame());
+        assert!(!stopped_break_in.take_served_frame());
+        assert!(!stopped_break_in.take_for_continue());
     }
 
     /// A trace step's expected stop is its own successor, so break-on-demand has nothing to

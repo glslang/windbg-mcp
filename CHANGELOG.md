@@ -298,6 +298,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Composite Secure Kernel debugger workers enter and leave one lifecycle atomically.** The
+  public DbgEng worker is linked to its hidden controller in the same registry critical section
+  that admits it, before attach can wait for an initial stop. A missing child handle is no longer
+  treated as a verified exit, and a controller preserved after its public peer closes now restores
+  the public recovery handle so a later `end_session` can finish the release.
+
+- **Secure Kernel teardown cannot cancel the guarded-byte rollback it requested.** Mutation and
+  ordinary reads remain teardown-cancellable, while rollback writes and their read-back use the
+  existing absolute cleanup deadline without consulting the already-set teardown flag.
+
+- **A running managed-KD Ctrl+Break is consumed exactly once.** Its forwarded transport byte is
+  discarded after the same byte wakes the running wait and completes the target-side rendezvous,
+  so the next `g` no longer inherits a phantom deferred break.
+
+- **Configured live-smoke commands drain stdout and stderr while they run.** A verbose guest
+  trigger can no longer fill an anonymous pipe and deadlock before the harness starts reading it.
+
+- **An M6 trace failure is published before its worker releases the running-job claim.** A stopping
+  engine-free read can no longer observe a terminal job in the interval before its restoration or
+  re-arm failure becomes visible.
+
 - **Stopping an M6 service trace while its worker is decoding the current stop returns the
   completed prefix.** The stop-vs-observation lock now reports that linearized outcome separately
   from decoder and recorder failures, so successful restoration cannot leave the trace job
@@ -308,7 +329,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unique, and interval-only rank matching is withheld while any candidate's classification is
   unproved.
 
-- **Guarded Secure Kernel write bytes reject non-ASCII input before byte-pair parsing.** A
+- **Secure Kernel instruction and guarded-write bytes reject non-ASCII input before byte-pair parsing.** A
   multibyte character with an even UTF-8 byte length could previously pass the length check and
   panic when the MCP handler sliced through the character; malformed input now returns the same
   typed non-hexadecimal argument error as other invalid bytes.

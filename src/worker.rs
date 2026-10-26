@@ -2128,6 +2128,10 @@ fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
         if ending_session && result.is_err() {
             KERNEL_SAFETY.preserve();
         }
+        // The supervisor's engine-free trace reader uses the running claim as its terminal
+        // boundary. Publish any failure before giving that claim back, so a stopping read cannot
+        // observe "job finished" in the interval before the failure becomes visible.
+        record_service_trace_failure(id, &result);
         let result = if release(id) {
             // The engine may have consumed the Ctrl+Break, or the request may have been lodged as
             // the operation was already returning — in which case it is still pending with nothing
@@ -2139,10 +2143,6 @@ fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
         } else {
             result
         };
-        // The supervisor consumes an armed trace job's final reply in the background. Retain its
-        // failure beside the immutable prefix before any queued read can run, so restoration or
-        // re-arm failure cannot be mistaken for a successful stopped trace.
-        record_service_trace_failure(id, &result);
         // **Before the `Done`, which is what makes it worth a message of its own.** The channel is
         // one pipe read in order, so a retirement sent here is applied by the supervisor before
         // this op's answer reaches its caller — and before anything queued behind it is
@@ -15584,19 +15584,19 @@ mod tests {
         assert!(eof.contains("stop_active_service_trace();"));
 
         let completion = source
-            .split_once("        let result = if release(id) {")
+            .split_once("        record_service_trace_failure(id, &result);")
             .expect("the engine-thread completion boundary exists")
             .1
             .split_once("        if let Emit::Unencodable")
             .expect("the ordinary Done emission ends the completion boundary")
             .0;
-        let retained_failure = completion
-            .find("record_service_trace_failure(id, &result);")
-            .expect("trace failure is retained on the engine thread");
+        let released = completion
+            .find("let result = if release(id) {")
+            .expect("the running claim is released on the engine thread");
         let target_watch = completion
             .find("watch_the_target(&engine, id, watch);")
             .expect("target observation precedes the job reply");
-        assert!(retained_failure < target_watch);
+        assert!(released < target_watch);
     }
 
     #[test]

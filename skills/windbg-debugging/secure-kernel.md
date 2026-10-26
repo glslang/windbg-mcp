@@ -359,7 +359,7 @@ Note that `live_control_unresolved` also appears **transiently** on a healthy re
 Six things about that sequence are not visible from the tool signatures, and each one costs a run
 against somebody's VM to discover:
 
-- **These fifteen tools are an `extra` group**, so a client that asks for nothing is served none of
+- **These twenty-three tools are an `extra` group**, so a client that asks for nothing is served none of
   them and `open_sk_live_control` is refused `-32602` naming `--tools`. The group is widened on the
   server's command line — except on a listener, where a client may carry its own surface
   (`WINDBG_MCP_TOOLS_<NAME>`, or a `tools` field in the credential file) that replaces the run's

@@ -75,7 +75,7 @@
 //! See `docs/smoke-test.md` for the runbook.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
@@ -23251,22 +23251,43 @@ fn managed_secure_kernel_kd_lifecycle_script_does_not_require_symbols() {
 
 struct ConfiguredCommand {
     child: Option<Child>,
+    stdout: Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>,
+    stderr: Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>,
     what: String,
 }
 
 impl ConfiguredCommand {
+    fn collect(
+        reader: &mut Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>,
+        stream: &str,
+    ) -> Vec<u8> {
+        reader
+            .take()
+            .unwrap_or_else(|| panic!("configured command still owns its {stream} reader"))
+            .join()
+            .unwrap_or_else(|_| panic!("configured command {stream} reader panicked"))
+            .unwrap_or_else(|error| panic!("reading configured command {stream}: {error}"))
+    }
+
+    fn output(&mut self, status: std::process::ExitStatus) -> std::process::Output {
+        std::process::Output {
+            status,
+            stdout: Self::collect(&mut self.stdout, "stdout"),
+            stderr: Self::collect(&mut self.stderr, "stderr"),
+        }
+    }
+
     fn wait(mut self, within: Duration) -> std::process::Output {
         let deadline = Instant::now() + within;
-        loop {
-            if self
+        let status = loop {
+            if let Some(status) = self
                 .child
                 .as_mut()
                 .expect("configured command still owns its process")
                 .try_wait()
                 .expect("query the command")
-                .is_some()
             {
-                break;
+                break status;
             }
             if Instant::now() >= deadline {
                 let mut child = self
@@ -23275,24 +23296,25 @@ impl ConfiguredCommand {
                     .expect("configured command owns a process");
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = self.stdout.take().map(std::thread::JoinHandle::join);
+                let _ = self.stderr.take().map(std::thread::JoinHandle::join);
                 panic!("{} exceeded {within:?}", self.what);
             }
             std::thread::sleep(Duration::from_millis(100));
-        }
-        self.child
-            .take()
-            .expect("configured command owns a process")
-            .wait_with_output()
-            .expect("collect the command's output")
+        };
+        self.child.take();
+        self.output(status)
     }
 }
 
 impl Drop for ConfiguredCommand {
     fn drop(&mut self) {
-        if let Some(child) = self.child.as_mut() {
+        if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
+        let _ = self.stdout.take().map(std::thread::JoinHandle::join);
+        let _ = self.stderr.take().map(std::thread::JoinHandle::join);
     }
 }
 
@@ -23305,7 +23327,7 @@ fn spawn_configured_command(command: &Value, what: &str) -> ConfiguredCommand {
         .first()
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("{what} names a program"));
-    let child = Command::new(program)
+    let mut child = Command::new(program)
         .args(
             command[1..]
                 .iter()
@@ -23317,8 +23339,28 @@ fn spawn_configured_command(command: &Value, what: &str) -> ConfiguredCommand {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap_or_else(|error| panic!("launching {what}: {error}"));
+    let stdout = child
+        .stdout
+        .take()
+        .expect("configured command owns its piped stdout");
+    let stderr = child
+        .stderr
+        .take()
+        .expect("configured command owns its piped stderr");
     ConfiguredCommand {
         child: Some(child),
+        stdout: Some(std::thread::spawn(move || {
+            let mut stdout = stdout;
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes)?;
+            Ok(bytes)
+        })),
+        stderr: Some(std::thread::spawn(move || {
+            let mut stderr = stderr;
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes)?;
+            Ok(bytes)
+        })),
         what: what.to_string(),
     }
 }
@@ -23326,6 +23368,24 @@ fn spawn_configured_command(command: &Value, what: &str) -> ConfiguredCommand {
 /// Run a configured host-side command array to completion and return its output.
 fn run_configured_command(command: &Value, what: &str, within: Duration) -> std::process::Output {
     spawn_configured_command(command, what).wait(within)
+}
+
+#[test]
+fn configured_commands_drain_both_pipes_while_the_child_runs() {
+    const BYTES: usize = 256 * 1024;
+    let command = serde_json::json!([
+        "powershell.exe",
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "$payload = 'x' * 262144; [Console]::Out.Write($payload); [Console]::Error.Write($payload)"
+    ]);
+
+    let output = run_configured_command(&command, "pipe-drain regression", Duration::from_secs(10));
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout.len(), BYTES);
+    assert_eq!(output.stderr.len(), BYTES);
 }
 
 /// M8's demonstration: the Secure Kernel driven end to end through this server's **own**
