@@ -1476,6 +1476,12 @@ impl<P: ControlProvider> LiveControl<P> {
         Ok(())
     }
 
+    fn first_unreserved_slot(&self) -> Result<u8> {
+        (0..MAX_HARDWARE_BREAKPOINTS as u8)
+            .find(|slot| self.reserved_slots & (1 << *slot) == 0)
+            .context("no unreserved hardware-breakpoint slot is available for the CR3 step")
+    }
+
     /// The debug-register slots this controller may write: the ones it has armed, plus `extra`
     /// (a slot a step borrows or has just released).
     fn owned_slots(&self, extra: impl IntoIterator<Item = u8>) -> Vec<u8> {
@@ -2327,17 +2333,11 @@ impl<P: ControlProvider> LiveControl<P> {
                 StopReason::HardwareBreakpoint { slot }
                 | StopReason::BreakRequest { slot }
                 | StopReason::StepOver { slot, .. } => slot,
-                StopReason::SingleStep => {
-                    self.breakpoints
-                        .first()
-                        .context("the stepping session has no hardware-breakpoint slot to borrow")?
-                        .slot
-                }
-                StopReason::SoftwareBreakpoint { .. } => (0..MAX_HARDWARE_BREAKPOINTS as u8)
-                    .find(|slot| self.reserved_slots & (1 << *slot) == 0)
-                    .context(
-                        "no unreserved hardware-breakpoint slot is available for the CR3 step",
-                    )?,
+                StopReason::SingleStep => match self.breakpoints.first() {
+                    Some(breakpoint) => breakpoint.slot,
+                    None => self.first_unreserved_slot()?,
+                },
+                StopReason::SoftwareBreakpoint { .. } => self.first_unreserved_slot()?,
                 StopReason::DebugException | StopReason::BreakpointException => {
                     bail!("the stopped event has no validated reason")
                 }
@@ -7773,6 +7773,98 @@ mod tests {
             cr3_write.successor(),
             "the CR3 successor uses the first unreserved slot"
         );
+    }
+
+    #[test]
+    fn a_cr3_step_after_a_software_single_step_borrows_an_unreserved_slot() {
+        let first = instruction();
+        let cr3_write = InstructionGuard {
+            address: HexU64(first.successor()),
+            bytes: vec![0x0f, 0x22, 0xdc],
+        };
+        let mut dispatcher = FakeDispatcher::new([
+            observed(StopReason::HardwareBreakpoint { slot: 1 }),
+            observed_software(),
+            observed(StopReason::SingleStep),
+        ]);
+        let provider = FakeProvider::new()
+            .with_hardware_slot(1)
+            .with_single_step_rips([cr3_write.address.0]);
+        let mut control =
+            LiveControl::open_many_with_options(vec![provider], false, 0b0001).unwrap();
+        control
+            .arm(
+                &mut dispatcher,
+                vec![BreakpointGuard {
+                    slot: 1,
+                    instruction: first.clone(),
+                }],
+                ArmMode::Natural,
+            )
+            .unwrap();
+        let hardware = control.wait_for_stop(&mut dispatcher).unwrap();
+
+        let foreign = 0xffff_f804_a105_eeb0;
+        set_low(
+            &mut control.providers[0].provider.registers,
+            RegisterName::Dr0,
+            foreign,
+        );
+        control
+            .continue_to_software_breakpoints_until(
+                &mut dispatcher,
+                &hardware.epoch,
+                vec![first],
+                Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+        dispatcher.retained_recovery_deadline =
+            Some(Instant::now() + std::time::Duration::from_secs(1));
+        let software = control.wait_for_stop(&mut dispatcher).unwrap();
+        control
+            .step_retained_breakpoint_until(
+                &mut dispatcher,
+                &software.epoch,
+                StepGuard {
+                    instruction: Some(software.instruction),
+                    expected_rips: Vec::new(),
+                },
+                Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+        let single_step = control.wait_for_stop(&mut dispatcher).unwrap();
+        assert_eq!(single_step.event.reason, StopReason::SingleStep);
+        assert_eq!(
+            single_step.registers.low(RegisterName::Rip).unwrap(),
+            cr3_write.address.0
+        );
+
+        control
+            .step(
+                &mut dispatcher,
+                &single_step.epoch,
+                StepGuard {
+                    instruction: Some(cr3_write.clone()),
+                    expected_rips: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            control.expected_stop,
+            Some(ExpectedStop::StepOver { slot: 1, .. })
+        ));
+        let registers = &control.test_provider().registers;
+        let low = |name| {
+            registers
+                .iter()
+                .find(|register| register.name == name)
+                .unwrap()
+                .low
+                .0
+        };
+        assert_eq!(low(RegisterName::Dr0), foreign);
+        assert_eq!(low(RegisterName::Dr1), cr3_write.successor());
     }
 
     /// With the VTL1 controller armed before the VTL0 debugger, the debugger's address appears in
