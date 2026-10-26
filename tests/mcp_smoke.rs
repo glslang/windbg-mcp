@@ -23257,6 +23257,21 @@ struct ConfiguredCommand {
 }
 
 impl ConfiguredCommand {
+    fn readers_finished(&self) -> bool {
+        self.stdout
+            .as_ref()
+            .is_none_or(std::thread::JoinHandle::is_finished)
+            && self
+                .stderr
+                .as_ref()
+                .is_none_or(std::thread::JoinHandle::is_finished)
+    }
+
+    fn detach_readers(&mut self) {
+        drop(self.stdout.take());
+        drop(self.stderr.take());
+    }
+
     fn collect(
         reader: &mut Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>,
         stream: &str,
@@ -23296,13 +23311,22 @@ impl ConfiguredCommand {
                     .expect("configured command owns a process");
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = self.stdout.take().map(std::thread::JoinHandle::join);
-                let _ = self.stderr.take().map(std::thread::JoinHandle::join);
+                self.detach_readers();
                 panic!("{} exceeded {within:?}", self.what);
             }
             std::thread::sleep(Duration::from_millis(100));
         };
         self.child.take();
+        while !self.readers_finished() {
+            if Instant::now() >= deadline {
+                self.detach_readers();
+                panic!(
+                    "{} exited, but its output pipes did not close within {within:?}",
+                    self.what
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         self.output(status)
     }
 }
@@ -23313,8 +23337,7 @@ impl Drop for ConfiguredCommand {
             let _ = child.kill();
             let _ = child.wait();
         }
-        let _ = self.stdout.take().map(std::thread::JoinHandle::join);
-        let _ = self.stderr.take().map(std::thread::JoinHandle::join);
+        self.detach_readers();
     }
 }
 
@@ -23386,6 +23409,78 @@ fn configured_commands_drain_both_pipes_while_the_child_runs() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(output.stdout.len(), BYTES);
     assert_eq!(output.stderr.len(), BYTES);
+}
+
+#[test]
+fn configured_command_output_readers_obey_the_command_deadline() {
+    let child = Command::new("cmd.exe")
+        .args(["/d", "/c", "exit", "0"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let stdout = std::thread::spawn(move || {
+        let _ = held.recv();
+        Ok(Vec::new())
+    });
+    let command = ConfiguredCommand {
+        child: Some(child),
+        stdout: Some(stdout),
+        stderr: Some(std::thread::spawn(|| Ok(Vec::new()))),
+        what: "blocked output reader regression".into(),
+    };
+    let started = Instant::now();
+
+    let waiting = std::thread::spawn(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            command.wait(Duration::from_secs(1))
+        }))
+    });
+    while !waiting.is_finished() && started.elapsed() < Duration::from_secs(3) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let completed = waiting.is_finished();
+    drop(release);
+    let result = waiting.join().expect("the deadline test thread survives");
+
+    assert!(completed, "the output reader was joined without a bound");
+    let panic = result.expect_err("an inherited pipe must spend the deadline");
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("non-string panic");
+    assert!(message.contains("output pipes did not close"), "{message}");
+}
+
+#[test]
+fn configured_command_drop_detaches_a_blocked_output_reader() {
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let command = ConfiguredCommand {
+        child: None,
+        stdout: Some(std::thread::spawn(move || {
+            let _ = held.recv();
+            Ok(Vec::new())
+        })),
+        stderr: None,
+        what: "blocked drop reader regression".into(),
+    };
+    let started = Instant::now();
+
+    let dropping = std::thread::spawn(move || drop(command));
+    while !dropping.is_finished() && started.elapsed() < Duration::from_secs(1) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let completed = dropping.is_finished();
+    drop(release);
+    dropping.join().expect("the drop test thread survives");
+
+    assert!(
+        completed,
+        "Drop joined a reader whose pipe can still be inherited"
+    );
 }
 
 /// M8's demonstration: the Secure Kernel driven end to end through this server's **own**

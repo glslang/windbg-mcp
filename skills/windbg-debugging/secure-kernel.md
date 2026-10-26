@@ -392,8 +392,11 @@ a checkpoint can be read on a different machine from the one that made it. For a
 a *running* guest, use `--sk-live`: the transport is theirs to supply, the server ships none, and the
 role runs on the debugger host outside MCP. For a controlled stop, stopped-state inspection, step or
 resume at a chosen address, use `open_sk_live_control` and the epoch-bound MCP sequence above, after
-the operator supplies the exact disposable target and both providers. If they want **WinDbg itself**
-on that stop, use `open_sk_kd`. It returns a generated local named pipe for
+the operator supplies the exact disposable target and both providers. For an ordinary MCP debugger
+on that target, use `open_sk_debugger`: it creates one managed session whose DbgEng worker is paired
+with the hidden Secure Kernel controller, so the generic symbol, stack, disassembly, breakpoint and
+execution tools apply. If they want **external WinDbg itself** on that stop, use `open_sk_kd`. It
+returns a generated local named pipe for
 `kd -k com:pipe,port=\\.\pipe\<name>,resets=0`, while MCP retains lifecycle and recovery and WinDbg
 owns execution. The `--sk-kd-target` role remains a standalone diagnostic fallback. What has been
 measured through the facade is one `t`, an `r` after it and `q` — the limits are in

@@ -1418,6 +1418,11 @@ impl Session {
     fn preserve_composite_controller(&self, why: String) {
         let public_peer_gone = self.release_or_handoff_verified();
         self.update_state(|state| {
+            // Losing the hidden controller does not settle an already-unresolved public attach;
+            // only its explicit kernel handoff can release that worker and its endpoint claim.
+            if matches!(state, SessionState::KernelUnresolved(_)) {
+                return None;
+            }
             (state.is_live() || (public_peer_gone && matches!(state, SessionState::Closed(_))))
                 .then_some(SessionState::LiveControlUnresolved(why))
         });
@@ -9458,6 +9463,40 @@ mod tests {
         assert!(matches!(kernel.state(), SessionState::Closed(_)));
         kernel.preserve_kernel("late worker EOF racing the verified handoff");
         assert!(matches!(kernel.state(), SessionState::Closed(_)));
+    }
+
+    #[tokio::test]
+    async fn composite_controller_failure_does_not_hide_kernel_handoff() {
+        let debugger = kernel_with_child_in(
+            "composite-kernel-unresolved",
+            SessionState::KernelUnresolved("attach completion is unconfirmed".into()),
+        );
+        let mut controller =
+            Arc::into_inner(dormant("composite-controller", SessionState::Open)).unwrap();
+        controller.kind = SessionKind::SecureKernelKd;
+        let controller = Arc::new(controller);
+        let sessions = Sessions::new(Duration::from_secs(1));
+        sessions.admit_as(&controller, true).unwrap();
+        sessions
+            .admit_with_companion(&debugger, false, Some(&controller.id))
+            .unwrap();
+
+        debugger.preserve_composite_controller("the controller also needs recovery".into());
+        assert_eq!(
+            debugger.state(),
+            SessionState::KernelUnresolved("attach completion is unconfirmed".into()),
+            "controller recovery must not erase the public worker's handoff state"
+        );
+
+        let ended = sessions
+            .kernel_handoff(&debugger, debugger.pid)
+            .await
+            .expect("the original unresolved-kernel recovery path remains accepted")
+            .data
+            .unwrap();
+        assert_eq!(ended["worker_terminated"], true);
+        assert_eq!(ended["recovery_required"], true);
+        assert!(debugger.child.lock().unwrap().is_none());
     }
 
     #[tokio::test]
