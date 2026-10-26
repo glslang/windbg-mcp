@@ -1442,30 +1442,41 @@ fn pair_round_trips(
 ) -> Vec<RoundTrip> {
     let mut open: Vec<RoundTrip> = Vec::new();
     let mut trips: Vec<RoundTrip> = Vec::new();
-    let mut vp: Option<Option<u8>> = None;
+    let mut vp: Option<u8> = None;
     for event in events {
-        match vp {
-            None => vp = Some(event.vp_index),
-            Some(first) if first != event.vp_index => marks.push(Mark {
+        let same_vp = match (vp, event.vp_index) {
+            (None, Some(current)) => {
+                vp = Some(current);
+                true
+            }
+            (Some(first), Some(current)) if first == current => true,
+            _ => false,
+        };
+        if !same_vp {
+            marks.push(Mark {
                 layer: Some(Layer::M5Hypervisor),
                 kind: MarkKind::SeveralVps,
                 sequence: Some(event.sequence),
                 after_sequence: None,
                 detail: format!(
                     "transition {} is on VP {:?} where the first was on VP {:?}",
-                    event.sequence, event.vp_index, first
+                    event.sequence, event.vp_index, vp
                 ),
-            }),
-            Some(_) => {}
+            });
         }
-        match (event.kind, event.source_vtl, event.target_vtl) {
-            (TransitionKind::VtlCall, Some(0), Some(1)) => open.push(RoundTrip {
+        let role = same_vp.then_some(match (event.kind, event.source_vtl, event.target_vtl) {
+            (TransitionKind::VtlCall, Some(0), Some(1)) => Some(TransitionKind::VtlCall),
+            (TransitionKind::VtlReturn, Some(1), Some(0)) => Some(TransitionKind::VtlReturn),
+            _ => None,
+        });
+        match role.flatten() {
+            Some(TransitionKind::VtlCall) => open.push(RoundTrip {
                 call_sequence: event.sequence,
                 return_sequence: None,
                 call_tick: clock.tick(event.host_qpc),
                 return_tick: None,
             }),
-            (TransitionKind::VtlReturn, Some(1), Some(0)) => match open.pop() {
+            Some(TransitionKind::VtlReturn) => match open.pop() {
                 Some(mut trip) => {
                     trip.return_sequence = Some(event.sequence);
                     trip.return_tick = clock.tick(event.host_qpc);
@@ -1494,16 +1505,48 @@ fn pair_round_trips(
                     });
                 }
             },
-            _ => marks.push(Mark {
-                layer: Some(Layer::M5Hypervisor),
-                kind: MarkKind::UnexpectedTransition,
-                sequence: Some(event.sequence),
-                after_sequence: None,
-                detail: format!(
-                    "transition {} is {:?} from VTL {:?} to VTL {:?}, neither a VTL0 call nor a VTL1 return",
-                    event.sequence, event.kind, event.source_vtl, event.target_vtl
-                ),
-            }),
+            _ => {
+                marks.push(Mark {
+                    layer: Some(Layer::M5Hypervisor),
+                    kind: MarkKind::UnexpectedTransition,
+                    sequence: Some(event.sequence),
+                    after_sequence: None,
+                    detail: format!(
+                        "transition {} is {:?} from VTL {:?} to VTL {:?} on VP {:?}, so it is a pairing barrier",
+                        event.sequence,
+                        event.kind,
+                        event.source_vtl,
+                        event.target_vtl,
+                        event.vp_index
+                    ),
+                });
+                for trip in open.drain(..) {
+                    marks.push(Mark {
+                        layer: Some(Layer::M5Hypervisor),
+                        kind: MarkKind::UnmatchedCall,
+                        sequence: Some(trip.call_sequence),
+                        after_sequence: None,
+                        detail: format!(
+                            "VTL call {} has no proved return before pairing barrier {}",
+                            trip.call_sequence, event.sequence
+                        ),
+                    });
+                    unmatched.push(Unmatched {
+                        m6_sequence: None,
+                        stage: Some(Stage::M5VtlCall),
+                        event: Some(EventId {
+                            layer: Layer::M5Hypervisor,
+                            sequence: trip.call_sequence,
+                            stage: Stage::M5VtlCall,
+                        }),
+                        reason: format!(
+                            "pairing barrier {} prevents proving this VTL call's return",
+                            event.sequence
+                        ),
+                    });
+                    trips.push(trip);
+                }
+            }
         }
     }
     for trip in open {
@@ -1531,6 +1574,26 @@ fn pair_round_trips(
     }
     trips.sort_by_key(|trip| trip.call_sequence);
     trips
+}
+
+fn m5_has_pairing_barrier(events: &[M5Event]) -> bool {
+    let mut vp = None;
+    events.iter().any(|event| {
+        let same_vp = match (vp, event.vp_index) {
+            (None, Some(current)) => {
+                vp = Some(current);
+                true
+            }
+            (Some(first), Some(current)) => first == current,
+            _ => false,
+        };
+        !same_vp
+            || !matches!(
+                (event.kind, event.source_vtl, event.target_vtl),
+                (TransitionKind::VtlCall, Some(0), Some(1))
+                    | (TransitionKind::VtlReturn, Some(1), Some(0))
+            )
+    })
 }
 
 /// Which round trips could hold an instant: the one that strictly encloses it, plus any whose
@@ -1603,6 +1666,7 @@ struct Ctx<'a> {
     clock: Clock,
     m4: Option<(&'a LayerSummary, &'a [M4Event])>,
     m5: Option<(&'a LayerSummary, &'a [RoundTrip])>,
+    m5_events: Option<&'a [M5Event]>,
     m6: &'a LayerSummary,
     m6_entries: usize,
     m4_candidates: Vec<usize>,
@@ -1814,6 +1878,29 @@ fn decide_m5(ctx: &Ctx<'_>, tick: Option<u64>, stage: Stage) -> (Decision, Optio
             None,
         );
     };
+    let events = ctx
+        .m5_events
+        .expect("M5 summary and events travel together");
+    if m5_has_pairing_barrier(events) {
+        let kind = match stage {
+            Stage::M5VtlCall => TransitionKind::VtlCall,
+            Stage::M5VtlReturn => TransitionKind::VtlReturn,
+            _ => unreachable!("only M5 stages are decided here"),
+        };
+        return (
+            Decision::Ambiguous {
+                candidates: Candidates::new(
+                    stage,
+                    events
+                        .iter()
+                        .filter(|event| event.kind == kind || event.kind == TransitionKind::Other)
+                        .map(|event| event.sequence),
+                ),
+                reason: "an unclassified hypervisor transition is a pairing barrier, so no call/return pairing across this trace is unique".into(),
+            },
+            None,
+        );
+    }
     if trips.is_empty() {
         return (
             Decision::Unmatched {
@@ -2057,6 +2144,7 @@ pub(crate) fn join(input: &JoinInput) -> anyhow::Result<JoinedCapture> {
         m5: m5
             .as_ref()
             .map(|(summary, _)| (summary, round_trips.as_slice())),
+        m5_events: m5.as_ref().map(|(_, events)| events.as_slice()),
         m6: &m6_summary,
         m6_entries: m6_events
             .iter()
@@ -3361,6 +3449,75 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn unreadable_m5_transitions_are_pairing_barriers() {
+        let fixture = fixture(9, 1, true);
+        let truth = fixture.truth[0].clone();
+        let mut broken = fixture.input;
+        let entry_tick = records_mut(&mut broken)[0]["entry"]["site"]["host_qpc"]["tick"]
+            .as_u64()
+            .unwrap();
+        *transitions_mut(&mut broken) = vec![
+            json!({
+                "sequence": 0, "host_qpc": {"tick": entry_tick - 30, "frequency": FREQUENCY},
+                "host_monotonic_us": 10, "kind": "vtl_call", "vp_index": 3,
+                "source_vtl": 0, "target_vtl": 1,
+                "provenance": {"read_failures": []}
+            }),
+            json!({
+                "sequence": 1, "host_qpc": {"tick": entry_tick - 20, "frequency": FREQUENCY},
+                "host_monotonic_us": 20, "kind": "vtl_return", "vp_index": 3,
+                "source_vtl": null, "target_vtl": null,
+                "provenance": {"read_failures": ["source_vtl", "target_vtl"]}
+            }),
+            json!({
+                "sequence": 2, "host_qpc": {"tick": entry_tick - 10, "frequency": FREQUENCY},
+                "host_monotonic_us": 30, "kind": "vtl_call", "vp_index": 3,
+                "source_vtl": null, "target_vtl": null,
+                "provenance": {"read_failures": ["source_vtl", "target_vtl"]}
+            }),
+            json!({
+                "sequence": 3, "host_qpc": {"tick": entry_tick + 10, "frequency": FREQUENCY},
+                "host_monotonic_us": 40, "kind": "vtl_return", "vp_index": 3,
+                "source_vtl": 1, "target_vtl": 0,
+                "provenance": {"read_failures": []}
+            }),
+        ];
+        broken.layers.m5_hypervisor.as_mut().unwrap().trace["unreadable_hits"] = json!(2);
+
+        let joined = join(&broken).unwrap();
+        assert!(
+            joined
+                .round_trips
+                .iter()
+                .all(|trip| trip.call_sequence != 0 || trip.return_sequence != Some(3))
+        );
+        assert!(joined.marks.iter().any(|mark| {
+            mark.kind == MarkKind::UnexpectedTransition && mark.sequence == Some(1)
+        }));
+        assert!(joined.marks.iter().any(|mark| {
+            mark.kind == MarkKind::UnexpectedTransition && mark.sequence == Some(2)
+        }));
+        let chain = chain_for(&joined, truth.m6_sequence);
+        for (decision, expected) in [
+            (&chain.stages.m5_vtl_call, [0, 2]),
+            (&chain.stages.m5_vtl_return, [1, 3]),
+        ] {
+            let Decision::Ambiguous { candidates, reason } = decision else {
+                panic!("a pairing barrier must withhold the M5 match: {decision:?}");
+            };
+            let listed: Vec<u64> = candidates
+                .sequence_ranges
+                .iter()
+                .flat_map(|range| range.first..=range.last)
+                .collect();
+            assert_eq!(listed, expected);
+            assert!(reason.contains("pairing barrier"), "{reason}");
+        }
+        assert!(chain.call_id.is_none());
+        assert_eq!(chain.verdict, ChainVerdict::Incomplete);
     }
 
     #[test]
