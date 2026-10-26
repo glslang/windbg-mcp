@@ -390,6 +390,12 @@ pub struct OpenedSession {
     pub kind: SessionKindName,
     /// What was opened — a path, a pid, a redacted connection label. Never carries a debug key.
     pub target: String,
+    /// A generated debugger connection the caller is meant to hand to another local process.
+    /// Present only for the standalone Secure Kernel KD facade. It is absent from ordinary
+    /// kernel attaches (whose connection may carry a key) and from the composite Secure Kernel
+    /// debugger (whose private pipe must remain supervisor-owned).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection: Option<String>,
     /// The opener's own diagnostic (`vertarget`, `r`, the TTD lifetime query), verbatim, with
     /// [`Self::summary`] rendered under it.
     pub report: String,

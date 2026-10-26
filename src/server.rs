@@ -2851,10 +2851,12 @@ pub(crate) fn changes_debug_target(command: &str) -> bool {
 /// A parameter rather than two functions, because everything else about an open is shared: the
 /// milestones, the phases, the withdrawal of a profile claim, and every failure branch with its
 /// own recovery advice. Only the success payload differs — see [`structured::SkOpenOutcome`].
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum OpenShape {
     /// A target DbgEng holds: what [`structured::OpenOutcome`] describes.
     Debuggee,
+    /// The standalone managed facade, including the generated local connection its peer needs.
+    SecureKernelKd { connection: String },
     /// A Hyper-V capture read for its Secure Kernel.
     Capture,
 }
@@ -3043,6 +3045,10 @@ impl WindbgServer {
                 // capture opener that answered with `OpenOutcome` would have to put its decode in
                 // `TargetSummary`, which is the arrangement `structured::SkOpenOutcome` records
                 // the cost of: 73 KB of schema inlined into seven openers for one tool's answer.
+                let connection = match &shape {
+                    OpenShape::SecureKernelKd { connection } => Some(connection.clone()),
+                    OpenShape::Debuggee | OpenShape::Capture => None,
+                };
                 match (shape, sk) {
                     (OpenShape::Capture, Some(capture)) => outcome_result(
                         text,
@@ -3069,12 +3075,13 @@ impl WindbgServer {
                         Some(id),
                         TargetCreated::Yes,
                     ),
-                    (OpenShape::Debuggee, _) => outcome_result(
+                    (OpenShape::Debuggee | OpenShape::SecureKernelKd { .. }, _) => outcome_result(
                         text,
                         structured::OpenOutcome::Ok(structured::OpenedSession {
                             session_id: id,
                             kind: kind.into(),
                             target,
+                            connection,
                             report,
                             summary,
                             profile: profile.map(Box::new),
@@ -4877,6 +4884,7 @@ impl WindbgServer {
         };
         let pipe_token = token.chars().take(32).collect::<String>();
         let pipe = format!("windbg-mcp-sk-{pipe_token}");
+        let connection = format!(r"com:pipe,port=\\.\pipe\{pipe},resets=0");
         let controller_what = format!("VM {} VTL1 VP {} KD pipe {}", target.vm_id, target.vp, pipe);
         let request = crate::kdtarget::ManagedRequest {
             open: crate::skdispatch::OpenRequest {
@@ -4914,7 +4922,7 @@ impl WindbgServer {
                     controller_what,
                     None,
                     EngineOp::OpenSecureKernelKd(Box::new(request)),
-                    OpenShape::Debuggee,
+                    OpenShape::SecureKernelKd { connection },
                     Some(EngineOp::SkKdServe),
                 )
                 .await;

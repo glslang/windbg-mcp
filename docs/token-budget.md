@@ -415,12 +415,14 @@ None of these is a bug. They are recorded because they were invisible, and
    ceilings therefore remain fixed, with 1,877 B (1.4%) and 4,582 B (1.1%) headroom respectively.
 
    M8's `open_sk_debugger` adds one composite opener over the existing facade contract. It moves
-   the complete surface to **89 tools and 139,414 B** and the payload to **413,570 B**. The total
+   the complete surface to **89 tools and 139,414 B** and the payload to **413,570 B**. M8.1's
+   typed generated KD connection then adds 40 B to each of the nine ordinary opener schemas,
+   moving the payload to **413,930 B** without changing model-visible context. The total
    model-visible increase is **3,291 B**: 2,822 B is the opener's own golden row and 469 B is the
    surrounding instruction/cross-reference update. It buys the one-handle session boundary rather
    than another debugger operation: the hidden facade and public DbgEng worker share capacity,
    status and ordered teardown. The model and wire ceilings move deliberately to **142,000 B** and
-   **420,000 B**, leaving 2,586 B (1.9%) and 6,430 B (1.6%) respectively.
+   **420,000 B**, leaving 2,586 B (1.9%) and 6,070 B (1.4%) respectively.
 
    **The two tables do not reconcile, and that is the point of item 41.** The first is each group's
    share of the whole surface; the second is what a spec actually serves, which is less — `crash`

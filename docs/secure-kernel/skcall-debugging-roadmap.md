@@ -1459,15 +1459,21 @@ facade remains available. That probe passed on 2026-10-26 against Secure Kernel 
 same K3 nested bench: all three execution routes completed, composite release restored the baseline,
 and the post-release audit found no enabled DR slot, no TF/RF, no engine worker, unchanged guarded
 text and a healthy child without forced recovery. This is the first single-run route proof, not the
-repeated M8.2 matrix. M8.1's launchers and M8.2's gate remain. M8 is independent of M6/M7's
-trace schema.
+repeated M8.2 matrix. M8.1 now also has a checked-in classic-WinDbg/WinDbgX launcher: it consumes
+the facade's typed generated connection, keeps the live config off child command lines, and always
+ends a post-commit session after the debugger exits or fails to start. Its fake-client contract is
+an ordinary smoke test; the real front ends remain unqualified until M8.2. M8 is independent of
+M6/M7's trace schema and of item 122's direct-`sk_live_*` image-resolution work: the composite
+already gets modules, symbols and disassembly through its ordinary DbgEng peer.
 
 #### M8.0 — packet-to-controller contract
 
 Write the translation table before changing the facade:
 
-- KD `WriteBreakpoint` reads and retains the complete instruction guard and reserves one of at most
-  four hardware slots; `RestoreBreakpoint` removes only that handle.
+- KD `WriteBreakpoint` reads and retains the complete instruction guard. The composite and a
+  read-only standalone facade reserve one of at most four hardware slots; a standalone facade
+  admitted for memory writes uses M3's guarded one-shot INT3 path. `RestoreBreakpoint` removes
+  only that handle.
 - legacy Continue and non-trace Continue2 (`g`) with breakpoints call the proved M1 guarded
   continue-to-breakpoints path and enter one owned wait.
 - `g` with no breakpoint enters a distinct bounded running wait that can be stopped only by M2
@@ -1497,16 +1503,22 @@ the exact disposition. Both workers remain in the supervisor's internal registry
 public handle is visible and routable. Teardown closes the managed DbgEng peer first and lets only the hidden
 controller restore and release VTL1; generic KD `qd` cannot encode a distinct detach to this facade.
 
-Add PowerShell launchers for classic WinDbg and WinDbgX that resolve the executable and generated
-pipe from any working directory, keep credentials/keys off command lines and logs, and always end
-the MCP session after the debugger exits. Script tests use paths containing spaces, missing
-debuggers, early debugger exit and a fake client so they need neither elevation nor a live VM.
+The composite half is implemented and has one live route proof. The PowerShell launcher is now
+checked in at `tools/launch_sk_kd.ps1`: it resolves classic WinDbg or WinDbgX and the server from
+any working directory, reads the open arguments from JSON, consumes `open_sk_kd`'s typed generated
+connection, keeps configuration and policy values off child command lines, and always sends
+`end_session` after the debugger exits. Its offline fake-client test covers paths containing spaces,
+missing debuggers, early debugger exit and a failed open that still returned a recovery handle.
+The remaining acceptance is the real-client matrix in M8.2, not more launcher mechanics.
 
 #### M8.2 — live compatibility and safety gate
 
 Qualify classic WinDbg and WinDbgX separately on each of three clean boots. Each client must pass:
 
-- 100 `bp` → `g` → owned-stop cycles at the deterministic M1 site, including set/list/remove;
+- 100 `bp` → `g` → owned-stop cycles at the deterministic M1 site with the read-only policy's
+  hardware-slot mapping, including set/list/remove;
+- 100 more cycles with the write-authorized standalone facade's M3 guarded-INT3 mapping, including
+  proof that the original byte is restored at every stop and release;
 - 25 `g`-without-breakpoint → Ctrl+Break cycles using the M2 request;
 - natural-stop-wins, Ctrl+Break-wins, already-stopped, no-hit/timeout, reset, disconnect,
   reconnect and MCP-teardown races; and
@@ -1516,6 +1528,15 @@ Qualify classic WinDbg and WinDbgX separately on each of three clean boots. Each
 Every arm audits exact DR0–DR3/DR6/DR7/RFLAGS restoration, unchanged Secure Kernel text, one
 selected VP, same boot/`vmwp`, heartbeat and retained processes. A reset, hang, ambiguous stop or
 unproved restoration fails the gate and leaves ordinary `g` disabled.
+
+Run this in two engineering slices. M8.2a is an ignored qualification runner, completed offline
+before another live attempt: it takes explicit classic-WinDbg and WinDbgX paths, separate read-only
+and write-authorized startup policies, one counted guest trigger and the existing post-release
+audit; emits one JSON artifact per frontend/backend arm; and records boot identity before and after
+every arm. It must coordinate each `g` from transcript markers rather than sleeps, and a failed arm
+must still end the MCP session and run the audit. M8.2b is the three-boot execution of that fixed
+runner. On each boot it runs classic/hardware, classic/INT3, WinDbgX/hardware and WinDbgX/INT3 in
+that order, then the shared free-run and race rows. A code or config edit resets the boot count.
 
 Exit: both front ends perform `bp`/`g`/Ctrl+Break repeatedly through the managed session, all race
 controls have unique results, launchers work outside the repository, and the refusal is removed

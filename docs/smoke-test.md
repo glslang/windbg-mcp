@@ -273,6 +273,10 @@ is one run of each route on one boot and not M8.2's gate. It passed on 2026-10-2
 nested bench against Secure Kernel 26100.9457: the post-release audit reported DR0–DR3 zero, DR7
 `0x400`, TF/RF clear, unchanged state, zero engine workers and heartbeat OK. The runner removed the
 durable guest trigger after composite release and needed no forced recovery.
+The ordinary (non-live) smoke tier also runs `tools/test_launch_sk_kd.ps1`. Its fake MCP client
+proves that the M8 launcher consumes the typed generated connection, accepts an executable path
+containing spaces, refuses a missing debugger before opening, ends the managed session after an
+early debugger exit, and also ends a post-commit failed open that returned a recovery handle.
 The separate ignored test
 `a_managed_secure_kernel_kd_session_resolves_symbols_and_unwinds_a_natural_stop`
 requires `symbol_path` naming a prepared local symbol cache and `arm_mode: "natural"`. It forces a

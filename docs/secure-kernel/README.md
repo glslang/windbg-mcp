@@ -70,6 +70,9 @@ told that the guest never held, and the one live run it rests on are in
 `open_sk_debugger` is the MCP-native route over the same facade: it owns a hidden controller worker
 plus an ordinary DbgEng worker as one session and makes the generic debugger tools available on
 the returned handle. Ending it detaches DbgEng before releasing the controller.
+For an external interactive client, [`tools/launch_sk_kd.ps1`](../../tools/launch_sk_kd.ps1)
+opens the managed facade from a JSON argument file, launches either classic WinDbg or WinDbgX from
+the typed generated connection, and ends the MCP session when that debugger exits.
 
 ## The answer so far
 
