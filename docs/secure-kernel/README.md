@@ -65,9 +65,11 @@ a fall-through single step and quit — into the same guarded controller operati
 ([#463](https://github.com/glslang/windbg-mcp/pull/463)). Since 2026-10-25 a non-trace continue
 is routed onto the controller's qualified M1 path, or onto a bounded free run when no breakpoint
 is installed, and a running Ctrl+Break onto its M2 rendezvous; the roadmap's M8.2 gate is where
-those routes are live-qualified, and a failure there brings the earlier refusal back. It is a facade for the debugger over the root-driven controller, not a KD transport inside
+those routes were live-qualified. The three-clean-boot composite gate passed 75/75 running
+break-ins, and both real frontends separately passed 100 hardware and 100 guarded-INT3 hits. It is
+a facade for the debugger over the root-driven controller, not a KD transport inside
 the guest: Secure Kernel still ships none, which is gate S5a below. What it can do, what WinDbg is
-told that the guest never held, and the one live run it rests on are in
+told that the guest never held, and the qualification evidence it rests on are in
 [`kd-facade.md`](kd-facade.md).
 `open_sk_debugger` is the MCP-native route over the same facade: it owns a hidden controller worker
 plus an ordinary DbgEng worker as one session and makes the generic debugger tools available on

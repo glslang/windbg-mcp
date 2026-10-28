@@ -31,10 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unresolved peer preserves the controller, controller failure is carried onto the public recovery
   handle, and a facade that commits before its peer opens is revealed rather than stranded.
   `open_sk_kd` remains the explicit external-WinDbg facade. Named-pipe kernel reservations now
-  conflict by pipe name rather than with every kernel endpoint. The first live composite gate
-  passed on 2026-10-26 against Secure Kernel 26100.9457 on the K3 nested bench: generic symbols,
-  modules, stack, x64 disassembly, a hardware `bp`/`g`, `t`, a free `g` and running break-in all
-  completed, followed by a clean release and independent state audit with no forced recovery. A
+  conflict by pipe name rather than with every kernel endpoint. The final composite passed on
+  three clean K3 boots against Secure Kernel 26100.9457: generic symbols, modules, stack, x64
+  disassembly, a hardware `bp`/`g`, `t`, and 75/75 free-`g` running break-ins completed, with clean
+  release and the independent 60-second state audit on every boot. Classic WinDbg and WinDbgX
+  separately passed 100 hardware and 100 guarded-INT3 hits each on the final controller. A
   synthetic bounded GDT now defines the reported AMD64 selectors for DbgEng; without it, zero GDTR
   made the engine decode the real long-mode bytes `40 55` as 16-bit `inc ax; push bp` instead of
   `push rbp`.
@@ -48,7 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   break wake instead of a cancellation, and the engine thread runs M2's rendezvous; a natural stop
   that wins the race keeps its reason. A Ctrl+Break while stopped resends the retained stop, and
   one during a trace step remains a cancellation into recovery. The refusal added after the
-  2026-10-18 reset is retired; M8.2's live gate qualifies the routes, and the new ignored
+  2026-10-18 reset is retired; M8.2's three-clean-boot live gate passed those routes, and the ignored
   `a_managed_secure_kernel_kd_session_is_driven_by_this_servers_own_kernel_attach` drives them
   through this server's own kernel attach on the facade's pipe. A break request on a session that
   owns no slot now finds a free one or refuses, where it would have panicked.
@@ -289,6 +290,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   levels are `low`, `medium` and `xhigh`, without an error.
 
 ### Changed
+
+- **The Secure Kernel external-client launcher recognizes the current Store debugger UI host.**
+  WinDbgX package discovery now prefers `DbgX.Shell.exe`, used by current Microsoft.WinDbg
+  packages, before the older package `WinDbgX.exe` names and the short-lived WindowsApps alias.
 
 - **A live Secure Kernel memory transport can use the VID handle the worker already discovers.**
   `{vmwp_pid}` and `{partition_handle}` are now expanded in the allowlisted live-memory command,
