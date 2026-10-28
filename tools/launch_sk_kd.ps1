@@ -169,6 +169,7 @@ function Start-SkMcpClient {
         Process = $process
         Input = $input
         NextId = 1
+        PendingRead = $null
     }
 }
 
@@ -199,10 +200,15 @@ function Send-SkMcpRequest {
         if ($remaining -le 0) {
             throw "Timed out waiting for MCP request $Method."
         }
-        $read = $Client.Process.StandardOutput.ReadLineAsync()
+        $read = $Client.PendingRead
+        if ($null -eq $read) {
+            $read = $Client.Process.StandardOutput.ReadLineAsync()
+            $Client.PendingRead = $read
+        }
         if (-not $read.Wait($remaining)) {
             throw "Timed out waiting for MCP request $Method."
         }
+        $Client.PendingRead = $null
         $line = $read.Result
         if ($null -eq $line) {
             throw "windbg-mcp closed stdout while $Method was in flight."
