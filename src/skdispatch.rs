@@ -3987,6 +3987,10 @@ impl EventDispatcher for VmwpDispatcher<'_> {
             .require_single_processor_software_breakpoint_scope()
     }
 
+    fn single_processor_scope_is_proved(&self) -> bool {
+        self.state.vm_processor_count == Some(1)
+    }
+
     fn begin_disarm(
         &mut self,
         targets: &[TargetIdentity],

@@ -134,6 +134,46 @@ try {
     Assert-SkLauncher ($quoted.Contains('"a path with spaces"')) 'space-bearing native arguments were not quoted'
     Assert-SkLauncher ($quoted.EndsWith('"ends in slash\\"')) 'a trailing slash was not doubled before its quote'
 
+    $firstRead = New-Object 'System.Threading.Tasks.TaskCompletionSource[string]'
+    $secondRead = New-Object 'System.Threading.Tasks.TaskCompletionSource[string]'
+    $reads = New-Object 'System.Collections.Generic.Queue[System.Threading.Tasks.Task[string]]'
+    $reads.Enqueue($firstRead.Task)
+    $reads.Enqueue($secondRead.Task)
+    $reader = [pscustomobject] @{ Reads = $reads }
+    $reader | Add-Member -MemberType ScriptMethod -Name ReadLineAsync -Value {
+        return $this.Reads.Dequeue()
+    }
+    $written = New-Object System.Collections.Generic.List[string]
+    $fakeInput = [pscustomobject] @{ Lines = $written }
+    $fakeInput | Add-Member -MemberType ScriptMethod -Name WriteLine -Value {
+        param([string] $Line)
+        [void] $this.Lines.Add($Line)
+    }
+    $fakeClient = @{
+        Process = [pscustomobject] @{ StandardOutput = $reader }
+        Input = $fakeInput
+        NextId = 1
+        PendingRead = $null
+    }
+    $requestTimedOut = $false
+    try {
+        [void] (Send-SkMcpRequest $fakeClient 'session_status' $null 100)
+    } catch {
+        $requestTimedOut = $_.Exception.Message.Contains('Timed out')
+    }
+    Assert-SkLauncher $requestTimedOut 'the scripted MCP request did not time out'
+    Assert-SkLauncher ($fakeClient.PendingRead.Id -eq $firstRead.Task.Id) `
+        'a timed-out MCP request discarded its outstanding stdout read'
+
+    $firstRead.SetResult('{"jsonrpc":"2.0","id":1,"result":{}}')
+    $secondRead.SetResult('{"jsonrpc":"2.0","id":2,"result":{"released":true}}')
+    $afterTimeout = Send-SkMcpRequest $fakeClient 'tools/call' $null 1000
+    Assert-SkLauncher ((Get-SkProperty $afterTimeout 'id') -eq 2) `
+        'the request after a timeout did not drain the old response and receive its own'
+    Assert-SkLauncher ($null -eq $fakeClient.PendingRead) `
+        'the completed MCP request retained a stale stdout read'
+    Assert-SkLauncher ($written.Count -eq 2) 'the fake MCP client did not send both requests'
+
     Write-Output 'Secure Kernel KD launcher tests passed.'
 } finally {
     $targetRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\target'))

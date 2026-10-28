@@ -304,6 +304,11 @@ pub(crate) trait EventDispatcher {
     fn verify_software_breakpoint_scope_until(&mut self, _deadline: Instant) -> Result<()> {
         bail!("this dispatcher cannot prove software-breakpoint VP coverage")
     }
+    /// Whether target preparation proved that no other VP can change the shared page tables while
+    /// the selected VP single-steps.
+    fn single_processor_scope_is_proved(&self) -> bool {
+        false
+    }
     /// Bring a running armed target to provider-write quiescence so it can be disarmed: either
     /// Hyper-V pauses the VM with no event outstanding, or an owned event arrives first and is
     /// held. Either ending quiesces the VP. An arrival is the disarm point rather than a fault,
@@ -2002,7 +2007,8 @@ impl<P: ControlProvider> LiveControl<P> {
             let reuse_mapping = matches!(
                 &expected_stop,
                 ExpectedStop::SingleStep { instruction, .. }
-                    if self.providers[active].observed_cr3 == Some(stop_cr3)
+                    if dispatcher.single_processor_scope_is_proved()
+                        && self.providers[active].observed_cr3 == Some(stop_cr3)
                         && preserves_page_table_mapping(instruction)?
             );
             self.providers[active].observed_cr3 = Some(stop_cr3);
@@ -4250,6 +4256,7 @@ mod tests {
         /// disarm ending; what it decided is recorded in `triaged`.
         site_events: VecDeque<SiteEvent>,
         triaged: Vec<Triage>,
+        single_processor_scope: bool,
     }
 
     impl FakeDispatcher {
@@ -4282,6 +4289,7 @@ mod tests {
                 disarm_holds: None,
                 site_events: VecDeque::new(),
                 triaged: Vec::new(),
+                single_processor_scope: true,
             }
         }
 
@@ -4322,6 +4330,10 @@ mod tests {
                 bail!("{reason}");
             }
             Ok(())
+        }
+
+        fn single_processor_scope_is_proved(&self) -> bool {
+            self.single_processor_scope
         }
 
         fn begin_disarm(
@@ -7162,6 +7174,28 @@ mod tests {
                 .0,
             0x400
         );
+    }
+
+    #[test]
+    fn mapping_preserving_step_rebinds_when_a_sole_vp_is_not_proved() {
+        let mut dispatcher = FakeDispatcher::new([
+            observed(StopReason::HardwareBreakpoint { slot: 0 }),
+            observed(StopReason::SingleStep),
+        ]);
+        dispatcher.single_processor_scope = false;
+        let mut control =
+            LiveControl::open_with_transition(FakeProvider::new().with_stopped_cr3_change(), true)
+                .unwrap();
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Natural)
+            .unwrap();
+        let hardware = control.wait_for_stop(&mut dispatcher).unwrap();
+        control
+            .step(&mut dispatcher, &hardware.epoch, straight_step())
+            .unwrap();
+        control.wait_for_stop(&mut dispatcher).unwrap();
+
+        assert_eq!(dispatcher.bound_cr3s, [0xdead_0000, 0xdead_0000]);
     }
 
     #[test]
