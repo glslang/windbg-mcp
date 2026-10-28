@@ -404,13 +404,13 @@ docs/smoke-test.md has the runbook.
 | `r` | Values live measured; display diagnostic remains | Real stopped general, segment, flag, CR3 and debug-register values; unavailable special-register fields are zero |
 | `t` over a fall-through instruction | Live measured | Real TF step and returned VTL1 vector-1 event |
 | Virtual instruction reads/disassembly | Live measured | Real VTL1 virtual memory, plus narrowly scoped compatibility addresses |
-| `bp`/`g`, hardware-slot mapping | One server-owned DbgEng composite pass; repeated M8.2 qualification remains | Guarded VTL1 DR state and retained dispatcher event |
-| `bp`/`g`, guarded INT3 mapping | Implemented for a write-authorized standalone facade; M8.2 qualification remains | M3 byte guard, proved pause and restoration |
-| `g` with no breakpoint | One bounded server-owned run stopped by `break_in`; repeated M8.2 qualification remains | Every slot released; ends only at a break-in, teardown or the recovery deadline |
+| `bp`/`g`, hardware-slot mapping | M8 product gate passed on three clean boots; Classic and WinDbgX each also passed 100 external-client hits | Guarded VTL1 DR state and retained dispatcher event |
+| `bp`/`g`, guarded INT3 mapping | Classic and WinDbgX each passed 100 write-authorized external-client hits with exact byte restoration | M3 byte guard, proved pause and restoration |
+| `g` with no breakpoint | 75/75 bounded composite runs stopped by typed `break_in` across three clean boots | Every slot released; ends only at a break-in, teardown or the recovery deadline |
 | Arbitrary memory/register writes | Refused | The standalone write-authorized facade owns only M3's guarded breakpoint byte; `SetContext` accepts only an unchanged prefix |
 | `lm m securekernel` module discovery | Live measured | Validated live debugger-data head, `KDBG` block and loaded-module list |
 | PDB symbol resolution and bounded stack walking | Live measured at a natural timer stop | Prepared PDB cache, live module range, real stack/code; two Secure Kernel frames |
-| Asynchronous break-in during a `g` | One server-owned DbgEng composite pass; repeated M8.2 qualification remains | A proved VM pause and a transient execute breakpoint at the paused RIP |
+| Asynchronous break-in during a `g` | 75/75 M2 rendezvous stops across the three-clean-boot composite gate | A proved VM pause and a transient execute breakpoint at the paused RIP |
 | `q` and MCP `end_session` | Live measured | Proved restore/release, followed by the external audit |
 
 `windbg-mcp --sk-kd-wire-probe --pipe <name>` is the transport-only fixture: one pipe, no VM, no
@@ -426,8 +426,9 @@ produced `Continue2` with the trace flag.
 The [item 119 capability record](../../DONE.md#119-windbg-mcp-what-a-vtl1-debugger-still-cannot-do--done-2026-10-07)
 holds the ordered ladder. The version record now names validated live debugger and module
 lists; module enumeration, PDB symbol resolution and one bounded natural stack walk have passed.
-Debugger display/write diagnostics, forced-disconnect behavior, stepping over anything but a
-fall-through, more than one VP and writes are left, each behind a guard or an explicit refusal in
-`src/sklive.rs` and `src/kdtarget.rs`. Facade-routed `g` and break-in are coded against the
-qualified direct M1/M2 paths and passed one server-owned composite run. M8.2 still owns the
-three-boot repeated front-end and race qualification.
+Debugger display/write diagnostics, forced-disconnect behavior, more than one VP and arbitrary
+writes remain behind a guard or an explicit refusal in `src/sklive.rs` and `src/kdtarget.rs`.
+Fall-through stepping and the item-123 CR3-writing step-over are supported. Facade-routed `g` and
+break-in passed the three-clean-boot server-owned composite gate; the real Classic/WinDbgX clients
+also passed both breakpoint packet paths. External GUI Ctrl+Break and race automation remain
+separate, non-gating compatibility research.

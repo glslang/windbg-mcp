@@ -71,6 +71,9 @@ function Resolve-SkDebugger {
             $packages = Get-AppxPackage Microsoft.WinDbg -ErrorAction SilentlyContinue |
                 Sort-Object Version -Descending
             foreach ($package in $packages) {
+                # Current Store packages name the UI host DbgX.Shell.exe; older packages used
+                # WinDbgX.exe. Both are the long-lived package process, unlike the execution alias.
+                $candidates.Add((Join-Path $package.InstallLocation 'DbgX.Shell.exe'))
                 $candidates.Add((Join-Path $package.InstallLocation 'WinDbgX.exe'))
                 $candidates.Add((Join-Path $package.InstallLocation 'amd64\WinDbgX.exe'))
             }

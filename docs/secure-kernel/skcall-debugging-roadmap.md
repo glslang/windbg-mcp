@@ -1508,13 +1508,15 @@ the exact disposition. Both workers remain in the supervisor's internal registry
 public handle is visible and routable. Teardown closes the managed DbgEng peer first and lets only the hidden
 controller restore and release VTL1; generic KD `qd` cannot encode a distinct detach to this facade.
 
-The composite half is implemented and has one live route proof. The PowerShell launcher is now
-checked in at `tools/launch_sk_kd.ps1`: it resolves classic WinDbg or WinDbgX and the server from
+The composite and launcher work are complete. The PowerShell launcher is checked in at
+`tools/launch_sk_kd.ps1`: it resolves classic WinDbg or WinDbgX and the server from
 any working directory, reads the open arguments from JSON, consumes `open_sk_kd`'s typed generated
 connection, keeps configuration and policy values off child command lines, and always sends
 `end_session` after the debugger exits. Its offline fake-client test covers paths containing spaces,
 missing debuggers, early debugger exit and a failed open that still returned a recovery handle.
-The remaining acceptance is the real-client matrix in M8.2, not more launcher mechanics.
+The server-owned composite passed its three-clean-boot gate, and the real-client breakpoint matrix
+passed separately for both frontends and both breakpoint backends. The optional external GUI
+free-run/race rig is not part of the product exit.
 
 #### M8.2 — live compatibility and safety gate
 
@@ -1523,7 +1525,8 @@ generic debugger assertions, one hardware breakpoint, one fall-through step, and
 `g`-without-breakpoint → typed `break_in` cycles through one managed session. Each ordered release
 audits exact DR0–DR3/DR6/DR7/RFLAGS restoration, unchanged Secure Kernel text, one selected VP,
 the same boot/`vmwp`, heartbeat and retained processes. A reset, hang, ambiguous stop or unproved
-restoration fails the gate and leaves ordinary `g` disabled.
+restoration would have failed the gate and left ordinary `g` disabled. The final implementation
+passed all three boots and ordinary `g` is enabled.
 
 The external-client compatibility slice separately proves both packet paths on the final
 controller: classic WinDbg and WinDbgX must each pass 100 hardware-breakpoint and 100 guarded-INT3
@@ -1532,14 +1535,16 @@ free-run and race matrix below remains useful qualification machinery, but GUI C
 automation are deferred compatibility work rather than part of the product exit. The unsafe
 window-message and remote-DbgEng Ctrl+Break experiments are not repeated.
 
-Run this in two engineering slices. M8.2a is an ignored qualification runner, completed offline
-before another live attempt: it takes explicit classic-WinDbg and WinDbgX paths, separate read-only
+The work used two engineering slices. M8.2a is an ignored qualification runner, completed offline
+before live execution: it takes explicit classic-WinDbg and WinDbgX paths, separate read-only
 and write-authorized startup policies, one counted guest trigger and the existing post-release
 audit; emits one JSON artifact per frontend/backend arm; and records boot identity before and after
 every arm. It must coordinate each `g` from transcript markers rather than sleeps, and a failed arm
-must still end the MCP session and run the audit. M8.2b is the three-boot execution of that fixed
-runner. On each boot it runs classic/hardware, classic/INT3, WinDbgX/hardware and WinDbgX/INT3 in
-that order, then the shared free-run and race rows. A code or config edit resets the boot count.
+must still end the MCP session and run the audit. M8.2b is the three-boot server-owned composite:
+it runs 25 break-in cycles per
+boot. The final external compatibility slice uses M8.2a's breakpoint-only entry point for
+classic/hardware, classic/INT3, WinDbgX/hardware and WinDbgX/INT3. The optional shared free-run and
+race rows are retained as non-gating machinery and were not used to close M8.
 
 M8.2a started on 2026-10-26 with the offline contract in `tests/support/sk_m8.rs`. The private
 config is schema-versioned, denies unknown and per-boot discovery fields, fixes the breakpoint and
@@ -1562,18 +1567,21 @@ read, modules, symbol lookup, stack, disassembly and one step, sends an arbitrar
 that the facade must refuse, and proves the fifth breakpoint is refused; the runner checks both
 the client markers and the facade's typed-path log evidence rather than treating command echo as
 success.
-It then runs 25 marker-driven `g`/Ctrl+Break cycles through each frontend under the read-only
+The optional full-runner entry point can also run 25 marker-driven `g`/Ctrl+Break cycles through
+each frontend under the read-only
 policy. Ctrl+Break is an explicit per-frontend host command with exactly one authenticated-client
 PID substitution; both the helper's success and the facade's running-wait wake are required in the
-free-run artifact. This orchestration is compiled and tested offline but has not yet been run
-against the bench. The eight race rows now have a fixed one-to-one control/outcome contract, so a
+free-run artifact. This orchestration is compiled and tested offline but was deliberately not used
+as the product gate after the GUI/remote Ctrl+Break controls proved unsafe. The eight race rows have
+a fixed one-to-one control/outcome contract, so a
 disconnect result cannot accidentally satisfy reconnect and a resent stopped event cannot satisfy
 a running break-in. That contract is now executable for both frontends: each row owns its debugger
 script and session, reset is delivered by a separate authenticated-PID helper, disconnect kills the
 authenticated pipe client, reconnect requires a distinct second client, and running teardown waits
 for facade-side proof of `g` before MCP release. Every row publishes its transcript(s), facade log,
-audit and before/after boot identity. M8.2a completed offline on 2026-10-27; the first live
-execution begins M8.2b's boot count, and any resulting code or config correction resets it.
+audit and before/after boot identity. M8.2a completed offline on 2026-10-27. Its breakpoint-only
+entry point later supplied the passing external-client compatibility evidence; the server-owned
+composite supplied the three-boot M8.2b product gate.
 
 The first live attempt on 2026-10-27 did not count as an M8.2b boot. It found two harness defects
 before a guest trigger: GUI WinDbg does not implement KD/CDB's `-cf` option, so the launcher now
@@ -1588,7 +1596,7 @@ its nested hypervisor and removes K3's own VTL1 from the outer provider view. Wi
 off, K3 was cleanly stopped, restored to `ExposeVirtualizationExtensions=false`, and started again.
 Build 26100.9457 then reported VBS running while the root provider enumerated one child with
 `EnabledVtlSet=3`; VTL1 CR3 `0x2601000` and RIP both read with status zero. No breakpoint arm was
-started during diagnosis, so the next clean run begins M8.2b boot 1.
+started during diagnosis. The clean composite sequence that followed is recorded below.
 
 The four breakpoint arms then passed on one boot: classic/hardware, classic/INT3,
 WinDbgX/hardware and WinDbgX/INT3 each completed 100 ordered stops and their release audit. That
