@@ -1440,8 +1440,10 @@ the joined result and negative controls.
 
 ### M8 — debugger front ends
 
-Status: M8.0 and M8.1 complete; M8.2's server-owned composite gate complete, with external-client
-compatibility rows still in progress. M8.0's translation table is implemented in the facade: a
+Status: complete for the product path. M8.0 and M8.1 are complete, M8.2's server-owned composite
+gate is complete, and the external Classic/WinDbgX breakpoint rows are qualified on the final
+code. External free-run and race controls remain separate compatibility work rather than an M8
+gate. M8.0's translation table is implemented in the facade: a
 non-trace continue with breakpoints is M1's continue-to-breakpoints, one with none is a bounded
 free run (`LiveControl::continue_running_until`, which arms nothing and stops only at a break
 request, teardown or the recovery deadline), a running Ctrl+Break binds to the exact wait and
@@ -1464,9 +1466,10 @@ free-run/break-in cycles through the same composite, followed by the same releas
 also has a checked-in classic-WinDbg/WinDbgX launcher: it consumes
 the facade's typed generated connection, keeps the live config off child command lines, and always
 ends a post-commit session after the debugger exits or fails to start. Its fake-client contract is
-an ordinary smoke test; the real front ends remain unqualified until M8.2. M8 is independent of
-M6/M7's trace schema and of item 122's direct-`sk_live_*` image-resolution work: the composite
-already gets modules, symbols and disassembly through its ordinary DbgEng peer.
+an ordinary smoke test; M8.2 has now qualified both real front ends for hardware and guarded-INT3
+breakpoint traffic. Their GUI-driven running-interrupt and race rows are not the product gate. M8
+is independent of M6/M7's trace schema and of item 122's direct-`sk_live_*` image-resolution work:
+the composite already gets modules, symbols and disassembly through its ordinary DbgEng peer.
 
 #### M8.0 — packet-to-controller contract
 
@@ -1628,14 +1631,23 @@ symbols, registers, stack, disassembly, a hardware breakpoint and one fall-throu
 the generic tools. Each ordered release terminated both workers and passed its 60-second audit
 with the same `vmwp` at all three samples, stable SK text, heartbeat healthy, no recent `vmwp`
 errors, DR0--DR3 zero, DR7 `0x400`, and TF/RF clear. This closes the server-owned M8.2b gate.
-The external clients' remaining compatibility rows stay separate; GUI input automation is not on
-the product's critical path.
+The current code's external breakpoint slice was then rerun on the third boot through the
+breakpoint-only M8.2a entry point. Classic/hardware, Classic/INT3, WinDbgX/hardware and WinDbgX/INT3
+each completed 100 ordered target hits. Every arm ended through MCP, retained boot
+`11464:639287765535459851` and `vmwp` 11464, and passed its 60-second audit with partition 9,
+stable SK text, heartbeat healthy, no recent `vmwp` errors, DR0--DR3 zero, DR7 `0x400`, and TF/RF
+clear. This is current-code packet/launcher compatibility evidence for both breakpoint backends;
+it does not reopen the unsafe GUI/remote Ctrl+Break experiments. The external clients' free-run
+and race rows stay separate, while GUI input automation remains outside the product's critical
+path.
 
-Exit: both front ends perform `bp`/`g`/Ctrl+Break repeatedly through the managed session, all race
-controls have unique results, launchers work outside the repository, and the refusal is removed
-only for the qualified single-VP shape. EXDI is evaluated after this exit and is not a prerequisite;
-it is accepted only if it adds compatibility without host registration, in-process vendor loading
-or weaker worker isolation.
+Exit: the server-owned composite performs breakpoint `g`, bounded free-run, typed `break_in`, and
+the generic debugger assertions repeatedly through one managed session on the qualified single-VP
+shape; its three-boot gate and release audits pass. The external launchers work outside the
+repository and both real clients pass the hardware and guarded-INT3 packet paths. External GUI
+Ctrl+Break and race automation is not required for that product exit. EXDI is evaluated after this
+exit and is not a prerequisite; it is accepted only if it adds compatibility without host
+registration, in-process vendor loading or weaker worker isolation.
 
 ## M1 implementation record
 

@@ -3273,6 +3273,73 @@ fn qualification_runner_executes_post_breakpoint_matrix_on_one_boot() {
     }
 }
 
+fn run_breakpoint_matrix(config: &Config, baseline: &BootIdentity) {
+    for (frontend, backend) in [
+        (Frontend::Classic, BreakpointBackend::Hardware),
+        (Frontend::Classic, BreakpointBackend::Int3),
+        (Frontend::WinDbgX, BreakpointBackend::Hardware),
+        (Frontend::WinDbgX, BreakpointBackend::Int3),
+    ] {
+        let boot_before = probe_boot(config, "M8.2a pre-arm boot probe")
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            &boot_before, baseline,
+            "the M8.2a boot changed before the {:?}/{:?} arm",
+            frontend, backend
+        );
+        let artifact = run_breakpoint_arm(config, frontend, backend, boot_before);
+        let published = persist_artifact(config.artifact_directory(), &artifact)
+            .unwrap_or_else(|error| panic!("{error}"));
+        eprintln!(
+            "M8.2a {:?}/{:?}: {:?}; artifact {}",
+            frontend,
+            backend,
+            artifact.verdict,
+            published.display()
+        );
+        assert_eq!(
+            artifact.verdict,
+            Verdict::Pass,
+            "M8.2a {:?}/{:?} failed: {:#?}",
+            frontend,
+            backend,
+            artifact.failures
+        );
+        assert_eq!(
+            artifact.boot_after.as_ref(),
+            Some(baseline),
+            "the M8.2a boot changed during the {:?}/{:?} arm",
+            frontend,
+            backend
+        );
+    }
+}
+
+#[test]
+#[ignore = "runs the destructive M8.2a breakpoint matrix; set WINDBG_MCP_SMOKE_SK_KD_M8 and run alone"]
+fn qualification_runner_executes_breakpoint_matrix_on_one_boot() {
+    let Some(path) = std::env::var_os("WINDBG_MCP_SMOKE_SK_KD_M8") else {
+        eprintln!(
+            "SKIPPED: set WINDBG_MCP_SMOKE_SK_KD_M8=<private M8.2a config> to run the breakpoint matrix"
+        );
+        return;
+    };
+    let path = PathBuf::from(path);
+    let text = fs::read_to_string(&path).unwrap_or_else(|error| {
+        panic!(
+            "cannot read M8.2a qualification config {}: {error}",
+            path.display()
+        )
+    });
+    let config = Config::parse(&text).unwrap_or_else(|error| panic!("{error}"));
+    config
+        .preflight_files()
+        .unwrap_or_else(|error| panic!("{error}"));
+    let baseline =
+        probe_boot(&config, "M8.2a initial boot probe").unwrap_or_else(|error| panic!("{error}"));
+    run_breakpoint_matrix(&config, &baseline);
+}
+
 #[test]
 #[ignore = "runs the destructive M8.2a debugger matrix; set WINDBG_MCP_SMOKE_SK_KD_M8 and run alone"]
 fn qualification_runner_executes_full_m8_2a_matrix_on_one_boot() {
@@ -3296,45 +3363,7 @@ fn qualification_runner_executes_full_m8_2a_matrix_on_one_boot() {
     let baseline =
         probe_boot(&config, "M8.2a initial boot probe").unwrap_or_else(|error| panic!("{error}"));
 
-    for (frontend, backend) in [
-        (Frontend::Classic, BreakpointBackend::Hardware),
-        (Frontend::Classic, BreakpointBackend::Int3),
-        (Frontend::WinDbgX, BreakpointBackend::Hardware),
-        (Frontend::WinDbgX, BreakpointBackend::Int3),
-    ] {
-        let boot_before = probe_boot(&config, "M8.2a pre-arm boot probe")
-            .unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(
-            boot_before, baseline,
-            "the M8.2a boot changed before the {:?}/{:?} arm",
-            frontend, backend
-        );
-        let artifact = run_breakpoint_arm(&config, frontend, backend, boot_before);
-        let published = persist_artifact(config.artifact_directory(), &artifact)
-            .unwrap_or_else(|error| panic!("{error}"));
-        eprintln!(
-            "M8.2a {:?}/{:?}: {:?}; artifact {}",
-            frontend,
-            backend,
-            artifact.verdict,
-            published.display()
-        );
-        assert_eq!(
-            artifact.verdict,
-            Verdict::Pass,
-            "M8.2a {:?}/{:?} failed: {:#?}",
-            frontend,
-            backend,
-            artifact.failures
-        );
-        assert_eq!(
-            artifact.boot_after.as_ref(),
-            Some(&baseline),
-            "the M8.2a boot changed during the {:?}/{:?} arm",
-            frontend,
-            backend
-        );
-    }
+    run_breakpoint_matrix(&config, &baseline);
 
     for frontend in [Frontend::Classic, Frontend::WinDbgX] {
         let boot_before = probe_boot(&config, "M8.2a pre-free-run boot probe")
