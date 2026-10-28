@@ -275,7 +275,11 @@ on three clean K3 boots on 2026-10-28 against Secure Kernel 26100.9457: 75/75 br
 distinct `vmwp` PIDs, partition IDs and SK relocations. Every ordered release and 60-second audit
 kept its boot's `vmwp` PID and SK text stable, reported DR0–DR3 zero, DR7 `0x400`, TF/RF clear, no
 recent `vmwp` errors and heartbeat OK. This is the server-owned composite M8.2 gate; the external
-Classic/WinDbgX compatibility matrix remains separate.
+Classic/WinDbgX compatibility matrix remains separate. The current code's external breakpoint
+slice also passed on the third boot: Classic and WinDbgX each completed 100 hardware-breakpoint
+and 100 guarded-INT3 hits, then released and passed the 60-second audit without changing boot or
+`vmwp`. The external free-run and race rows remain separate and the unsafe GUI/remote Ctrl+Break
+experiments are not repeated.
 The ordinary (non-live) smoke tier also runs `tools/test_launch_sk_kd.ps1`. Its fake MCP client
 proves that the M8 launcher consumes the typed generated connection, accepts an executable path
 containing spaces, refuses a missing debugger before opening, ends the managed session after an
@@ -318,6 +322,16 @@ on the current boot. It stops after the first failed artifact:
 ```powershell
 cargo test --test mcp_smoke `
   sk_m8::qualification_runner_executes_full_m8_2a_matrix_on_one_boot `
+  -- --ignored --exact --nocapture
+```
+
+The breakpoint-only entry point runs the first four arms without invoking any configured external
+interrupt or reset command. Use it when qualifying packet and launcher compatibility independently
+of the free-run and race controls:
+
+```powershell
+cargo test --test mcp_smoke `
+  sk_m8::qualification_runner_executes_breakpoint_matrix_on_one_boot `
   -- --ignored --exact --nocapture
 ```
 
