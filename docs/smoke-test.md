@@ -272,14 +272,17 @@ DbgEng before releasing the hidden controller), and runs the
 composite session. It first passed as a single-route proof on 2026-10-26. After the repeated gate
 found and fixed the pre-wait transition race and a queued native-return event, the final code passed
 on three clean K3 boots on 2026-10-28 against Secure Kernel 26100.9457: 75/75 break-ins, three
-distinct `vmwp` PIDs, partition IDs and SK relocations. Every ordered release and 60-second audit
-kept its boot's `vmwp` PID and SK text stable, reported DR0–DR3 zero, DR7 `0x400`, TF/RF clear, no
-recent `vmwp` errors and heartbeat OK. This is the server-owned composite M8.2 gate; the external
-Classic/WinDbgX compatibility matrix remains separate. The current code's external breakpoint
-slice also passed on the third boot: Classic and WinDbgX each completed 100 hardware-breakpoint
-and 100 guarded-INT3 hits, then released and passed the 60-second audit without changing boot or
-`vmwp`. The external free-run and race rows remain separate and the unsafe GUI/remote Ctrl+Break
-experiments are not repeated.
+distinct `vmwp` PIDs, partition IDs and SK relocations. The composite binary reported
+`windbg-mcp 0.23.0+ge31b232e-dirty.b48fcacf`; that exact source tree was then committed as
+`a9f194d0`. Every ordered release and 60-second audit kept its boot's `vmwp` PID and SK text stable,
+reported DR0–DR3 zero, DR7 `0x400`, TF/RF clear, no recent `vmwp` errors and heartbeat OK. This is
+the server-owned composite M8.2 gate; the external Classic/WinDbgX compatibility matrix remains
+separate. The final controller's external breakpoint slice also passed on the third boot with
+`windbg-mcp 0.23.0+ga9f194d0-dirty.4b655566`; its breakpoint-only harness change was then committed
+as `187c7c2c`. Classic and WinDbgX each completed 100 hardware-breakpoint and 100 guarded-INT3
+hits, then released and passed the 60-second audit without changing boot or `vmwp`. The external
+free-run and race rows remain separate and the unsafe GUI/remote Ctrl+Break experiments are not
+repeated.
 The ordinary (non-live) smoke tier also runs `tools/test_launch_sk_kd.ps1`. Its fake MCP client
 proves that the M8 launcher consumes the typed generated connection, accepts an executable path
 containing spaces, refuses a missing debugger before opening, ends the managed session after an

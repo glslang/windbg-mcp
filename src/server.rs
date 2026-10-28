@@ -1176,8 +1176,10 @@ pub struct SkLiveOpenArgs {
     #[serde(default)]
     pub expected_cr3: Option<String>,
     /// Allow a natural-flow stop to enter through a different, nonzero page-aligned CR3. This is
-    /// required for a VTL1 user-to-Secure-Kernel exception or syscall transition. The initial
-    /// paused baseline and live-memory source must still match `expected_cr3` exactly.
+    /// required for a VTL1 user-to-Secure-Kernel exception or syscall transition. The paused
+    /// baseline must still match `expected_cr3` exactly. The live-memory source must match it
+    /// unless transition mode is enabled; that mode starts validation at `expected_cr3`, and a
+    /// redirected stop still requires that root exactly.
     #[serde(default)]
     pub allow_transition_cr3: bool,
     /// Virtual processor to control. Defaults to VP 0. The native event must report this VP.

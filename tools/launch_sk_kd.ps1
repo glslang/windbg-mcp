@@ -67,11 +67,6 @@ function Resolve-SkDebugger {
             }
         }
     } else {
-        $command = Get-Command WinDbgX.exe -CommandType Application -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-        if ($null -ne $command) {
-            $candidates.Add($command.Source)
-        }
         if ($null -ne (Get-Command Get-AppxPackage -ErrorAction SilentlyContinue)) {
             $packages = Get-AppxPackage Microsoft.WinDbg -ErrorAction SilentlyContinue |
                 Sort-Object Version -Descending
@@ -79,6 +74,13 @@ function Resolve-SkDebugger {
                 $candidates.Add((Join-Path $package.InstallLocation 'WinDbgX.exe'))
                 $candidates.Add((Join-Path $package.InstallLocation 'amd64\WinDbgX.exe'))
             }
+        }
+        # Prefer the package executable whose lifetime is the debugger UI. An app-execution alias
+        # can exit after activation and would make the launcher release the managed session early.
+        $command = Get-Command WinDbgX.exe -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($null -ne $command) {
+            $candidates.Add($command.Source)
         }
     }
 
@@ -251,6 +253,17 @@ function Invoke-SkMcpTool {
     return $structured
 }
 
+function Test-SkKdTerminalPhase {
+    param([string] $Phase)
+    return $Phase -in @(
+        'recovery_required',
+        'live_control_unresolved',
+        'failed',
+        'closed',
+        'released'
+    )
+}
+
 function Wait-SkKdReady {
     param(
         $Client,
@@ -280,7 +293,7 @@ function Wait-SkKdReady {
         if ($phase -eq 'waiting_for_peer') {
             return
         }
-        if ($phase -in @('recovery_required', 'failed', 'closed')) {
+        if (Test-SkKdTerminalPhase $phase) {
             throw "Secure Kernel KD session $SessionId entered terminal phase $phase before its pipe was ready."
         }
         Start-Sleep -Milliseconds 50
@@ -288,13 +301,15 @@ function Wait-SkKdReady {
 }
 
 function Stop-SkMcpClient {
-    param($Client)
+    param($Client, [int] $TimeoutMs = 120000)
     if ($null -eq $Client) {
         return
     }
     try { $Client.Input.Close() } catch {}
     try {
-        if (-not $Client.Process.WaitForExit(5000)) {
+        # Process exit is the supervisor's explicit shutdown-complete signal. Give its ordered
+        # Secure Kernel release the configured cleanup budget before the emergency kill fallback.
+        if (-not $Client.Process.WaitForExit($TimeoutMs)) {
             $Client.Process.Kill()
             [void] $Client.Process.WaitForExit(5000)
         }
@@ -425,7 +440,7 @@ function Invoke-SkKdLauncher {
             -LaunchDebugger { param($connection) Start-SkDebuggerAndWait $Debugger $connection } `
             -EndSession { param($session) Invoke-SkMcpTool $client 'end_session' @{ session_id = $session } $EndTimeout })
     } finally {
-        Stop-SkMcpClient $client
+        Stop-SkMcpClient $client $EndTimeout
     }
 }
 

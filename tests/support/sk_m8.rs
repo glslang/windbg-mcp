@@ -3564,6 +3564,92 @@ mod tests {
     }
 
     #[test]
+    fn configuration_preflight_reaches_every_command_array() {
+        fn command_mut(config: &mut Config, index: usize) -> &mut Vec<String> {
+            match index {
+                0 => &mut config.trigger,
+                1 => &mut config.boot_probe,
+                2 => &mut config.post_release_audit,
+                3 => &mut config.windbgx_script,
+                4 => &mut config.interrupts.classic,
+                5 => &mut config.interrupts.windbgx,
+                6 => &mut config.resets.classic,
+                7 => &mut config.resets.windbgx,
+                _ => panic!("unknown command fixture"),
+            }
+        }
+
+        let serial = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "windbg-mcp-m8-preflight-{}-{serial}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let profile = root.join("vmwp.json");
+        let hardware = root.join("hardware.json");
+        let int3 = root.join("int3.json");
+        fs::write(&profile, "{}").unwrap();
+        fs::write(
+            &hardware,
+            r#"{"disposable_vm_ids":["51749a1f-f939-44f5-b251-1251ef5b64a3"]}"#,
+        )
+        .unwrap();
+        fs::write(
+            &int3,
+            r#"{"disposable_vm_ids":["51749a1f-f939-44f5-b251-1251ef5b64a3"],"allow_memory_writes":true}"#,
+        )
+        .unwrap();
+
+        let executable = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let mut parsed = Config::parse(&config(open())).unwrap();
+        parsed.frontends.classic.clone_from(&executable);
+        parsed.frontends.windbgx.clone_from(&executable);
+        parsed.policies.hardware = hardware.to_string_lossy().into_owned();
+        parsed.policies.int3 = int3.to_string_lossy().into_owned();
+        parsed.symbol_path = root.to_string_lossy().into_owned();
+        parsed.open.insert(
+            "profile".into(),
+            Value::String(profile.to_string_lossy().into_owned()),
+        );
+        for index in 0..8 {
+            command_mut(&mut parsed, index)[0].clone_from(&executable);
+        }
+        parsed.preflight_files().unwrap();
+
+        let missing = root
+            .join("missing-command.exe")
+            .to_string_lossy()
+            .into_owned();
+        for (index, name) in [
+            "trigger",
+            "boot_probe",
+            "post_release_audit",
+            "windbgx_script",
+            "interrupts.classic",
+            "interrupts.windbgx",
+            "resets.classic",
+            "resets.windbgx",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let original =
+                std::mem::replace(&mut command_mut(&mut parsed, index)[0], missing.clone());
+            let error = parsed.preflight_files().unwrap_err();
+            command_mut(&mut parsed, index)[0] = original;
+            assert!(error.contains(name), "{name}: {error}");
+            assert!(error.contains("is not a file"), "{name}: {error}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn policy_pair_selects_one_hardware_and_one_int3_backend() {
         let vm = json!(["51749a1f-f939-44f5-b251-1251ef5b64a3"]);
         let hardware = json!({ "disposable_vm_ids": vm });
