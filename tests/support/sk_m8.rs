@@ -2735,6 +2735,10 @@ fn run_race_arm(
         let session = session_id
             .as_deref()
             .ok_or_else(|| "race opener returned no session id".to_string())?;
+        // Classic can execute its command file as soon as the process starts, and WinDbgX can do
+        // the same as soon as start_race_debugger delivers it. Bound running evidence before
+        // either frontend gets that opportunity.
+        let execution_log_offset = server.stderr().len();
         debugger = Some(spawn_debugger(
             frontend,
             config.frontend_path(frontend),
@@ -2759,12 +2763,11 @@ fn run_race_arm(
                 let armed = format!("WINDBG_MCP_RACE_ARMED {run_id}");
                 wait_for_transcript_marker(&transcript_path, &armed, Duration::from_secs(60))?;
                 let pid = wait_for_connected_debugger_pid(server, Duration::from_secs(5))?;
-                let log_offset = server.stderr().len();
                 let trigger = config.trigger_command(1);
                 let interrupt = config.interrupt_command(frontend, pid);
                 wait_for_server_log(
                     server,
-                    log_offset,
+                    execution_log_offset,
                     &["KD go to 1 hardware breakpoint(s)"],
                     Duration::from_secs(10),
                 )?;
@@ -2785,7 +2788,7 @@ fn run_race_arm(
                     ));
                     wait_for_server_log(
                         server,
-                        log_offset,
+                        execution_log_offset,
                         &["KD break-in woke the running wait"],
                         Duration::from_secs(10),
                     )?;
@@ -2814,7 +2817,7 @@ fn run_race_arm(
                 } else {
                     let fresh = wait_for_server_log(
                         server,
-                        log_offset,
+                        execution_log_offset,
                         &[
                             "target is already stopped; resending the retained stop",
                             "stop is awaiting acknowledgement; deferring it until continue",
@@ -2855,9 +2858,13 @@ fn run_race_arm(
             RaceScenario::NoHitTimeout => {
                 let armed = format!("WINDBG_MCP_RACE_ARMED {run_id}");
                 wait_for_transcript_marker(&transcript_path, &armed, Duration::from_secs(60))?;
-                let log_offset = server.stderr().len();
                 let unexpected = format!("WINDBG_MCP_RACE_UNEXPECTED_STOP {run_id}");
-                wait_for_no_hit_timeout(server, &transcript_path, &unexpected, log_offset)?;
+                wait_for_no_hit_timeout(
+                    server,
+                    &transcript_path,
+                    &unexpected,
+                    execution_log_offset,
+                )?;
                 artifact.transcript = fs::read_to_string(&transcript_path).unwrap_or_default();
                 artifact.observed = Some(RaceOutcome::IdleTimeoutReleased);
             }
@@ -2932,10 +2939,9 @@ fn run_race_arm(
             RaceScenario::McpTeardown => {
                 let armed = format!("WINDBG_MCP_RACE_ARMED {run_id}");
                 wait_for_transcript_marker(&transcript_path, &armed, Duration::from_secs(60))?;
-                let log_offset = server.stderr().len();
                 wait_for_server_log(
                     server,
-                    log_offset,
+                    execution_log_offset,
                     &["KD go with no breakpoint"],
                     Duration::from_secs(10),
                 )?;
@@ -4125,6 +4131,24 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn race_execution_log_window_precedes_debugger_launch() {
+        let source = include_str!("sk_m8.rs");
+        let arm = source
+            .split_once("fn run_race_arm(")
+            .unwrap()
+            .1
+            .split_once("#[test]")
+            .unwrap()
+            .0;
+        let offset = arm
+            .find("let execution_log_offset = server.stderr().len();")
+            .unwrap();
+        let launch = arm.find("debugger = Some(spawn_debugger(").unwrap();
+        assert!(offset < launch);
+        assert_eq!(arm.matches("execution_log_offset,").count(), 5);
     }
 
     #[test]
