@@ -41,11 +41,13 @@ provider per selected VP; their VM, partition, VTL and CR3 coordinates must agre
 
 `expected_cr3` always identifies the paused baseline and the address space used to validate an arm.
 By default every accepted stop must report that same root. `open_sk_live_control` may opt into
-`allow_transition_cr3` for natural mode when VTL1 user execution enters Secure Kernel through a
-different address space. The first hardware stop may then establish a different nonzero,
-page-aligned CR3; redirect mode cannot use the option. A one-shot software-breakpoint transition
-binds its patches to that accepted stop CR3, and its vector-3 stop must return in exactly that
-address space before restoration and restart-RIP normalization can proceed.
+`allow_transition_cr3` when VTL1 user execution enters Secure Kernel through a different address
+space. Only a natural hardware stop may then establish a different nonzero, page-aligned CR3. A
+redirected stop remains pinned to the startup CR3 even when the session has transition authority;
+this lets managed KD use an immediate redirected first stop and still follow later natural Secure
+Kernel entries. A one-shot software-breakpoint transition binds its patches to that accepted stop
+CR3, and its vector-3 stop must return in exactly that address space before restoration and
+restart-RIP normalization can proceed.
 
 Provider stdout is read on a dedicated non-DbgEng thread. Each complete protocol line has a
 10-second deadline, including the startup banner and hello, so a provider which remains alive but

@@ -1807,6 +1807,14 @@ pipe. The controller released cleanly: the VM stayed running with a healthy hear
 worker, provider or debugger survived. So the lifecycle test is red on this bench for the reason
 recorded above, and a green run of it is what would retire this paragraph.
 
+**Running break-in landed and was repeated live, 2026-10-28.** A server-owned DbgEng worker on the
+facade pipe completed 75 `g`-without-breakpoint / typed `break_in` cycles across three clean K3
+boots. Each serial break-in was bound to the exact running wait and returned the controller's M2
+stop; every ordered composite teardown then passed a 60-second audit with that boot's same `vmwp`,
+stable Secure Kernel text, DR0--DR3 zero, DR7 `0x400`, TF/RF clear and a healthy heartbeat. This
+closes the break-in half of the item. The decoder fuzz target remains open, so the item itself stays
+here.
+
 ## 121. [windbg-mcp] Tracing pool allocations on an x86 kernel
 
 **Half landed, 2026-10-13: the x86 reader is built and measured in user mode; a trace on a live

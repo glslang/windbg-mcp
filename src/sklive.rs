@@ -11,7 +11,9 @@
 //! bounded recovery path as an unexpected debugger stop.
 
 use anyhow::{Context, Result, anyhow, bail};
-use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind, Register};
+use iced_x86::{
+    Decoder, DecoderOptions, InstructionInfoFactory, Mnemonic, OpAccess, OpKind, Register,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -1180,6 +1182,32 @@ fn writes_cr3(instruction: &InstructionGuard) -> Result<bool> {
         && decoded.op0_register() == Register::CR3)
 }
 
+/// Whether one proved instruction can leave the cached virtual-to-physical map unchanged.
+///
+/// A one-VP target cannot race this instruction with another guest VP. Reusing the current map is
+/// therefore sound when the instruction writes neither memory nor a control register and cannot
+/// update EFER through WRMSR. Instructions outside this narrow class still require a complete
+/// page-table rewalk before their resulting stop is exposed.
+fn preserves_page_table_mapping(instruction: &InstructionGuard) -> Result<bool> {
+    let decoded = decode_instruction(instruction)?;
+    if decoded.mnemonic() == Mnemonic::Wrmsr {
+        return Ok(false);
+    }
+    let mut factory = InstructionInfoFactory::new();
+    let info = factory.info(&decoded);
+    let writes = |access| {
+        matches!(
+            access,
+            OpAccess::Write | OpAccess::CondWrite | OpAccess::ReadWrite | OpAccess::ReadCondWrite
+        )
+    };
+    Ok(!info.used_memory().iter().any(|used| writes(used.access()))
+        && !info
+            .used_registers()
+            .iter()
+            .any(|used| used.register().is_cr() && writes(used.access())))
+}
+
 /// Complete register evidence retained for one stop. Status and high halves remain visible instead
 /// of being discarded after validation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1748,9 +1776,6 @@ impl<P: ControlProvider> LiveControl<P> {
         self.require_running_unarmed()?;
         validate_breakpoints(&breakpoints, mode)?;
         self.require_unreserved(&breakpoints)?;
-        if self.allow_transition_cr3 && mode != ArmMode::Natural {
-            bail!("transition CR3 control requires natural arm mode");
-        }
         if mode == ArmMode::Redirect && self.providers.len() != 1 {
             bail!("redirect arming requires exactly one VP provider");
         }
@@ -1883,7 +1908,10 @@ impl<P: ControlProvider> LiveControl<P> {
                 .iter()
                 .map(|breakpoint| breakpoint.instruction.clone())
                 .collect::<Vec<_>>(),
-            ExpectedStop::SingleStep { instruction, .. } => vec![instruction.clone()],
+            // The source instruction was proved before it was released. Once its #DB is held,
+            // re-reading the old address proves nothing about the resulting stop and needlessly
+            // forces a whole page-table refresh before register evidence can be accepted.
+            ExpectedStop::SingleStep { .. } => Vec::new(),
             // The successor belongs to the address space established by the CR3 write. Reading
             // it here would use the old root; the stop is instead proved by DR6, RIP and the
             // temporary debug register after the new root has been accepted.
@@ -1957,7 +1985,7 @@ impl<P: ControlProvider> LiveControl<P> {
             }
             let first = match &expected_stop {
                 ExpectedStop::Hardware | ExpectedStop::BreakRequest { .. }
-                    if self.allow_transition_cr3 =>
+                    if self.allow_transition_cr3 && self.arm_mode == Some(ArmMode::Natural) =>
                 {
                     self.read_transition_snapshot(active)?
                 }
@@ -1971,14 +1999,30 @@ impl<P: ControlProvider> LiveControl<P> {
                 ExpectedStop::Software { cr3, .. } => self.read_snapshot(active, cr3.0)?,
             };
             let stop_cr3 = first.low(RegisterName::Cr3)?;
+            let reuse_mapping = matches!(
+                &expected_stop,
+                ExpectedStop::SingleStep { instruction, .. }
+                    if self.providers[active].observed_cr3 == Some(stop_cr3)
+                        && preserves_page_table_mapping(instruction)?
+            );
             self.providers[active].observed_cr3 = Some(stop_cr3);
             let second = self.read_snapshot(active, stop_cr3)?;
             if first != second {
                 bail!("VTL1 registers changed while the dispatcher event was held");
             }
-            match pause_deadline {
-                Some(deadline) => dispatcher.bind_stop_cr3_until(stop_cr3, deadline)?,
-                None => dispatcher.bind_stop_cr3(stop_cr3)?,
+            if reuse_mapping {
+                tracing::info!(
+                    target: "windbg_mcp::secure_kernel_mutation",
+                    vm_id = %self.providers[active].target.vm_id,
+                    vp = self.providers[active].target.vp,
+                    cr3 = format_args!("{stop_cr3:#x}"),
+                    "live Secure Kernel control retained the proved page-table mapping across a mapping-preserving single step"
+                );
+            } else {
+                match pause_deadline {
+                    Some(deadline) => dispatcher.bind_stop_cr3_until(stop_cr3, deadline)?,
+                    None => dispatcher.bind_stop_cr3(stop_cr3)?,
+                }
             }
             if self.allow_transition_cr3 {
                 for instruction in &expected_instructions {
@@ -3132,7 +3176,7 @@ impl<P: ControlProvider> LiveControl<P> {
                 .iter()
                 .map(|breakpoint| breakpoint.instruction.clone())
                 .collect::<Vec<_>>(),
-            ExpectedStop::SingleStep { instruction, .. } => vec![instruction.clone()],
+            ExpectedStop::SingleStep { .. } => Vec::new(),
             ExpectedStop::StepOver { .. } => Vec::new(),
             ExpectedStop::Software { .. } => Vec::new(),
         };
@@ -4618,6 +4662,11 @@ mod tests {
                 Action::Release(ReleaseMode::Resume),
             ]
         );
+        assert_eq!(
+            dispatcher.wait_instructions,
+            [vec![instruction()], vec![]],
+            "the step wait relies on its pre-release instruction proof"
+        );
     }
 
     #[test]
@@ -5829,7 +5878,7 @@ mod tests {
             },
             ObservedStop {
                 event: event(StopReason::DebugException),
-                instructions: vec![natural.clone()],
+                instructions: Vec::new(),
             },
         ]);
         let provider = FakeProvider::new().with_hardware_rip(BASE_RIP);
@@ -5975,7 +6024,7 @@ mod tests {
             },
             ObservedStop {
                 event: vp1_step,
-                instructions: vec![instruction()],
+                instructions: Vec::new(),
             },
         ]);
         let mut control =
@@ -6273,7 +6322,7 @@ mod tests {
             observed(StopReason::SingleStep),
             ObservedStop {
                 event: event(StopReason::DebugException),
-                instructions: vec![branch.clone()],
+                instructions: Vec::new(),
             },
         ]);
         let provider = FakeProvider::new().with_single_step_rips([TARGET_RIP + 5, branch_target.0]);
@@ -7056,11 +7105,6 @@ mod tests {
         let mut control =
             LiveControl::open_with_transition(FakeProvider::new().with_stopped_cr3_change(), true)
                 .unwrap();
-        let redirect = control
-            .arm(&mut dispatcher, breakpoints(), ArmMode::Redirect)
-            .unwrap_err();
-        assert!(redirect.to_string().contains("natural arm mode"));
-
         control
             .arm(&mut dispatcher, breakpoints(), ArmMode::Natural)
             .unwrap();
@@ -7082,10 +7126,15 @@ mod tests {
             .continue_from(&mut dispatcher, &stepped.epoch)
             .unwrap();
 
-        assert_eq!(dispatcher.bound_cr3s, [0xdead_0000, 0xdead_0000]);
+        assert_eq!(
+            dispatcher.bound_cr3s,
+            [0xdead_0000],
+            "the mapping-preserving step keeps the already proved root"
+        );
         assert_eq!(
             dispatcher.verification_roots,
-            [Some(0xdead_0000), Some(0xdead_0000), Some(0xdead_0000)]
+            [Some(0xdead_0000), Some(0xdead_0000)],
+            "the source instruction is proved before release and is not reread after it executes"
         );
         let registers = &control.test_provider().registers;
         for name in [
@@ -7113,6 +7162,24 @@ mod tests {
                 .0,
             0x400
         );
+    }
+
+    #[test]
+    fn transition_authority_does_not_relax_a_redirected_stop_cr3() {
+        let mut dispatcher =
+            FakeDispatcher::new([observed(StopReason::HardwareBreakpoint { slot: 0 })]);
+        let mut control =
+            LiveControl::open_with_transition(FakeProvider::new().with_stopped_cr3_change(), true)
+                .unwrap();
+
+        control
+            .arm(&mut dispatcher, breakpoints(), ArmMode::Redirect)
+            .unwrap();
+        let error = control.wait_for_stop(&mut dispatcher).unwrap_err();
+
+        assert!(error.to_string().contains("CR3"), "{error:#}");
+        assert!(control.fault().unwrap().target_left_paused);
+        assert!(dispatcher.bound_cr3s.is_empty());
     }
 
     #[test]
@@ -7477,6 +7544,11 @@ mod tests {
         assert!(writes_cr3(&guard(&[0x0f, 0x22, 0xdc])).unwrap());
         assert!(!writes_cr3(&guard(&[0x0f, 0x22, 0xd4])).unwrap());
         assert!(!writes_cr3(&guard(&[0x0f, 0x20, 0xdc])).unwrap());
+        assert!(preserves_page_table_mapping(&guard(&[0x90])).unwrap());
+        assert!(preserves_page_table_mapping(&guard(&[0x0f, 0x1f, 0x44, 0x00, 0x00])).unwrap());
+        assert!(!preserves_page_table_mapping(&guard(&[0x48, 0x89, 0x18])).unwrap());
+        assert!(!preserves_page_table_mapping(&guard(&[0x0f, 0x22, 0xdc])).unwrap());
+        assert!(!preserves_page_table_mapping(&guard(&[0x0f, 0x30])).unwrap());
     }
 
     #[test]
@@ -7969,10 +8041,15 @@ mod tests {
         );
     }
 
-    fn observed(_reason: StopReason) -> ObservedStop {
+    fn observed(reason: StopReason) -> ObservedStop {
         ObservedStop {
             event: event(StopReason::DebugException),
-            instructions: vec![instruction()],
+            instructions: if matches!(reason, StopReason::SingleStep | StopReason::StepOver { .. })
+            {
+                Vec::new()
+            } else {
+                vec![instruction()]
+            },
         }
     }
 

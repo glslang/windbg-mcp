@@ -40,6 +40,7 @@ try {
     }
     [void] (Invoke-SkKdLauncherCore `
         -OpenSession { [void] $events.Add('open'); return $fakeOpened } `
+        -ReadySession { param($actual) [void] $events.Add("ready:$actual") } `
         -LaunchDebugger {
             param($actual)
             [void] $events.Add("launch:$actual")
@@ -50,7 +51,7 @@ try {
             [void] $events.Add("end:$actual")
             return [pscustomobject] @{ status = 'ok'; released = $true }
         })
-    Assert-SkLauncher (($events -join '|') -eq "open|launch:$connection|end:fake-session") `
+    Assert-SkLauncher (($events -join '|') -eq "open|ready:fake-session|launch:$connection|end:fake-session") `
         'the fake client did not carry the typed connection through ordered cleanup'
 
     $events.Clear()
@@ -58,6 +59,7 @@ try {
     try {
         [void] (Invoke-SkKdLauncherCore `
             -OpenSession { [void] $events.Add('open'); return $fakeOpened } `
+            -ReadySession { param($actual) [void] $events.Add("ready:$actual") } `
             -LaunchDebugger { param($actual) [void] $events.Add('early-exit'); return 23 } `
             -EndSession {
                 param($actual)
@@ -68,8 +70,27 @@ try {
         $earlyExitReported = $_.Exception.Message.Contains('exited with code 23')
     }
     Assert-SkLauncher $earlyExitReported 'an early debugger exit was not reported'
-    Assert-SkLauncher (($events -join '|') -eq 'open|early-exit|end:fake-session') `
+    Assert-SkLauncher (($events -join '|') -eq 'open|ready:fake-session|early-exit|end:fake-session') `
         'an early debugger exit did not end the managed session'
+
+    $events.Clear()
+    $readinessFailureReported = $false
+    try {
+        [void] (Invoke-SkKdLauncherCore `
+            -OpenSession { [void] $events.Add('open'); return $fakeOpened } `
+            -ReadySession { param($actual) [void] $events.Add('ready-failed'); throw 'pipe readiness failed' } `
+            -LaunchDebugger { throw 'must not launch' } `
+            -EndSession {
+                param($actual)
+                [void] $events.Add("end:$actual")
+                return [pscustomobject] @{ status = 'ok'; released = $true }
+            })
+    } catch {
+        $readinessFailureReported = $_.Exception.Message.Contains('pipe readiness failed')
+    }
+    Assert-SkLauncher $readinessFailureReported 'a pipe-readiness failure was not reported'
+    Assert-SkLauncher (($events -join '|') -eq 'open|ready-failed|end:fake-session') `
+        'a pipe-readiness failure did not release the managed session before launch'
 
     $events.Clear()
     $failedOpen = [pscustomobject] @{
@@ -83,6 +104,7 @@ try {
     try {
         [void] (Invoke-SkKdLauncherCore `
             -OpenSession { [void] $events.Add('open'); return $failedOpen } `
+            -ReadySession { throw 'must not wait for readiness' } `
             -LaunchDebugger { throw 'must not launch' } `
             -EndSession {
                 param($actual)
@@ -100,6 +122,7 @@ try {
     try {
         [void] (Invoke-SkKdLauncherCore `
             -OpenSession { return $fakeOpened } `
+            -ReadySession { return } `
             -LaunchDebugger { return 0 } `
             -EndSession { return [pscustomobject] @{ status = 'ok'; released = $false } })
     } catch {

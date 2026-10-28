@@ -245,6 +245,42 @@ function Invoke-SkMcpTool {
     return $structured
 }
 
+function Wait-SkKdReady {
+    param(
+        $Client,
+        [Parameter(Mandatory = $true)][string] $SessionId,
+        [int] $TimeoutMs
+    )
+
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+    while ($true) {
+        $remaining = [int] [Math]::Min(
+            [int]::MaxValue,
+            ($deadline - [DateTime]::UtcNow).TotalMilliseconds
+        )
+        if ($remaining -le 0) {
+            throw "Timed out waiting for Secure Kernel KD session $SessionId to create its pipe."
+        }
+        $status = Invoke-SkMcpTool $Client 'session_status' @{ session_id = $SessionId } $remaining
+        $session = @((Get-SkProperty $status 'sessions')) |
+            Where-Object { (Get-SkProperty $_ 'session_id') -eq $SessionId } |
+            Select-Object -First 1
+        if ($null -eq $session) {
+            throw "session_status omitted Secure Kernel KD session $SessionId."
+        }
+        $state = Get-SkProperty $session 'state'
+        $name = Get-SkProperty $state 'state'
+        $phase = if ($name -eq 'secure_kernel_kd') { Get-SkProperty $state 'phase' } else { $name }
+        if ($phase -eq 'waiting_for_peer') {
+            return
+        }
+        if ($phase -in @('recovery_required', 'failed', 'closed')) {
+            throw "Secure Kernel KD session $SessionId entered terminal phase $phase before its pipe was ready."
+        }
+        Start-Sleep -Milliseconds 50
+    }
+}
+
 function Stop-SkMcpClient {
     param($Client)
     if ($null -eq $Client) {
@@ -292,6 +328,7 @@ function Get-SkOpenFailureMessage {
 function Invoke-SkKdLauncherCore {
     param(
         [Parameter(Mandatory = $true)][scriptblock] $OpenSession,
+        [Parameter(Mandatory = $true)][scriptblock] $ReadySession,
         [Parameter(Mandatory = $true)][scriptblock] $LaunchDebugger,
         [Parameter(Mandatory = $true)][scriptblock] $EndSession
     )
@@ -311,6 +348,7 @@ function Invoke-SkKdLauncherCore {
             if (-not $connection) {
                 throw 'open_sk_kd succeeded without its typed generated connection.'
             }
+            & $ReadySession $sessionId
             $exitCode = & $LaunchDebugger $connection
             if ($exitCode -ne 0) {
                 throw "The debugger exited with code $exitCode."
@@ -377,6 +415,7 @@ function Invoke-SkKdLauncher {
 
         [void] (Invoke-SkKdLauncherCore `
             -OpenSession { Invoke-SkMcpTool $client 'open_sk_kd' $arguments $OpenTimeout } `
+            -ReadySession { param($session) Wait-SkKdReady $client $session $OpenTimeout } `
             -LaunchDebugger { param($connection) Start-SkDebuggerAndWait $Debugger $connection } `
             -EndSession { param($session) Invoke-SkMcpTool $client 'end_session' @{ session_id = $session } $EndTimeout })
     } finally {

@@ -147,6 +147,17 @@ enum DisplacedBreakpoint {
     Hardware(InstructionGuard),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlSpaceWrite {
+    Unchanged,
+    /// DbgEng stages this immediately before tracing past a hit processor breakpoint. The live
+    /// controller performs the same disarm atomically in its retained-breakpoint step.
+    RetainedHardwareDisarm {
+        slot: u8,
+    },
+    Refused,
+}
+
 #[derive(Clone, Debug)]
 struct ReportedInstruction {
     guard: InstructionGuard,
@@ -567,7 +578,10 @@ impl ManagedRequest {
                 dispatcher_vnd,
                 target,
                 max_pause_ms: max_pause.as_millis() as u64,
-                allow_transition_cr3: false,
+                // The initial redirect, when selected, remains pinned to the provider's startup
+                // CR3. Once the debugger continues naturally, a Secure Kernel entry may arrive
+                // through another VTL1 address space; the controller rebinds and re-verifies it.
+                allow_transition_cr3: true,
                 allow_memory_writes: false,
                 additional_vps: Vec::new(),
                 reserved_hardware_slots: Vec::new(),
@@ -1101,6 +1115,7 @@ async fn run_async(
         eprintln!("initial KD state change sent");
 
         let mut displaced_breakpoint = None::<DisplacedBreakpoint>;
+        let mut pending_special_disarm = None::<u8>;
         let mut stopped_break_in = StoppedBreakIn::default();
         loop {
             let frame_wait =
@@ -1180,6 +1195,7 @@ async fn run_async(
                 compatibility.reset_peer_probes();
                 breakpoints.clear();
                 displaced_breakpoint = None;
+                pending_special_disarm = None;
                 stopped_break_in.reset();
                 send_stop(
                     &mut writer,
@@ -1270,10 +1286,13 @@ async fn run_async(
                 if read.address == crate::kdapi::AMD64_DEBUG_CONTROL_SPACE_KSPECIAL
                     && read.count as usize <= crate::kdapi::AMD64_SPECIAL_REGISTERS_BYTES
                 {
-                    let special = crate::kdapi::amd64_special_registers(
+                    let mut special = crate::kdapi::amd64_special_registers(
                         &values,
                         stopped_low(&stop, RegisterName::Cr3)?,
                     );
+                    if let Some(slot) = pending_special_disarm {
+                        stage_hardware_disarm(&mut special, slot);
+                    }
                     tracing::info!(
                         selector = format_args!("{:#x}", read.address),
                         count = read.count,
@@ -1290,12 +1309,41 @@ async fn run_async(
                     );
                     request.failure_response()
                 }
-            } else if let Some((write, _)) = request.write_control_space() {
+            } else if let Some((write, written)) = request.write_control_space() {
+                let (disposition, differences) =
+                    if write.address == crate::kdapi::AMD64_DEBUG_CONTROL_SPACE_KSPECIAL {
+                        let special = crate::kdapi::amd64_special_registers(
+                            &values,
+                            stopped_low(&stop, RegisterName::Cr3)?,
+                        );
+                        (
+                            classify_control_space_write(
+                                write.count,
+                                written,
+                                &special,
+                                &stop.event.reason,
+                            ),
+                            byte_differences(&special, written),
+                        )
+                    } else {
+                        (ControlSpaceWrite::Refused, Vec::new())
+                    };
                 eprintln!(
-                    "KD control-space write {:#x}+{:#x} is unsupported",
-                    write.address, write.count
+                    "KD control-space write {:#x}+{:#x}, disposition={disposition:?}, first_differences={:?}",
+                    write.address,
+                    write.count,
+                    differences.into_iter().take(32).collect::<Vec<_>>()
                 );
-                request.failure_response()
+                match disposition {
+                    ControlSpaceWrite::Unchanged => {
+                        request.write_control_space_response(write.count)?
+                    }
+                    ControlSpaceWrite::RetainedHardwareDisarm { slot } => {
+                        pending_special_disarm = Some(slot);
+                        request.write_control_space_response(write.count)?
+                    }
+                    ControlSpaceWrite::Refused => request.failure_response(),
+                }
             } else if request.api_number() == crate::kdapi::DBGKD_GET_CONTEXT_API {
                 log_context_shape(0, crate::kdapi::AMD64_CONTEXT_BYTES as u32);
                 request.get_context_response(&context)?
@@ -1316,9 +1364,11 @@ async fn run_async(
                 }
             } else if let Some(written) = request.set_context() {
                 let matches = context.matches_prefix(written);
+                let differences = context.differences(written);
                 eprintln!(
-                    "KD SetContext supplied {:#x} bytes, unchanged={matches}",
-                    written.len()
+                    "KD SetContext supplied {:#x} bytes, unchanged={matches}, first_differences={:?}",
+                    written.len(),
+                    differences.iter().take(32).collect::<Vec<_>>()
                 );
                 if matches {
                     request.success_response()
@@ -1370,9 +1420,38 @@ async fn run_async(
                 request.success_response()
             } else if let Some(trace) = request.continue_trace() {
                 eprintln!("KD Continue api={:#x} trace={trace}", request.api_number());
+                // DbgEng's attach synchronization break is deferred until its internal
+                // artifact-drain continue. Consume that protocol request before applying the
+                // execution guards below: redirect mode may already have a staged slot-0
+                // disarm, but this continue does not execute VTL1 or discharge that obligation.
                 if stopped_break_in.take_for_continue() {
                     tracing::info!(
                         "consuming the deferred Secure Kernel KD break-in without resuming VTL1"
+                    );
+                    send_stop(
+                        &mut writer,
+                        &mut link,
+                        ReportedStop {
+                            instruction: &reported_instruction.stream,
+                            values: &values,
+                            stop: &stop,
+                            exception: reported_exception,
+                        },
+                        stopped_since,
+                        service_pause,
+                    )
+                    .await?;
+                    continue;
+                }
+                if let Some(slot) = pending_special_disarm
+                    && (!trace
+                        || !matches!(
+                            stop.event.reason,
+                            StopReason::HardwareBreakpoint { slot: stopped } if stopped == slot
+                        ))
+                {
+                    eprintln!(
+                        "KD continue refused: the staged slot-{slot} KSPECIAL disarm requires a trace from its retained hardware-breakpoint stop"
                     );
                     send_stop(
                         &mut writer,
@@ -1414,9 +1493,29 @@ async fn run_async(
                         read_instruction_guard(session, rip, stopped_deadline)
                             .and_then(fallthrough_step_guard)
                             .and_then(|guard| {
-                                session
-                                    .step_until(engine, &stop.epoch, guard, stopped_deadline)
-                                    .map(|_| ())
+                                let retained = matches!(
+                                    stop.event.reason,
+                                    StopReason::SoftwareBreakpoint { .. }
+                                        | StopReason::HardwareBreakpoint { .. }
+                                ) && guard.instruction.as_ref() == Some(&stop.instruction);
+                                if retained {
+                                    eprintln!(
+                                        "KD trace executes the retained breakpoint instruction at {:#x} under its existing proof",
+                                        stop.instruction.address.0
+                                    );
+                                    session
+                                        .step_retained_breakpoint_until(
+                                            engine,
+                                            &stop.epoch,
+                                            guard,
+                                            stopped_deadline,
+                                        )
+                                        .map(|_| ())
+                                } else {
+                                    session
+                                        .step_until(engine, &stop.epoch, guard, stopped_deadline)
+                                        .map(|_| ())
+                                }
                             })
                     })
                 } else if let Some(displacement) = displaced_step.clone() {
@@ -1509,6 +1608,11 @@ async fn run_async(
                     .await?;
                     continue;
                 }
+                if let Some(slot) = pending_special_disarm.take() {
+                    eprintln!(
+                        "KD trace consumed the staged slot-{slot} KSPECIAL disarm through the guarded retained-breakpoint step"
+                    );
+                }
                 // A user trace from a just-restored breakpoint is itself the one-instruction
                 // displacement. Once that guarded transition succeeds, the retained source
                 // instruction is stale just as it is after DbgEng's private non-trace continue.
@@ -1529,6 +1633,9 @@ async fn run_async(
                     return Err(error);
                 }
                 let waited = session.wait_for_stop_interruptible(engine, &activity);
+                if let Err(error) = &waited {
+                    eprintln!("KD running wait failed: {error:#}");
+                }
                 let mut retained_since =
                     record_cleanup_deadline(&activity, options.max_pause, cleanup_deadline)?;
                 let wake = wait_waker.finish();
@@ -1568,15 +1675,28 @@ async fn run_async(
                     (Err(error), Some(reason)) => return Err(error.context(reason.to_string())),
                     (Err(error), None) => return Err(error),
                 };
+                pending_special_disarm = None;
                 report_managed_phase(managed_job, crate::proto::SecureKernelKdPhase::Stopped);
                 stopped_since = retained_since
                     .context("the Secure Kernel wait did not record when it retained the stop")?;
                 stopped_deadline = pause_deadline(stopped_since, service_pause)?;
-                (values, context) = read_context(session, &stop, stopped_deadline)?;
+                (values, context) =
+                    read_context(session, &stop, stopped_deadline).map_err(|error| {
+                        eprintln!("KD stopped-context refresh failed: {error:#}");
+                        error
+                    })?;
                 reported_exception =
                     state_change_exception(&stop.event.reason, values.rip, &breakpoints);
                 reported_instruction =
-                    read_reported_instruction(session, values.rip, stopped_deadline)?;
+                    read_reported_instruction(session, values.rip, stopped_deadline).map_err(
+                        |error| {
+                            eprintln!(
+                                "KD stopped instruction-stream read at {:#x} failed: {error:#}",
+                                values.rip
+                            );
+                            error
+                        },
+                    )?;
                 compatibility.on_execution_stop();
                 send_stop(
                     &mut writer,
@@ -1590,7 +1710,11 @@ async fn run_async(
                     stopped_since,
                     service_pause,
                 )
-                .await?;
+                .await
+                .map_err(|error| {
+                    eprintln!("KD next state-change send failed: {error:#}");
+                    error
+                })?;
                 continue;
             } else {
                 eprintln!("KD API {:#x} is not implemented", request.api_number());
@@ -1950,6 +2074,60 @@ fn read_context(
     let values = context_values(stop, &extra)?;
     let context = Amd64Context::from_values(&values);
     Ok((values, context))
+}
+
+fn unchanged_control_space_write(count: u32, written: &[u8], expected: &[u8]) -> bool {
+    !written.is_empty()
+        && written.len() == count as usize
+        && expected.get(..written.len()) == Some(written)
+}
+
+fn classify_control_space_write(
+    count: u32,
+    written: &[u8],
+    expected: &[u8],
+    reason: &StopReason,
+) -> ControlSpaceWrite {
+    if unchanged_control_space_write(count, written, expected) {
+        return ControlSpaceWrite::Unchanged;
+    }
+    if written.len() != count as usize || written.len() != expected.len() {
+        return ControlSpaceWrite::Refused;
+    }
+    let StopReason::HardwareBreakpoint { slot } = *reason else {
+        return ControlSpaceWrite::Refused;
+    };
+    let mut staged = expected.to_vec();
+    if !stage_hardware_disarm(&mut staged, slot) || staged == expected {
+        return ControlSpaceWrite::Refused;
+    }
+    if written == staged {
+        ControlSpaceWrite::RetainedHardwareDisarm { slot }
+    } else {
+        ControlSpaceWrite::Refused
+    }
+}
+
+fn stage_hardware_disarm(special: &mut [u8], slot: u8) -> bool {
+    if slot >= crate::sklive::MAX_HARDWARE_BREAKPOINTS as u8 || special.len() < 0x50 {
+        return false;
+    }
+    let mut bytes = [0; 8];
+    bytes.copy_from_slice(&special[0x48..0x50]);
+    let dr7 = u64::from_le_bytes(bytes) & !(1 << (u32::from(slot) * 2));
+    special[0x48..0x50].copy_from_slice(&dr7.to_le_bytes());
+    true
+}
+
+fn byte_differences(expected: &[u8], supplied: &[u8]) -> Vec<(usize, Option<u8>, Option<u8>)> {
+    let length = expected.len().max(supplied.len());
+    (0..length)
+        .filter_map(|offset| {
+            let expected = expected.get(offset).copied();
+            let supplied = supplied.get(offset).copied();
+            (expected != supplied).then_some((offset, expected, supplied))
+        })
+        .collect()
 }
 
 fn context_values(stop: &StopRecord, extra: &[RegisterValue]) -> Result<Amd64ContextValues> {
@@ -2582,6 +2760,47 @@ mod tests {
     }
 
     #[test]
+    fn control_space_accepts_only_a_complete_unchanged_prefix() {
+        let expected = [1, 2, 3, 4];
+        assert!(unchanged_control_space_write(3, &expected[..3], &expected));
+        assert!(!unchanged_control_space_write(2, &expected[..3], &expected));
+        assert!(!unchanged_control_space_write(0, &[], &expected));
+        assert!(!unchanged_control_space_write(3, &[1, 2, 4], &expected));
+        assert!(!unchanged_control_space_write(
+            5,
+            &[1, 2, 3, 4, 5],
+            &expected
+        ));
+        assert_eq!(
+            byte_differences(&expected, &[1, 7, 3]),
+            vec![(1, Some(2), Some(7)), (3, Some(4), None)]
+        );
+
+        let mut special = [0; crate::kdapi::AMD64_SPECIAL_REGISTERS_BYTES];
+        special[0x48..0x50].copy_from_slice(&0x401u64.to_le_bytes());
+        let mut disarmed = special;
+        disarmed[0x48..0x50].copy_from_slice(&0x400u64.to_le_bytes());
+        assert_eq!(
+            classify_control_space_write(
+                disarmed.len() as u32,
+                &disarmed,
+                &special,
+                &StopReason::HardwareBreakpoint { slot: 0 },
+            ),
+            ControlSpaceWrite::RetainedHardwareDisarm { slot: 0 }
+        );
+        assert_eq!(
+            classify_control_space_write(
+                disarmed.len() as u32,
+                &disarmed,
+                &special,
+                &StopReason::SingleStep,
+            ),
+            ControlSpaceWrite::Refused
+        );
+    }
+
+    #[test]
     fn kd_report_keeps_the_full_stream_separate_from_the_step_guard() {
         let stream = [
             0x48, 0x89, 0xc8, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
@@ -2657,6 +2876,10 @@ mod tests {
         assert_eq!(request.open.dispatcher_vnd, None);
         assert_eq!(request.open.target.partition_id, None);
         assert_eq!(request.open.target.expected_cr3, None);
+        assert!(
+            request.open.allow_transition_cr3,
+            "managed KD must rebind natural stops reached through another VTL1 address space"
+        );
         assert_eq!(request.kernel_base, None);
         assert_eq!(request.initial, None);
     }
@@ -2861,11 +3084,23 @@ mod tests {
         assert!(arm.contains("BreakInPolicy::Cancel"));
         assert!(arm.contains("BreakInPolicy::Rendezvous"));
         assert!(arm.contains("wait_waker.begin(activity.clone(), break_in);"));
+        assert!(arm.contains("KD trace executes the retained breakpoint instruction"));
+        assert!(arm.contains("guard.instruction.as_ref() == Some(&stop.instruction)"));
         assert!(arm.contains("session.continue_running(engine, &stop.epoch)"));
         assert!(arm.contains(".continue_to_software_breakpoints("));
         assert!(arm.contains(".continue_to_breakpoints(engine, &stop.epoch, guards)"));
         assert!(arm.contains("if crate::sklive::is_break_wake(&error) =>"));
         assert!(arm.contains(".break_on_demand(engine, || retained_at = Some(Instant::now()))"));
+        let attach_break = arm
+            .find("if stopped_break_in.take_for_continue()")
+            .expect("the attach synchronization break is consumed");
+        let staged_disarm = arm
+            .find("if let Some(slot) = pending_special_disarm")
+            .expect("the retained hardware disarm is guarded");
+        assert!(
+            attach_break < staged_disarm,
+            "the protocol-only attach continue must not be refused by an execution guard"
+        );
         assert!(
             !arm.contains("live qualification reset the target"),
             "the 2026-10-18 refusal is retired; M8.2's gate is where the route is qualified"

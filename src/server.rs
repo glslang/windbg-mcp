@@ -4895,7 +4895,10 @@ impl WindbgServer {
                 dispatcher_vnd,
                 target,
                 max_pause_ms,
-                allow_transition_cr3: false,
+                // Managed KD must follow an ordinary VTL1 caller through Secure Kernel entry.
+                // Redirect acceptance is still strict; only later natural arms may establish a
+                // different, proved root.
+                allow_transition_cr3: true,
                 allow_memory_writes: authorized.allow_memory_writes,
                 additional_vps: Vec::new(),
                 reserved_hardware_slots: Vec::new(),

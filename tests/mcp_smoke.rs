@@ -51,7 +51,9 @@
 //!   `WINDBG_MCP_SMOKE_SK_KD=<private JSON config>`) — opens the same disposable VM through the
 //!   MCP-managed KD session, connects an installed `kd.exe`, performs `t`, `r`, `q`, observes the
 //!   server phases, then releases through MCP. Boot-specific VND, partition, CR3, kernel base and
-//!   vmwp PID values are deliberately absent from the call.
+//!   vmwp PID values are deliberately absent from the call. The separate
+//!   `WINDBG_MCP_SMOKE_SK_KD_M8` gate drives the fixed classic-WinDbg/WinDbgX breakpoint,
+//!   Ctrl+Break and race matrix and publishes one immutable artifact per arm.
 //! * **MessageManager CTF** (`#[ignore]`d, `WINDBG_MCP_SMOKE_CTF=1`, and the live-kernel gate)
 //!   — deploys a benign allocation fixture over WinRM, then verifies that the real driver and its
 //!   pool objects are visible through the structured MCP tools. The PowerShell orchestrator owns
@@ -83,6 +85,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{Value, json};
+
+#[path = "support/sk_m8.rs"]
+mod sk_m8;
 
 /// The binary built for the current profile. Using Cargo's path (rather than
 /// `target/release/windbg-mcp.exe`) keeps the smoke test clear of the release exe that a
@@ -23522,8 +23527,8 @@ fn secure_kernel_kd_launcher_obeys_its_cleanup_contract() {
 /// debugger tools. `open_sk_debugger` creates the hidden managed KD facade and attaches an
 /// ordinary kernel worker to it, and from then on the generic tools do the work: a breakpoint at
 /// the configured Secure Kernel symbol, `continue_async` to it, the configured guest trigger,
-/// registers, stack and disassembly at the stop, a single step, then a run with no breakpoint
-/// broken in by `break_in`, whose stop is the controller's M2 rendezvous. The composite is ended
+/// registers, stack and disassembly at the stop, a single step, then 25 runs with no breakpoint
+/// broken in by `break_in`, whose stops are the controller's M2 rendezvous. The composite is ended
 /// through its one public handle and the configured external audit must pass afterwards.
 ///
 /// The config is the managed KD tier's, plus optional `breakpoint` (an expression; default
@@ -23533,6 +23538,8 @@ fn secure_kernel_kd_launcher_obeys_its_cleanup_contract() {
 #[test]
 #[ignore = "controls one explicitly disposable VBS VM; needs WINDBG_MCP_SMOKE_SK_KD and the startup policy, then run alone"]
 fn a_managed_secure_kernel_kd_session_is_driven_by_this_servers_own_kernel_attach() {
+    const FREE_RUN_CYCLES: usize = 25;
+
     let Some(config) = secure_kernel_kd_tier() else {
         return;
     };
@@ -23559,6 +23566,10 @@ fn a_managed_secure_kernel_kd_session_is_driven_by_this_servers_own_kernel_attac
         .and_then(Value::as_str)
         .unwrap_or("securekernel!IumInvokeSecureService")
         .to_string();
+    let arm_mode = config
+        .get("arm_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("natural");
     let symbol_path = config
         .get("symbol_path")
         .and_then(Value::as_str)
@@ -23609,6 +23620,24 @@ fn a_managed_secure_kernel_kd_session_is_driven_by_this_servers_own_kernel_attac
             modules.to_string().contains("securekernel"),
             "the client did not see the live securekernel image: {modules}"
         );
+
+        // Redirect mode opens on the profile's retained slot-0 stop. Consume that stop before
+        // installing the user's breakpoint: an ordinary `g` is correctly refused while its
+        // staged KSPECIAL disarm is still owed.
+        if arm_mode == "redirect" {
+            let initial = server.tool_data("registers", json!({ "session_id": &kd }), TARGET_STEP);
+            let initial_rip = initial["instruction_pointer"]
+                .as_str()
+                .expect("the redirected initial stop reports RIP")
+                .to_string();
+            let stepped = server.tool_data("step_into", json!({ "session_id": &kd }), TARGET_STEP);
+            eprintln!("--- client initial redirect step ---\n{stepped}");
+            assert_ne!(
+                stepped["stopped_at"],
+                json!(initial_rip),
+                "the redirected initial stop was not consumed: {stepped}"
+            );
+        }
 
         // M8.0 row one: `bp` arrives as WriteBreakpoint and the composite maps it to one of M1's
         // guarded execution slots. DbgEng still sees its ordinary code-breakpoint handle.
@@ -23684,63 +23713,80 @@ fn a_managed_secure_kernel_kd_session_is_driven_by_this_servers_own_kernel_attac
             json!({ "session_id": &kd, "all": true }),
             TARGET_STEP,
         );
-        let started = server.tool_data(
-            "continue_async",
-            json!({ "session_id": &kd, "max_run_ms": 120000 }),
-            TARGET_STEP,
-        );
-        let execution = started["execution"]
-            .as_str()
-            .expect("a started run mints a handle")
-            .to_string();
-        let trigger_output = if let Some(trigger) = trigger {
-            let output = trigger.wait(Duration::from_secs(120));
-            eprintln!(
-                "--- trigger ({}) ---\n{}\n{}",
-                output.status,
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
+        let mut trigger = trigger;
+        for cycle in 0..FREE_RUN_CYCLES {
+            let started = server.tool_data(
+                "continue_async",
+                json!({ "session_id": &kd, "max_run_ms": 120000 }),
+                TARGET_STEP,
             );
-            Some(output)
-        } else {
-            std::thread::sleep(Duration::from_secs(3));
-            None
-        };
-        let asked = server.tool_data(
-            "break_in",
-            json!({ "session_id": &kd, "execution": &execution }),
-            TARGET_STEP,
-        );
-        assert_eq!(asked["requested"], json!(true), "{asked}");
-        let broken = server.tool_data(
-            "wait_for_stop",
-            json!({ "session_id": &kd, "execution": &execution, "timeout_ms": 120000 }),
-            TARGET_STEP,
-        );
-        eprintln!("--- client stop from the break-in ---\n{broken}");
-        assert!(
-            !broken["stop"].is_null(),
-            "the break-in produced no stop: {broken}\n--- stderr ---\n{}",
-            server.stderr()
-        );
+            assert_eq!(started["running"], json!(true), "cycle {cycle}: {started}");
+            let execution = started["execution"]
+                .as_str()
+                .expect("a started run mints a handle")
+                .to_string();
+            let trigger_output = if cycle == 0 {
+                if let Some(trigger) = trigger.take() {
+                    let output = trigger.wait(Duration::from_secs(120));
+                    eprintln!(
+                        "--- trigger ({}) ---\n{}\n{}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    Some(output)
+                } else {
+                    std::thread::sleep(Duration::from_secs(3));
+                    None
+                }
+            } else {
+                None
+            };
+            let asked = server.tool_data(
+                "break_in",
+                json!({ "session_id": &kd, "execution": &execution }),
+                TARGET_STEP,
+            );
+            assert_eq!(asked["requested"], json!(true), "cycle {cycle}: {asked}");
+            let broken = server.tool_data(
+                "wait_for_stop",
+                json!({ "session_id": &kd, "execution": &execution, "timeout_ms": 120000 }),
+                TARGET_STEP,
+            );
+            eprintln!("--- client stop from break-in {cycle:02} ---\n{broken}");
+            assert!(
+                !broken["stop"].is_null() && broken["stop"]["interrupted"] == true,
+                "break-in cycle {cycle} produced no interrupted stop: {broken}\n--- stderr ---\n{}",
+                server.stderr()
+            );
+            // A trigger transport failure must not strand a running target: prove and collect
+            // the explicit break-in first, then report the external command's failure.
+            if let Some(output) = trigger_output {
+                assert!(output.status.success(), "the configured trigger failed");
+            }
+        }
         let registers = server.tool_data("registers", json!({ "session_id": &kd }), TARGET_STEP);
         eprintln!("--- client registers after the break-in ---\n{registers}");
-        // A trigger transport failure must not strand a running target: prove and collect the
-        // explicit break-in first, then report the external command's failure.
-        if let Some(output) = trigger_output {
-            assert!(output.status.success(), "the configured trigger failed");
-        }
 
         let stderr = server.stderr();
         for expected in [
             "KD go to 1 hardware breakpoint(s)",
             "KD restored the hit hardware-breakpoint handle",
-            "KD go with no breakpoint",
-            "KD break-in woke the running wait",
         ] {
             assert!(
                 stderr.contains(expected),
                 "the facade did not log {expected:?}\n--- stderr ---\n{stderr}"
+            );
+        }
+        for expected in [
+            "KD go with no breakpoint",
+            "KD break-in woke the running wait",
+        ] {
+            let count = stderr.matches(expected).count();
+            assert!(
+                count >= FREE_RUN_CYCLES,
+                "the facade logged {count} occurrences of {expected:?}, expected at least \
+                 {FREE_RUN_CYCLES}\n--- stderr ---\n{stderr}"
             );
         }
     }));
@@ -23749,9 +23795,6 @@ fn a_managed_secure_kernel_kd_session_is_driven_by_this_servers_own_kernel_attac
     let ended = server.call_tool("end_session", json!({ "session_id": &kd }), TARGET_STEP);
     eprintln!("--- composite session end ---\n{ended}");
     eprintln!("--- managed KD server audit ---\n{}", server.stderr());
-    if let Err(panic) = run {
-        resume_unwind(panic);
-    }
     assert_no_error(&ended, "tools/call end_session");
     let ended = &ended["result"]["structuredContent"];
     assert_eq!(ended["status"], "ok", "{ended}");
@@ -23788,6 +23831,9 @@ fn a_managed_secure_kernel_kd_session_is_driven_by_this_servers_own_kernel_attac
         0,
         "a hardware breakpoint remained armed: {audit}"
     );
+    if let Err(panic) = run {
+        resume_unwind(panic);
+    }
 }
 
 fn managed_secure_kernel_kd_gate(symbol_gate: bool) {
