@@ -1336,6 +1336,12 @@ async fn run_async(
                 );
                 match disposition {
                     ControlSpaceWrite::Unchanged => {
+                        // A complete unchanged DR7 field restores the real armed image after
+                        // DbgEng's staged compatibility disarm. A shorter prefix says nothing
+                        // about DR7 and must retain the obligation.
+                        if complete_special_dr7_was_written(written) {
+                            pending_special_disarm = None;
+                        }
                         request.write_control_space_response(write.count)?
                     }
                     ControlSpaceWrite::RetainedHardwareDisarm { slot } => {
@@ -1587,6 +1593,12 @@ async fn run_async(
                             if trace { "trace" } else { "go" }
                         );
                         return Err(error);
+                    }
+                    if trace {
+                        // No instruction executed and the controller's hardware slot remains
+                        // armed. Drop only the compatibility image DbgEng staged for this trace,
+                        // so a restored DR7 or a later go is not trapped behind a stale disarm.
+                        pending_special_disarm = None;
                     }
                     report_managed_phase(managed_job, crate::proto::SecureKernelKdPhase::Stopped);
                     eprintln!(
@@ -2108,8 +2120,16 @@ fn classify_control_space_write(
     }
 }
 
+const AMD64_SPECIAL_DR7_END: usize = 0x50;
+
+fn complete_special_dr7_was_written(written: &[u8]) -> bool {
+    written.len() >= AMD64_SPECIAL_DR7_END
+}
+
 fn stage_hardware_disarm(special: &mut [u8], slot: u8) -> bool {
-    if slot >= crate::sklive::MAX_HARDWARE_BREAKPOINTS as u8 || special.len() < 0x50 {
+    if slot >= crate::sklive::MAX_HARDWARE_BREAKPOINTS as u8
+        || special.len() < AMD64_SPECIAL_DR7_END
+    {
         return false;
     }
     let mut bytes = [0; 8];
@@ -2798,6 +2818,8 @@ mod tests {
             ),
             ControlSpaceWrite::Refused
         );
+        assert!(!complete_special_dr7_was_written(&special[..0x4f]));
+        assert!(complete_special_dr7_was_written(&special[..0x50]));
     }
 
     #[test]
@@ -3089,6 +3111,8 @@ mod tests {
         assert!(arm.contains("session.continue_running(engine, &stop.epoch)"));
         assert!(arm.contains(".continue_to_software_breakpoints("));
         assert!(arm.contains(".continue_to_breakpoints(engine, &stop.epoch, guards)"));
+        assert!(arm.contains("if trace {\n                        // No instruction executed"));
+        assert!(arm.contains("pending_special_disarm = None;"));
         assert!(arm.contains("if crate::sklive::is_break_wake(&error) =>"));
         assert!(arm.contains(".break_on_demand(engine, || retained_at = Some(Instant::now()))"));
         let attach_break = arm

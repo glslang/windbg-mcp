@@ -134,6 +134,36 @@ try {
     Assert-SkLauncher ($quoted.Contains('"a path with spaces"')) 'space-bearing native arguments were not quoted'
     Assert-SkLauncher ($quoted.EndsWith('"ends in slash\\"')) 'a trailing slash was not doubled before its quote'
 
+    foreach ($phase in @('recovery_required', 'live_control_unresolved', 'failed', 'closed', 'released')) {
+        Assert-SkLauncher (Test-SkKdTerminalPhase $phase) "terminal phase $phase was not recognized"
+    }
+    Assert-SkLauncher (-not (Test-SkKdTerminalPhase 'waiting_for_peer')) `
+        'the ready phase was classified as terminal'
+
+    $launcherSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'launch_sk_kd.ps1') -Raw
+    $packageCandidate = $launcherSource.IndexOf('Get-AppxPackage Microsoft.WinDbg')
+    $aliasCandidate = $launcherSource.IndexOf('Get-Command WinDbgX.exe')
+    Assert-SkLauncher ($packageCandidate -ge 0 -and $packageCandidate -lt $aliasCandidate) `
+        'WinDbgX resolution did not prefer the package executable over its execution alias'
+
+    $stopEvents = New-Object System.Collections.Generic.List[string]
+    $fakeStopInput = [pscustomobject] @{ Events = $stopEvents }
+    $fakeStopInput | Add-Member -MemberType ScriptMethod -Name Close -Value {
+        [void] $this.Events.Add('input:closed')
+    }
+    $fakeStopProcess = [pscustomobject] @{ Events = $stopEvents }
+    $fakeStopProcess | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {
+        param([int] $TimeoutMs)
+        [void] $this.Events.Add("wait:$TimeoutMs")
+        return $true
+    }
+    $fakeStopProcess | Add-Member -MemberType ScriptMethod -Name Kill -Value {
+        [void] $this.Events.Add('kill')
+    }
+    Stop-SkMcpClient @{ Input = $fakeStopInput; Process = $fakeStopProcess } 4321
+    Assert-SkLauncher (($stopEvents -join '|') -eq 'input:closed|wait:4321') `
+        'the launcher did not wait its configured cleanup budget for orderly server shutdown'
+
     $firstRead = New-Object 'System.Threading.Tasks.TaskCompletionSource[string]'
     $secondRead = New-Object 'System.Threading.Tasks.TaskCompletionSource[string]'
     $reads = New-Object 'System.Collections.Generic.Queue[System.Threading.Tasks.Task[string]]'

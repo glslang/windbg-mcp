@@ -103,10 +103,13 @@ heartbeat. K3 remained on its original boot, the child remained running, exact t
 were removed, both provider services were stopped, staging was removed, and the runner used no
 forced recovery. On 2026-10-28 the final controller repeated the same generic assertions and 25
 free-run/break-in cycles on each of three clean boots; all 75 stops, ordered releases and
-60-second audits passed. The external WinDbg/WinDbgX breakpoint slice was then rerun against the
-same final code on the third boot: both clients completed 100 hardware and 100 guarded-INT3 hits,
-and every arm passed guarded release and its 60-second audit. External free-run and race controls
-remain separate; the unsafe GUI/remote Ctrl+Break experiments are not repeated.
+60-second audits passed. The tested binary reported
+`windbg-mcp 0.23.0+ge31b232e-dirty.b48fcacf`; that exact source tree was then committed as
+`a9f194d0`. The external WinDbg/WinDbgX breakpoint slice was rerun against the final controller on
+the third boot with `windbg-mcp 0.23.0+ga9f194d0-dirty.4b655566`; its breakpoint-only harness
+change was then committed as `187c7c2c`. Both clients completed 100 hardware and 100 guarded-INT3
+hits, and every arm passed guarded release and its 60-second audit. External free-run and race
+controls remain separate; the unsafe GUI/remote Ctrl+Break experiments are not repeated.
 
 ## Running the managed session
 

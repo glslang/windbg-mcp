@@ -390,11 +390,11 @@
     {
       "annotations": 132,
       "description": 369,
-      "inputSchema": 3033,
-      "modelVisible": 3463,
+      "inputSchema": 3179,
+      "modelVisible": 3609,
       "name": "open_sk_live_control",
       "outputSchema": 4742,
-      "wire": 8368
+      "wire": 8514
     },
     {
       "annotations": 114,
@@ -805,13 +805,13 @@
   "totals": {
     "annotations": 10036,
     "description": 51407,
-    "inputSchema": 83194,
+    "inputSchema": 83340,
     "instructions": 2022,
-    "modelVisible": 139414,
+    "modelVisible": 139560,
     "outputSchema": 261861,
-    "payload": 413930,
+    "payload": 414076,
     "tools": 89,
-    "wire": 413830,
+    "wire": 413976,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10296
   }

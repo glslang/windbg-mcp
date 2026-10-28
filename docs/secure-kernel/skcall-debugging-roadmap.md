@@ -1518,21 +1518,19 @@ The remaining acceptance is the real-client matrix in M8.2, not more launcher me
 
 #### M8.2 — live compatibility and safety gate
 
-Qualify classic WinDbg and WinDbgX separately on each of three clean boots. Each client must pass:
+The product gate is the server-owned composite on three clean boots. Each boot must pass the
+generic debugger assertions, one hardware breakpoint, one fall-through step, and 25 bounded
+`g`-without-breakpoint → typed `break_in` cycles through one managed session. Each ordered release
+audits exact DR0–DR3/DR6/DR7/RFLAGS restoration, unchanged Secure Kernel text, one selected VP,
+the same boot/`vmwp`, heartbeat and retained processes. A reset, hang, ambiguous stop or unproved
+restoration fails the gate and leaves ordinary `g` disabled.
 
-- 100 `bp` → `g` → owned-stop cycles at the deterministic M1 site with the read-only policy's
-  hardware-slot mapping, including set/list/remove;
-- 100 more cycles with the write-authorized standalone facade's M3 guarded-INT3 mapping, including
-  proof that the original byte is restored at every stop and release;
-- 25 `g`-without-breakpoint → Ctrl+Break cycles using the M2 request;
-- natural-stop-wins, Ctrl+Break-wins, already-stopped, no-hit/timeout, reset, disconnect,
-  reconnect and MCP-teardown races; and
-- `r`, bounded memory reads, `lm`, symbols, stack, one fall-through `t`, refused writes and a
-  refused fifth breakpoint before and after the run tests.
-
-Every arm audits exact DR0–DR3/DR6/DR7/RFLAGS restoration, unchanged Secure Kernel text, one
-selected VP, same boot/`vmwp`, heartbeat and retained processes. A reset, hang, ambiguous stop or
-unproved restoration fails the gate and leaves ordinary `g` disabled.
+The external-client compatibility slice separately proves both packet paths on the final
+controller: classic WinDbg and WinDbgX must each pass 100 hardware-breakpoint and 100 guarded-INT3
+owned-stop cycles, including set/list/remove and exact byte restoration. The full external
+free-run and race matrix below remains useful qualification machinery, but GUI Ctrl+Break and race
+automation are deferred compatibility work rather than part of the product exit. The unsafe
+window-message and remote-DbgEng Ctrl+Break experiments are not repeated.
 
 Run this in two engineering slices. M8.2a is an ignored qualification runner, completed offline
 before another live attempt: it takes explicit classic-WinDbg and WinDbgX paths, separate read-only
@@ -1626,14 +1624,17 @@ pending prior transition. Every other stop remains fail-closed.
 
 That final code passed the composite gate on three clean boots on 2026-10-28: `vmwp` PIDs 6952,
 11188 and 11464, partition IDs 7, 8 and 9, and a different discovered Secure Kernel relocation on
-each. All 75 free-run/break-in cycles returned the M2 stop, and every boot also passed modules,
-symbols, registers, stack, disassembly, a hardware breakpoint and one fall-through step through
-the generic tools. Each ordered release terminated both workers and passed its 60-second audit
-with the same `vmwp` at all three samples, stable SK text, heartbeat healthy, no recent `vmwp`
-errors, DR0--DR3 zero, DR7 `0x400`, and TF/RF clear. This closes the server-owned M8.2b gate.
-The current code's external breakpoint slice was then rerun on the third boot through the
-breakpoint-only M8.2a entry point. Classic/hardware, Classic/INT3, WinDbgX/hardware and WinDbgX/INT3
-each completed 100 ordered target hits. Every arm ended through MCP, retained boot
+each. The binary reported `windbg-mcp 0.23.0+ge31b232e-dirty.b48fcacf`; that exact source tree was
+then committed as `a9f194d0`. All 75 free-run/break-in cycles returned the M2 stop, and every boot
+also passed modules, symbols, registers, stack, disassembly, a hardware breakpoint and one
+fall-through step through the generic tools. Each ordered release terminated both workers and
+passed its 60-second audit with the same `vmwp` at all three samples, stable SK text, heartbeat
+healthy, no recent `vmwp` errors, DR0--DR3 zero, DR7 `0x400`, and TF/RF clear. This closes the
+server-owned M8.2b gate. The final controller's external breakpoint slice was then rerun on the
+third boot through the breakpoint-only M8.2a entry point with
+`windbg-mcp 0.23.0+ga9f194d0-dirty.4b655566`; its breakpoint-only harness change was then committed
+as `187c7c2c`. Classic/hardware, Classic/INT3, WinDbgX/hardware and WinDbgX/INT3 each completed 100
+ordered target hits. Every arm ended through MCP, retained boot
 `11464:639287765535459851` and `vmwp` 11464, and passed its 60-second audit with partition 9,
 stable SK text, heartbeat healthy, no recent `vmwp` errors, DR0--DR3 zero, DR7 `0x400`, and TF/RF
 clear. This is current-code packet/launcher compatibility evidence for both breakpoint backends;
