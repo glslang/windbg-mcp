@@ -209,6 +209,27 @@ impl ManipulateRequest {
             .map(|request| (request, self.data.as_slice()))
     }
 
+    pub(crate) fn write_control_space_response(
+        &self,
+        bytes_written: u32,
+    ) -> Result<Vec<u8>, ApiError> {
+        let request =
+            self.read_memory(DBGKD_WRITE_CONTROL_SPACE_API)
+                .ok_or(ApiError::WrongApi {
+                    expected: DBGKD_WRITE_CONTROL_SPACE_API,
+                    actual: self.api_number(),
+                })?;
+        if bytes_written > request.count {
+            return Err(ApiError::ReadResponseTooLong {
+                requested: request.count,
+                actual: bytes_written as usize,
+            });
+        }
+        let mut response = self.success_response();
+        response[28..32].copy_from_slice(&bytes_written.to_le_bytes());
+        Ok(response)
+    }
+
     fn read_memory(&self, api: u32) -> Option<ReadMemory> {
         (self.api_number() == api).then(|| ReadMemory {
             address: quad(&self.bytes, 16),
@@ -335,6 +356,18 @@ impl Amd64Context {
 
     pub(crate) fn matches_prefix(&self, bytes: &[u8]) -> bool {
         !bytes.is_empty() && self.bytes.starts_with(bytes)
+    }
+
+    pub(crate) fn differences(&self, bytes: &[u8]) -> Vec<(usize, u8, u8)> {
+        self.bytes
+            .iter()
+            .copied()
+            .zip(bytes.iter().copied())
+            .enumerate()
+            .filter_map(|(offset, (expected, supplied))| {
+                (expected != supplied).then_some((offset, expected, supplied))
+            })
+            .collect()
     }
 
     fn set_u16(&mut self, at: usize, value: u16) {
@@ -644,6 +677,22 @@ mod tests {
     }
 
     #[test]
+    fn a_control_space_write_reply_reports_every_written_byte() {
+        let mut captured = vec![0; MANIPULATE_BYTES + AMD64_SPECIAL_REGISTERS_BYTES];
+        captured[..4].copy_from_slice(&DBGKD_WRITE_CONTROL_SPACE_API.to_le_bytes());
+        captured[16..24].copy_from_slice(&AMD64_DEBUG_CONTROL_SPACE_KSPECIAL.to_le_bytes());
+        captured[24..28].copy_from_slice(&(AMD64_SPECIAL_REGISTERS_BYTES as u32).to_le_bytes());
+        let request = ManipulateRequest::decode(&captured).unwrap();
+
+        let response = request
+            .write_control_space_response(AMD64_SPECIAL_REGISTERS_BYTES as u32)
+            .unwrap();
+
+        assert_eq!(word(&response, 8), STATUS_SUCCESS);
+        assert_eq!(word(&response, 28), AMD64_SPECIAL_REGISTERS_BYTES as u32);
+    }
+
+    #[test]
     fn protocol_sizes_match_the_measured_amd64_abi() {
         assert_eq!(MANIPULATE_BYTES, 0x38);
         assert_eq!(WAIT_STATE_CHANGE64_BYTES, 0xf0);
@@ -773,6 +822,18 @@ mod tests {
         let context = Amd64Context::from_values(&Amd64ContextValues::default());
         assert!(!context.matches_prefix(&[]));
         assert!(context.matches_prefix(&context.bytes[..1]));
+    }
+
+    #[test]
+    fn context_differences_name_each_changed_byte() {
+        let context = Amd64Context::from_values(&Amd64ContextValues::default());
+        let mut supplied = context.bytes;
+        supplied[0x30] ^= 1;
+        supplied[0xf8] ^= 2;
+        assert_eq!(
+            context.differences(&supplied),
+            vec![(0x30, 0x17, 0x16), (0xf8, 0, 2)]
+        );
     }
 
     #[test]

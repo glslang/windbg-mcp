@@ -268,15 +268,73 @@ array (host-side, run after `continue_async` reports `running`; an idle guest re
 a second `continue_async` with nothing armed, `break_in` and `wait_for_stop`. It requires the
 facade log to show the three routes taken, ends the one public session through MCP (which detaches
 DbgEng before releasing the hidden controller), and runs the
-`post_release_audit` with the same DR7 check. It is the first live probe of M8.0's routing; a pass
-is one run of each route on one boot and not M8.2's gate. It passed on 2026-10-26 on the same K3
-nested bench against Secure Kernel 26100.9457: the post-release audit reported DR0–DR3 zero, DR7
-`0x400`, TF/RF clear, unchanged state, zero engine workers and heartbeat OK. The runner removed the
-durable guest trigger after composite release and needed no forced recovery.
+`post_release_audit` with the same DR7 check. The free-run/break-in row is repeated 25 times in one
+composite session. It first passed as a single-route proof on 2026-10-26. After the repeated gate
+found and fixed the pre-wait transition race and a queued native-return event, the final code passed
+on three clean K3 boots on 2026-10-28 against Secure Kernel 26100.9457: 75/75 break-ins, three
+distinct `vmwp` PIDs, partition IDs and SK relocations. Every ordered release and 60-second audit
+kept its boot's `vmwp` PID and SK text stable, reported DR0–DR3 zero, DR7 `0x400`, TF/RF clear, no
+recent `vmwp` errors and heartbeat OK. This is the server-owned composite M8.2 gate; the external
+Classic/WinDbgX compatibility matrix remains separate.
 The ordinary (non-live) smoke tier also runs `tools/test_launch_sk_kd.ps1`. Its fake MCP client
 proves that the M8 launcher consumes the typed generated connection, accepts an executable path
 containing spaces, refuses a missing debugger before opening, ends the managed session after an
 early debugger exit, and also ends a post-commit failed open that returned a recovery handle.
+
+M8.2a has a separate, still read-only preflight gate. Set `WINDBG_MCP_SMOKE_SK_KD_M8` to its
+private JSON config and run:
+
+```powershell
+cargo test --test mcp_smoke `
+  sk_m8::qualification_preflight_reads_one_healthy_static_boot `
+  -- --ignored --exact --nocapture
+```
+
+The schema is `windbg-mcp.sk-kd-m8.2a-config/v1`. It carries `disposable: true`; one static
+`open` object; distinct `frontends.classic` and `frontends.windbgx` executables; read-only
+`policies.hardware` and write-authorized `policies.int3`; per-frontend `interrupts.classic` and
+`interrupts.windbgx` Ctrl+Break command arrays and `resets.classic` and `resets.windbgx` debugger
+reset command arrays, each with exactly one `{pid}` substitution; `breakpoint`,
+`symbol_path`, one counted `trigger` command with exactly one `{count}` element, `boot_probe`,
+`post_release_audit` and `artifact_dir`. The interrupt command must deliver a real Ctrl+Break to
+the authenticated debugger PID, the reset command must deliver the debugger's reset control, and
+both must return nonzero if they cannot. The open object must omit per-boot
+`vmwp_pid`, dispatcher VND, partition ID, CR3 and kernel-base values: discovery still owns those.
+It must select VP 0 and fixes both connect and
+running-idle bounds at 60 seconds; shortening a timeout does not shrink the qualification gate.
+It also fixes `arm_mode` at `redirect`: that creates the first held stop immediately on an idle
+guest. After WinDbg steps that guarded NOP, every counted breakpoint and race stop is reached by
+natural guest execution. The counted trigger starts only after WinDbg has armed cycle zero, so
+neither the generated pipe nor the initial stop depends on an idle guest reaching the profile guard.
+The boot probe prints one JSON object naming the configured VM, boot identity, `vmwp` PID, VP count
+and heartbeat state. Preflight verifies the files, the policy delta and one healthy single-VP boot;
+it also resolves every configured host-command program before it starts the server, arms a
+breakpoint or counts a qualification boot.
+
+The destructive runner uses the same config and executes the four fixed breakpoint arms, one
+25-cycle free-run/Ctrl+Break arm for each frontend, then all eight race rows through each frontend
+on the current boot. It stops after the first failed artifact:
+
+```powershell
+cargo test --test mcp_smoke `
+  sk_m8::qualification_runner_executes_full_m8_2a_matrix_on_one_boot `
+  -- --ignored --exact --nocapture
+```
+
+For each arm it creates a unique command file and debugger log beneath `artifact_dir`, starts the
+server with that arm's policy, and launches the configured classic WinDbg or WinDbgX directly on
+the generated facade pipe. The 100-call counted trigger does not start until the debugger log
+contains the first arm marker. On success or failure, the runner asks MCP to release the session before it
+terminates the debugger, runs `post_release_audit`, probes the boot again and atomically publishes
+the JSON result. A passing artifact requires all 100 ordered stops, the same healthy boot identity
+and a passing audit. Each free-run arm likewise requires all 25 `g`/Ctrl+Break cycles, 25 successful
+interrupt helper calls and facade-side proof that each request woke the running wait. The runner
+then gives every race a separate immutable artifact and accepts only its assigned outcome:
+natural-stop-wins, Ctrl+Break-wins, already-stopped resend, no-hit timeout and release, reset resend,
+disconnect-to-reconnect, completed reconnect, and MCP teardown while running. Every row releases,
+audits and rechecks the boot independently. An offline green test is not a live qualification
+result.
+
 The separate ignored test
 `a_managed_secure_kernel_kd_session_resolves_symbols_and_unwinds_a_natural_stop`
 requires `symbol_path` naming a prepared local symbol cache and `arm_mode: "natural"`. It forces a

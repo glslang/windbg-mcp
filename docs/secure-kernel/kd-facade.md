@@ -91,8 +91,8 @@ continued to it. The review that
 filed items 115–119 read the facade and did not run it; the managed gates above are the later
 evidence against those findings.
 
-On 2026-10-26 the server-owned DbgEng composite passed its first live M8 route probe on the same K3
-nested bench. Through the ordinary MCP debugger tools it resolved the 26100.9457 PDB, enumerated
+On 2026-10-26 the server-owned DbgEng composite passed its first live M8 route probe on the K3
+one-VP VBS bench. Through the ordinary MCP debugger tools it resolved the 26100.9457 PDB, enumerated
 `securekernel.exe`, installed `securekernel!IumInvokeSecureService` in a hardware slot, continued
 to a guest enclave call, read registers and a two-frame symbolized stack, disassembled the x64
 entry, and single-stepped its first instruction. It then cleared the slot, performed a bounded
@@ -101,8 +101,9 @@ release restored the controller baseline before resuming the child. The independ
 DR0–DR3 zero, DR7 `0x400`, TF/RF clear, no engine workers, unchanged guarded text and a healthy
 heartbeat. K3 remained on its original boot, the child remained running, exact trigger artifacts
 were removed, both provider services were stopped, staging was removed, and the runner used no
-forced recovery. This is one pass of each route on one boot, not M8.2's repeated race matrix or an
-external WinDbg/WinDbgX qualification.
+forced recovery. On 2026-10-28 the final controller repeated the same generic assertions and 25
+free-run/break-in cycles on each of three clean boots; all 75 stops, ordered releases and
+60-second audits passed. The external WinDbg/WinDbgX compatibility matrix remains separate.
 
 ## Running the managed session
 
@@ -286,13 +287,17 @@ which single steps are refused, and what every other request is answered with:
   `pop ss`, `lss`), because the trap can land somewhere other than the successor. A decoded
   `mov cr3,r64` is carried to that successor with a temporary hardware breakpoint rather than TF;
   the controller binds the resulting root and removes the slot before reporting the stop.
-  **`g` is routed since 2026-10-25 and passed its first server-owned live probe on 2026-10-26.** A non-trace
+  **`g` is routed since 2026-10-25 and passed the server-owned three-clean-boot gate on
+  2026-10-28.** A non-trace
   continue (legacy or `Continue2`) with hardware breakpoints installed is M1's proved
   continue-to-breakpoints; with none installed it is a bounded free run in which every slot is
   released and only a Ctrl+Break, teardown or the wait's recovery deadline can stop the VP, never
-  an infinite resume. A transition the controller refuses resends the held stop, so the session
-  survives it. The call-debugging roadmap's M8.2 gate owns the packet-race and recovery
-  qualification of both routes; the one-run probe is the ignored test
+  an infinite resume. Managed KD grants transition-CR3 authority to those natural arms: a stop in
+  another VTL1 address space is accepted only after two stable snapshots, a nonzero page-aligned
+  root, a rebound memory walker and fresh breakpoint-byte verification. The immediate redirected
+  first stop remains pinned to the startup CR3. A transition the controller refuses resends the
+  held stop, so the session survives it. The call-debugging roadmap's M8.2 gate owns the packet-race and recovery
+  qualification of both routes; the repeated probe is the ignored test
   `a_managed_secure_kernel_kd_session_is_driven_by_this_servers_own_kernel_attach`, which drives
   them through `open_sk_debugger`'s supervisor-owned composite. Whatever WinDbg sends for `p` is
   handled by the trace arm.
@@ -302,8 +307,8 @@ which single steps are refused, and what every other request is answered with:
   refused, as are all control-space writes. No guest memory is written and no general-purpose register is: the only writes are the
   controller's own — debug registers for a breakpoint, TF for a step — and the baseline restores
   them at release.
-- **Break-in during a `g` is routed to M2 since 2026-10-25 and passed its first server-owned live
-  probe on 2026-10-26.** The serial break-in byte binds to the exact running wait: the reader marks the
+- **Break-in during a `g` is routed to M2 since 2026-10-25 and passed 75 server-owned live cycles
+  across three clean boots on 2026-10-28.** The serial break-in byte binds to the exact running wait: the reader marks the
   wait's break request before it interrupts the owned DbgEng wait, the dispatcher answers that
   interruption as a break wake rather than a cancellation, and the engine thread runs the M2
   rendezvous, a proved VM pause, a transient execute breakpoint at the paused RIP and the ordinary

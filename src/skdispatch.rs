@@ -76,6 +76,7 @@ pub(crate) const CLEANUP_RESERVE: Duration = Duration::from_secs(30);
 pub(crate) const MIN_PAUSE_MS: u64 = CLEANUP_RESERVE.as_millis() as u64 * 2;
 const POLL: Duration = Duration::from_millis(20);
 const EVENT_TYPE_VECTOR: u64 = 0x0100_0002;
+const STATUS_BREAKPOINT: u32 = 0x8000_0003;
 const DEBUG_VECTOR: u8 = 1;
 const BREAKPOINT_VECTOR: u8 = 3;
 const MAX_AMD64_INSTRUCTION_BYTES: usize = 15;
@@ -107,6 +108,18 @@ fn require_retention_deadline(deadline: Option<Instant>) -> Result<()> {
         bail!("the absolute Secure Kernel pause bound expired during retention cleanup");
     }
     Ok(())
+}
+
+fn is_first_chance_breakpoint_at(
+    event: Option<&dbgscope::dbgeng::DebugEvent>,
+    address: u64,
+) -> bool {
+    event.is_some_and(|event| {
+        event.first_chance
+            && event.exception.as_ref().is_some_and(|exception| {
+                exception.code == STATUS_BREAKPOINT && exception.address == address
+            })
+    })
 }
 
 fn debug_wait_remaining(deadline: Instant, activity: Option<&WaitActivity>) -> Duration {
@@ -871,6 +884,10 @@ impl Session {
             instructions,
             deadline,
         )?;
+        // The retained event is complete and the software-breakpoint wait starts a new pause
+        // window when its vector-3 callback is retained. Reusing this stop's absolute deadline
+        // would make repeated DbgEng `g` cycles spend one cumulative service interval.
+        self.pause_window = None;
         Ok(LiveTransition {
             phase: control.phase(),
             epoch,
@@ -2589,6 +2606,16 @@ impl WaitActivity {
         if self.0.phase.load(Ordering::Acquire) != WAIT_ARMED {
             bail!("the interruptible DbgEng wait was entered more than once");
         }
+        // A Ctrl+Break can bind while the engine thread is still completing the continue
+        // transition. It needs no SetInterrupt then: no DbgEng wait exists to leave, and filing
+        // one as soon as this activity becomes active can stop vmwp before its first owned `g`.
+        // Return the bound wake directly so the engine thread enters M2 from the dispatcher's
+        // proved running boundary. A request that races this check observes WAIT_ACTIVE below and
+        // uses the documented cross-thread interrupt in the ordinary way.
+        if self.break_requested() {
+            self.0.phase.store(WAIT_FINISHED, Ordering::Release);
+            return Err(BreakWake.into());
+        }
         let (managed, live) = match self.0.owner {
             Some(WaitOwner::ManagedKd(job)) => match crate::worker::begin_kd_wait(job) {
                 Some(guard) => (Some(guard), None),
@@ -2707,6 +2734,17 @@ enum DisarmPumpStep {
     UnownedStop,
 }
 
+/// What one bounded `g` slice decided while draining the prior event's Hyper-V transition before
+/// a new running disarm can ask for its own pause.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransitionPumpStep {
+    HoldEvent,
+    Completed,
+    KeepPumping,
+    Interrupted,
+    UnownedStop,
+}
+
 /// An arrival at the event site wins over every other reading of the slice, because the event is
 /// outstanding whatever else happened and nothing but this adapter may carry it. `pause` is the
 /// helper's verdict so far: `None` while it is still running, `Some(true)` once the VM is paused.
@@ -2723,6 +2761,22 @@ fn disarm_pump_step(
         (Some(Interruption::OnRequest), _) => DisarmPumpStep::Interrupted,
         (Some(Interruption::Deadline { .. }), Some(true)) => DisarmPumpStep::Paused,
         (Some(Interruption::Deadline { .. }), _) => DisarmPumpStep::KeepPumping,
+    }
+}
+
+fn transition_pump_step(
+    cut_short: Option<&Interruption>,
+    at_event_site: bool,
+    transition_finished: bool,
+) -> TransitionPumpStep {
+    if at_event_site {
+        return TransitionPumpStep::HoldEvent;
+    }
+    match (cut_short, transition_finished) {
+        (None, _) => TransitionPumpStep::UnownedStop,
+        (Some(Interruption::OnRequest), _) => TransitionPumpStep::Interrupted,
+        (Some(Interruption::Deadline { .. }), true) => TransitionPumpStep::Completed,
+        (Some(Interruption::Deadline { .. }), false) => TransitionPumpStep::KeepPumping,
     }
 }
 
@@ -3542,17 +3596,20 @@ impl VmwpDispatcher<'_> {
                 }
             }
         }
+        if let Some(disarmed) =
+            self.pump_pending_transition_before_pause(targets, event_site, deadline, triage)?
+        {
+            return Ok(disarmed);
+        }
         // A pause this disarm asked for earlier (recovery re-entering after a fault) is reused; any
-        // other pending transition, such as a step's resume kick, is joined before a pause is asked
-        // for.
+        // prior resume or delayed completion kick was pumped to completion above before a new pause
+        // is asked for.
         let pause_pending = self
             .state
             .completion_kick
             .as_ref()
             .is_some_and(|kick| matches!(kick.action, Some(VmAction::Pause)));
-        if !pause_pending {
-            self.state.finish_completion_kick_until(deadline)?;
-        }
+        debug_assert!(pause_pending || self.state.completion_kick.is_none());
         self.state.claim_vm_pause(targets)?;
         if !pause_pending {
             self.state.completion_kick = Some(VmTransition::immediate(
@@ -3661,6 +3718,191 @@ impl VmwpDispatcher<'_> {
                 ),
             }
         }
+    }
+
+    /// Drain a prior event's delayed pause/resume kick without debugger-stopping vmwp in front of
+    /// it. The next break request can arrive before the first owned wait has run even once; joining
+    /// that helper synchronously then deadlocks its Resume-VM behind the debugger stop. Pumping
+    /// keeps the event-site breakpoint authoritative, so an arriving owned event still wins and
+    /// becomes the disarm point.
+    fn pump_pending_transition_before_pause(
+        &mut self,
+        targets: &[TargetIdentity],
+        event_site: u64,
+        deadline: Option<Instant>,
+        triage: &mut dyn EventTriage,
+    ) -> Result<Option<Disarmed>> {
+        let pending_pause = self
+            .state
+            .completion_kick
+            .as_ref()
+            .is_some_and(|kick| matches!(kick.action, Some(VmAction::Pause)));
+        if self.state.completion_kick.is_none() || pending_pause {
+            return Ok(None);
+        }
+
+        tracing::info!(
+            target: "windbg_mcp::secure_kernel_mutation",
+            vm_id = %self.bound_vm_id()?,
+            "dispatcher is pumping vmwp under its event-site breakpoint until the prior Hyper-V transition completes or an owned event arrives"
+        );
+        let bound = deadline
+            .unwrap_or_else(|| Instant::now() + Duration::from_millis(u64::from(DEBUG_WAIT)));
+        let mut handle_native_return = false;
+        let mut drained_native_returns = 0usize;
+        loop {
+            let remaining = bound.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                self.state.phase = DispatcherPhase::ReadyForStopInterrupted;
+                bail!(
+                    "the prior Hyper-V transition did not finish before the running disarm \
+                     deadline; the VM is retained as possibly paused"
+                );
+            }
+            let slice = remaining.min(DISARM_PUMP_SLICE);
+            let timeout = slice.as_millis().clamp(1, u128::from(u32::MAX)) as u32;
+            let command = if std::mem::take(&mut handle_native_return) {
+                "gh"
+            } else {
+                "g"
+            };
+            let run = self
+                .engine
+                .execute_and_wait(command, timeout)
+                .map_err(debugger)?;
+            if run.target_gone {
+                bail!("vmwp left the debugger while draining the prior Hyper-V transition");
+            }
+            let rip = self.engine.instruction_pointer().map_err(debugger)?;
+            if rip == event_site
+                && let Some((event_pointer, event)) =
+                    self.classify_event_at_site(targets, event_site)?
+            {
+                let site = self.site_event(event_pointer, &event, true)?;
+                match triage.triage(&site)? {
+                    Triage::Own => {
+                        return self
+                            .hold_event_at_site(event_pointer, event_site, event, targets, deadline)
+                            .map(Some);
+                    }
+                    Triage::Foreign { vtl } => {
+                        self.carry_foreign_event(event_pointer, event_site, &event, vtl, deadline)?;
+                    }
+                }
+            }
+
+            // Removing DbgEng's native-return breakpoint restores its bytes but does not discard
+            // a breakpoint event which was already queued. It can surface on this later `g` while
+            // the completion kick is still pending. This exact event is ours: consume it handled
+            // before polling the transition or asking for the new pause. Every other stop at the
+            // address remains fail-closed.
+            if let Some(event) = self.queued_owned_native_return_event(rip, event_site)? {
+                drained_native_returns += 1;
+                handle_native_return = true;
+                tracing::info!(
+                    target: "windbg_mcp::secure_kernel_mutation",
+                    address = format_args!("{rip:#x}"),
+                    drained = drained_native_returns,
+                    thread = event.thread,
+                    "dispatcher drained a queued owned native-return breakpoint while pumping the prior Hyper-V transition"
+                );
+                continue;
+            }
+
+            let transition = self
+                .state
+                .completion_kick
+                .as_mut()
+                .context("the pending Hyper-V transition disappeared while it was pumped")?
+                .try_finish();
+            let transition_finished = transition.is_some();
+            if let Some(result) = transition {
+                self.state.completion_kick = None;
+                if let Err(error) = result {
+                    self.state.vm_paused = true;
+                    self.state.provider_writes_quiesced = false;
+                    return Err(error.context(
+                        "the prior Hyper-V transition failed while the running disarm pumped vmwp",
+                    ));
+                }
+            }
+            match transition_pump_step(
+                run.cut_short.as_ref(),
+                rip == event_site,
+                transition_finished,
+            ) {
+                TransitionPumpStep::HoldEvent => {
+                    // An event-site stop which did not decode as a selected event belongs to the
+                    // native handler and was carried above. Once the prior transition has ended,
+                    // the new pause pump can continue it under the same installed breakpoint.
+                    if transition_finished {
+                        tracing::info!(
+                            target: "windbg_mcp::secure_kernel_mutation",
+                            "dispatcher completed the prior Hyper-V transition at the event site"
+                        );
+                        return Ok(None);
+                    }
+                }
+                TransitionPumpStep::Completed => {
+                    tracing::info!(
+                        target: "windbg_mcp::secure_kernel_mutation",
+                        "dispatcher completed the prior Hyper-V transition while pumping vmwp"
+                    );
+                    return Ok(None);
+                }
+                TransitionPumpStep::KeepPumping => {}
+                TransitionPumpStep::Interrupted => {
+                    self.state.phase = DispatcherPhase::ReadyForStopInterrupted;
+                    bail!("draining the prior Hyper-V transition was interrupted on request");
+                }
+                TransitionPumpStep::UnownedStop => bail!(
+                    "vmwp stopped at {rip:#x} for an event the live-control adapter does not own \
+                     while draining the prior Hyper-V transition"
+                ),
+            }
+        }
+    }
+
+    fn queued_owned_native_return_event(
+        &self,
+        rip: u64,
+        event_site: u64,
+    ) -> Result<Option<dbgscope::dbgeng::DebugEvent>> {
+        if !matches!(
+            self.state.phase,
+            DispatcherPhase::ReadyForStop | DispatcherPhase::ReadyForStopInterrupted
+        ) {
+            return Ok(None);
+        }
+        let site = &self.state.profile.native_return;
+        let native_return = self.site_address(site)?;
+        if rip != native_return {
+            return Ok(None);
+        }
+        let owned_event_site =
+            self.require_owned_site_breakpoint(&self.state.profile.event_held)?;
+        if owned_event_site != event_site {
+            bail!("the transition pump's event-site breakpoint changed");
+        }
+        let native_breakpoint_still_installed = self
+            .engine
+            .breakpoints()
+            .map_err(debugger)?
+            .iter()
+            .any(|breakpoint| breakpoint.enabled && breakpoint.address == Some(native_return));
+        let original_restored = self
+            .engine
+            .read_memory(native_return, site.original.len())
+            .map_err(debugger)?
+            == site.original;
+        let event = self.engine.last_event().map_err(debugger)?;
+        if !native_breakpoint_still_installed
+            && original_restored
+            && is_first_chance_breakpoint_at(event.as_ref(), native_return)
+        {
+            return Ok(event);
+        }
+        Ok(None)
     }
 
     /// Retain the owned event vmwp holds at the event site as the disarm point.
@@ -3966,9 +4208,11 @@ impl EventDispatcher for VmwpDispatcher<'_> {
             .memory
             .as_mut()
             .context("the live VTL1 memory source is absent")?;
-        match pause_deadline {
-            Some(deadline) => memory.refresh_until(deadline)?,
-            None => memory.refresh()?,
+        if !instructions.is_empty() {
+            match pause_deadline {
+                Some(deadline) => memory.refresh_until(deadline)?,
+                None => memory.refresh()?,
+            }
         }
         let observed_instructions = instructions
             .iter()
@@ -5385,43 +5629,90 @@ impl VmwpDispatcher<'_> {
         // The native return proves success before vmwp has executed past the call. Let the existing
         // DbgEng watchdog interrupt that ordinary execution, then detach before joining the Hyper-V
         // helper whose pause request is blocked while the callback remains debugger-stopped.
-        let remaining = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
-        if remaining.is_some_and(|remaining| remaining.is_zero()) {
-            bail!("the absolute Secure Kernel pause bound expired during dispatcher completion");
-        }
-        let wait = remaining
-            .map(|remaining| remaining.min(Duration::from_millis(u64::from(NATIVE_SETTLE_WAIT))))
-            .unwrap_or_else(|| Duration::from_millis(u64::from(NATIVE_SETTLE_WAIT)));
-        let timeout = wait.as_millis().clamp(1, u128::from(u32::MAX)) as u32;
-        let outer_limited = remaining.is_some_and(|remaining| {
-            remaining <= Duration::from_millis(u64::from(NATIVE_SETTLE_WAIT))
-        });
-        let run = self
-            .engine
-            .execute_and_wait("g", timeout)
-            .map_err(debugger)?;
-        tracing::info!(
-            target: "windbg_mcp::secure_kernel_mutation",
-            "dispatcher resumed vmwp to settle native event completion"
-        );
-        if run.target_gone {
-            bail!("vmwp left the debugger while settling native event completion");
-        }
-        match run.cut_short {
-            Some(Interruption::Deadline { .. }) if !outer_limited => Ok(()),
-            Some(Interruption::Deadline { .. }) => {
-                bail!("the absolute Secure Kernel pause bound expired during dispatcher completion")
-            }
-            Some(Interruption::OnRequest) => {
-                bail!("native event completion was interrupted on request")
-            }
-            None => {
-                let rip = self.engine.instruction_pointer().map_err(debugger)?;
+        let site = self.state.profile.native_return.clone();
+        let native_return = self.site_address(&site)?;
+        let mut resume_handled = false;
+        let mut drained = 0usize;
+        loop {
+            let remaining =
+                deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            if remaining.is_some_and(|remaining| remaining.is_zero()) {
                 bail!(
-                    "vmwp stopped unexpectedly while settling native event completion at \
-                     {rip:#x}; debugger_output={:?}",
-                    run.output.trim()
-                )
+                    "the absolute Secure Kernel pause bound expired during dispatcher completion"
+                );
+            }
+            let wait = remaining
+                .map(|remaining| {
+                    remaining.min(Duration::from_millis(u64::from(NATIVE_SETTLE_WAIT)))
+                })
+                .unwrap_or_else(|| Duration::from_millis(u64::from(NATIVE_SETTLE_WAIT)));
+            let timeout = wait.as_millis().clamp(1, u128::from(u32::MAX)) as u32;
+            let outer_limited = remaining.is_some_and(|remaining| {
+                remaining <= Duration::from_millis(u64::from(NATIVE_SETTLE_WAIT))
+            });
+            let command = if resume_handled { "gh" } else { "g" };
+            let run = self
+                .engine
+                .execute_and_wait(command, timeout)
+                .map_err(debugger)?;
+            tracing::info!(
+                target: "windbg_mcp::secure_kernel_mutation",
+                command,
+                "dispatcher resumed vmwp to settle native event completion"
+            );
+            if run.target_gone {
+                bail!("vmwp left the debugger while settling native event completion");
+            }
+            match run.cut_short {
+                Some(Interruption::Deadline { .. }) if !outer_limited => return Ok(()),
+                Some(Interruption::Deadline { .. }) => {
+                    bail!(
+                        "the absolute Secure Kernel pause bound expired during dispatcher completion"
+                    )
+                }
+                Some(Interruption::OnRequest) => {
+                    bail!("native event completion was interrupted on request")
+                }
+                None => {
+                    let rip = self.engine.instruction_pointer().map_err(debugger)?;
+                    let event = self.engine.last_event().map_err(debugger)?;
+                    let breakpoint_still_installed = self
+                        .engine
+                        .breakpoints()
+                        .map_err(debugger)?
+                        .iter()
+                        .any(|breakpoint| {
+                            breakpoint.enabled && breakpoint.address == Some(native_return)
+                        });
+                    let original_restored = self
+                        .engine
+                        .read_memory(native_return, site.original.len())
+                        .map_err(debugger)?
+                        == site.original;
+                    if rip == native_return
+                        && self.state.breakpoint.is_none()
+                        && matches!(self.state.phase, DispatcherPhase::NativeReturn(_))
+                        && !breakpoint_still_installed
+                        && original_restored
+                        && is_first_chance_breakpoint_at(event.as_ref(), native_return)
+                    {
+                        drained += 1;
+                        resume_handled = true;
+                        tracing::info!(
+                            target: "windbg_mcp::secure_kernel_mutation",
+                            address = format_args!("{native_return:#x}"),
+                            drained,
+                            thread = event.as_ref().map(|event| event.thread),
+                            "dispatcher drained a queued owned native-return breakpoint event"
+                        );
+                        continue;
+                    }
+                    bail!(
+                        "vmwp stopped unexpectedly while settling native event completion at \
+                         {rip:#x}; debugger_output={:?}",
+                        run.output.trim()
+                    )
+                }
             }
         }
     }
@@ -6744,6 +7035,35 @@ mod tests {
     const TRACE_REQUEST: u64 = 0xffff_8000_0000_2000;
     const TRACE_STACK: u64 = 0xffff_8000_0000_3000;
 
+    #[test]
+    fn only_a_first_chance_breakpoint_at_the_owned_site_can_be_drained() {
+        let address = 0x0000_7ff7_0000_1234;
+        let event = dbgscope::dbgeng::DebugEvent {
+            kind: 1,
+            process: 0,
+            thread: 7,
+            first_chance: true,
+            exception: Some(dbgscope::dbgeng::ExceptionRecord {
+                code: STATUS_BREAKPOINT,
+                flags: 0,
+                address,
+                parameters: Vec::new(),
+                nested: None,
+            }),
+            context: None,
+        };
+        assert!(is_first_chance_breakpoint_at(Some(&event), address));
+
+        let mut changed = event.clone();
+        changed.first_chance = false;
+        assert!(!is_first_chance_breakpoint_at(Some(&changed), address));
+        changed = event.clone();
+        changed.exception.as_mut().unwrap().code = 0xc000_0005;
+        assert!(!is_first_chance_breakpoint_at(Some(&changed), address));
+        assert!(!is_first_chance_breakpoint_at(Some(&event), address + 1));
+        assert!(!is_first_chance_breakpoint_at(None, address));
+    }
+
     fn trace_stop(
         manifest: &crate::skservice::ServiceManifest,
         phase: &str,
@@ -7190,7 +7510,7 @@ mod tests {
             .0;
         assert_eq!(
             pump.matches("triage.triage(").count(),
-            pump.matches("self.hold_event_at_site(").count(),
+            pump.matches(".hold_event_at_site(").count(),
             "every hold in the pump is preceded by a triage"
         );
 
@@ -7632,6 +7952,16 @@ mod tests {
         assert!(!break_wake.request_break());
         break_wake.cancel_break();
         assert!(!break_wake.break_requested());
+
+        let bound_before_entry = WaitActivity::new(Duration::from_secs(1));
+        assert!(bound_before_entry.request_break());
+        let error = match bound_before_entry.enter() {
+            Ok(_) => panic!("a pre-entry break must not publish an interruptible DbgEng wait"),
+            Err(error) => error,
+        };
+        assert!(is_break_wake(&error));
+        assert_eq!(bound_before_entry.phase(), WaitActivityPhase::Finished);
+        assert_eq!(bound_before_entry.while_active(|| 7), None);
     }
 
     #[test]
@@ -7679,7 +8009,7 @@ mod tests {
     }
 
     #[test]
-    fn step_and_software_rearm_reuse_the_pause_window_until_a_true_continue() {
+    fn only_a_step_reuses_the_pause_window_after_a_running_transition() {
         let source = include_str!("skdispatch.rs").replace("\r\n", "\n");
         let wait = source
             .split_once("pub(crate) fn wait_for_stop(\n")
@@ -7766,8 +8096,8 @@ mod tests {
             "continue-to-breakpoints must end the retained event's pause window: {rearmed}"
         );
         assert!(
-            !software.contains("self.pause_window = None"),
-            "software re-arm must retain the absolute pause window until its wait: {software}"
+            software.contains("self.pause_window = None"),
+            "software re-arm must give its resulting vector-3 stop a fresh pause window: {software}"
         );
         assert!(
             continued.contains("self.pause_window = None"),
@@ -8114,6 +8444,68 @@ mod tests {
             disarm_pump_step(None, false, Some(true)),
             DisarmPumpStep::UnownedStop
         );
+    }
+
+    #[test]
+    fn a_prior_transition_is_pumped_to_completion_before_the_new_pause() {
+        let deadline = Interruption::Deadline { after_ms: 250 };
+        for cut_short in [None, Some(&Interruption::OnRequest), Some(&deadline)] {
+            for finished in [false, true] {
+                assert_eq!(
+                    transition_pump_step(cut_short, true, finished),
+                    TransitionPumpStep::HoldEvent,
+                    "{cut_short:?} {finished}"
+                );
+            }
+        }
+        assert_eq!(
+            transition_pump_step(Some(&deadline), false, false),
+            TransitionPumpStep::KeepPumping
+        );
+        assert_eq!(
+            transition_pump_step(Some(&deadline), false, true),
+            TransitionPumpStep::Completed
+        );
+        assert_eq!(
+            transition_pump_step(Some(&Interruption::OnRequest), false, true),
+            TransitionPumpStep::Interrupted
+        );
+        assert_eq!(
+            transition_pump_step(None, false, true),
+            TransitionPumpStep::UnownedStop
+        );
+
+        let source = include_str!("skdispatch.rs").replace("\r\n", "\n");
+        let disarm = source
+            .split_once("    fn pause_or_hold_running_target(\n")
+            .expect("the running disarm exists")
+            .1
+            .split_once("    fn pump_pending_transition_before_pause(\n")
+            .expect("the transition pump follows it")
+            .0;
+        assert!(disarm.contains("pump_pending_transition_before_pause("));
+        assert!(!disarm.contains("finish_completion_kick_until(deadline)"));
+
+        let transition_pump = source
+            .split_once("    fn pump_pending_transition_before_pause(\n")
+            .expect("the transition pump exists")
+            .1
+            .split_once("    fn hold_event_at_site(\n")
+            .expect("the event holder follows it")
+            .0;
+        let run = transition_pump
+            .find("execute_and_wait(command,")
+            .expect("vmwp is pumped while the prior transition is pending");
+        let poll = transition_pump
+            .find(".try_finish()")
+            .expect("the prior transition is polled without joining");
+        assert!(run < poll);
+        assert!(transition_pump.contains("hold_event_at_site("));
+        let native_return = transition_pump
+            .find("queued_owned_native_return_event(")
+            .expect("a queued native return is recognised before the transition is polled");
+        assert!(native_return < poll);
+        assert!(transition_pump.contains("\"gh\""));
     }
 
     #[test]

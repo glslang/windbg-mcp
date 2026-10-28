@@ -1440,7 +1440,8 @@ the joined result and negative controls.
 
 ### M8 — debugger front ends
 
-Status: in progress since 2026-10-25. M8.0's translation table is implemented in the facade: a
+Status: M8.0 and M8.1 complete; M8.2's server-owned composite gate complete, with external-client
+compatibility rows still in progress. M8.0's translation table is implemented in the facade: a
 non-trace continue with breakpoints is M1's continue-to-breakpoints, one with none is a bounded
 free run (`LiveControl::continue_running_until`, which arms nothing and stops only at a break
 request, teardown or the recovery deadline), a running Ctrl+Break binds to the exact wait and
@@ -1455,11 +1456,12 @@ live probe is the ignored `a_managed_secure_kernel_kd_session_is_driven_by_this_
 The new `open_sk_debugger` owns both workers as one supervisor composite, exposes only the ordinary
 DbgEng handle, and drives breakpoint, run, trigger, stop, registers, stack, step, free run,
 break-in and ordered release through the generic tools. The original `open_sk_kd` external-WinDbg
-facade remains available. That probe passed on 2026-10-26 against Secure Kernel 26100.9457 on the
-same K3 nested bench: all three execution routes completed, composite release restored the baseline,
-and the post-release audit found no enabled DR slot, no TF/RF, no engine worker, unchanged guarded
-text and a healthy child without forced recovery. This is the first single-run route proof, not the
-repeated M8.2 matrix. M8.1 now also has a checked-in classic-WinDbg/WinDbgX launcher: it consumes
+facade remains available. That probe first passed on 2026-10-26 against Secure Kernel 26100.9457 on
+K3: all three execution routes completed, composite release restored the baseline, and the
+post-release audit found no enabled DR slot, no TF/RF, no engine worker, unchanged guarded text and
+a healthy child without forced recovery. On 2026-10-28 the strengthened probe passed 25 consecutive
+free-run/break-in cycles through the same composite, followed by the same release audit. M8.1 now
+also has a checked-in classic-WinDbg/WinDbgX launcher: it consumes
 the facade's typed generated connection, keeps the live config off child command lines, and always
 ends a post-commit session after the debugger exits or fails to start. Its fake-client contract is
 an ordinary smoke test; the real front ends remain unqualified until M8.2. M8 is independent of
@@ -1537,6 +1539,97 @@ every arm. It must coordinate each `g` from transcript markers rather than sleep
 must still end the MCP session and run the audit. M8.2b is the three-boot execution of that fixed
 runner. On each boot it runs classic/hardware, classic/INT3, WinDbgX/hardware and WinDbgX/INT3 in
 that order, then the shared free-run and race rows. A code or config edit resets the boot count.
+
+M8.2a started on 2026-10-26 with the offline contract in `tests/support/sk_m8.rs`. The private
+config is schema-versioned, denies unknown and per-boot discovery fields, fixes the breakpoint and
+free-run counts at 100 and 25, requires distinct classic/WinDbgX executables and policies that
+differ only by `allow_memory_writes`, and gives the counted trigger one `{count}` substitution.
+The generated debugger script has an exact ready/arm/hit/complete marker grammar with no sleeps or
+`q`; its parser rejects stale, duplicate and reordered markers. The per-arm artifact cannot pass
+without all cycles, one healthy single-VP boot identity before and after, and a passing post-release
+audit, and artifact publication is an atomic, no-overwrite rename. The ignored read-only preflight
+entry validates both debugger and policy files, requires the policies to differ only by the INT3
+write authority, and binds the configured VM to one healthy boot/`vmwp`/VP report. The destructive
+runner now owns the four breakpoint arms in their required order: it starts a fresh policy-bound
+facade for each arm, launches the selected real debugger with a generated command file through
+WinDbg's `-c $<file` surface, starts the 100-call trigger only after cycle zero is visibly armed,
+derives progress only from ordered log
+markers, ends the MCP session before terminating the client, then runs the audit and boot probe
+even after an arm failure. Its JSON artifact embeds both the debugger transcript and facade log.
+Before and after the 100 cycles, the generated client script exercises registers, a bounded live
+read, modules, symbol lookup, stack, disassembly and one step, sends an arbitrary virtual write
+that the facade must refuse, and proves the fifth breakpoint is refused; the runner checks both
+the client markers and the facade's typed-path log evidence rather than treating command echo as
+success.
+It then runs 25 marker-driven `g`/Ctrl+Break cycles through each frontend under the read-only
+policy. Ctrl+Break is an explicit per-frontend host command with exactly one authenticated-client
+PID substitution; both the helper's success and the facade's running-wait wake are required in the
+free-run artifact. This orchestration is compiled and tested offline but has not yet been run
+against the bench. The eight race rows now have a fixed one-to-one control/outcome contract, so a
+disconnect result cannot accidentally satisfy reconnect and a resent stopped event cannot satisfy
+a running break-in. That contract is now executable for both frontends: each row owns its debugger
+script and session, reset is delivered by a separate authenticated-PID helper, disconnect kills the
+authenticated pipe client, reconnect requires a distinct second client, and running teardown waits
+for facade-side proof of `g` before MCP release. Every row publishes its transcript(s), facade log,
+audit and before/after boot identity. M8.2a completed offline on 2026-10-27; the first live
+execution begins M8.2b's boot count, and any resulting code or config correction resets it.
+
+The first live attempt on 2026-10-27 did not count as an M8.2b boot. It found two harness defects
+before a guest trigger: GUI WinDbg does not implement KD/CDB's `-cf` option, so the launcher now
+uses WinDbg's documented `-c $<file` command surface, and the old audit input was bound to a stale
+`vmwp` PID, so M8 uses a current-boot discovery audit. Cleanup left no debugger, server or worker
+and the guest heartbeat remained healthy. A fresh K3 boot with both provider drivers already
+running, followed by a guest-initiated full restart to exclude Fast Startup, initially exposed only
+VTL0 to the root provider: partition status `0x10001` and a VTL1 CR3 status of `0x15`, including
+throughout a four-second enclave secure call. This was the expected nested-root topology left by
+M7, not a provider regression: K3 still had `ExposeVirtualizationExtensions=true`, which launches
+its nested hypervisor and removes K3's own VTL1 from the outer provider view. With the nested L2
+off, K3 was cleanly stopped, restored to `ExposeVirtualizationExtensions=false`, and started again.
+Build 26100.9457 then reported VBS running while the root provider enumerated one child with
+`EnabledVtlSet=3`; VTL1 CR3 `0x2601000` and RIP both read with status zero. No breakpoint arm was
+started during diagnosis, so the next clean run begins M8.2b boot 1.
+
+The four breakpoint arms then passed on one boot: classic/hardware, classic/INT3,
+WinDbgX/hardware and WinDbgX/INT3 each completed 100 ordered stops and their release audit. That
+boot does not count after the controller corrections which followed. The GUI free-run arm also
+showed that synthesizing Ctrl+Break through window messages or a second remote DbgEng connection is
+not a safe qualification control: neither path reliably reaches the authenticated KD client, and
+the remote experiment reset the host. Those experiments are not repeated. The product path is the
+server-owned composite, where `break_in` is a typed request bound to the exact public execution;
+Classic and WinDbgX remain separate packet/launcher compatibility evidence rather than the means
+by which the generic-tool session proves its running interrupt.
+
+The first 25-cycle composite run on 2026-10-28 found a real controller race at cycle 1. A break
+could bind after continue released the old stop but before the owned DbgEng wait became active;
+the prior event's delayed Hyper-V completion kick was still pending, and synchronously joining its
+Resume-VM after debugger-stopping `vmwp` consumed the break deadline. The corrected dispatcher
+returns a pre-entry break as a bound wake without issuing `SetInterrupt`, and pumps an outstanding
+completion transition in bounded `g` slices under its event-site breakpoint before asking for the
+new pause. The rerun passed all 25 cycles on the same K3 boot, with stops in 14.1--14.9 seconds,
+then released the composite and passed the 60-second audit: the same `vmwp` PID and SK text at all
+three samples, heartbeat healthy, no recent `vmwp` errors, DR0--DR3 zero, DR7 `0x400`, and TF/RF
+clear.
+
+The next clean boot found the other side of that pump at cycle 22. DbgEng had already queued the
+dispatcher-owned native-return breakpoint event before its breakpoint was removed and original
+bytes restored; when that event surfaced on the later `g`, the pump treated it as an unowned stop
+and failed closed. Recovery restored VTL1 and resumed the VM, but the public worker did not
+acknowledge release before the smoke process exited, so the guarded recovery powered off only K3,
+removed the exact orphan and restarted it. Its 60-second audit passed before work resumed. The
+final pump consumes this event with one `gh` only when all ownership proofs agree: exact
+native-return address, first-chance `STATUS_BREAKPOINT`, restored original bytes, no native-return
+breakpoint still installed, the event-site breakpoint still owned, the ready-for-stop phase and a
+pending prior transition. Every other stop remains fail-closed.
+
+That final code passed the composite gate on three clean boots on 2026-10-28: `vmwp` PIDs 6952,
+11188 and 11464, partition IDs 7, 8 and 9, and a different discovered Secure Kernel relocation on
+each. All 75 free-run/break-in cycles returned the M2 stop, and every boot also passed modules,
+symbols, registers, stack, disassembly, a hardware breakpoint and one fall-through step through
+the generic tools. Each ordered release terminated both workers and passed its 60-second audit
+with the same `vmwp` at all three samples, stable SK text, heartbeat healthy, no recent `vmwp`
+errors, DR0--DR3 zero, DR7 `0x400`, and TF/RF clear. This closes the server-owned M8.2b gate.
+The external clients' remaining compatibility rows stay separate; GUI input automation is not on
+the product's critical path.
 
 Exit: both front ends perform `bp`/`g`/Ctrl+Break repeatedly through the managed session, all race
 controls have unique results, launchers work outside the repository, and the refusal is removed
