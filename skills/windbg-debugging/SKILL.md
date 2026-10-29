@@ -11,6 +11,8 @@ debugging, and **Time Travel Debugging (TTD)** of `.run` traces. It also reads a
 kind of target that is not a debuggee at all — a **Hyper-V checkpoint's Secure Kernel
 (VTL1)**, where nothing executes and the tools only read — plus an isolated live-control session
 for one selected VTL1 VP in an exact disposable VBS VM.
+The same controller can be exposed as M8's ordinary composite DbgEng session, so generic debugger
+tools work on Secure Kernel, or as a managed local pipe for Classic WinDbg/WinDbgX.
 
 **Verify the environment first.** Most failures are setup, not debugging — wrong engine
 DLL, missing symbols, or no elevation. Read **[setup.md](setup.md)** before the first
@@ -38,7 +40,7 @@ already does the job.
 |-------|-------|
 | Session | `open_dump`, `open_trace`, `attach_kernel_local`, `attach_kernel`, `attach_process`, `launch`, `end_session`, `session_status` |
 | State | `registers`, `read_memory`, `walk_memory`, `backtrace` (typed frames, each `module`+`RVA` as well as its symbol), `modules`, `threads`, `disassemble`, `dx` |
-| Control | `go`, `step_over`, `step_into`, `set_breakpoint`, `breakpoints` (what the session holds), `clear_breakpoints` (`ids`, or `all: true`), `run_to_address` |
+| Control | `go`, `step_over`, `step_into`, `continue_async`, `wait_for_stop`, `break_in`, `set_breakpoint`, `breakpoints` (what the session holds), `clear_breakpoints` (`ids`, or `all: true`), `run_to_address` |
 | Transaction | `debug_batch` — an ordered sequence with assertions and a rollback the engine runs, not the client |
 | TTD nav | `step_back` (`t-`), `step_over_back` (`p-`), `reverse_go` (`g-`), `goto_position` (`!tt`) |
 | TTD analysis | `ttd_calls`, `ttd_memory`, `ttd_events`, `index_trace`, `record_trace` |
@@ -207,14 +209,17 @@ where its stderr is not on your screen.
   annotated destructive and retires your `session_id` when the expression touches command
   execution. Ordinary TTD queries don't trip it.
 - **TTD is user-mode only** (a Microsoft limitation) — you cannot time-travel a kernel target.
-- **Secure Kernel capture, live decode and live control are three distinct routes.** An
+- **Secure Kernel capture, live decode, low-level live control and M8 debugging are four distinct routes.** An
   `open_sk_capture` session reads a fixed Hyper-V checkpoint, so nothing executes. `--sk-live` is a
   command-line decode role using an operator-supplied memory transport, with no MCP session. The
   live-control opener and ten MCP operations instead bind operator-supplied register and memory providers plus an
   exact-build `vmwp` adapter to one selected VP in a disposable VBS VM; they stop, inspect, step and
-  resume through epoch-bound operations. All session routes refuse ordinary debugger tools and must
-  be closed with `end_session`; an unresolved live-control teardown retains its worker and target
-  reservation for operator recovery. [secure-kernel.md](secure-kernel.md) has the prerequisites and
-  routing rules.
+  resume through epoch-bound operations. `open_sk_debugger` layers an ordinary DbgEng worker over
+  that controller and returns one composite session on which the generic debugger tools work;
+  `open_sk_kd` gives the same facade to external WinDbg. Capture, low-level control and standalone
+  KD handles refuse generic debugger tools; only the managed composite admits them. All session
+  routes must be closed with `end_session`; an unresolved controller teardown retains its worker
+  and target reservation for operator recovery. [secure-kernel.md](secure-kernel.md) has the
+  prerequisites and routing rules.
 - **Each tool call is bounded by a per-call timeout** (~60s for load/exec waits); a `go`
   against a long-running live target may hit it.

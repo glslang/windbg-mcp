@@ -1,17 +1,18 @@
 # Playbook: the Secure Kernel (VTL1)
 
-**Goal:** inspect or control a Windows guest's **Secure Kernel** — the VBS VTL1 side, memory a
-running Windows cannot read about itself. Four capture tools read a Hyper-V saved state; seven
-live-control tools stop, inspect, step and resume one selected VP in an exact disposable VBS VM.
+**Goal:** inspect, control, or ordinarily debug a Windows guest's **Secure Kernel** — the VBS VTL1
+side, memory a running Windows cannot read about itself. Four capture tools read a Hyper-V saved
+state; ten low-level live-control operations stop, inspect, step and resume one selected VP; M8
+exposes the same controller as an ordinary DbgEng kernel session.
 
-**There are three routes.** A **capture** is a file, and its MCP tools read it with no driver, no
+**There are four routes.** A **capture** is a file, and its MCP tools read it with no driver, no
 debuggee, and nothing running. A **live decode** uses the `--sk-live` command-line role and an
-operator-supplied memory transport. **Live execution control** is a separate MCP session using
-operator-supplied register and memory providers plus a build-matched `vmwp` adapter. This repository
-ships no privileged provider. For a running guest, choose between
-[live decode](#the-live-route-the-operator-supplies-the-transport) and
-[live control](#live-execution-control-a-separate-mcp-session) according to whether the request
-needs a snapshot or stop/step/resume.
+operator-supplied memory transport. **Low-level live execution control** is a separate MCP session
+using operator-supplied register and memory providers plus a build-matched `vmwp` adapter. The
+normal **debugger route** uses `open_sk_debugger` for generic MCP debugger tools or `open_sk_kd` for
+an external WinDbg client. This repository ships no privileged provider. For a running guest,
+choose live decode only for a current snapshot, low-level control for controller evidence, and the
+M8 debugger route for ordinary symbols, stack, disassembly, breakpoints and execution control.
 
 ## What the capture route needs on the host
 
@@ -385,21 +386,62 @@ against somebody's VM to discover:
   not give you: its `instruction` field describes what the previous step executed. Supplying it
   again fails saying the step address does not match the stopped RIP.
 
+## M8: use an ordinary debugger session
+
+For user-facing debugging, prefer `open_sk_debugger` over manually composing the ten low-level
+operations. It returns one public composite `session_id`: a normal DbgEng worker is attached to a
+private KD facade pipe, while a hidden worker retains controller and recovery ownership. Generic
+tools on that handle operate on VTL1, not on host `vmwp`.
+
+The setup is exact and must be checked before opening:
+
+1. The VM is explicitly disposable, running, heartbeat-healthy, and visible to the provider that
+   owns it. On the qualified one-VP K3 topology, nested virtualization is disabled; enabling K3's
+   nested hypervisor removes K3's own VTL1 from the outer provider view.
+2. The operator's register/control and live-memory providers are installed and running. The
+   reproducible sklab setup currently uses `h3probe.sys` for registers/control and `hvmm.sys` for
+   direct memory; `windbg-mcp` itself still ships neither driver.
+3. `WINDBG_MCP_SK_LIVE_POLICY` was present when the server started and admits the exact VM GUID,
+   complete provider command templates, profile root, and pause bound.
+4. The dispatcher profile matches the current `vmwp.exe` path, SHA-256 and `SizeOfImage`, carries
+   the matching VID identity and guarded sites, and contains `secure_kernel_kd` initial-stop and
+   debugger-metadata RVAs. Live PID, partition, CR3 and Secure Kernel base are discovered per boot;
+   they are not copied into the profile.
+5. The symbol path contains the PDB matching the configured `securekernel.exe` when names, stacks,
+   or symbolic breakpoints are requested.
+
+After `open_sk_debugger`, use the ordinary sequence: set the symbol path; list modules; set a
+breakpoint; call `continue_async`; start the guest trigger only once running is reported; call
+`wait_for_stop`; inspect registers, stack and disassembly; step; clear breakpoints; and use
+`continue_async` + `break_in` + `wait_for_stop` for a bounded free-run rendezvous. Finish with
+`end_session` and require `released: true`; a closed public DbgEng peer alone is not release.
+
+Use `open_sk_kd` only when a human needs Classic WinDbg or WinDbgX. Prefer the checked-in
+`tools/launch_sk_kd.ps1`, which owns the generated pipe, debugger process, ordered MCP teardown and
+failure cleanup. For WinDbgX, name the package's `DbgX.Shell.exe`, not its WindowsApps execution
+alias. A read-only policy maps up to four `bp` handles to hardware slots. A write-authorized policy
+allows only the guarded, one-shot INT3 breakpoint route and requires one VP; it does not grant
+arbitrary writes.
+
+The complete architecture, profile fields, policy example, acceptance evidence and recovery rules
+are in [`docs/secure-kernel/m8-debugger.md`](../../docs/secure-kernel/m8-debugger.md). For a
+repeatable bench, use the sibling `secure-kernel-lab` repository's `docs/m8-runbook.md`; its modules
+generate the policies, open/config files, enclave trigger and 60-second audit instead of depending
+on the former private scripts.
+
 ### If the user wants live Secure Kernel
 
-Offer the capture first: it answers the same landmarks, needs no driver and no weakened bench, and
-a checkpoint can be read on a different machine from the one that made it. For a current decode of
-a *running* guest, use `--sk-live`: the transport is theirs to supply, the server ships none, and the
-role runs on the debugger host outside MCP. For a controlled stop, stopped-state inspection, step or
-resume at a chosen address, use `open_sk_live_control` and the epoch-bound MCP sequence above, after
-the operator supplies the exact disposable target and both providers. For an ordinary MCP debugger
-on that target, use `open_sk_debugger`: it creates one managed session whose DbgEng worker is paired
-with the hidden Secure Kernel controller, so the generic symbol, stack, disassembly, breakpoint and
-execution tools apply. If they want **external WinDbg itself** on that stop, use `open_sk_kd`. It
+Offer the capture first when a fixed snapshot answers the question: it needs no driver and can be
+read on another machine. For a current decode of a *running* guest, use `--sk-live`: the transport
+is theirs to supply and the role runs outside MCP. For controller development or exact epoch-bound
+stop evidence, use `open_sk_live_control`. For ordinary interactive debugging, use
+`open_sk_debugger`: its generic symbol, stack, disassembly, breakpoint and execution tools are the
+M8 product path. If they want **external WinDbg itself**, use `open_sk_kd`. It
 returns a generated local named pipe for
 `kd -k com:pipe,port=\\.\pipe\<name>,resets=0`, while MCP retains lifecycle and recovery and WinDbg
-owns execution. The `--sk-kd-target` role remains a standalone diagnostic fallback. What has been
-measured through the facade is one `t`, an `r` after it and `q` — the limits are in
+owns execution. The `--sk-kd-target` role remains a standalone diagnostic fallback. M8's managed
+gate passed generic tools plus 75/75 free-run break-ins on three clean boots, and Classic WinDbg
+and WinDbgX each passed 100 hardware and 100 guarded-INT3 hits. The remaining limits are in
 [`docs/secure-kernel/kd-facade.md`](../../docs/secure-kernel/kd-facade.md).
 
 ## Where the rest of it is
@@ -409,6 +451,8 @@ measured through the facade is one `t`, an `r` after it and `q` — the limits a
 - [`docs/secure-kernel/kd-facade.md`](../../docs/secure-kernel/kd-facade.md) — WinDbg in front of
   the live controller: the connection string, what it can do today, and what it is told that the
   guest never held.
+- [`docs/secure-kernel/m8-debugger.md`](../../docs/secure-kernel/m8-debugger.md) — the M8 product
+  architecture, complete setup contract, profile lifecycle, qualification and recovery procedure.
 - [`docs/secure-kernel/README.md`](../../docs/secure-kernel/README.md) — the research record behind
   all of it: what is reachable from where, which landmarks survive a reboot and which do not, and
   what the lab needs. Several sections record what did **not** work, which is most of the value.

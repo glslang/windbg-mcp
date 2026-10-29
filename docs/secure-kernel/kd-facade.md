@@ -1,5 +1,9 @@
 # The Secure Kernel KD facade
 
+For the consolidated M8 architecture, exact profile/policy/driver setup, managed and external
+operator flows, acceptance evidence and recovery rules, start with
+[`m8-debugger.md`](m8-debugger.md). This page is the detailed KD packet and compatibility contract.
+
 `open_sk_kd` puts an installed WinDbg in front of the live Secure Kernel controller
 that [`live-control-provider.md`](live-control-provider.md) describes. WinDbg is the **protocol
 client**: a dedicated engine worker serves the serial KD packet stream over a generated local named
