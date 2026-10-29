@@ -74,6 +74,8 @@ told that the guest never held, and the qualification evidence it rests on are i
 `open_sk_debugger` is the MCP-native route over the same facade: it owns a hidden controller worker
 plus an ordinary DbgEng worker as one session and makes the generic debugger tools available on
 the returned handle. Ending it detaches DbgEng before releasing the controller.
+The consolidated M8 architecture, setup, profile lifecycle, driver boundary, qualification and
+recovery guide is [`m8-debugger.md`](m8-debugger.md).
 For an external interactive client, [`tools/launch_sk_kd.ps1`](../../tools/launch_sk_kd.ps1)
 opens the managed facade from a JSON argument file, launches either classic WinDbg or WinDbgX from
 the typed generated connection, and ends the MCP session when that debugger exits.
@@ -223,6 +225,7 @@ Read them in this order; each assumes the one before it.
 | 8 | [Inbox device graph probe](vdev-graph-probe.md) | K1.2's result: the six devices share one owned partition and the measured two-span 4 GiB Windows RAM map for three clean initialization, RAM-complete, reverse-teardown, memory-destruction, and partition-deletion cycles. Firmware and VP start remain open. |
 | 9 | [Diskless inbox firmware preflight](vdev-firmware-probe.md) | K1.3's result: the inbox BIOS builds five exact-readback UEFI memory regions and 19 VP0 state records, five diskless devices cold-power successfully, and the state applies cleanly in three fresh partitions. The boot-memory callback uses byte ranges; a private execution check reaches DXE. VP0 remains outside the tracked acceptance run; storage and the owner-side completion dispatcher remain open. |
 | 10 | [The Secure Kernel KD facade](kd-facade.md) | `open_sk_kd`: a server-managed, authenticated local WinDbg session over the live controller. `open_sk_debugger`: the same target exposed as one ordinary MCP DbgEng session with an internal facade companion. The measured gates cover validated live debugger metadata, modules, symbols, stack, x64 disassembly, one hardware `bp`/`g`, one fall-through `t`, a bounded free `g`, asynchronous break-in, ordered MCP release and an independent state audit. Repetition, multi-VP and writes remain bounded as the page describes. |
+| 11 | [M8 Secure Kernel debugger](m8-debugger.md) | The completed product path in one place: two-worker composite architecture, generic-tool and external-WinDbg surfaces, exact profile and policy setup, current provider/driver split, qualification evidence and fail-closed recovery. |
 
 Two older side-investigations, kept because they are about the same binary:
 
@@ -268,14 +271,19 @@ happily. Running the identical scan in both guests settles it — 1 SK image and
 VBS guest, **0 and 0** in the VBS-off one, which yields *more* PE headers overall (152 against 112)
 and so is not simply failing to read.
 
-Reproducing the **live** route from gate 3 onward needs a bench that is **deliberately
-weakened**, and the instruments live outside this repository on purpose:
+Reproducing the **live** route from gate 3 onward needs an isolated driver-development bench. The
+privileged instruments remain outside this repository, but the sibling `secure-kernel-lab`
+repository now carries the source and build for `h3probe.sys`, exact vmwp profiles, provider
+adapters, generated policies, M8 triggers, audits and qualification modules:
 
-- **Test-signing on, Secure Boot off, HVCI off.** A driver that reads another partition's memory is
-  not something Microsoft will sign.
-- **A loaded kernel driver** issuing hypercalls via `nt!HvlInvokeHypercall`.
-- Gate 4's oracle additionally needs LiveCloudKd's driver, which ships signed by a **revoked**
-  certificate and must be re-signed for the bench to load it.
+- **A host policy that admits the operator's locally built and signed test driver.** M8 does not
+  change host security settings. In particular, do not disable HVCI merely because an unrelated
+  Code Integrity event appears to name it; that interpretation was tested on this bench, changed
+  the failure not at all, and was reverted.
+- **A loaded `h3probe.sys`** for register/control and boot-scoped identity.
+- **Currently, a separately obtained and locally loadable LiveCloudKd `hvmm.sys`** for the direct
+  VTL1 GPA read/write path. Normal M8 does not load `hvlib.dll`. Sklab records a staged migration
+  to put this memory path behind h3probe and remove the external driver.
 
 None of that is a configuration to leave running. The feasibility document's stop conditions and
 its record of which Code Integrity policy actually blocks what are part of the result, not
@@ -288,5 +296,6 @@ that can be read on another machine. The probe that does it is checked in as
 [`tools/sk_savedstate_probe.py`](../../tools/sk_savedstate_probe.py), one of the two instruments
 from this investigation that can be, because it needs no driver to go with it. The other is
 [`tools/sk_hypercall_scan.py`](../../tools/sk_hypercall_scan.py), gate S5a's scanner, which needs
-less still: it reads `securekernel.exe` as a file, with no debugger, no target and no VM. Everything
-else here stays out of the repository, because it needs the weakened bench above to mean anything.
+less still: it reads `securekernel.exe` as a file, with no debugger, no target and no VM. The
+privileged binaries, symbols, credentials, VM disks and run evidence remain untracked even in
+sklab; only their configuration, source where owned, hashes and procedures are versioned.
