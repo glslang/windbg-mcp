@@ -197,8 +197,8 @@ Start the server with the policy and tool group in its environment, then call:
 ```jsonc
 open_sk_debugger {
   "profile": "D:\\sklab\\profiles\\vmwp-dispatcher-profile-26100.9457.json",
-  "control_transport": "python D:\\sklab\\control.py --vm-id ... --partition-id {partition_id} --vp {vp}",
-  "live_transport": "python D:\\sklab\\memory.py --vm-id ... --partition-id {partition_id} --vp {vp} --cr3 {cr3} --vmwp-pid {vmwp_pid} --partition-handle {partition_handle}",
+  "control_transport": "\"C:\\Python313\\python.exe\" \"D:\\sklab\\control.py\" --vm-id 51749a1f-f939-44f5-b251-1251ef5b64a3 --partition-id {partition_id} --vp {vp}",
+  "live_transport": "\"C:\\Python313\\python.exe\" \"D:\\sklab\\memory.py\" --vm-id 51749a1f-f939-44f5-b251-1251ef5b64a3 --partition-id {partition_id} --vp {vp} --cr3 {cr3} --vmwp-pid {vmwp_pid} --partition-handle {partition_handle}",
   "vm_id": "51749a1f-f939-44f5-b251-1251ef5b64a3",
   "vp": 0,
   "arm_mode": "redirect",
