@@ -1617,6 +1617,144 @@ fn live_control_usage() -> &'static str {
      [--partition-id <assertion>] [--expected-cr3 <assertion>]"
 }
 
+/// The `--sk-discover-identity` role: this boot's dispatcher VND, VID partition handle and
+/// partition id, discovered exactly as a live-control session discovers them, for a caller that
+/// needs them without opening one. The partition handle is printed because it is the point: a
+/// memory provider opens VID against it from outside any session. It is the operator's own
+/// process reading its own host, which is why this is a role and not an MCP tool; a tool would
+/// hand the handle to a client, where the session confines it to the live-memory command.
+pub(crate) const DISCOVER_IDENTITY_FLAG: &str = "--sk-discover-identity";
+
+struct IdentityRequest {
+    profile: std::path::PathBuf,
+    vm_id: String,
+    vmwp_pid: u32,
+    dispatcher_vnd: Option<u64>,
+    partition_id: Option<u64>,
+}
+
+impl IdentityRequest {
+    fn parse(args: &[String]) -> Result<Self> {
+        let mut profile = None;
+        let mut vm_id = None;
+        let mut vmwp_pid = None;
+        let mut dispatcher_vnd = None;
+        let mut partition_id = None;
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
+            let value = |iter: &mut std::slice::Iter<'_, String>| {
+                iter.next()
+                    .cloned()
+                    .with_context(|| format!("{arg} needs a value"))
+            };
+            match arg.as_str() {
+                "--profile" => profile = Some(value(&mut iter)?.into()),
+                "--vm-id" => vm_id = Some(value(&mut iter)?),
+                "--vmwp-pid" => {
+                    vmwp_pid = Some(value(&mut iter)?.parse().context("invalid --vmwp-pid")?)
+                }
+                "--dispatcher-vnd" => {
+                    dispatcher_vnd = Some(cli_word("dispatcher-vnd", &value(&mut iter)?)?)
+                }
+                "--partition-id" => {
+                    partition_id = Some(cli_word("partition-id", &value(&mut iter)?)?)
+                }
+                other => bail!("unknown argument {other:?}\n\n{}", identity_usage()),
+            }
+        }
+        let vm_id: String = vm_id.context(identity_usage())?;
+        TargetRequest {
+            vm_id: vm_id.clone(),
+            partition_id: partition_id.map(HexU64),
+            vp: 0,
+            expected_cr3: None,
+        }
+        .validate()?;
+        // An asserted PID is checked against the VM when discovery attaches, as acceptance does.
+        let vmwp_pid = match vmwp_pid {
+            Some(pid) => pid,
+            None => resolve_vmwp_pid(&vm_id, None)?,
+        };
+        Ok(Self {
+            profile: profile.context(identity_usage())?,
+            vm_id,
+            vmwp_pid,
+            dispatcher_vnd,
+            partition_id,
+        })
+    }
+}
+
+#[derive(serde::Serialize)]
+struct IdentityResult {
+    schema: &'static str,
+    vm_id: String,
+    vmwp_pid: u32,
+    dispatcher_vnd: HexU64,
+    partition_handle: HexU64,
+    partition_id: HexU64,
+    late_entry_hits: u32,
+}
+
+pub(crate) fn run_identity_discovery(args: &[String], engine: &DebugEngine) -> Result<()> {
+    let request = IdentityRequest::parse(args)?;
+    // The same cross-process reservation a live-control session takes, so discovery cannot attach
+    // beside a session that already owns this VM's vmwp, nor a session open beside discovery.
+    let _reservation = VmReservation::acquire(&request.vm_id)?;
+    let profile = DispatcherProfile::load(&request.profile)?;
+    let mut state = VmwpDispatcherState::new(
+        profile,
+        request.vmwp_pid,
+        request.dispatcher_vnd,
+        request.vm_id.clone(),
+    )?;
+    let discovered = state
+        .bind(engine)
+        .discover_identity_only(request.partition_id);
+    let found = match discovered {
+        Ok(found) => found,
+        Err(primary) => match state.bind(engine).teardown() {
+            Ok(()) => return Err(primary),
+            Err(cleanup) if state.attached => hold_contained(&primary, &cleanup),
+            Err(cleanup) => return Err(anyhow!("{primary:#}; cleanup: {cleanup:#}")),
+        },
+    };
+    let result = IdentityResult {
+        schema: "windbg-mcp.sk-identity.v1",
+        vm_id: request.vm_id,
+        vmwp_pid: request.vmwp_pid,
+        dispatcher_vnd: HexU64(found.dispatcher_vnd),
+        partition_handle: HexU64(found.partition_handle),
+        partition_id: HexU64(found.partition_id),
+        late_entry_hits: state.late_discovery_hits,
+    };
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
+/// A discovery that cannot be torn down while still attached leaves vmwp contained, as a live
+/// worker does: detaching would release a thread that may be part-way through
+/// `VidGetHvPartitionId`, and returning would detach it all the same, in the engine's drop. This
+/// role has no supervisor to retain it for operator recovery, so it holds the attach itself.
+fn hold_contained(primary: &anyhow::Error, cleanup: &anyhow::Error) -> ! {
+    eprintln!(
+        "identity discovery failed and vmwp remains contained: {primary:#}; cleanup: {cleanup:#}"
+    );
+    eprintln!(
+        "process {} holds the debugger attach to vmwp and will not release it; recover by \
+         terminating this exact process, which ends vmwp with it",
+        std::process::id()
+    );
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
+    }
+}
+
+fn identity_usage() -> &'static str {
+    "usage: windbg-mcp --sk-discover-identity --profile <json> --vm-id <guid> \
+     [--vmwp-pid <assertion>] [--dispatcher-vnd <assertion>] [--partition-id <assertion>]"
+}
+
 fn cli_word(name: &str, value: &str) -> Result<u64> {
     value
         .strip_prefix("0x")
@@ -1693,6 +1831,9 @@ pub(crate) struct VmwpDispatcherState {
     last_registered_context: Option<u64>,
     scratch_allocated: bool,
     breakpoint: Option<OwnedBreakpoint>,
+    /// Queued hits on the discovery entry, taken by other vmwp threads before its breakpoint was
+    /// removed and continued handled while the partition call ran.
+    late_discovery_hits: u32,
     phase: DispatcherPhase,
     attached: bool,
     threads_frozen: bool,
@@ -1755,6 +1896,7 @@ impl VmwpDispatcherState {
             last_registered_context: None,
             scratch_allocated: false,
             breakpoint: None,
+            late_discovery_hits: 0,
             phase: DispatcherPhase::Fresh,
             attached: false,
             threads_frozen: false,
@@ -2840,6 +2982,20 @@ struct DiscoveredIdentity {
     dispatcher_vnd: u64,
     partition_handle: u64,
     partition_id: u64,
+}
+
+/// What discovery does with its scratch page before detaching: a live session keeps it for the
+/// handler registration that follows, and discovery alone frees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiscoveryScratch {
+    Keep,
+    Release,
+}
+
+/// An owned breakpoint already removed, whose queued hits a later run may still deliver.
+struct RetiredBreakpoint {
+    address: u64,
+    original: Vec<u8>,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -5100,10 +5256,31 @@ impl VmwpDispatcher<'_> {
         self.state.claim_discovery_pause()?;
         run_vm_action(&self.state.vm_id, VmAction::Pause, POWERSHELL_WAIT)?;
         self.state.confirm_vm_pause()?;
-        self.discover_identity(asserted_partition)
+        self.discover_identity(asserted_partition, DiscoveryScratch::Keep)
     }
 
-    fn discover_identity(&mut self, asserted_partition: Option<u64>) -> Result<DiscoveredIdentity> {
+    /// The same discovery as [`Self::prepare_identity`], with nothing bound after it: the
+    /// `--sk-discover-identity` role. The scratch page is freed before the handled detach rather
+    /// than kept for a handler registration, because nothing registers one and the next
+    /// discovery refuses a scratch address that is still mapped.
+    fn discover_identity_only(
+        &mut self,
+        asserted_partition: Option<u64>,
+    ) -> Result<DiscoveredIdentity> {
+        if self.state.profile.discovery.is_none() {
+            bail!("the dispatcher profile has no discovery site");
+        }
+        self.state.claim_discovery_pause()?;
+        run_vm_action(&self.state.vm_id, VmAction::Pause, POWERSHELL_WAIT)?;
+        self.state.confirm_vm_pause()?;
+        self.discover_identity(asserted_partition, DiscoveryScratch::Release)
+    }
+
+    fn discover_identity(
+        &mut self,
+        asserted_partition: Option<u64>,
+        scratch: DiscoveryScratch,
+    ) -> Result<DiscoveredIdentity> {
         let discovery = self
             .state
             .profile
@@ -5146,9 +5323,14 @@ impl VmwpDispatcher<'_> {
         if dispatcher_vnd == 0 || partition_handle == 0 {
             bail!("dispatcher discovery returned a zero VND or partition handle");
         }
+        let entry = RetiredBreakpoint {
+            address: self.site_address(&discovery.entry)?,
+            original: discovery.entry.original.clone(),
+        };
         self.remove_owned_breakpoint()?;
 
-        let partition_id = self.call_vid_get_hv_partition_id(partition_handle, &discovery)?;
+        let partition_id =
+            self.call_vid_get_hv_partition_id(partition_handle, &discovery, &entry)?;
         let found = DiscoveredIdentity {
             dispatcher_vnd,
             partition_handle,
@@ -5175,6 +5357,9 @@ impl VmwpDispatcher<'_> {
         self.state.dispatcher_vnd = Some(found.dispatcher_vnd);
         self.state.discovered_identity = Some(found.clone());
         self.state.identity_discovered = true;
+        if scratch == DiscoveryScratch::Release {
+            self.free_scratch_while_attached()?;
+        }
         self.detach_handled()?;
         self.state.phase = DispatcherPhase::Fresh;
         Ok(found)
@@ -5184,6 +5369,7 @@ impl VmwpDispatcher<'_> {
         &mut self,
         partition_handle: u64,
         discovery: &crate::sklive::DispatcherDiscoveryProfile,
+        entry: &RetiredBreakpoint,
     ) -> Result<u64> {
         let export = self.verify_vid_build(discovery)?;
         self.allocate_discovery_scratch()?;
@@ -5208,8 +5394,9 @@ impl VmwpDispatcher<'_> {
             self.write_register("rcx", partition_handle)?;
             self.write_register("rdx", self.state.profile.scratch_base.0)?;
             self.write_register("rip", export)?;
-            self.run_to_current_breakpoint(
+            self.run_to_owned_breakpoint(
                 Instant::now() + Duration::from_millis(u64::from(DEBUG_WAIT)),
+                Some(entry),
             )?;
             if self.engine.instruction_pointer().map_err(debugger)? != return_address {
                 bail!("VidGetHvPartitionId stopped away from its return address");
@@ -6132,12 +6319,33 @@ impl VmwpDispatcher<'_> {
     }
 
     fn run_to_current_breakpoint(&mut self, deadline: Instant) -> Result<()> {
+        self.run_to_owned_breakpoint(deadline, None)
+    }
+
+    /// Run to the owned breakpoint, continuing any queued hit on `retired`.
+    ///
+    /// Several vmwp threads can take one software breakpoint before the first event is reported,
+    /// and each later one is queued behind it. Removing the breakpoint does not withdraw them: they
+    /// arrive on the next resume as first-chance breakpoint exceptions at the restored address,
+    /// which is what the native-return settle already drains. Discovery's partition call is that
+    /// next resume after the entry breakpoint is removed, so without this a queued entry hit
+    /// stopped the call before its return and left vmwp contained. Measured 2026-10-30 with cdb on
+    /// K3's vmwp, 26 discovery-entry samples continued with `gh` instead of detached: in one, a
+    /// second dispatcher thread was already parked one byte past the entry's `int 3` at the first
+    /// hit, was delivered after `bc *` as a first-chance breakpoint at the restored entry, and
+    /// `gh` resumed it with vmwp unharmed.
+    fn run_to_owned_breakpoint(
+        &mut self,
+        deadline: Instant,
+        retired: Option<&RetiredBreakpoint>,
+    ) -> Result<()> {
         let expected = self
             .state
             .breakpoint
             .as_ref()
             .context("no owned breakpoint is armed")?
             .address;
+        let mut resume_handled = false;
         loop {
             let remaining = debug_wait_remaining(deadline, self.state.wait_activity.as_ref());
             if remaining.is_zero() {
@@ -6147,13 +6355,15 @@ impl VmwpDispatcher<'_> {
                 bail!("the debugger did not reach the owned breakpoint before its deadline");
             }
             let timeout = remaining.as_millis().clamp(1, u128::from(u32::MAX)) as u32;
+            let command = if resume_handled { "gh" } else { "g" };
             let run = self
                 .engine
-                .execute_and_wait("g", timeout)
+                .execute_and_wait(command, timeout)
                 .map_err(debugger)?;
             tracing::info!(
                 target: "windbg_mcp::secure_kernel_mutation",
                 expected = format_args!("{expected:#x}"),
+                command,
                 "dispatcher resumed vmwp toward its owned breakpoint"
             );
             if run.target_gone {
@@ -6204,8 +6414,48 @@ impl VmwpDispatcher<'_> {
             if self.engine.instruction_pointer().map_err(debugger)? == expected {
                 return Ok(());
             }
+            if let Some(retired) = retired
+                && self.is_queued_retired_hit(retired)?
+            {
+                self.state.late_discovery_hits += 1;
+                resume_handled = true;
+                tracing::info!(
+                    target: "windbg_mcp::secure_kernel_mutation",
+                    address = format_args!("{:#x}", retired.address),
+                    drained = self.state.late_discovery_hits,
+                    "dispatcher continued a queued hit on its removed discovery breakpoint"
+                );
+                continue;
+            }
             bail!("the debugger stopped for an event the live-control adapter does not own")
         }
+    }
+
+    /// A stop that is a breakpoint taken before `retired` was removed: a first-chance
+    /// `STATUS_BREAKPOINT` at its address, with no breakpoint installed there and the original
+    /// bytes back. Nothing else can raise one at that address once the bytes are restored.
+    fn is_queued_retired_hit(&self, retired: &RetiredBreakpoint) -> Result<bool> {
+        if self.engine.instruction_pointer().map_err(debugger)? != retired.address {
+            return Ok(false);
+        }
+        let event = self.engine.last_event().map_err(debugger)?;
+        if !is_first_chance_breakpoint_at(event.as_ref(), retired.address) {
+            return Ok(false);
+        }
+        let still_installed = self
+            .engine
+            .breakpoints()
+            .map_err(debugger)?
+            .iter()
+            .any(|breakpoint| breakpoint.enabled && breakpoint.address == Some(retired.address));
+        if still_installed {
+            return Ok(false);
+        }
+        Ok(self
+            .engine
+            .read_memory(retired.address, retired.original.len())
+            .map_err(debugger)?
+            == retired.original)
     }
 
     fn set_site_breakpoint(&mut self, site: &DispatcherSite) -> Result<()> {
@@ -6496,6 +6746,11 @@ impl VmwpDispatcher<'_> {
             wait_for_process_attach(self.engine, pending, self.state.vmwp_pid, deadline)?;
         }
         require_completion_deadline(deadline)?;
+        self.free_scratch_while_attached()?;
+        self.detach_handled()
+    }
+
+    fn free_scratch_while_attached(&mut self) -> Result<()> {
         let scratch = self.state.profile.scratch_base.0;
         self.engine
             .execute_command(&format!(".dvfree {scratch:016x} 0"))
@@ -6509,7 +6764,7 @@ impl VmwpDispatcher<'_> {
             address = format_args!("{scratch:#x}"),
             "dispatcher freed and verified vmwp callback scratch"
         );
-        self.detach_handled()
+        Ok(())
     }
 
     fn bound_vm_id(&self) -> Result<&str> {
@@ -8292,6 +8547,105 @@ mod tests {
         assert_eq!(request.open.dispatcher_vnd, None);
         assert_eq!(request.open.target.partition_id, None);
         assert_eq!(request.open.target.expected_cr3, None);
+    }
+
+    #[test]
+    fn identity_request_takes_discovery_coordinates_and_nothing_a_session_needs() {
+        let args = [
+            "--profile",
+            r"C:\private\profile.json",
+            "--vm-id",
+            "11111111-2222-3333-4444-555555555555",
+            "--vmwp-pid",
+            "4242",
+            "--dispatcher-vnd",
+            "0x200000001000",
+            "--partition-id",
+            "0x27",
+        ]
+        .map(str::to_string);
+        let request = IdentityRequest::parse(&args).unwrap();
+        assert_eq!(request.vmwp_pid, 4242);
+        assert_eq!(request.dispatcher_vnd, Some(0x2000_0000_1000));
+        assert_eq!(request.partition_id, Some(0x27));
+        assert_eq!(
+            request.profile,
+            std::path::Path::new(r"C:\private\profile.json")
+        );
+
+        for (extra, why) in [
+            ("--control-transport", "a session's provider"),
+            ("--live-transport", "a session's memory source"),
+            ("--expected-cr3", "a provider assertion"),
+        ] {
+            let mut with = args.to_vec();
+            with.extend([extra.to_string(), "x".to_string()]);
+            let error = IdentityRequest::parse(&with).err().map(|e| e.to_string());
+            assert!(
+                error.is_some_and(|error| error.contains("unknown argument")),
+                "{extra} is {why}, not a discovery coordinate"
+            );
+        }
+        let without_profile = [
+            "--vm-id",
+            "11111111-2222-3333-4444-555555555555",
+            "--vmwp-pid",
+            "4242",
+        ]
+        .map(str::to_string);
+        assert!(IdentityRequest::parse(&without_profile).is_err());
+    }
+
+    /// Discovery alone frees its scratch while still attached, before the handled detach; a live
+    /// session keeps it for the handler registration that follows. Both run the one discovery.
+    #[test]
+    fn discovery_alone_frees_its_scratch_before_detaching_and_a_session_keeps_it() {
+        let source = include_str!("skdispatch.rs").replace("\r\n", "\n");
+        let section = |start: &str, end: &str| {
+            source
+                .split_once(start)
+                .unwrap_or_else(|| panic!("{start} exists"))
+                .1
+                .split_once(end)
+                .unwrap_or_else(|| panic!("{start} ends before {end}"))
+                .0
+                .to_string()
+        };
+        let prepare = section("    fn prepare_identity(", "    fn discover_identity_only(");
+        assert!(
+            prepare.contains("self.discover_identity(asserted_partition, DiscoveryScratch::Keep)")
+        );
+        let alone = section(
+            "    fn discover_identity_only(",
+            "    fn discover_identity(\n",
+        );
+        assert!(
+            alone.contains("self.discover_identity(asserted_partition, DiscoveryScratch::Release)")
+        );
+        let discover = section(
+            "    fn discover_identity(\n",
+            "    fn call_vid_get_hv_partition_id(",
+        );
+        let free = discover
+            .find("self.free_scratch_while_attached()?;")
+            .expect("discovery frees the scratch on release");
+        let detach = discover
+            .find("self.detach_handled()?;")
+            .expect("discovery detaches handled");
+        assert!(free < detach);
+        let removed = discover
+            .find("self.remove_owned_breakpoint()?;")
+            .expect("the entry breakpoint is removed");
+        let retired = discover
+            .find("let entry = RetiredBreakpoint {")
+            .expect("the removed entry is named for the partition call");
+        assert!(retired < removed);
+
+        let call = section(
+            "    fn call_vid_get_hv_partition_id(",
+            "    fn verify_vid_build(",
+        );
+        assert!(call.contains("self.run_to_owned_breakpoint(") && call.contains("Some(entry),"));
     }
 
     #[test]

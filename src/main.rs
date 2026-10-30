@@ -143,12 +143,18 @@ fn main() -> Result<()> {
     let is_worker = args.iter().any(|arg| arg == worker::WORKER_FLAG);
     let is_live_control = args.iter().any(|arg| arg == skdispatch::LIVE_CONTROL_FLAG);
     let is_sk_kd_target = args.iter().any(|arg| arg == kdtarget::TARGET_FLAG);
+    let is_sk_discovery = args
+        .iter()
+        .any(|arg| arg == skdispatch::DISCOVER_IDENTITY_FLAG);
     // A service has no console, so its stderr goes nowhere at all — and the failure most worth
     // seeing is a listener that refuses to start, which happens before `server_log` can be asked
     // anything. Decided here because logging is initialised before the role is acted on.
     let to_file =
         matches!(service::requested(&args), Some(service::Role::Run)).then(service::log_path);
-    init_logging(is_worker || is_live_control || is_sk_kd_target, to_file);
+    init_logging(
+        is_worker || is_live_control || is_sk_kd_target || is_sk_discovery,
+        to_file,
+    );
     if args.iter().any(|arg| arg == hostclock::CLOCK_PROBE_FLAG) {
         return hostclock::run_probe();
     }
@@ -175,6 +181,14 @@ fn main() -> Result<()> {
         // K4.2b acceptance uses the worker's engine constructor and runs synchronously on this
         // thread. It speaks no MCP and accepts no debugger command text.
         return worker::run_sk_live_control(&args[at + 1..]);
+    }
+    if let Some(at) = args
+        .iter()
+        .position(|arg| arg == skdispatch::DISCOVER_IDENTITY_FLAG)
+    {
+        // Live control's own discovery, run alone: the same engine constructor and thread, and
+        // the identity printed for a caller that needs it outside any session.
+        return worker::run_sk_discover_identity(&args[at + 1..]);
     }
     if let Some(at) = args.iter().position(|arg| arg == kdtarget::TARGET_FLAG) {
         // Native KD facade over the same guarded VTL1 controller. Engine construction stays in

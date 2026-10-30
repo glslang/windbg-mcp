@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`windbg-mcp --sk-discover-identity` runs live control's vmwp discovery on its own.** It pauses
+  the VM, attaches, samples the dispatcher entry and calls `VidGetHvPartitionId` on a hijacked
+  thread, exactly as `sk_live_arm`'s preparation does, then frees its scratch page, detaches handled
+  and prints the dispatcher VND, VID partition handle and partition id as one JSON document. It is
+  for a caller that needs those values outside any session, a memory provider opening VID against
+  the handle above all, and it is a command-line role rather than a tool so that the handle reaches
+  the operator's own process and never an MCP client. It takes the same cross-process VM reservation
+  as a live session. A discovery that cannot restore its partition call holds vmwp contained rather
+  than detaching, and says which process to end. Measured on K3 (Secure Kernel 26100.9457, vmwp
+  26100.9711): about two seconds per run, and the VND and handle agree with a cdb sample of the
+  same boot.
+
 - **`open_sk_debugger` exposes the Secure Kernel as one ordinary debugger session (M8.1).** The
   supervisor opens the existing managed KD facade in an internal worker, attaches a second
   worker's DbgEng kernel session to its generated pipe, and returns only that public handle, so
@@ -297,6 +309,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   2026-09-10; no dependency moves here.
 
 ### Fixed
+
+- **A queued hit on the discovery entry no longer contains vmwp.** Two dispatcher threads can take
+  the entry breakpoint before the first event is reported, and the second hit is delivered on the
+  next resume even after the breakpoint is removed. That resume was the partition call, which
+  stopped short of its return and left the dispatcher contained. The call's run now continues a
+  first-chance breakpoint at the removed entry handled, as native-return settling already drains
+  its own. Measured 2026-10-30 with cdb on K3's vmwp: 1 of 26 entry samples had a second thread
+  parked past the `int 3`, delivered after `bc *` and resumed harmlessly by `gh`. The continue
+  path itself is covered by a source test and has not yet fired in a live discovery.
 
 - **Composite Secure Kernel debugger workers enter and leave one lifecycle atomically.** The
   public DbgEng worker is linked to its hidden controller in the same registry critical section
