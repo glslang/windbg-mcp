@@ -36,7 +36,9 @@ session's decode-on-open makes.
 client for an operator-supplied provider. Exact VM/partition/VP/VTL/CR3 identity and an opaque epoch
 travel on every request; reads and compare-and-write register updates are refused while running;
 and the debugger-owned process publishes the exact held dispatcher event without giving the
-provider a VID receive loop. `--sk-control-probe` validates the non-mutating handshake. The contract
+provider a VID receive loop. `--sk-control-probe` validates the non-mutating handshake, and
+`--sk-discover-identity` runs the session's `vmwp` discovery alone and prints the VND, VID partition
+handle and partition id for a caller outside any session. The contract
 and its state machine are documented in
 [`live-control-provider.md`](live-control-provider.md). The live-control MCP tools drive that
 dedicated worker session: `open_sk_live_control`, `sk_live_arm`, `sk_live_wait`, `sk_live_break`,

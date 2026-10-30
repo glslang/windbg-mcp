@@ -11,6 +11,18 @@ narrow acceptance lifecycle through the same engine constructor and thread owner
 worker. The same state machine is also exposed as a separate MCP session kind whose worker owns
 the provider, adapter and DbgEng attachment.
 
+`--sk-discover-identity --profile <json> --vm-id <guid>` runs only the adapter's discovery, step 2
+below up to the provider: it pauses the VM, attaches to `vmwp`, samples the dispatcher entry, calls
+`VidGetHvPartitionId` on a hijacked thread with the others frozen, frees its scratch page and
+detaches handled. It prints `windbg-mcp.sk-identity.v1` JSON naming the VM, `vmwp` PID, dispatcher
+VND, VID partition handle and partition id; `--vmwp-pid`, `--dispatcher-vnd` and `--partition-id`
+are optional assertions, as on the session. It exists for a caller that opens VID against the
+handle outside any session, which is why it is a role and not a tool: the session confines the
+handle to the live-memory command, and a tool would hand it to an MCP client. It takes the same
+cross-process VM reservation as a session. If the partition call cannot be restored, the role
+holds `vmwp` contained and never exits; ending that exact process ends `vmwp` with it, which is the
+same recovery as an unresolved live worker.
+
 ## Process boundary
 
 The provider owns exact-partition VTL1 register access. It does not receive or complete VID

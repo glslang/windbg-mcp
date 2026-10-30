@@ -99,6 +99,16 @@ pub(crate) fn run_sk_live_control(args: &[String]) -> anyhow::Result<()> {
     crate::skdispatch::run_acceptance(args, &engine)
 }
 
+/// Runs worker-owned vmwp identity discovery alone, with the engine and thread ownership of a
+/// live-control worker, and prints the identity.
+pub(crate) fn run_sk_discover_identity(args: &[String]) -> anyhow::Result<()> {
+    let (engine, limitation) = build_engine(None).map_err(anyhow::Error::msg)?;
+    if let Some(limitation) = limitation {
+        anyhow::bail!("the selected debugger engine cannot run vmwp discovery: {limitation}");
+    }
+    crate::skdispatch::run_identity_discovery(args, &engine)
+}
+
 /// Runs the native KD facade with the same one-engine, one-thread ownership as live control.
 pub(crate) fn run_sk_kd_target(args: &[String]) -> anyhow::Result<()> {
     let (engine, limitation) = build_engine(None).map_err(anyhow::Error::msg)?;
