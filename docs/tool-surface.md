@@ -8,8 +8,8 @@ how much of that surface a run serves, and four behaviours the table has no room
 The default serves every ordinary group and omits the `securekernel` extra. Explicit `--tools all`
 serves all eighty-nine tools. Their definitions are paid before the model has asked anything, once
 per conversation. Every
-figure on this page reads `tests/golden/tool_budget.json` as recorded on 2026-10-28 by serving
-build `0.23.0+g3176d29a-dirty.a483f64b`, rather than being an invariant: any edit to a tool's
+figure on this page reads `tests/golden/tool_budget.json` as recorded on 2026-10-30 by serving
+build `0.23.0+gf72424e4-dirty.f6d9a4cc`, rather than being an invariant: any edit to a tool's
 description moves it, so
 re-derive before quoting one. The tables below are checked against a
 running server by `every_documented_surface_figure_matches_the_served_surface`; this sentence is
@@ -26,7 +26,7 @@ windbg-mcp.exe --tools session,inspect,crash
 | `--tools` | Tools | Model context |
 |---|---:|---:|
 | *(absent)* — ordinary groups | 66 | 103,534 B |
-| `all` | 89 | 139,560 B |
+| `all` | 89 | 139,475 B |
 | `session,inspect,exec,crash` | 33 | 49,332 B |
 | `session,inspect,crash` | 23 | 34,092 B |
 | `crash` | 13 | 20,515 B |

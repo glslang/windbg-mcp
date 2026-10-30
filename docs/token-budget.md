@@ -343,7 +343,7 @@ None of these is a bug. They are recorded because they were invisible, and
    Where the bytes sit, and what each profile costs:
 
    Both tables read [`tests/golden/tool_budget.json`](../tests/golden/tool_budget.json) as recorded
-   on **2026-10-28** by serving build `0.23.0+g3176d29a-dirty.a483f64b`; they move with any edit to
+   on **2026-10-30** by serving build `0.23.0+gf72424e4-dirty.f6d9a4cc`; they move with any edit to
    a description. The `securekernel` row is an extra group: the absent spec omits it, while `all`
    includes it.
 
@@ -351,7 +351,7 @@ None of these is a bug. They are recorded because they were invisible, and
    |---|---:|---:|---:|
    | `allocator` | 12 | 19,807 | 14.2% |
    | `ioctl` | 11 | 16,088 | 11.5% |
-   | `securekernel` | 23 | 36,026 | 25.8% |
+   | `securekernel` | 23 | 35,941 | 25.8% |
    | `exec` | 10 | 15,087 | 10.8% |
    | `session` | 10 | 14,208 | 10.2% |
    | `inspect` | 10 | 13,485 | 9.7% |
@@ -362,7 +362,7 @@ None of these is a bug. They are recorded because they were invisible, and
    | `--tools` | tools | model |
    |---|---:|---:|
    | *(absent)* | 66 | 103,534 |
-   | `all` | 89 | 139,560 |
+   | `all` | 89 | 139,475 |
    | `session,inspect,exec,crash` | 33 | 49,332 |
    | `session,inspect,crash` | 23 | 34,092 |
    | `crash` | 13 | 20,515 |
@@ -424,8 +424,10 @@ None of these is a bug. They are recorded because they were invisible, and
    than another debugger operation: the hidden facade and public DbgEng worker share capacity,
    status and ordered teardown. The later correction to `allow_transition_cr3`'s input description
    adds 146 B to both current totals, bringing the surface to **139,560 B** and the payload to
-   **414,076 B**. The model and wire ceilings remain **142,000 B** and **420,000 B**, leaving 2,440
-   B (1.7%) and 5,924 B (1.4%) respectively.
+   **414,076 B**. Deleting `sk_live_continue_to_breakpoints`'s sentence saying the facade did not
+   route `g` through it, which M8.0 made untrue, then takes 85 B from both, to **139,475 B** and
+   **413,991 B**. The model and wire ceilings remain **142,000 B** and **420,000 B**, leaving 2,525
+   B (1.8%) and 6,009 B (1.4%) respectively.
 
    **The two tables do not reconcile, and that is the point of item 41.** The first is each group's
    share of the whole surface; the second is what a spec actually serves, which is less — `crash`

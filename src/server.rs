@@ -5260,8 +5260,7 @@ impl WindbgServer {
     /// Consume the current stopped epoch, verify and install a replacement set of natural-flow
     /// hardware breakpoints while the dispatcher event is still held, then resume. M1 currently
     /// requires a session with exactly one selected VP. This is the guarded run/break transition;
-    /// immediately use the live wait operation afterward to collect the next stop. The managed KD
-    /// facade does not yet route WinDbg `g` through this experimental path.
+    /// immediately use the live wait operation afterward to collect the next stop.
     #[rmcp::tool(
         annotations(
             title = "Continue to live Secure Kernel breakpoints",

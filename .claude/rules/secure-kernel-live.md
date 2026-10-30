@@ -15,7 +15,7 @@ follows is this server's half.
 
 **The tool group is `extra`, so the default surface does not serve it.** `securekernel` is the only
 group marked that way, which means a client that asks for nothing gets every *ordinary* group and
-none of these twelve tools. The refusal is `-32602` naming `--tools`, which reads like a
+none of the group's tools (twenty-three; `src/toolset.rs` has the current count). The refusal is `-32602` naming `--tools`, which reads like a
 configuration mistake rather than a missing capability — and an **unset** `WINDBG_MCP_TOOLS`
 produces it just as surely as a narrowed one. **On stdio the command line is the only way to widen
 it**, and that is a property of where the variable is read rather than of the group: a tools spec in
@@ -186,10 +186,11 @@ dispatcher's interrupted wait answers `BreakWake` and the engine thread runs `br
 for a `t` it never sets it, so the break-in stays a cancellation into recovery, because a trace
 step's expected stop is its own successor and break-on-demand needs a natural running arm.
 Mutation-verified 2026-10-25: removing the flag from `request` fails
-`a_break_in_during_a_go_requests_the_rendezvous_before_it_interrupts`. Both routes are coded
-against the qualified direct M1/M2 paths and unmeasured live through the facade; the ignored
-`..._is_driven_by_this_servers_own_kernel_attach` is the probe, and it is `--tools all`
-because `open_sk_kd` is `extra` and `attach_kernel` is ordinary.
+`a_break_in_during_a_go_requests_the_rendezvous_before_it_interrupts`. Both routes reuse the
+qualified direct M1/M2 paths, and M8.2 measured them live through the facade on three clean K3
+boots on 2026-10-28 (the roadmap's M8.2 record). The ignored
+`..._is_driven_by_this_servers_own_kernel_attach` is the probe. It runs on `--tools all` because
+`open_sk_debugger` is `extra` and the generic tools it drives are ordinary.
 
 **The M7.2 join decides nothing a capture cannot prove, and three of its readings surprise.**
 `windbg-mcp --m7-join` (`src/skjoin.rs`) joins the three drained traces offline;
