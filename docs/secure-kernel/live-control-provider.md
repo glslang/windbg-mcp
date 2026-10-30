@@ -295,8 +295,8 @@ proved VM pause to keep provider state stable:
    instruction guards while the event is still held, restores the prior owned debug state, installs
    the new natural-flow DR set, and resumes. The next operation must be `sk_live_wait`; keeping the
    transition and wait separate makes the mutation non-interruptible while leaving only the pure
-   DbgEng wait open to Ctrl+Break. This path is an M1 qualification surface and is not yet used by
-   the managed KD facade's `g` command. The M1 surface currently accepts exactly one selected VP;
+   DbgEng wait open to Ctrl+Break. The KD facade routes a WinDbg `g` with breakpoints installed
+   through this same transition ([`kd-facade.md`](kd-facade.md)). The M1 surface currently accepts exactly one selected VP;
    multi-VP re-arm is refused while preserving the held epoch.
 8. Before any continue, step, recovery or teardown releases guest execution, every guarded memory
    write is restored in reverse order and read back through the stopped virtual address. Failure

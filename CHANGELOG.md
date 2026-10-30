@@ -361,8 +361,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`--tools all` serves eighty-nine tools, eleven more than 0.23.0, and all eleven are in the
   opt-in `securekernel` group**, which now holds twenty-three. A client that names no spec still
   gets the same 66 tools, at 103,534 model-visible bytes (103,579 in 0.23.0). The complete surface
-  is 139,560 model-visible bytes and 414,076 on the wire (`tests/golden/tool_budget.json`, measured
-  2026-10-28), under ceilings of 142,000 and 420,000. `docs/token-budget.md` records each step.
+  is 139,475 model-visible bytes and 413,991 on the wire (`tests/golden/tool_budget.json`, measured
+  2026-10-30), under ceilings of 142,000 and 420,000. `docs/token-budget.md` records each step.
 
 - **A live Secure Kernel memory transport can use the VID handle the worker already discovers.**
   `{vmwp_pid}` and `{partition_handle}` are now expanded in the allowlisted live-memory command,

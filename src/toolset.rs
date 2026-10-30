@@ -1,7 +1,7 @@
 //! Which of this server's eighty-nine tools a run advertises.
 //!
 //! The tool surface is paid **once per conversation, before anything is debugged**, and it is
-//! 139,560 bytes — roughly 35k tokens (measured 2026-10-28; every figure here moves with any edit
+//! 139,475 bytes — roughly 35k tokens (measured 2026-10-30; every figure here moves with any edit
 //! to a description, so re-derive rather than cite). Seven tenths of that is prose, and the prose is what tells
 //! a model how to drive the tools, so there is no strip here the way there was in
 //! [`crate::schema`]: `FOLLOWUPS.md` item 24 measured it and the only honest lever left is the one
@@ -32,11 +32,11 @@
 //!   ioctl           11   16,088  driver objects, IRP stacks, reachability, hazards, IOCTL maps,
 //!                                  references to an address, device security and the
 //!                                  whole-driver survey
-//!   securekernel    23   36,026  captured and live VTL1 inspection and execution control, plus
+//!   securekernel    23   35,941  captured and live VTL1 inspection and execution control, plus
 //!                                  ordinary-kernel and hypervisor transition tracing
 //! ```
 //!
-//! Those bytes are a measurement of **2026-10-28** and move with any edit to a description — the
+//! Those bytes are a measurement of **2026-10-30** and move with any edit to a description — the
 //! whole surface they are shares of is 89 tools, which is what the rows above sum to.
 //! Re-derive rather than quoting them.
 //!
