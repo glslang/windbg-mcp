@@ -40,6 +40,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   made the engine decode the real long-mode bytes `40 55` as 16-bit `inc ax; push bp` instead of
   `push rbp`.
 
+- **`tools/launch_sk_kd.ps1` puts classic WinDbg or WinDbgX on `open_sk_kd`, and the opener
+  returns its connection typed.** The launcher finds the debugger and the server from any working
+  directory and reads the `open_sk_kd` argument object from a JSON file. It opens the facade over a
+  private stdio MCP client and starts the debugger with only the generated local pipe; the startup
+  policy and provider commands stay in the inherited environment and off every child command line.
+  It sends `end_session` once the debugger exits, and also when the debugger fails to start or an
+  open fails with a recovery handle. For WinDbgX it looks for `DbgX.Shell.exe` first, the UI host
+  current Microsoft.WinDbg packages ship, then the older `WinDbgX.exe` names and the WindowsApps
+  alias. `open_sk_kd`'s success result now also carries the generated string as a typed
+  `connection` field, so a client does not have to parse it out of `target`. `open_sk_debugger`
+  leaves the field out, because its pipe stays private to the supervisor. The offline
+  `tools/test_launch_sk_kd.ps1` covers paths containing spaces, a missing debugger, early exit and a
+  failed open that still returned a recovery handle.
+
 - **The Secure Kernel KD facade routes `g` and a running Ctrl+Break onto the qualified
   controller paths (M8.0).** A non-trace continue with hardware breakpoints installed is M1's
   continue-to-breakpoints; with none installed it is a new bounded free run,
@@ -104,7 +118,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the slots it arms.** DR0-DR3 and DR6 are one set per VP shared across VTLs and only DR7 is per
   VTL, measured 2026-10-24 in the M7.1a nested lab when M6's slot-0 arm overwrote the VTL0 kernel
   debugger's `ba` on the same child VP. A session opened with reserved slots never writes, arms or
-  borrows them: an arm naming one is refused, a break request's transient slot skips them, every
+  borrows them: an arm naming one is refused, a break request's transient slot and the slot a CR3
+  step borrows (after a software breakpoint too) skip them, every
   restore writes back only the slots the session armed and compares only those, and the
   exactly-one-slot DR6 check reads only the session's own B bits, so a foreign sticky bit no longer
   disqualifies a stop. The service-trace manifest still numbers its sites from slot 0; the trace
@@ -239,6 +254,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   single PID emitted by three successful labelled lifecycle invocations, then disarmed, detached
   and left the same guest boot and `vmwp` healthy with no retained worker.
 
+- **`sk_live_continue_to_software_breakpoints` plants guarded one-shot `INT3` breakpoints in live
+  VTL1 (M3).** Up to 64 exact instruction guards are installed as one-byte patches under a proved
+  VM-wide pause, and they are the only guest writes allowed to survive a run. The `sk_live_wait`
+  that follows accepts a vector-3 stop only with RIP at an owned patch or one byte past it, the two
+  forms VID reports, so adjacent patch addresses are refused before anything is written. It
+  restores and verifies every patch, normalizes RIP to the patch and returns the stop. Patches are
+  one-shot and must be rearmed. The transition requires `allow_memory_writes`, an
+  instruction-coherent memory transport, a provider advertising `breakpoint_events`, and a VM
+  proved to have exactly one virtual processor by the count cached from Hyper-V before discovery
+  can stop `vmwp`. Each patch is bound to the CR3 its guard was verified in, and restoration that
+  cannot be proved contains the VM. Measured 2026-10-21 on the one-vCPU K3 guest: the hardware and
+  software stops both reported CR3 `0x1071df000`, the patch at `0xfffff80546604900` was restored
+  to `48 83 EC 08`, and VID reported the native vector-3 RIP at the patched byte rather than past
+  it. Teardown restored DR0–DR3, DR6, DR7 and RFLAGS and left the same boot running. A
+  write-authorized `open_sk_kd` maps WinDbg's `bp` onto this path; the composite debugger and a
+  read-only facade keep hardware slots.
+
+- **`sk_live_write_memory` compares and replaces 1–64 bytes of live VTL1 memory at a held stop
+  (M3).** The worker converts the retained event into a proved VM-wide pause, checks the expected
+  bytes, writes within one virtual and physical page, reads the replacement back and keeps the
+  original. Before any continue, step, recovery or teardown lets the guest run, every retained
+  write is restored in reverse order and read back, and an original that cannot be proved leaves
+  the VM contained, so no write made with this tool survives execution. Two gates, independent of
+  each other: the startup policy's new `allow_memory_writes` (default `false`), and a memory
+  transport advertising `max_write` and `write_coherency=instruction_coherent`.
+
+- **`sk_live_break` stops a naturally running VTL1 VP on demand (M2).** For one naturally armed VP
+  it proves a VM pause, samples RIP and CR3, guards a transient execute breakpoint at that
+  instruction in a free hardware slot (or an owned slot it replaces temporarily), and resumes into
+  the ordinary vector-1 wait, which reports the stop with the new `break_request` reason. A
+  request racing an in-flight `sk_live_wait` is bound to that exact job: the request reader uses a
+  scoped `SetInterrupt` only to leave the host wait, the engine thread does the pause and the
+  rendezvous, and both callers receive the same stop epoch. A natural breakpoint that wins keeps
+  its `hardware_breakpoint` reason. A bound wait's timeout or failure reaches the request with its
+  category intact. A request against a retained stop is refused without consuming its epoch, and
+  one read after teardown is refused as `stale_session` without touching the target. Qualified
+  live on K3 on 2026-10-20 (a concurrent break, a second request refused, a timeout into
+  fail-closed recovery, and teardown first), ending with DR0–DR3, DR6, DR7 and RFLAGS equal to the
+  baseline and the VM on the same boot and `vmwp`.
+
+- **`sk_live_continue_to_breakpoints` re-arms live VTL1 from a held stop and resumes (M1).** It
+  consumes the stopped epoch, verifies one to four replacement instruction guards while the event
+  is still held, restores the prior owned debug state, installs the new natural-flow DR set and
+  resumes. The next stop is collected by `sk_live_wait`, which stays a separate call so that the
+  register changes cannot be interrupted and only the wait is open to a break. No-hit, timeout or
+  a failed guard either restores the baseline or holds the session fail-closed with a recovery
+  result. It needs exactly one selected VP: a multi-VP re-arm is refused with the held epoch
+  preserved. Qualified on 2026-10-20 with 300/300 transitions, 100 cycles on each of three clean K3
+  boots, plus stale-epoch, stale-byte, no-hit and forced-teardown cases, every cycle ending with
+  exact DR0–DR3, DR6, DR7 and RFLAGS restoration. It is the path M8.0's facade routes `g` with
+  breakpoints through.
+
 - **The WinDbg pane is installable from this marketplace, beside the server.** `mods/windbg-pane/`
   — the Claude Code mod that draws a WinDbg-style pane from the server's tool calls as they happen
   — is now the marketplace's second plugin, so `/plugin install windbg-pane@windbg-mcp` puts it in
@@ -291,9 +358,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **The Secure Kernel external-client launcher recognizes the current Store debugger UI host.**
-  WinDbgX package discovery now prefers `DbgX.Shell.exe`, used by current Microsoft.WinDbg
-  packages, before the older package `WinDbgX.exe` names and the short-lived WindowsApps alias.
+- **`--tools all` serves eighty-nine tools, eleven more than 0.23.0, and all eleven are in the
+  opt-in `securekernel` group**, which now holds twenty-three. A client that names no spec still
+  gets the same 66 tools, at 103,534 model-visible bytes (103,579 in 0.23.0). The complete surface
+  is 139,560 model-visible bytes and 414,076 on the wire (`tests/golden/tool_budget.json`, measured
+  2026-10-28), under ceilings of 142,000 and 420,000. `docs/token-budget.md` records each step.
 
 - **A live Secure Kernel memory transport can use the VID handle the worker already discovers.**
   `{vmwp_pid}` and `{partition_handle}` are now expanded in the allowlisted live-memory command,
@@ -354,6 +423,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   time-compatible hit can no longer be filtered out strongly enough to make another hit look
   unique, and interval-only rank matching is withheld while any candidate's classification is
   unproved.
+
+- **The M7 join no longer pairs across a hypervisor transition it cannot place, or treats a trace
+  that lost a breakpoint as complete.** An M5 transition with no VP, on a different VP, or that is
+  neither a VTL0 call nor a VTL1 return is now a pairing barrier. VTL calls still open at it are
+  reported unmatched instead of pairing with a later return, and while any barrier stands the M5
+  stages are left ambiguous rather than rank-matched. A layer whose trace breakpoints were gone when
+  it was read gets a `missing_breakpoints` mark and no longer counts as a complete run, so its open
+  round trip bounds nothing.
+
+- **WinDbgX can step through `open_sk_kd`.** The facade's version record now advertises
+  `DBGKD_VERS_FLAG_HSS`, which keeps WinDbg on the target-assisted trace path that the guarded step
+  implements. Without it, WinDbgX 10.0.26100 worked out a software-step successor from NT
+  compatibility state, truncated the redirected RIP to its 16-bit offset (`0x512b` on the measured
+  stop), and failed `t` before sending a trace request. Classic KD had always used the
+  trace-enabled `Continue2` path and did not need the flag.
 
 - **Secure Kernel instruction and guarded-write bytes reject non-ASCII input before byte-pair parsing.** A
   multibyte character with an even UTF-8 byte length could previously pass the length check and
@@ -494,6 +578,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- **`docs/secure-kernel/m8-debugger.md` is the starting page for the Secure Kernel debugger.** It
+  brings the M8 architecture, the exact profile, policy and driver setup, the managed and external
+  operator flows, the acceptance evidence and the recovery rules onto one page, and
+  `kd-facade.md` stays the detailed packet contract. The shipped `windbg-debugging` skill now
+  points to `open_sk_debugger` for an MCP debugger and `open_sk_kd` for external WinDbg, and lists
+  the three trace pairs.
+- **Nothing a target holds is redacted from an answer, and `docs/limitations.md` now says that is
+  deliberate** (#287). A dump, a trace or a live target answers with whatever is in it, and no
+  scrub is attempted: a filter would be a guess about which strings are private, and a partial one
+  reads as a complete one. The only masking is of credential-shaped text in this server's own
+  transcript, so treat a dump, and any answer about one, as being as sensitive as the machine it
+  came from. The kernel sample `081226-2187-01.dmp` keeps the capturing guest's paths, since
+  rewriting them would mean it was no longer a real capture.
 - **The README names the project's official sources, and warns about the rest.** Third-party MCP
   directories list the repository unasked, and one invited the maintainer to "claim" and monetise a
   listing. The new *Official sources* section lists the four channels this project publishes
