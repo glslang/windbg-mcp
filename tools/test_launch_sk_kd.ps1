@@ -143,11 +143,16 @@ try {
     $launcherSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'launch_sk_kd.ps1') -Raw
     $packageCandidate = $launcherSource.IndexOf('Get-AppxPackage Microsoft.WinDbg')
     $shellCandidate = $launcherSource.IndexOf("'DbgX.Shell.exe'")
+    $legacyCandidate = $launcherSource.IndexOf('Join-Path $package.InstallLocation ''WinDbgX.exe''')
+    $legacyAmd64Candidate = $launcherSource.IndexOf('Join-Path $package.InstallLocation ''amd64\WinDbgX.exe''')
     $aliasCandidate = $launcherSource.IndexOf('Get-Command WinDbgX.exe')
     Assert-SkLauncher ($packageCandidate -ge 0 -and $packageCandidate -lt $aliasCandidate) `
         'WinDbgX resolution did not prefer the package executable over its execution alias'
     Assert-SkLauncher ($shellCandidate -gt $packageCandidate -and $shellCandidate -lt $aliasCandidate) `
         'WinDbgX resolution omitted the current package UI host DbgX.Shell.exe'
+    Assert-SkLauncher ($legacyCandidate -ge 0 -and $legacyAmd64Candidate -ge 0 -and
+        $shellCandidate -lt $legacyCandidate -and $shellCandidate -lt $legacyAmd64Candidate) `
+        'WinDbgX resolution did not prefer DbgX.Shell.exe over the legacy package WinDbgX.exe names'
 
     $stopEvents = New-Object System.Collections.Generic.List[string]
     $fakeStopInput = [pscustomobject] @{ Events = $stopEvents }
