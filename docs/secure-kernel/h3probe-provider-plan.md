@@ -7,7 +7,8 @@ register/control provider and the live-memory provider that drive it, and the qu
 proves them. A client then needs an operator-installed driver, a startup policy and MCP calls, and
 nothing else.
 
-`secure-kernel-lab` (sklab) carries all three today and becomes an ordinary client. It keeps the
+[`secure-kernel-lab`](https://github.com/glslang/secure-kernel-lab) (sklab) carries all three
+today and becomes an ordinary client. It keeps the
 lab: VM provisioning and disk reset, guest triggers, run orchestration, evidence audits and the
 driver service's lifecycle. It stops opening `\\.\H3Probe` itself.
 
@@ -30,9 +31,9 @@ wherever the code and docs meet that boundary:
 Two reasons stood behind it, and only one survives.
 
 **Privacy no longer holds.** The provider, the VID layout and the driver were private because the
-bench was. sklab is being published with `h3probe.c`, the derivation of its VID memory operation,
-and both Python providers. Kept out of this repository after that, they buy no secrecy and cost
-three things:
+bench was. sklab was published on 2026-10-31 with `h3probe.c`, the derivation of its VID memory
+operation, and both Python providers. Kept out of this repository now, they buy no secrecy and
+cost three things:
 
 - every change to the driver's ABI is two commits in two repositories;
 - the startup policy allow-lists a Python interpreter and two scripts;
