@@ -206,7 +206,8 @@ it cannot, the build is an operator step and CI checks the source only.
 
 ### Phase 2: harden what is about to be a component of this repository
 
-Four findings, read from the source on 2026-10-30. None of them has been measured.
+Four findings, read from the source on 2026-10-30. The third was measured and fixed in sklab on
+2026-10-31, before the move; the other three have not been measured.
 
 - **The hypercall pages are shared and unlocked.** RUN and CALL go through one global input/output
   page pair (`g_InputVa`, `g_OutputVa`) with no lock around it. The driver's only locks are push
@@ -216,11 +217,16 @@ Four findings, read from the source on 2026-10-30. None of them has been measure
   distinct registers at once must agree with the same reads made one at a time.
 - **CALL issues any hypercall.** Its doc comment says it "issues Control verbatim", while the
   providers need only `0x50` and `0x51`. Allow-list those two.
-- **The device's DACL is whatever `IoCreateDevice` gives it.** There is no SDDL, and every code is
-  `FILE_ANY_ACCESS`. Measure the effective descriptor first, then create the device with
-  `IoCreateDeviceSecure`, restricted to SYSTEM and Administrators. sklab's checks already require
-  an elevated administrator for most of the modules that open it, and Phase 2's acceptance run
-  finds any that do not.
+- **The device admitted unelevated callers. Fixed in sklab, 2026-10-31.** Every code is
+  `FILE_ANY_ACCESS`, so any handle can issue them. `IoCreateDevice`'s default descriptor granted
+  Everyone read and write. A medium-integrity token with Administrators disabled, which is what an
+  unelevated process runs with, opened `\\.\H3Probe` and reached the dispatch routine. Tightening
+  the descriptor at runtime refused it at `\\.\H3Probe` but not at `\\.\H3Probe\x`, because the
+  device lacked `FILE_DEVICE_SECURE_OPEN`. The driver now calls `IoCreateDeviceSecure` with
+  `SDDL_DEVOBJ_SYS_ALL_ADM_ALL` and that flag. The rebuilt image refused the token on both paths
+  and still admitted an elevated caller. The restriction costs nothing, because every legitimate
+  caller is an elevated administrator, as any debugger is. What it shuts out is that
+  administrator's own unelevated processes.
 - **An unknown control code succeeds with zero bytes.** Answer `STATUS_INVALID_DEVICE_REQUEST`
   instead.
 
@@ -230,7 +236,8 @@ after [Phase 7](#phase-7-sklab-becomes-a-client). Until then, an sklab module co
 - **Pass:**
   - Phase 1's acceptance again;
   - the concurrency test;
-  - an open by a non-administrator, refused.
+  - an open by a medium-integrity token with Administrators disabled, still refused at
+    `\\.\H3Probe` and at a path under it.
 - **Control:** run the concurrency test against the Phase 1 build first. A race that never shows
   there is not evidence that the lock works, so record it as unreproduced rather than as passed.
 - **Stop:** if the lock changes timing enough to fail a live gate, measure before relaxing
