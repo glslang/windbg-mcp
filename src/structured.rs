@@ -2545,6 +2545,198 @@ pub struct StackTrace {
     pub frames_truncated: bool,
 }
 
+/// Whether the current thread's call stack could have been produced by calls — the judgement a
+/// stack-spoofing detector makes, as values. `docs/stack-lineage-plan.md` is the design and the
+/// measurements behind it; [`crate::lineage`] is where every rule below is decided.
+///
+/// **Three verdicts, because "nothing was found" and "nothing could be checked" are opposite
+/// facts.** A positive finding makes the stack `suspicious` whatever else was unavailable; the
+/// absence of evidence never does. `consistent` is the one that has to be earned — only the CPU's
+/// own shadow stack is strong enough to call a stack clean — so on most targets the honest answer
+/// is `unknown`, and that is the design rather than a gap in it.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct StackLineage {
+    pub verdict: LineageVerdict,
+    /// Every frame of the walk, innermost first, with what was found about each.
+    pub frames: Vec<FrameLineage>,
+    /// As [`StackTrace::frames_truncated`]. A truncated walk is never `consistent`: the frames
+    /// past the cap were not examined.
+    pub frames_truncated: bool,
+    /// The first frame the walk could not vouch for, when there is one. It and every frame under it
+    /// are [`ReachedBy::BeyondWalk`] and judged by nothing — that is what keeps a dump whose image
+    /// is missing from reading as a spoofed stack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub walk_lost_at: Option<u32>,
+    pub shadow_stack: ShadowStack,
+    /// What made the verdict `suspicious`, one entry per frame and kind. Empty for the other two.
+    pub findings: Vec<LineageFinding>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LineageVerdict {
+    /// The shadow stack was compared and vouched for every return address the walk reached.
+    Consistent,
+    /// A frame the walk could vouch for has a finding; see [`StackLineage::findings`].
+    Suspicious,
+    /// No finding, and not enough evidence to call the stack clean.
+    Unknown,
+}
+
+/// One frame and what was found about it.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FrameLineage {
+    /// The same record [`StackTrace::frames`] carries, so a frame here joins one there.
+    pub frame: FrameInfo,
+    pub reached_by: ReachedBy,
+    pub call_site: CallSite,
+    pub shadow: ShadowMatch,
+    /// Which shadow-stack entry matched, counted up from the shadow-stack pointer. Present exactly
+    /// when [`Self::shadow`] is `matched`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_slot: Option<u32>,
+}
+
+/// How the walk arrived at a frame, which decides whether anything found there is evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReachedBy {
+    /// Frame 0: the thread's own registers.
+    Context,
+    /// The frame above had unwind data, so the walker read this return address from the slot that
+    /// data names — a value planted there is the target's doing.
+    UnwindData,
+    /// Frame 1 under a frame 0 with no unwind entry in an image whose unwind table the engine
+    /// holds: the x64 and ARM64 ABIs' rule for a function that calls nothing, which is exact for
+    /// one (a syscall stub, the commonest frame 0 there is). Kept only when it checks out, and
+    /// judged like an unwind-data frame.
+    LeafRule,
+    /// The frame above had no unwind data the engine could read, so this frame is the walker's
+    /// inference, kept because it checked out.
+    Inferred,
+    /// At or past [`StackLineage::walk_lost_at`].
+    BeyondWalk,
+}
+
+/// What ends at a frame's address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CallSite {
+    /// Frame 0, whose address is where the thread is rather than where anything returns.
+    NotAReturnAddress,
+    /// A call instruction ends exactly here.
+    Call,
+    /// A system call ends here: where a syscall returns, which a kernel walk crosses.
+    SystemCall,
+    /// The frame above resumes a saved context — an exception, APC, callback or trap dispatcher —
+    /// so this is where execution was interrupted, not where a call returns.
+    ResumedContext,
+    /// No call ends here.
+    NotACall,
+    /// The bytes before it could not be read: a dump that did not capture the code.
+    Unreadable,
+    /// An instruction set this does not decode.
+    NotDecoded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ShadowMatch {
+    /// On the shadow stack, at [`FrameLineage::shadow_slot`].
+    Matched,
+    /// The shadow stack demonstrably went past where this return address would be, and it is not
+    /// there: the CPU recorded no call returning here.
+    Missing,
+    /// Not compared — no shadow stack, frame 0, an exempt frame, or past what could be read.
+    NotChecked,
+}
+
+/// The thread's hardware shadow stack, as read or as the reason it was not.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ShadowStack {
+    pub status: ShadowStatus,
+    /// Why there is no comparison. Present exactly when [`Self::status`] is `unavailable`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<ShadowAbsence>,
+    /// The shadow-stack pointer (`ssp`), when the engine reported one at all — zero included,
+    /// since a zero is the measured reason for most `unavailable` answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pointer: Option<String>,
+    /// The thread's `IA32_U_CET` (`cetumsr`), when it was read. Bit 0 is `SH_STK_EN`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cet_msr: Option<String>,
+    /// How many shadow-stack entries were read.
+    pub entries_read: u32,
+    /// Why the read stopped before it had all the entries it wanted, when it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_stopped: Option<ShadowReadStop>,
+    /// Entries passed over to match a later frame: calls the CPU recorded and the walk does not
+    /// show. Each such frame the walk could vouch for also carries a `hidden_calls` finding, and any
+    /// at all keep the verdict from `consistent`.
+    pub skipped_entries: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ShadowStatus {
+    /// Read, and compared against the walk.
+    Compared,
+    /// There is no shadow stack to read; [`ShadowStack::unavailable`] says why.
+    Unavailable,
+    /// The pointer is real and the memory behind it would not read — the common case for a dump,
+    /// which captures thread stacks and not shadow stacks.
+    Unreadable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ShadowAbsence {
+    /// The engine has no `ssp` register for this target: every architecture but x64 (measured on
+    /// x86 and ARM64, which answer "bad register").
+    NoRegister,
+    /// A kernel target. The kernel's shadow stack is not read by this tool.
+    KernelTarget,
+    /// The pointer reads zero. That is a thread with no shadow stack in force **or a capture that
+    /// recorded none** — measured to read identically — so it is never evidence of a clean stack.
+    PointerZero,
+    /// The pointer is non-zero and `cetumsr` says shadow stacks are off for the thread: a pair this
+    /// does not try to interpret.
+    NotEnabled,
+    /// The pointer is non-zero and `cetumsr` would not read.
+    MsrUnreadable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ShadowReadStop {
+    /// The next page would not read.
+    Unreadable,
+    /// A shadow-stack restore token: past it lies another stack.
+    Token,
+}
+
+/// One thing found about one frame.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LineageFinding {
+    /// [`FrameInfo::index`] of the frame it is about.
+    pub frame: u32,
+    pub kind: FindingKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingKind {
+    /// The code is in memory no loaded module holds. A JIT puts code there legitimately; injected
+    /// code does too.
+    UnbackedCode,
+    /// No call ends at this return address, so no call returns to it.
+    NotPrecededByCall,
+    /// The return address is not on the shadow stack: the CPU recorded no call returning here.
+    MissingFromShadowStack,
+    /// Shadow-stack entries were passed over to reach this frame: calls the walk does not show.
+    HiddenCalls,
+}
+
 /// A run of instructions, as values and as the listing rendered from them.
 ///
 /// **The coordinate, on every instruction.** A disassembly is a contiguous range, so naming the

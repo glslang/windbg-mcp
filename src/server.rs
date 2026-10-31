@@ -1956,6 +1956,20 @@ pub struct BacktraceArgs {
 const MAX_BACKTRACE_FRAMES: u32 = 256;
 const DEFAULT_BACKTRACE_FRAMES: u32 = 32;
 
+/// `stack_lineage`'s arguments: `backtrace`'s, because it judges the same walk. Its own type rather
+/// than a reuse so the schema it ships is named for the tool it belongs to.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StackLineageArgs {
+    /// How many frames to walk and judge (default 32, maximum 256).
+    #[serde(default)]
+    pub frames: Option<u32>,
+    /// Which session to act on. Omit for the current one; pass an opener's handle to route to that
+    /// session and be refused if its target was replaced or closed.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DriverObjectArgs {
@@ -6013,6 +6027,41 @@ impl WindbgServer {
         engine_result_for(args.session_id.as_deref(), out)
     }
 
+    /// Judge whether the current thread's call stack could have been produced by calls — the check
+    /// a stack-spoofing detector makes. Each return address is tested: does a call instruction end
+    /// at it, is its code in a loaded module, and — on an x64 user-mode thread with CET shadow
+    /// stacks in force — is it on the CPU's shadow stack. `verdict` is `suspicious` when a frame
+    /// the walk reached through its registers or unwind data fails a test (`findings` names
+    /// them), `consistent` only when the shadow stack vouched for every return address, and
+    /// otherwise `unknown`: the usual answer, since most targets have no shadow stack and a frame
+    /// the walker had to guess is no evidence either way (`walk_lost_at` says where that began).
+    /// Frames carry `module` + `rva`, as a stack walk's do.
+    #[rmcp::tool(
+        annotations(
+            title = "Judge stack lineage",
+            read_only_hint = true,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<Outcome<structured::StackLineage>>()
+    )]
+    async fn stack_lineage(
+        &self,
+        Parameters(args): Parameters<StackLineageArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::StackLineage {
+                    frames: args
+                        .frames
+                        .unwrap_or(DEFAULT_BACKTRACE_FRAMES)
+                        .clamp(1, MAX_BACKTRACE_FRAMES),
+                },
+            )
+            .await;
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
     /// List modules, as typed values and as a listing rendered from those same values: each
     /// module's name, image name, start/end addresses and **symbol state** — `deferred` (not
     /// fetched yet) is not the same as `none` (this module has no symbols), which `lm` renders as
@@ -7865,6 +7914,11 @@ const TOOL_NOTES: &[ToolNote] = &[
         note: "Same records as `crash_triage`'s `frames`.",
     },
     ToolNote {
+        tool: "stack_lineage",
+        names: &["backtrace"],
+        note: "Its frames are the records `backtrace` returns, each with the judgement beside it.",
+    },
+    ToolNote {
         tool: "backtrace",
         names: &["execute"],
         note: "`execute { \"command\": \"k\" }` gives the engine's own listing instead, with \
@@ -8755,6 +8809,7 @@ mod tests {
             "read_memory",
             "walk_memory",
             "backtrace",
+            "stack_lineage",
             "modules",
             "decode_ioctl",
         ] {

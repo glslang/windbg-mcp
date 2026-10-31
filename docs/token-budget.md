@@ -343,28 +343,28 @@ None of these is a bug. They are recorded because they were invisible, and
    Where the bytes sit, and what each profile costs:
 
    Both tables read [`tests/golden/tool_budget.json`](../tests/golden/tool_budget.json) as recorded
-   on **2026-10-30** by serving build `0.23.0+gf72424e4-dirty.f6d9a4cc`; they move with any edit to
+   on **2026-10-31** by serving build `0.23.0+g052e6ff5-dirty.0fb36ff7`; they move with any edit to
    a description. The `securekernel` row is an extra group: the absent spec omits it, while `all`
    includes it.
 
    | group | tools | bytes | share |
    |---|---:|---:|---:|
-   | `allocator` | 12 | 19,807 | 14.2% |
-   | `ioctl` | 11 | 16,088 | 11.5% |
-   | `securekernel` | 23 | 35,941 | 25.8% |
-   | `exec` | 10 | 15,087 | 10.8% |
-   | `session` | 10 | 14,208 | 10.2% |
-   | `inspect` | 10 | 13,485 | 9.7% |
-   | `batch` | 1 | 10,296 | 7.4% |
-   | `crash` | 3 | 7,473 | 5.4% |
-   | `ttd` | 9 | 7,090 | 5.1% |
+   | `allocator` | 12 | 19,807 | 14.1% |
+   | `ioctl` | 11 | 16,088 | 11.4% |
+   | `securekernel` | 23 | 35,941 | 25.5% |
+   | `exec` | 10 | 15,087 | 10.7% |
+   | `session` | 10 | 14,208 | 10.1% |
+   | `inspect` | 11 | 14,906 | 10.6% |
+   | `batch` | 1 | 10,296 | 7.3% |
+   | `crash` | 3 | 7,473 | 5.3% |
+   | `ttd` | 9 | 7,090 | 5.0% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 66 | 103,534 |
-   | `all` | 89 | 139,475 |
-   | `session,inspect,exec,crash` | 33 | 49,332 |
-   | `session,inspect,crash` | 23 | 34,092 |
+   | *(absent)* | 67 | 104,955 |
+   | `all` | 90 | 140,896 |
+   | `session,inspect,exec,crash` | 34 | 50,753 |
+   | `session,inspect,crash` | 24 | 35,513 |
    | `crash` | 13 | 20,515 |
 
    M2's direct `sk_live_break` addition moves the complete surface from 79 tools and 125,448 B to
@@ -428,6 +428,15 @@ None of these is a bug. They are recorded because they were invisible, and
    route `g` through it, which M8.0 made untrue, then takes 85 B from both, to **139,475 B** and
    **413,991 B**. The model and wire ceilings remain **142,000 B** and **420,000 B**, leaving 2,525
    B (1.8%) and 6,009 B (1.4%) respectively.
+
+   `stack_lineage` (2026-10-31) moves the complete surface to **90 tools and 140,896 B** and the
+   payload to **419,943 B**. The tool owns all of it: 1,421 model-visible bytes (an 865 B
+   description, a 502 B input schema, annotations), and 5,951 B on the wire, of which 4,427 B is its
+   output schema — seven small enums and the `FrameInfo` closure the stack tools share, inlined
+   again as every tool's own `$defs` are. **Both ceilings were left where they were**, and the wire
+   one now has **57 B** of headroom (0.01%) against the model one's 1,104 B (0.8%). So the next
+   schema-bearing tool meets the wire ceiling as a decision rather than a margin: a reduction, or a
+   recorded raise beside the others in `mcp_smoke`'s `WIRE_CEILING`.
 
    **The two tables do not reconcile, and that is the point of item 41.** The first is each group's
    share of the whole surface; the second is what a spec actually serves, which is less — `crash`

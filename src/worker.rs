@@ -4027,6 +4027,7 @@ fn execute(
             }
         }
         EngineOp::Backtrace { frames } => backtrace(e, frames as usize),
+        EngineOp::StackLineage { frames } => stack_lineage(e, frames as usize),
         EngineOp::Disassemble { address, count } => {
             disassemble(e, address.as_deref(), count as usize)
         }
@@ -6748,6 +6749,239 @@ fn render_backtrace(trace: &structured::StackTrace, asked: usize) -> String {
         ));
     }
     out
+}
+
+/// The current thread's stack judged frame by frame — whether each return address could have been
+/// produced by a call. [`crate::lineage`] is the judgement and `docs/stack-lineage-plan.md` the
+/// design; this function only observes.
+///
+/// **The same walk as [`backtrace`]**, through [`walk_attributed`], so a frame here is that tool's
+/// record and joins it. Per frame it then asks the engine whether it holds unwind data for the
+/// frame's code and what the bytes before its address are; once per call it reads the two
+/// shadow-stack registers and, when they describe a shadow stack in force, the shadow stack.
+///
+/// **Every read that fails is a value, not an error.** A page of code a dump did not capture, a
+/// module lookup that failed, a register this architecture does not have: the judgement has a
+/// state for each, and failing the call over one would turn "this could not be checked" into "there
+/// is no answer". Only the walk failing fails the call, for [`backtrace`]'s reason.
+fn stack_lineage(e: &DebugEngine, frames: usize) -> Result<Output, Failed> {
+    let (attributed, frames_truncated) =
+        walk_attributed(e, frames, "stack_lineage").map_err(failed)?;
+    let set = e.instruction_set();
+    let observed: Vec<crate::lineage::ObservedFrame> = attributed
+        .iter()
+        .map(|frame| observe_lineage_frame(e, frame, set))
+        .collect();
+    let shadow = observe_shadow_stack(e, observed.len());
+    let judged = crate::lineage::judge(crate::lineage::Observed {
+        frames: observed,
+        frames_truncated,
+        shadow,
+    });
+    Ok(Output::typed(crate::lineage::render(&judged), judged))
+}
+
+/// One frame's readings for [`stack_lineage`].
+fn observe_lineage_frame(
+    e: &DebugEngine,
+    attributed: &AttributedFrame,
+    set: dbgscope::dbgeng::InstructionSet,
+) -> crate::lineage::ObservedFrame {
+    use crate::lineage::{Placed, Preceding, Unwind};
+    use dbgscope::dbgeng::InstructionSet;
+    let address = attributed.frame.instruction_offset;
+    let innermost = attributed.frame.index == 0;
+    // A return address is the instruction *after* a call, and where that call was the last thing in
+    // its function the address is the first byte of the next one — so the entry asked about is the
+    // call's own last byte, which is the lookup an x64 unwinder makes for the same reason. Frame 0's
+    // address is the instruction itself.
+    let lookup = if innermost {
+        address
+    } else {
+        address.wrapping_sub(1)
+    };
+    let unwind = match e.function_extent(lookup) {
+        Ok(FunctionExtent::Region { .. }) => Unwind::Entry,
+        // **Only frame 0's absence decides anything** — it is what licenses the leaf rule for the
+        // frame under it — so only frame 0 pays to establish that the absence is real. The engine
+        // answers "no entry" just the same for an image it does not hold (measured on
+        // `cppthrow-fastfail.dmp`, whose image is not on this host), and there the ABI argument
+        // for the leaf rule says nothing.
+        Ok(FunctionExtent::NoEntry) => match (&attributed.module, innermost) {
+            (Attribution::In(module), true) if unwind_table_readable(e, module.base) => {
+                Unwind::NoEntry
+            }
+            (_, true) => Unwind::Unknown,
+            (_, false) => Unwind::NoEntry,
+        },
+        Ok(FunctionExtent::Unsupported(_)) => Unwind::NotApplicable,
+        Err(why) => {
+            tracing::debug!(
+                "worker: stack_lineage could not read frame {}'s unwind entry: {why}",
+                attributed.frame.index
+            );
+            Unwind::Unknown
+        }
+    };
+    let preceding = match (innermost, set) {
+        // Frame 0's address is where the thread is, not a return address; nothing is read for it
+        // and the judgement never looks at this.
+        (true, _) => Preceding::Unreadable,
+        (false, InstructionSet::X86 | InstructionSet::Amd64) => crate::lineage::preceding(
+            &bytes_before(e, address, crate::lineage::MAX_CALL_BYTES),
+            address,
+            set,
+        ),
+        (false, InstructionSet::Arm64) => {
+            crate::lineage::preceding(&bytes_before(e, address, 4), address, set)
+        }
+        (false, InstructionSet::Other(_)) => Preceding::NotDecoded,
+    };
+    crate::lineage::ObservedFrame {
+        info: triage::frame_info(attributed),
+        address,
+        placed: match attributed.module {
+            Attribution::In(_) => Placed::InModule,
+            Attribution::NoModule => Placed::NoModule,
+            Attribution::Unknown => Placed::Unknown,
+        },
+        unwind,
+        preceding,
+    }
+}
+
+/// Whether the engine holds the unwind table of the image at `base`: its headers read and so does
+/// the start of its `.pdata`.
+///
+/// What makes "this frame has no unwind entry" a fact about the code rather than about the capture.
+/// The section name rather than the exception directory because the section table is what
+/// `pe::read_image` returns; an image that merged `.pdata` into another section answers `false`,
+/// which costs only the leaf rule — the conservative direction.
+fn unwind_table_readable(e: &DebugEngine, base: u64) -> bool {
+    let Ok(image) = pe::read_image(base, |at, len| e.read_memory(at, len).ok()) else {
+        return false;
+    };
+    image.sections.iter().any(|section| {
+        section.name == ".pdata"
+            && section.virtual_size >= 8
+            && e.read_memory(base.wrapping_add(u64::from(section.rva)), 8)
+                .is_ok()
+    })
+}
+
+/// Up to `wanted` bytes ending at `end`, or as many of the last of them as will read.
+///
+/// **Two reads at most, split at the page `end - 1` is on**, because a dump captures memory by
+/// page and the bytes that matter most are nearest the address: a call ending there is usually five
+/// or six bytes long and on the same page. The page before is needed only for a long instruction
+/// that straddles it, so a page the dump left out costs those and nothing else. Whatever comes back
+/// short is [`crate::lineage::preceding`]'s to read as "not enough to rule a call out".
+fn bytes_before(e: &DebugEngine, end: u64, wanted: usize) -> Vec<u8> {
+    let Some(last) = end.checked_sub(1) else {
+        return Vec::new();
+    };
+    let start = end.saturating_sub(wanted as u64);
+    let page = last & !0xfff;
+    let near = start.max(page);
+    let Ok(mut tail) = e.read_memory(near, (end - near) as usize) else {
+        return Vec::new();
+    };
+    if start < near
+        && let Ok(mut head) = e.read_memory(start, (near - start) as usize)
+    {
+        head.append(&mut tail);
+        return head;
+    }
+    tail
+}
+
+/// The thread's shadow stack for [`stack_lineage`], or why there is none to compare against.
+///
+/// **The register first, then the target kind**, because an architecture with no `ssp` at all is
+/// the more basic answer: x86 and ARM64 targets answer "bad register" for it (measured), x64 ones
+/// answer a value. **Zero is reported as zero and judged as nothing** — the x64 samples, which
+/// record no CET state at all, read `ssp=0` and `cetumsr=0`, exactly as a thread without shadow
+/// stacks does.
+fn observe_shadow_stack(e: &DebugEngine, frames: usize) -> crate::lineage::ShadowObservation {
+    use crate::lineage::ShadowObservation;
+    use structured::ShadowAbsence;
+    let unavailable = |reason, pointer, msr| ShadowObservation::Unavailable {
+        reason,
+        pointer,
+        msr,
+    };
+    let pointer = match e.integer_register("ssp") {
+        Ok(pointer) => pointer,
+        Err(why) => {
+            tracing::debug!("worker: stack_lineage read no shadow-stack pointer: {why}");
+            return unavailable(ShadowAbsence::NoRegister, None, None);
+        }
+    };
+    // The kernel's shadow stack covers kernel frames only, and a kernel walk crosses into user mode
+    // below a system call — comparing the two would report every user frame missing. A target this
+    // cannot classify is treated as the one it must not compare.
+    match e.is_kernel_target() {
+        Ok(false) => {}
+        Ok(true) => return unavailable(ShadowAbsence::KernelTarget, Some(pointer), None),
+        Err(why) => {
+            tracing::debug!("worker: stack_lineage could not classify the target: {why}");
+            return unavailable(ShadowAbsence::KernelTarget, Some(pointer), None);
+        }
+    }
+    if pointer == 0 {
+        let msr = e.integer_register("cetumsr").ok();
+        return unavailable(ShadowAbsence::PointerZero, Some(0), msr);
+    }
+    let msr = match e.integer_register("cetumsr") {
+        Ok(msr) => msr,
+        Err(why) => {
+            tracing::debug!("worker: stack_lineage read no CET MSR: {why}");
+            return unavailable(ShadowAbsence::MsrUnreadable, Some(pointer), None);
+        }
+    };
+    // `IA32_U_CET` bit 0 is `SH_STK_EN`.
+    if msr & 1 == 0 {
+        return unavailable(ShadowAbsence::NotEnabled, Some(pointer), Some(msr));
+    }
+    let wanted = frames.saturating_sub(1) + crate::lineage::SHADOW_MARGIN;
+    let (bytes, unreadable) = read_shadow_stack(e, pointer, wanted * 8);
+    let (entries, token) = crate::lineage::shadow_entries(&bytes, pointer);
+    ShadowObservation::Read {
+        pointer,
+        msr,
+        entries,
+        // A token ends the entries before the read's own end, so it is the reason that applies.
+        stopped: token.or(unreadable),
+    }
+}
+
+/// `size` bytes of shadow stack up from `pointer`, a page at a time, stopping at the first page
+/// that will not read — a dump captures thread stacks and not shadow stacks, so on most of them
+/// that is the first.
+fn read_shadow_stack(
+    e: &DebugEngine,
+    pointer: u64,
+    size: usize,
+) -> (Vec<u8>, Option<structured::ShadowReadStop>) {
+    let mut bytes = Vec::with_capacity(size);
+    let mut at = pointer;
+    while bytes.len() < size {
+        let Some(page_end) = (at | 0xfff).checked_add(1) else {
+            return (bytes, Some(structured::ShadowReadStop::Unreadable));
+        };
+        let chunk = ((page_end - at) as usize).min(size - bytes.len());
+        match e.read_memory(at, chunk) {
+            Ok(read) => bytes.extend_from_slice(&read),
+            Err(why) => {
+                tracing::debug!(
+                    "worker: stack_lineage stopped reading the shadow stack at {at:#x}: {why}"
+                );
+                return (bytes, Some(structured::ShadowReadStop::Unreadable));
+            }
+        }
+        at = page_end;
+    }
+    (bytes, None)
 }
 
 /// DbgEng writes a 64-bit address as ``fffff801`3c677ef0`` — a backtick separating the halves —
