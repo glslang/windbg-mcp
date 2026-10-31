@@ -23413,7 +23413,11 @@ fn configured_commands_drain_both_pipes_while_the_child_runs() {
         "$payload = 'x' * 262144; [Console]::Out.Write($payload); [Console]::Error.Write($payload)"
     ]);
 
-    let output = run_configured_command(&command, "pipe-drain regression", Duration::from_secs(10));
+    // The bound is there to catch a hang, not a slow child. A helper that stopped draining while
+    // the child runs leaves the child blocked on a full pipe for good, which fails at any bound.
+    // A 10 s bound also failed on slow `powershell.exe` runs: 3 of 40 CI runs from 2026-10-28 to
+    // 2026-10-31, on both x64 and arm64, each with both readers already running.
+    let output = run_configured_command(&command, "pipe-drain regression", Duration::from_secs(60));
     assert!(output.status.success(), "{output:?}");
     assert_eq!(output.stdout.len(), BYTES);
     assert_eq!(output.stderr.len(), BYTES);
