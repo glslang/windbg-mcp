@@ -2348,7 +2348,7 @@ Every live Secure Kernel session runs two providers this repository does not car
 `k4_control_provider.py` and `gpa_server.py`, over a driver it does not carry either, `h3probe.sys`.
 All three are in sklab. They were kept out by item 103's standing decision that the repository
 distributes no driver and the operator supplies the transport. Its reason was privacy, and that
-reason ends when sklab is published. The plan keeps the rest of the posture: no binary is
+reason ended when sklab was published on 2026-10-31. The plan keeps the rest of the posture: no binary is
 distributed, the server never installs or starts a driver, and the providers stay child processes.
 
 - **Why deferred:** it is eight phases, most of them with live runs on the disposable VM, and the
