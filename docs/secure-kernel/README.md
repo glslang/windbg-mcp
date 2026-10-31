@@ -226,6 +226,7 @@ Read them in this order; each assumes the one before it.
 | 9 | [Diskless inbox firmware preflight](vdev-firmware-probe.md) | K1.3's result: the inbox BIOS builds five exact-readback UEFI memory regions and 19 VP0 state records, five diskless devices cold-power successfully, and the state applies cleanly in three fresh partitions. The boot-memory callback uses byte ranges; a private execution check reaches DXE. VP0 remains outside the tracked acceptance run; storage and the owner-side completion dispatcher remain open. |
 | 10 | [The Secure Kernel KD facade](kd-facade.md) | `open_sk_kd`: a server-managed, authenticated local WinDbg session over the live controller. `open_sk_debugger`: the same target exposed as one ordinary MCP DbgEng session with an internal facade companion. The measured gates cover validated live debugger metadata, modules, symbols, stack, x64 disassembly, one hardware `bp`/`g`, one fall-through `t`, a bounded free `g`, asynchronous break-in, ordered MCP release and an independent state audit. Repetition, multi-VP and writes remain bounded as the page describes. |
 | 11 | [M8 Secure Kernel debugger](m8-debugger.md) | The completed product path in one place: two-worker composite architecture, generic-tool and external-WinDbg surfaces, exact profile and policy setup, current provider/driver split, qualification evidence and fail-closed recovery. |
+| 12 | [h3probe provider plan](h3probe-provider-plan.md) | **A plan, not started.** Moves the `h3probe.sys` source and the two providers that drive it into this repository, as built-in roles of the same executable speaking the existing protocols, so that sklab becomes an ordinary client. Records which half of item 103's no-driver decision it reverses (privacy) and which it keeps (no binary, no driver install, child-process providers), and phases each with a pass condition, a control and a stop condition. |
 
 Two older side-investigations, kept because they are about the same binary:
 
@@ -280,10 +281,11 @@ adapters, generated policies, M8 triggers, audits and qualification modules:
   change host security settings. In particular, do not disable HVCI merely because an unrelated
   Code Integrity event appears to name it; that interpretation was tested on this bench, changed
   the failure not at all, and was reverted.
-- **A loaded `h3probe.sys`** for register/control and boot-scoped identity.
-- **Currently, a separately obtained and locally loadable LiveCloudKd `hvmm.sys`** for the direct
-  VTL1 GPA read/write path. Normal M8 does not load `hvlib.dll`. Sklab records a staged migration
-  to put this memory path behind h3probe and remove the external driver.
+- **A loaded `h3probe.sys`** for register/control, boot-scoped identity and the direct VTL1 GPA
+  read/write path. Sklab's migration off LiveCloudKd's `hvmm.sys` completed on 2026-10-29, so no
+  separately obtained driver remains, and
+  [`h3probe-provider-plan.md`](h3probe-provider-plan.md) moves h3probe and its providers into
+  this repository.
 
 None of that is a configuration to leave running. The feasibility document's stop conditions and
 its record of which Code Integrity policy actually blocks what are part of the result, not

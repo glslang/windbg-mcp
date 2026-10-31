@@ -21,9 +21,9 @@
 //! So the seam is a **child process speaking a line protocol on its stdio**. What ships here is the
 //! client half, which contains no privileged code, links nothing, and can be read in one sitting.
 //! The operator's half can be anything that can read their guest. The first bench transport drove
-//! `hvlib`; the current one duplicates the worker-discovered VID partition handle out of `vmwp`
-//! and drives the operator's memory driver directly. A separate `HvCallReadGpa` mode remains the
-//! negative control — it is the route that *refuses*.
+//! `hvlib`; the current one passes the worker-discovered VID partition handle *value* to the
+//! operator's memory driver, which uses it inside `vmwp` without duplicating it. A separate
+//! `HvCallReadGpa` mode remains the negative control — it is the route that *refuses*.
 //!
 //! A DLL with an agreed export would have been the other option and is worse here: it would put
 //! unsafe FFI and a vendor ABI in this crate, and a provider that `__fastfail`s — which gate S0

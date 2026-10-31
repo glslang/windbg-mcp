@@ -399,8 +399,8 @@ The setup is exact and must be checked before opening:
    owns it. On the qualified one-VP K3 topology, nested virtualization is disabled; enabling K3's
    nested hypervisor removes K3's own VTL1 from the outer provider view.
 2. The operator's register/control and live-memory providers are installed and running. The
-   reproducible sklab setup currently uses `h3probe.sys` for registers/control and `hvmm.sys` for
-   direct memory; `windbg-mcp` itself still ships neither driver.
+   reproducible sklab setup uses one driver, `h3probe.sys`, for registers/control and direct
+   memory; `windbg-mcp` itself ships no driver.
 3. `WINDBG_MCP_SK_LIVE_POLICY` was present when the server started and admits the exact VM GUID,
    complete provider command templates, profile root, and pause bound.
 4. The dispatcher profile matches the current `vmwp.exe` path, SHA-256 and `SizeOfImage`, carries
