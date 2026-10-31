@@ -92,6 +92,9 @@ reopen it). An unmarked line is simply open.
 - [Item 131](#131-windbg-mcp-the-eval-never-runs-a-mutating-tool) — [windbg-mcp] The eval never runs a mutating tool
 - [Item 132](#132-windbg-mcp-no-scenario-has-outgrown-a-models-own-window) — [windbg-mcp] No scenario has outgrown a model's own window
 - [Item 133](#133-windbg-mcp-the-live-vtl1-driver-and-its-providers-live-outside-this-repository) — [windbg-mcp] The live VTL1 driver and its providers live outside this repository
+- [Item 134](#134-windbg-mcp-the-transition-drain-faults-on-an-unattributed-ntdlldbgbreakpoint-stop-in-vmwp) — [windbg-mcp] The transition drain faults on an unattributed `ntdll!DbgBreakPoint` stop in `vmwp`
+- [Item 135](#135-windbg-mcp-a-secure-kernel-debuggers-public-peer-is-kept-unresolved-after-its-controller-has-released) — [windbg-mcp] A Secure Kernel debugger's public peer is kept unresolved after its controller has released
+- [Item 136](#136-windbg-mcp-dispatcher-discovery-waits-sixty-seconds-for-one-arrival-that-sometimes-never-comes) — [windbg-mcp] Dispatcher discovery waits sixty seconds for one arrival that sometimes never comes
 
 ## 2. [dbgscope] Typed write primitives
 
@@ -2361,6 +2364,197 @@ distributed, the server never installs or starts a driver, and the providers sta
   providers on one boot. Item 129 removes one row of the plan's map outright: the coordinates sklab
   reads before an open.
 
+## 134. [windbg-mcp] The transition drain faults on an unattributed `ntdll!DbgBreakPoint` stop in `vmwp`
+
+**Repo:** `windbg-mcp`. **Origin:** an independent M8 qualification on K3, 2026-10-30, sklab run
+`20261030T191050-validate-m8-3c21df` — exe SHA-256 `7081FACE…3942109`, `serverInfo`
+`0.23.0+g30ebbdfc`.
+
+**What happened.** The composite
+(`a_managed_secure_kernel_kd_session_is_driven_by_this_servers_own_kernel_attach`) panicked with
+`break-in cycle 6 produced no interrupted stop` after `wait_for_stop` ran its full 120 s. The cycle
+counter is zero-based, so this was the seventh break-in on that boot, and the six before it had
+completed. On the controller's side the Ctrl+Break was bound at 19:12:33.277, just as the free run
+started. `pump_pending_transition_before_pause` then began draining the prior cycle's Hyper-V
+transition. It pumped `vmwp` for 2.65 s and carried one foreign event at the site at 19:12:35.928.
+Then it failed with `vmwp stopped at 0x7ff870603f40 for an event the live-control adapter does not
+own while draining the prior Hyper-V transition`. The qualification report resolves that address as
+`ntdll!DbgBreakPoint`; the log carries only the address.
+
+Recovery then ran, in this order:
+
+- a second pump;
+- a VM pause;
+- DR7, DR6 and RFLAGS written back to baseline;
+- the site breakpoint removed, with its original bytes verified;
+- a handled detach and a resume.
+
+It logged `recovery_errors=0, target_left_paused=false`, and the controller session reached
+`released` at 19:12:42.839. The VM passed the next 60-second audit. Item 135 is what happened to the
+public session afterwards.
+
+**What is not known: whose break it was.** The error records the RIP and nothing else: no thread, no
+exception code and no `.lastevent`. So this run cannot attribute the stop. The leading hypothesis is
+that the stop was the adapter's own:
+
+- Each `g` the pump issues is a bounded wait of `DISARM_PUMP_SLICE`, 250 ms.
+- dbgscope ends a wait that reaches its bound with `SetInterrupt(DEBUG_INTERRUPT_ACTIVE)`
+  (`break_in_only`).
+- On a running user-mode process, DbgEng usually delivers that as a break-in thread that executes
+  `ntdll!DbgBreakPoint`. That delivery has not been measured on `vmwp` here.
+- If a slice's deadline break was raised just as the site event arrived, the wait would return for
+  the event and leave the break queued for the next `g`.
+- That `g` would then stop with no `cut_short`, which `transition_pump_step` maps to `UnownedStop`.
+
+The shape fits: about ten silent slices before the carried event, and 4 ms between that event and
+the recovery's pump. That does not establish it.
+
+The pump already drains one queued event of exactly this kind, `queued_owned_native_return_event`:
+DbgEng's native-return breakpoint, removed but already queued. The other candidate is the KD
+break-in's own `SetInterrupt` (`kdtarget::WaitWaker::spawn_interrupt`). The log does not say whether
+cycle 6's wake went that way, or took the path `WaitActivity::enter` returns without an interrupt.
+
+- **What would close it:** first, make the stop attributable. `UnownedStop` should carry the event
+  as fields: the thread id, that thread's start address, the exception code and the first-chance
+  flag. A RIP in prose is not enough. This applies to this pump and to the running disarm's
+  `disarm_pump_step`, which has the same `(None, _)` arm under the same slices.
+
+  If the next occurrence turns out to be the engine's own break-in, consume it handled, the way the
+  native-return drain does. Match it on what makes it provably this adapter's: a DbgEng break-in
+  thread at `DbgBreakPoint`, after a deadline break this pump raised. Every other stop stays
+  fail-closed. If it is not the adapter's, the item becomes the question of what raised a breakpoint
+  in `vmwp`.
+- **Why deferred:** the failure fails safe: recovery restored the target and the audit passed. It has
+  been seen once in 57 free-run break-ins attempted under that build. That count is the six before
+  it, the failure itself, and 25 on each of the other two composite boots under the build. Boot 1's
+  25 ran under a different build, which the origin record below explains. A drain matched on a
+  guess could consume a stop that belongs to someone else, so the attribution comes first. M8's
+  acceptance in [`docs/secure-kernel/m8-debugger.md`](docs/secure-kernel/m8-debugger.md) (three
+  clean boots, 75/75) is a pass on three boots, not a failure rate.
+- **Where it picks up:**
+  - `pump_pending_transition_before_pause`, `transition_pump_step` and `disarm_pump_step` in
+    `src/skdispatch.rs`, with `queued_owned_native_return_event` as the precedent;
+  - dbgscope's `break_in_only`, for how a slice ends;
+  - lines 1425–1495 of the run's `m8-composite.stderr.log`, for the sequence.
+
+## 135. [windbg-mcp] A Secure Kernel debugger's public peer is kept unresolved after its controller has released
+
+**Repo:** `windbg-mcp`. **Origin:** the same run as item 134.
+
+**What happened.** `open_sk_debugger` opens two workers as one session:
+
+- a hidden controller that serves the KD facade (`sess-18e364629d231a58-1`, worker pid 2168);
+- the public DbgEng peer the caller drives, attached to the facade's pipe (`sess-18e3646353bd376c-2`,
+  pid 7824).
+
+When item 134's fault ended the KD service, the controller recovered. The supervisor recorded its
+session as `releasing` at 19:12:37.485 and `released` at 19:12:42.839. Nothing told the peer, whose
+run `exec-18e36478160034f0-8` went on waiting on a pipe whose server had gone. After its full 120 s,
+`wait_for_stop` answered that the run's bound had passed and "a stop is on its way". None came.
+
+`end_session` followed 6 ms later. It set `kernel_unresolved` and waited out its 60 s budget with no
+reply from the worker. It then returned `recovery_required: true, released: false`, with automatic
+termination refused and pid 7824 retained. The qualification cleared that worker by exact-PID
+recovery. The transcript is the run's `mcp.jsonl`, sequence numbers 104–115.
+
+**Why this is a gap rather than the preservation rule working.** Keeping the worker is right for a
+remote kernel the server cannot see. Here the server holds the evidence itself.
+
+`release_tree` (`src/engine.rs`) releases the public peer first, because dropping the facade first
+"severs the KD pipe under DbgEng and turns an orderly detach into an ambiguous kernel failure". The
+peer's only route to the target is that pipe into its companion controller. This run reached the
+order that comment guards against, from the other side: the controller ended on its own and severed
+the pipe. What the controller confirmed on the way out is the state the peer's preservation exists
+to protect: DR7 and DR6 at baseline, the original bytes verified, a handled detach and the VM
+resumed.
+
+Two separate things went wrong:
+
+- the peer was not told that its companion had ended, so a caller waited two minutes on a stop that
+  could not arrive;
+- its release was judged as if the target were unknown.
+
+The worker's wait on the severed pipe did not return in the 60 s after the run's bound had broken it
+in (by `wait_for_stop`'s own account).
+
+- **What would close it:** when a companion confirms its release, end the public peer's run with a
+  stop that says so: `target_gone`, or a typed reason naming the controller's outcome. Then decide
+  the peer's teardown from that outcome rather than from its own unanswerable wait.
+
+  Whether the peer worker can then be terminated with nothing left to recover is a claim to test,
+  not to assume. The worker holds a DbgEng kernel client over a pipe to a process that has already
+  detached. "Terminating it touches nothing on the target" is the kind of fails-safe sentence
+  `.claude/rules/measurement-provenance.md` says needs a test. A controller that ended *preserved*,
+  rather than released, must keep both workers, as it does today.
+- **Why deferred:** it changes the composite lifecycle that `.claude/rules/session-teardown.md`
+  binds. Only a controller fault reaches this case. A fake-provider test can stage the order, but
+  the "nothing left to recover" claim needs a live run.
+- **Where it picks up:**
+  - `release_tree`, `open_secure_kernel_debugger` and `preserve_composite_controller` in
+    `src/engine.rs`;
+  - the controller's session transitions, which the supervisor already records;
+  - [`docs/sessions.md`](docs/sessions.md), for the preservation contract a change must keep.
+
+## 136. [windbg-mcp] Dispatcher discovery waits sixty seconds for one arrival that sometimes never comes
+
+**Repo:** `windbg-mcp`. **Origin:** the same qualification's fault-gate block, sklab runs
+`20261030T214508-fault-debugger-loss-3240d2` and `20261030T215010-fault-identity-change-0fa73d`.
+
+**What happened.** `discover_identity` (`src/skdispatch.rs`) runs these steps:
+
+1. pause the VM;
+2. attach to `vmwp`;
+3. plant a breakpoint at the profile's discovery entry, `vmwp+0x2c360`;
+4. start a Resume on a helper;
+5. run `vmwp` toward the breakpoint for `DEBUG_WAIT`, which is 60 s.
+
+Both runs failed at step 5. The Resume completed and was verified, but no dispatcher thread reached
+the entry, and the wait expired with `the debugger wait reached its deadline`. Discovery then
+removed the breakpoint with its original bytes verified, detached with the event handled and
+resumed the VM. `vmwp` was not lost and nothing was retained, unlike the `cdb` discovery that item
+129 records killing `vmwp`.
+Each gate passed on its next fresh boot.
+
+**The arrival is all-or-nothing, so a longer bound would not help.** The evening ran twelve
+standalone `--sk-discover-identity` discoveries:
+
+- the ten that passed reached the entry 0.10–0.19 s after the Resume was verified;
+- the two that failed reached nothing in 59.65 s.
+
+Discovery depends on one callback that the Resume normally provokes at once, and on those two boots
+it provoked none.
+
+Nine of the twelve ran under the qualified exe (`7081FACE…`), and both failures are among those
+nine. The other three ran under `12C827C8…`. The same function also runs inside each opener: the
+seven in-process discoveries in the four `validate.m8` runs under `7081FACE…` all reached `arming`
+in 1.4–2.0 s.
+
+Both failures came straight after a fault gate that ended faulted. The first followed a provider
+death that left the target paused. The second followed an injected debugger loss. With n=2 that is
+an ordering to check against the gates before the successes, not a cause.
+
+This is a second case of the problem item 129 recorded on 2026-10-13: a stop that needs an ambient
+entry, which an idle guest may not supply. There it was a guarded VTL1 RVA; here it is `vmwp`'s own
+dispatcher.
+
+- **What would close it:** discovery that does not hinge on one arrival. There are two routes:
+  - Provoke a callback discovery can count on: re-kick the VM transition from a helper while `vmwp`
+    runs under the planted breakpoint. The kick comes after a bound well above the 0.19 s worst
+    success and well below 60 s, with a fixed number of kicks. It must not happen with `vmwp`
+    debugger-stopped, which `.claude/rules/secure-kernel-live.md` forbids.
+  - Or find out why the Resume provoked no callback on those boots.
+
+  Either way, record at the deadline what each `vmwp` thread was doing and what Hyper-V reported for
+  the VM, so the next failure shows which of the two it was.
+- **Why deferred:** the failure fails safe, and a retry on a fresh boot passed both times. The kick
+  also changes the order of Hyper-V calls around a debugger-held process, which needs live runs on
+  the disposable VM.
+- **Where it picks up:**
+  - `discover_identity`, `run_to_current_breakpoint` and `VmTransition` in `src/skdispatch.rs`;
+  - the completion kick the transition drain already issues from a helper (`COMPLETION_KICK_AFTER`),
+    as the precedent;
+  - the two runs' `k4-auto-k3-sk-live-identity.log`.
+
 ## Where these items came from
 
 Each cluster above, and what filing it measured. Items named here as *"now in `DONE.md`"* have
@@ -2546,5 +2740,24 @@ against turned out not to be the model's, and nothing in them had come within ha
 Item 133 came from preparing `secure-kernel-lab` for a public push on 2026-10-30: with the driver
 and both providers about to be public there, the privacy that had kept them out of this repository
 no longer did.
+Items 134–136 came from an independent qualification of the M8 debugger and the h3probe-only bench
+on K3 on 2026-10-30. It passed its functional gates and filed three reliability findings:
+
+- boot 2's composite faulting in the transition drain on a stop nothing owned (134);
+- the public peer that this fault left unresolved after its controller had released (135);
+- two discoveries that timed out before their fault gates began (136).
+
+Boot 2's failure is two items rather than one because its halves close independently, in different
+files.
+
+The qualification named one build: exe SHA-256 `7081FACE…` at HEAD `30ebbdfc`. But the tree was
+dirty, and two builds reported that HEAD. The evening's first eight runs, through
+`20261030T185815-validate-m8-ebc6a9` (the first of its four composite boots), ran under
+`12C827C8…`, and what differed between the two builds is not recorded. Under the named build there
+were three composite boots, two of them clean.
+
+The four commits since then (`eae8cea0`–`052e6ff5`) change a doc comment in `src/livesrc.rs` and a
+test bound in `tests/mcp_smoke.rs`. They touch no server code path, and the qualification did not
+cover them.
 `DECISIONS.md`'s 2026-08-02 entries are the bounded-command coverage review that produced
 item 13, now in [`DONE.md`](./DONE.md).
