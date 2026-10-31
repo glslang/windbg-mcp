@@ -91,6 +91,7 @@ reopen it). An unmarked line is simply open.
 - [Item 130](#130-windbg-mcp-a-transcript-cannot-be-joined-to-the-clients-opentelemetry-trace) — [windbg-mcp] A transcript cannot be joined to the client's OpenTelemetry trace
 - [Item 131](#131-windbg-mcp-the-eval-never-runs-a-mutating-tool) — [windbg-mcp] The eval never runs a mutating tool
 - [Item 132](#132-windbg-mcp-no-scenario-has-outgrown-a-models-own-window) — [windbg-mcp] No scenario has outgrown a model's own window
+- [Item 133](#133-windbg-mcp-the-live-vtl1-driver-and-its-providers-live-outside-this-repository) — [windbg-mcp] The live VTL1 driver and its providers live outside this repository
 
 ## 2. [dbgscope] Typed write primitives
 
@@ -2338,6 +2339,28 @@ facts (a break with cause `answer` at the first fact that needed them), or degra
   break causes in `local_model_eval.grade_conversation`, whose `error` and `answer` are the two a
   window would produce.
 
+## 133. [windbg-mcp] The live VTL1 driver and its providers live outside this repository
+
+**Repo:** `windbg-mcp`, with the matching removals in `secure-kernel-lab` (sklab). **Origin:**
+preparing sklab for a public push on 2026-10-30.
+
+Every live Secure Kernel session runs two providers this repository does not carry,
+`k4_control_provider.py` and `gpa_server.py`, over a driver it does not carry either, `h3probe.sys`.
+All three are in sklab. They were kept out by item 103's standing decision that the repository
+distributes no driver and the operator supplies the transport. Its reason was privacy, and that
+reason ends when sklab is published. The plan keeps the rest of the posture: no binary is
+distributed, the server never installs or starts a driver, and the providers stay child processes.
+
+- **Why deferred:** it is eight phases, most of them with live runs on the disposable VM, and the
+  path through sklab works today.
+- **What would close it:** the final acceptance in
+  [`docs/secure-kernel/h3probe-provider-plan.md`](docs/secure-kernel/h3probe-provider-plan.md).
+  The policy admits `builtin:h3probe` and no interpreter; the live tier, the KD gate and sklab's M8
+  acceptance pass on three fresh boots; and sklab's `src/` opens no device.
+- **Where it picks up:** the plan's Phase 0, a protocol transcript and memory corpus from the Python
+  providers on one boot. Item 129 removes one row of the plan's map outright: the coordinates sklab
+  reads before an open.
+
 ## Where these items came from
 
 Each cluster above, and what filing it measured. Items named here as *"now in `DONE.md`"* have
@@ -2520,5 +2543,8 @@ Item 131 came from closing item 39 on 2026-10-17: of the two things its first ru
 measuring the mutating tools is work and needed an entry of its own.
 Item 132 came from the review of that close on 2026-10-18, when the window its runs were measured
 against turned out not to be the model's, and nothing in them had come within half of the model's.
+Item 133 came from preparing `secure-kernel-lab` for a public push on 2026-10-30: with the driver
+and both providers about to be public there, the privacy that had kept them out of this repository
+no longer did.
 `DECISIONS.md`'s 2026-08-02 entries are the bounded-command coverage review that produced
 item 13, now in [`DONE.md`](./DONE.md).

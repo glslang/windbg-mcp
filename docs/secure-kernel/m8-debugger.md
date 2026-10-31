@@ -178,17 +178,16 @@ Paths and complete tokenized commands are canonicalized and compared with the al
 allowed Python executable cannot be reused with another script or `-c` payload. Provider
 placeholders are expanded only from guarded discovery, after the corresponding identity exists.
 
-The current reproducible sklab bench uses two demand-start host drivers:
+The current reproducible sklab bench uses one demand-start host driver, `h3probe.sys`, built from
+sklab's source. It supplies VTL1 register/control operations, boot-scoped identity, and the direct
+guest-physical read/write path through the identity-bound VID partition handle. Sklab's migration
+off LiveCloudKd's `hvmm.sys` completed on 2026-10-29, and its final acceptance ran with the `hvmm`
+service uninstalled and no process holding `hvlib.dll`.
 
-- `h3probe.sys` supplies VTL1 register/control operations and boot-scoped identity.
-- LiveCloudKd's `hvmm.sys` supplies the direct guest-physical read/write path through the
-  identity-bound VID partition handle. Normal M8 does not load `hvlib.dll`.
-
-Both services must already be installed and running before `open_sk_debugger` or `open_sk_kd`.
+The service must already be installed and running before `open_sk_debugger` or `open_sk_kd`.
 `windbg-mcp` never installs or starts a driver. The sklab runbook records build, signing, service,
-hash pinning, and start/stop commands. Sklab also carries the migration plan to move direct memory
-access into `h3probe` and remove the external `hvmm.sys` dependency; until that plan passes its
-live gates, two drivers are the current truth.
+hash pinning, and start/stop commands. [`h3probe-provider-plan.md`](h3probe-provider-plan.md)
+moves the driver's source, and the providers that drive it, into this repository.
 
 ## Open a managed MCP debugger
 
