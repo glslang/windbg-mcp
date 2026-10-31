@@ -2457,6 +2457,34 @@ failure above, so `ensure_x86_worker` re-reads the worker's `ProductVersion` aft
 deletes a stale artifact to deny cargo the reuse, and asks once more; a second failure reports
 itself as a stale build rather than as a missing worker.
 
+## Stack lineage over every sample
+
+`stack_lineage_calls_no_degraded_walk_spoofed_and_no_sample_clean` rides the debugger tier
+(`WINDBG_MCP_SMOKE_DUMP=1`) and opens all seven checked-in dumps in turn. It needs no fixture of its
+own, because the samples between them are every shape of walk this bench has: a clean x64 kernel
+walk, an x64 and an ARM64 one that degrade under a driver with no image, an ARM64 kernel trap at a
+PC in user memory, two x64 user faults and an x86 one. The design those cases were measured for is
+[`stack-lineage-plan.md`](stack-lineage-plan.md); what the test pins is its two load-bearing
+properties.
+
+- **A walk the engine guessed is never a finding.** Three of the walks turn into a stack address,
+  the image base or a pool pointer under an image this host does not hold. Each must come back
+  `unknown` with `walk_lost_at` set, and no frame at or under it judged. A change that judges
+  `beyond_walk` frames fails here as a spoofing report against an ordinary crash dump.
+- **Nothing is called clean without a shadow stack, and none of these has one.** The x64 dumps
+  report `pointer_zero` with the pointer printed as zero (they record XSTATE features `0x7`, no
+  `CET_U`), the ARM64 and x86 ones `no_register`, and the x64 kernel ones `kernel_target`. No case
+  may be `consistent`.
+
+The one `suspicious` case is deliberate: `121524-4703-01.dmp` is a `0xFC` whose trapped PC is in
+user memory, so `unbacked_code` on that frame is the finding a detector exists to make. And the test
+checks each sample's frames against `backtrace`'s on the same session, because "the same records"
+is the claim the two tools are joined on.
+
+**What it cannot reach is the `compared` half**: the CPU's shadow stack has never been read here,
+since no machine on this bench has CET. `FOLLOWUPS.md` item 137 is the fixture and host that would
+close it.
+
 ## Manual checklist
 
 Not automated: no runner has a kernel target, a TTD-capable engine, or elevation. Run these by hand

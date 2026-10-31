@@ -4075,6 +4075,7 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
         ),
         ("modules", json!({}), "error"),
         ("backtrace", json!({}), "error"),
+        ("stack_lineage", json!({}), "error"),
         ("disassemble", json!({}), "error"),
         (
             "set_breakpoint",
@@ -5334,7 +5335,7 @@ fn a_listener_serves_the_narrowed_surface_it_was_started_with() {
     // was typed — `session` is added whatever it said.
     let log = listener.stderr();
     assert!(
-        log.contains("serving 13 of 89 tools (session, crash)"),
+        log.contains("serving 13 of 90 tools (session, crash)"),
         "the listener does not report the surface it ended up with: {log}"
     );
 }
@@ -5366,7 +5367,7 @@ fn two_clients_on_one_listener_are_served_two_surfaces() {
     let local_token = server.token.clone();
     assert!(
         server.wait_for_stderr(
-            "serving 20 of 89 tools (session, inspect) — except bench serves 13 of 89 tools \
+            "serving 21 of 90 tools (session, inspect) — except bench serves 13 of 90 tools \
              (session, crash)",
             Duration::from_secs(30)
         ),
@@ -5390,7 +5391,7 @@ fn two_clients_on_one_listener_are_served_two_surfaces() {
 
     let by_local = listed(&mut server, &local_token, &local_mcp);
     let by_bench = listed(&mut server, &bench_token, &bench_mcp);
-    assert_eq!(by_local.len(), 20, "{by_local:?}");
+    assert_eq!(by_local.len(), 21, "{by_local:?}");
     assert_eq!(by_bench.len(), 13, "{by_bench:?}");
     assert!(by_local.contains(&"registers".to_string()), "{by_local:?}");
     assert!(
@@ -6967,6 +6968,198 @@ fn a_module_rva_target_refuses_an_rva_outside_the_named_image() {
         edge["target"]["module"], "nt",
         "the last byte of `nt` is in `nt`: {edge:#}"
     );
+}
+
+/// **`stack_lineage` over every checked-in sample, which is every shape of walk this bench has**,
+/// and the two properties the design rests on (`docs/stack-lineage-plan.md` §2): a frame the walk
+/// guessed is never a finding, and nothing is called clean without a shadow stack — which none of
+/// these carries.
+///
+/// The cases are the measurements the design was made from. Three of these walks degrade into
+/// garbage under an image this host does not hold — on the x64 user dump a stack address, the image
+/// base and `0x80` follow the faulting frame — and judging those frames would call ordinary crash
+/// dumps spoofed; they must come back `unknown`, with `walk_lost_at` set. One sample *is* what a
+/// detector should flag, and must say so: the ARM64 `0xFC` is a kernel trap at a PC in user memory,
+/// so the CPU really was executing code no module holds.
+///
+/// **Asserted on properties rather than on frame lists**, because the walk is the engine's and its
+/// depth moves between builds. What must hold on every engine is the verdict, the shadow-stack
+/// reason, that every frame the walk could vouch for is a call or is explained, and that nothing
+/// under `walk_lost_at` is judged. The frames are also checked against `backtrace`'s on the same
+/// session, since "the same records" is the claim the two tools' frames are joined on.
+#[test]
+fn stack_lineage_calls_no_degraded_walk_spoofed_and_no_sample_clean() {
+    if target_tier().is_none() {
+        return;
+    }
+    struct Case {
+        dump: &'static str,
+        verdict: &'static str,
+        shadow: &'static str,
+        /// Whether the walk loses its footing, where that was measured; `None` where it depends
+        /// on whether the dump happened to capture a page of code.
+        lost: Option<bool>,
+        findings: &'static [&'static str],
+    }
+    let cases = [
+        // x64 `0x9F`: a clean all-`nt` walk, every return address after an `e8 rel32`.
+        Case {
+            dump: "052126-34312-01.dmp",
+            verdict: "unknown",
+            shadow: "kernel_target",
+            lost: Some(false),
+            findings: &[],
+        },
+        // x64 `MessageManager` double free: garbage under the driver, whose image is not here.
+        Case {
+            dump: "081226-2187-01.dmp",
+            verdict: "unknown",
+            shadow: "kernel_target",
+            lost: Some(true),
+            findings: &[],
+        },
+        // ARM64 HEVD `/GS` failure: a trap frame, then HEVD with no image.
+        Case {
+            dump: "082126-7015-01.dmp",
+            verdict: "unknown",
+            shadow: "no_register",
+            lost: Some(true),
+            findings: &[],
+        },
+        // ARM64 `0xFC`: the trapped PC is in user memory, in no module.
+        Case {
+            dump: "121524-4703-01.dmp",
+            verdict: "suspicious",
+            shadow: "no_register",
+            lost: Some(false),
+            findings: &["unbacked_code"],
+        },
+        // x64 user fault, emulated: no `CET_U` recorded, so `ssp` reads zero. With no image the
+        // walk degrades under frame 0 — except on the one host that still has the fixture's
+        // binary, which unwinds it whole (`docs/smoke-test.md`, "The negative fixture").
+        Case {
+            dump: "cppthrow-fastfail.dmp",
+            verdict: "unknown",
+            shadow: "pointer_zero",
+            lost: (!std::path::Path::new(r"C:\wmfixture\cppthrow.exe").exists()).then_some(true),
+            findings: &[],
+        },
+        Case {
+            dump: "stale-throw-abort.dmp",
+            verdict: "unknown",
+            shadow: "pointer_zero",
+            lost: Some(false),
+            findings: &[],
+        },
+        // x86: no `ssp` register, and no unwind tables, so nothing past frame 0 is evidence.
+        Case {
+            dump: "cppthrow-fastfail-x86.dmp",
+            verdict: "unknown",
+            shadow: "no_register",
+            lost: None,
+            findings: &[],
+        },
+    ];
+    let samples = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/samples/");
+    for case in &cases {
+        let path = format!("{samples}{}", case.dump);
+        let mut server = Server::started();
+        let session = server.open_session("open_dump", json!({ "path": path }), TARGET_STEP);
+        let response = server.call_tool(
+            "stack_lineage",
+            json!({ "session_id": session }),
+            TARGET_STEP,
+        );
+        assert_no_error(&response, "tools/call stack_lineage");
+        let data = &response["result"]["structuredContent"];
+        let text = text_of(&response["result"]);
+        let dump = case.dump;
+        assert_eq!(data["status"], "ok", "{dump}: {text}");
+        eprintln!(
+            "{dump}: {} with {} frames, walk lost at {}, shadow {}",
+            data["verdict"],
+            data["frames"].as_array().map_or(0, Vec::len),
+            data["walk_lost_at"],
+            data["shadow_stack"]["unavailable"]
+        );
+
+        assert_eq!(data["verdict"], case.verdict, "{dump}: {data:#}");
+        assert_eq!(
+            data["shadow_stack"]["status"], "unavailable",
+            "{dump}: none of these carries a shadow stack: {data:#}"
+        );
+        assert_eq!(
+            data["shadow_stack"]["unavailable"], case.shadow,
+            "{dump}: {data:#}"
+        );
+        if case.shadow == "pointer_zero" {
+            assert_eq!(
+                data["shadow_stack"]["pointer"], "0x0000000000000000",
+                "{dump}: a zero is reported as a zero: {data:#}"
+            );
+        }
+        let found: Vec<&str> = data["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .filter_map(|finding| finding["kind"].as_str())
+            .collect();
+        assert_eq!(found, case.findings, "{dump}: {data:#}");
+        if let Some(lost) = case.lost {
+            assert_eq!(
+                data["walk_lost_at"].is_u64(),
+                lost,
+                "{dump}: where the walk lost its footing: {data:#}"
+            );
+        }
+        assert!(
+            text.starts_with(&format!("LINEAGE: {}", case.verdict.to_uppercase())),
+            "{dump}: the listing leads with the verdict:\n{text}"
+        );
+
+        let frames = data["frames"].as_array().expect("frames");
+        assert!(!frames.is_empty(), "{dump}: every sample has a stack");
+        let lost_at = data["walk_lost_at"].as_u64();
+        for row in frames {
+            let index = row["frame"]["index"].as_u64().expect("an index");
+            let reached = row["reached_by"].as_str().expect("reached_by");
+            assert_eq!(
+                reached == "beyond_walk",
+                lost_at.is_some_and(|lost| index >= lost),
+                "{dump}: frame {index} and walk_lost_at disagree: {data:#}"
+            );
+            // A frame the walk could vouch for is a call, a syscall return or a dispatcher's
+            // resumed context — or its code was not captured. Never "no call" on these samples.
+            if matches!(reached, "unwind_data" | "leaf_rule") {
+                assert!(
+                    matches!(
+                        row["call_site"].as_str(),
+                        Some("call" | "system_call" | "resumed_context" | "unreadable")
+                    ),
+                    "{dump}: frame {index} is judged and no call ends at it: {data:#}"
+                );
+            }
+        }
+        for finding in data["findings"].as_array().expect("findings") {
+            let at = finding["frame"].as_u64().expect("a frame index") as usize;
+            assert!(
+                matches!(
+                    frames[at]["reached_by"].as_str(),
+                    Some("context" | "unwind_data" | "leaf_rule")
+                ),
+                "{dump}: a finding on a frame the walk could not vouch for: {data:#}"
+            );
+        }
+
+        // The same records as `backtrace`'s, frame for frame.
+        let stack = server.tool_data("backtrace", json!({ "session_id": session }), TARGET_STEP);
+        let walked: Vec<&Value> = stack["frames"].as_array().expect("frames").iter().collect();
+        assert_eq!(walked.len(), frames.len(), "{dump}");
+        for (row, frame) in frames.iter().zip(walked) {
+            assert_eq!(&row["frame"], frame, "{dump}: the two tools' frames differ");
+        }
+    }
+    ran("stack_lineage over every checked-in sample");
 }
 
 /// The debugger tier's gate for a test that needs an **image target**: a PE opened with

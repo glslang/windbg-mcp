@@ -703,6 +703,15 @@
       "wire": 3073
     },
     {
+      "annotations": 72,
+      "description": 865,
+      "inputSchema": 502,
+      "modelVisible": 1421,
+      "name": "stack_lineage",
+      "outputSchema": 4427,
+      "wire": 5951
+    },
+    {
       "annotations": 116,
       "description": 74,
       "inputSchema": 343,
@@ -803,15 +812,15 @@
     }
   ],
   "totals": {
-    "annotations": 10036,
-    "description": 51322,
-    "inputSchema": 83340,
+    "annotations": 10108,
+    "description": 52187,
+    "inputSchema": 83842,
     "instructions": 2022,
-    "modelVisible": 139475,
-    "outputSchema": 261861,
-    "payload": 413991,
-    "tools": 89,
-    "wire": 413891,
+    "modelVisible": 140896,
+    "outputSchema": 266288,
+    "payload": 419943,
+    "tools": 90,
+    "wire": 419842,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10296
   }

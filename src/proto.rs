@@ -327,6 +327,22 @@ pub enum EngineOp {
         /// How many frames to walk. Bounded by the supervisor before it gets here.
         frames: u32,
     },
+    /// The current thread's stack judged frame by frame — whether each return address could have
+    /// been produced by a call — as [`crate::structured::StackLineage`].
+    ///
+    /// One op rather than a sequence of reads for [`Self::Backtrace`]'s reason, and the same walk
+    /// through the same helper, so a frame here is the record `backtrace` returns. On top of it the
+    /// worker asks, per frame, for the unwind entry and the bytes before the address, and then
+    /// reads the two shadow-stack registers and the shadow stack itself; [`crate::lineage`] judges
+    /// what came back without touching the engine.
+    ///
+    /// Unbounded for [`Self::Backtrace`]'s reason: direct engine calls, none of which a watchdog
+    /// can stop. The reads it adds are small and capped — fifteen bytes per frame and at most
+    /// [`crate::lineage::SHADOW_MARGIN`] entries past the walk's own need.
+    StackLineage {
+        /// How many frames to walk. Bounded by the supervisor before it gets here.
+        frames: u32,
+    },
     /// A run of instructions, as values and as the listing rendered from them.
     ///
     /// One op rather than `u` for [`Self::Backtrace`]'s reason: the answer is each instruction's

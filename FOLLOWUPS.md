@@ -95,6 +95,8 @@ reopen it). An unmarked line is simply open.
 - [Item 134](#134-windbg-mcp-the-transition-drain-faults-on-an-unattributed-ntdlldbgbreakpoint-stop-in-vmwp) — [windbg-mcp] The transition drain faults on an unattributed `ntdll!DbgBreakPoint` stop in `vmwp`
 - [Item 135](#135-windbg-mcp-a-secure-kernel-debuggers-public-peer-is-kept-unresolved-after-its-controller-has-released) — [windbg-mcp] A Secure Kernel debugger's public peer is kept unresolved after its controller has released
 - [Item 136](#136-windbg-mcp-dispatcher-discovery-waits-sixty-seconds-for-one-arrival-that-sometimes-never-comes) — [windbg-mcp] Dispatcher discovery waits sixty seconds for one arrival that sometimes never comes
+- [Item 137](#137-windbg-mcp-the-shadow-stack-half-of-stack-lineage-has-not-run-against-a-cet-target) — [windbg-mcp] The shadow-stack half of stack lineage has not run against a CET target
+- [Item 138](#138-dbgscope--windbg-mcp-stack-lineage-recognises-a-dispatcher-by-name-not-by-its-unwind-record) — [dbgscope + windbg-mcp] Stack lineage recognises a dispatcher by name, not by its unwind record
 
 ## 2. [dbgscope] Typed write primitives
 
@@ -2555,6 +2557,55 @@ dispatcher.
     as the precedent;
   - the two runs' `k4-auto-k3-sk-live-identity.log`.
 
+## 137. [windbg-mcp] The shadow-stack half of stack lineage has not run against a CET target
+
+**Repo:** `windbg-mcp`. **Origin:** building `stack_lineage` on 2026-10-31
+([`docs/stack-lineage-plan.md`](docs/stack-lineage-plan.md) §6.2).
+
+`stack_lineage` compares each return address with the thread's hardware shadow stack, read through
+the engine's `ssp` and `cetumsr` registers and `read_memory`. Every rule of that comparison is a unit
+test on synthetic entries (`lineage::tests`), and **none of it has met a real shadow stack**: the
+debugger guest is ARM64, which has no `ssp` register at all (measured, "bad register"), and the x64
+samples were written by emulated processes whose extended context records XSTATE features `0x7` —
+no `CET_U` — and read `ssp=0`. So the tier measures the `unavailable` half on every sample and the
+`compared` half nowhere.
+
+- **Why deferred:** it needs an x64 host with hardware-enforced stack protection on, and this bench
+  has none.
+- **What would close it:** on such a host, a small x64 fixture with a control arm (ordinary nested
+  calls, paused at a breakpoint: expected `consistent`, every frame `matched`, slots in order) and a
+  planted arm (a return address pushed with no call, paused before the `ret` that would fault:
+  expected `suspicious` with `missing_from_shadow_stack` on that frame), run live and from a full
+  dump of each. Four things are measured on the way, each of which the design assumes: that
+  `integer_register("ssp")` and `"cetumsr"` answer non-zero for a CET-enforced thread, live and from
+  a dump that recorded `CET_U`; that the shadow-stack pages read; that a stack through
+  `KiUserExceptionDispatcher` matches with the dispatcher's frame exempt; and that a restore token
+  is where the read stops. The fixture is a detector's ground truth, a paused process the tool
+  observes, and is not to be grown into anything else.
+- **Where it picks up:** `worker::observe_shadow_stack`, which is the only code between the engine
+  and the tested rules.
+
+## 138. [dbgscope + windbg-mcp] Stack lineage recognises a dispatcher by name, not by its unwind record
+
+**Repo:** `dbgscope` for the primitive, `windbg-mcp` for the adoption. **Origin:** building
+`stack_lineage` on 2026-10-31.
+
+The frame under an exception, APC, callback or trap dispatcher is an interrupted PC rather than a
+return address, so no call ends at it and the CPU pushed nothing for it. `stack_lineage` exempts it
+(`resumed_context`) when the frame above is a `Ki*` routine of `nt` or `ntdll` — a curated rule,
+applied only where the bytes have already failed to show a call. The fact itself is in the unwind
+record: `UWOP_PUSH_MACHFRAME` on x64, and on ARM64 the custom trap-frame code `E8` that `.fnent`
+shows for `nt!KiArm64ExceptionVectors` (measured on `082126-7015-01.dmp`). A dispatcher the rule
+misses makes the frame under it `not_preceded_by_call`; a module with no symbols makes every one of
+them miss.
+
+- **Why deferred:** reading the record needs a primitive dbgscope does not have.
+  `DebugEngine::function_extent` consumes the raw entry and returns only the region.
+- **What would close it:** a typed dbgscope method returning the unwind record's machine-frame /
+  trap-frame fact for an address (x64 and ARM64, the two layouts `function_extent` already decodes),
+  and `lineage::resumes_context` reading it instead of the name.
+- **Where it picks up:** `lineage::resumes_context`.
+
 ## Where these items came from
 
 Each cluster above, and what filing it measured. Items named here as *"now in `DONE.md`"* have
@@ -2759,5 +2810,10 @@ were three composite boots, two of them clean.
 The four commits since then (`eae8cea0`–`052e6ff5`) change a doc comment in `src/livesrc.rs` and a
 test bound in `tests/mcp_smoke.rs`. They touch no server code path, and the qualification did not
 cover them.
+
+Items 137 and 138 came from building `stack_lineage` on 2026-10-31: its shadow-stack comparison is
+unit-tested and has never met a real shadow stack, because no machine on this bench has CET (137),
+and the frame under a dispatcher is recognised by a curated `Ki*` name rule where the unwind record
+holds the fact (138).
 `DECISIONS.md`'s 2026-08-02 entries are the bounded-command coverage review that produced
 item 13, now in [`DONE.md`](./DONE.md).

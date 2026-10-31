@@ -6,10 +6,10 @@ how much of that surface a run serves, and four behaviours the table has no room
 ## Serving fewer tools (`--tools`)
 
 The default serves every ordinary group and omits the `securekernel` extra. Explicit `--tools all`
-serves all eighty-nine tools. Their definitions are paid before the model has asked anything, once
+serves all ninety tools. Their definitions are paid before the model has asked anything, once
 per conversation. Every
-figure on this page reads `tests/golden/tool_budget.json` as recorded on 2026-10-30 by serving
-build `0.23.0+gf72424e4-dirty.f6d9a4cc`, rather than being an invariant: any edit to a tool's
+figure on this page reads `tests/golden/tool_budget.json` as recorded on 2026-10-31 by serving
+build `0.23.0+g052e6ff5-dirty.0fb36ff7`, rather than being an invariant: any edit to a tool's
 description moves it, so
 re-derive before quoting one. The tables below are checked against a
 running server by `every_documented_surface_figure_matches_the_served_surface`; this sentence is
@@ -25,10 +25,10 @@ windbg-mcp.exe --tools session,inspect,crash
 
 | `--tools` | Tools | Model context |
 |---|---:|---:|
-| *(absent)* — ordinary groups | 66 | 103,534 B |
-| `all` | 89 | 139,475 B |
-| `session,inspect,exec,crash` | 33 | 49,332 B |
-| `session,inspect,crash` | 23 | 34,092 B |
+| *(absent)* — ordinary groups | 67 | 104,955 B |
+| `all` | 90 | 140,896 B |
+| `session,inspect,exec,crash` | 34 | 50,753 B |
+| `session,inspect,crash` | 24 | 35,513 B |
 | `crash` | 13 | 20,515 B |
 
 The spec is a comma-separated list of the group names in the [tool table](../README.md#tools), of

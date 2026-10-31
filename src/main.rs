@@ -48,6 +48,7 @@ mod kdimage;
 mod kdprobe;
 mod kdtarget;
 mod kdwire;
+mod lineage;
 mod listen;
 mod livesrc;
 mod logbridge;

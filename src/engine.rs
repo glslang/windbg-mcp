@@ -6549,6 +6549,39 @@ mod tests {
     /// three ways — accept every debugger op on a capture, accept every capture op elsewhere, and
     /// replace the allow-list with a deny-list naming `read_memory`, `current_location` and
     /// `modules`, where `breakpoints` is the row that then goes through.
+    /// `stack_lineage` was added with no line here, which is the allow-list doing its job: an op
+    /// nobody named for a Secure Kernel kind is refused there by construction. Pinned so the claim
+    /// in `docs/stack-lineage-plan.md` §5 is a test rather than an inference — on a capture the
+    /// engine holds an image and no thread, and on a live or KD session the debugger target is not
+    /// the guest whose stack would be judged.
+    #[test]
+    fn stack_lineage_runs_on_every_ordinary_kind_and_no_secure_kernel_one() {
+        let op = EngineOp::StackLineage { frames: 32 };
+        for kind in [
+            SessionKind::Dump,
+            SessionKind::Trace,
+            SessionKind::KernelLocal,
+            SessionKind::Kernel,
+            SessionKind::Process,
+            SessionKind::Launch,
+        ] {
+            assert!(
+                refuse_op_on_kind(kind, &op).is_none(),
+                "{kind:?} refused stack_lineage"
+            );
+        }
+        for kind in [
+            SessionKind::SecureKernel,
+            SessionKind::SecureKernelLive,
+            SessionKind::SecureKernelKd,
+        ] {
+            assert!(
+                refuse_op_on_kind(kind, &op).is_some(),
+                "{kind:?} accepted stack_lineage"
+            );
+        }
+    }
+
     #[test]
     fn a_capture_session_accepts_its_own_ops_and_refuses_the_debugger_ones() {
         let capture_ops = [

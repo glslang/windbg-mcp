@@ -2,7 +2,7 @@
   "schemaDialects": [
     "https://json-schema.org/draft/2020-12/schema"
   ],
-  "toolCount": 89,
+  "toolCount": 90,
   "tools": [
     {
       "hints": {
@@ -2790,6 +2790,41 @@
       ],
       "required": [],
       "title": "Resolve a Secure Kernel symbol"
+    },
+    {
+      "hints": {
+        "destructive": null,
+        "idempotent": null,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "stack_lineage",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/StackLineage",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
+      "params": [
+        "frames: integer|null/uint32",
+        "session_id: string|null"
+      ],
+      "required": [],
+      "title": "Judge stack lineage"
     },
     {
       "hints": {

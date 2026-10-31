@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`stack_lineage` judges whether the current thread's call stack could have been produced by
+  calls** — the check a stack-spoofing detector makes, as a read-only `inspect` tool. Each return
+  address is tested for a call ending at it (decoded from the bytes before it, every start that
+  would end there), for code in a loaded module, and — on an x64 user-mode thread with CET shadow
+  stacks in force — against the CPU's shadow stack, read through the engine's own `ssp` and
+  `cetumsr` registers. The verdict is three-valued: `suspicious` when a frame the walk could vouch
+  for has a finding, `consistent` only when the shadow stack vouched for every return address, and
+  `unknown` otherwise, which is the usual answer and never means clean. Two measurements on the
+  checked-in samples shaped it. A walk the engine had to guess under an image this host does not
+  hold looks exactly like a spoofed stack (a stack address, the image base and `0x80` as frames on
+  the x64 user dump), so a frame is judged only when it was reached through its context, unwind
+  data or the leaf rule, and `walk_lost_at` names the first one that was not. And the x64 samples
+  record no CET state at all yet read `ssp=0`, exactly as a thread without shadow stacks does, so a
+  zero pointer is `pointer_zero` and never evidence. The ARM64 `0xFC` sample comes back
+  `suspicious` for the right reason: its trapped PC is in user memory no module holds. The positive
+  shadow-stack path is unit-tested and **not yet measured** — no machine on this bench has CET;
+  `docs/stack-lineage-plan.md` has the design, the measurements and what is still owed.
+
 - **`windbg-mcp --sk-discover-identity` runs live control's vmwp discovery on its own.** It pauses
   the VM, attaches, samples the dispatcher entry and calls `VidGetHvPartitionId` on a hijacked
   thread, exactly as `sk_live_arm`'s preparation does, then frees its scratch page, detaches handled
