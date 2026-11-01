@@ -71,7 +71,10 @@ pub(crate) fn builtin_command(
                 target.vp.to_string(),
                 "--writes".into(),
             ]);
-            if cr3_known {
+            // A transition-capable control provider may publish a stop in a different VTL1
+            // address space than the one reported by its startup hello. Let the memory role
+            // discover the paused CR3; the worker still validates and binds the source root.
+            if cr3_known && !allow_transition_cr3 {
                 words.extend([
                     "--expected-cr3".into(),
                     format!("{:#x}", target.expected_cr3.0),
@@ -316,15 +319,13 @@ impl ControlProvider {
                         write.value.0,
                         0,
                     ) {
-                        let mut rollback = Vec::new();
-                        for (name, value) in before[..applied].iter().rev() {
-                            if let Err(error) =
+                        let rollback =
+                            rollback_failed_register_write(&before, applied, |name, value| {
+                                // write_register reads the value back, so an empty result means
+                                // every possibly mutated register was proved restored.
                                 self.probe
-                                    .write_register(self.partition, self.vp, *name, *value, 0)
-                            {
-                                rollback.push(format!("{name:?}: {error:#}"));
-                            }
-                        }
+                                    .write_register(self.partition, self.vp, name, value, 0)
+                            });
                         let detail = if rollback.is_empty() {
                             format!("register write failed and was rolled back: {primary:#}")
                         } else {
@@ -388,6 +389,22 @@ impl ControlProvider {
             high: HexU64(high),
         })
     }
+}
+
+fn rollback_failed_register_write(
+    before: &[(RegisterName, u64)],
+    attempted: usize,
+    mut restore: impl FnMut(RegisterName, u64) -> Result<()>,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    // The failing call may have completed its hypercall before its verification read failed, so
+    // restore it as well as every earlier write.
+    for (name, value) in before[..=attempted].iter().rev() {
+        if let Err(error) = restore(*name, *value) {
+            failures.push(format!("{name:?}: {error:#}"));
+        }
+    }
+    failures
 }
 
 pub(crate) fn run_control(args: &[String]) -> Result<()> {
@@ -1313,6 +1330,12 @@ mod tests {
         assert!(memory.contains(&"4242".into()));
         assert!(memory.contains(&"0x2e0".into()));
         assert!(memory.contains(&"--writes".into()));
+        assert!(memory.contains(&"--expected-cr3".into()));
+
+        let transition_memory = crate::livesrc::split_command(
+            &builtin_command(&target, true, Some((4242, 0x2e0)), true).unwrap(),
+        );
+        assert!(!transition_memory.contains(&"--expected-cr3".into()));
     }
 
     #[test]
@@ -1421,5 +1444,19 @@ mod tests {
         assert!(format!("{error:#}").contains("restoration: verified"));
         assert_eq!(writes.get(), 2);
         assert_eq!(byte.get(), 0x42);
+    }
+
+    #[test]
+    fn a_failed_register_write_rolls_back_the_attempted_register() {
+        let before = [(RegisterName::Rip, 0xffff_f807_2000_1234)];
+        let mut restored = Vec::new();
+
+        let failures = rollback_failed_register_write(&before, 0, |name, value| {
+            restored.push((name, value));
+            Ok(())
+        });
+
+        assert!(failures.is_empty());
+        assert_eq!(restored, before);
     }
 }
