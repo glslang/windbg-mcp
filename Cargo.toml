@@ -90,6 +90,9 @@ windows-sys = { version = "0.61", features = [
     # `GetThreadContext`/`SetThreadContext` preserve the exact stopped vmwp thread around the
     # profiled VidGetHvPartitionId call used by Secure Kernel target discovery.
     "Win32_System_Kernel",
+    # `DeviceIoControl`, used only by the two built-in h3probe provider roles. The driver remains
+    # operator-built and operator-started; these calls are the user-mode side of its typed ABI.
+    "Win32_System_IO",
     # `CreateFileW` + `GetFileInformationByHandle`, which is how `src/skinspect.rs` answers whether
     # two paths are the same file before it writes a report over one of them. A **hard link** is one
     # file under two names and `canonicalize` keeps both, so every path-shaped comparison says

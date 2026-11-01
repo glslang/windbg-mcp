@@ -19,6 +19,10 @@ struct PolicyFile {
     disposable_vm_ids: Vec<String>,
     #[serde(default)]
     transport_commands: Vec<String>,
+    /// Provider implementations carried by this exact executable. Kept separate from command
+    /// allow-listing so policy never has to authorize an interpreter or a second binary image.
+    #[serde(default)]
+    builtin_transports: Vec<String>,
     #[serde(default)]
     profile_roots: Vec<PathBuf>,
     #[serde(default)]
@@ -35,6 +39,7 @@ struct PolicyFile {
 pub(crate) struct Policy {
     disposable_vm_ids: BTreeSet<String>,
     transport_commands: BTreeSet<Vec<String>>,
+    builtin_transports: BTreeSet<String>,
     profile_roots: Vec<String>,
     kit_roots: Vec<String>,
     max_pause_ms: Option<u64>,
@@ -66,14 +71,14 @@ impl Policy {
     fn from_file(file: PolicyFile) -> Result<Self> {
         let live_dimensions = [
             !file.disposable_vm_ids.is_empty(),
-            !file.transport_commands.is_empty(),
+            !file.transport_commands.is_empty() || !file.builtin_transports.is_empty(),
             !file.profile_roots.is_empty(),
         ];
         let has_live_authority = live_dimensions.iter().all(|present| *present);
         if live_dimensions.iter().any(|present| *present) && !has_live_authority {
             bail!(
-                "Secure Kernel live policy must supply disposable_vm_ids, transport_commands and \
-                 profile_roots together"
+                "Secure Kernel live policy must supply disposable_vm_ids, provider authority \
+                 (builtin_transports or transport_commands), and profile_roots together"
             );
         }
         if has_live_authority && file.max_pause_ms.is_none() {
@@ -94,6 +99,19 @@ impl Policy {
             .transport_commands
             .into_iter()
             .map(|command| normalize_transport("transport command", &command))
+            .collect::<Result<_>>()?;
+        let builtin_transports = file
+            .builtin_transports
+            .into_iter()
+            .map(|name| {
+                if name != crate::h3provider::BUILTIN {
+                    bail!(
+                        "unknown built-in Secure Kernel transport {name:?}; this build provides only {:?}",
+                        crate::h3provider::BUILTIN
+                    );
+                }
+                Ok(name)
+            })
             .collect::<Result<_>>()?;
         let profile_roots = file
             .profile_roots
@@ -122,6 +140,7 @@ impl Policy {
         Ok(Self {
             disposable_vm_ids,
             transport_commands,
+            builtin_transports,
             profile_roots,
             kit_roots,
             max_pause_ms: file.max_pause_ms,
@@ -205,6 +224,12 @@ impl Policy {
     }
 
     fn authorize_transport(&self, name: &str, command: &str) -> Result<String> {
+        if command == crate::h3provider::BUILTIN {
+            if !self.builtin_transports.contains(command) {
+                bail!("{name} selects a built-in provider not admitted by startup policy");
+            }
+            return Ok(command.to_string());
+        }
         let (normalized, launch) = canonical_transport(name, command)?;
         if !self.transport_commands.contains(&normalized) {
             bail!("{name} is not an exact transport command admitted by startup policy");
@@ -312,6 +337,7 @@ mod tests {
         let empty = PolicyFile {
             disposable_vm_ids: Vec::new(),
             transport_commands: Vec::new(),
+            builtin_transports: Vec::new(),
             profile_roots: Vec::new(),
             kit_roots: Vec::new(),
             max_pause_ms: None,
@@ -326,6 +352,7 @@ mod tests {
         let capture_only = PolicyFile {
             disposable_vm_ids: Vec::new(),
             transport_commands: Vec::new(),
+            builtin_transports: Vec::new(),
             profile_roots: Vec::new(),
             kit_roots: vec![root.clone()],
             max_pause_ms: None,
@@ -343,6 +370,7 @@ mod tests {
         let partial = PolicyFile {
             disposable_vm_ids: vec!["51749a1f-f939-44f5-b251-1251ef5b64a3".to_string()],
             transport_commands: Vec::new(),
+            builtin_transports: Vec::new(),
             profile_roots: Vec::new(),
             kit_roots: vec![std::env::temp_dir()],
             max_pause_ms: Some(600_000),
@@ -356,6 +384,7 @@ mod tests {
         let write_only = PolicyFile {
             disposable_vm_ids: Vec::new(),
             transport_commands: Vec::new(),
+            builtin_transports: Vec::new(),
             profile_roots: Vec::new(),
             kit_roots: vec![std::env::temp_dir()],
             max_pause_ms: None,
@@ -373,6 +402,7 @@ mod tests {
         let file = PolicyFile {
             disposable_vm_ids: vec!["51749a1f-f939-44f5-b251-1251ef5b64a3".to_string()],
             transport_commands: vec![command],
+            builtin_transports: Vec::new(),
             profile_roots: vec![directory],
             kit_roots: Vec::new(),
             max_pause_ms: None,
@@ -397,6 +427,7 @@ mod tests {
             let file = PolicyFile {
                 disposable_vm_ids: vec!["51749a1f-f939-44f5-b251-1251ef5b64a3".to_string()],
                 transport_commands: vec![command.clone()],
+                builtin_transports: Vec::new(),
                 profile_roots: vec![directory.clone()],
                 kit_roots: Vec::new(),
                 max_pause_ms: Some(max_pause_ms),
@@ -412,6 +443,7 @@ mod tests {
         let minimum = PolicyFile {
             disposable_vm_ids: vec!["51749a1f-f939-44f5-b251-1251ef5b64a3".to_string()],
             transport_commands: vec![command],
+            builtin_transports: Vec::new(),
             profile_roots: vec![directory],
             kit_roots: Vec::new(),
             max_pause_ms: Some(crate::skdispatch::MIN_PAUSE_MS),
@@ -440,6 +472,7 @@ mod tests {
         let policy = Policy {
             disposable_vm_ids: BTreeSet::new(),
             transport_commands: BTreeSet::new(),
+            builtin_transports: BTreeSet::new(),
             profile_roots: Vec::new(),
             kit_roots: vec![normalized_path(&canonical)],
             max_pause_ms: None,
@@ -479,6 +512,7 @@ mod tests {
         let policy = Policy {
             disposable_vm_ids: BTreeSet::new(),
             transport_commands: BTreeSet::from([allowed.clone()]),
+            builtin_transports: BTreeSet::new(),
             profile_roots: Vec::new(),
             kit_roots: Vec::new(),
             max_pause_ms: None,
@@ -489,6 +523,30 @@ mod tests {
         let injected = format!("\"{}\" -c dangerous", executable.display());
         let injected = normalize_transport("fixture", &injected).expect("injection is parseable");
         assert!(!policy.transport_commands.contains(&injected));
+    }
+
+    #[test]
+    fn built_in_provider_has_its_own_exact_allow_list() {
+        let policy = Policy {
+            disposable_vm_ids: BTreeSet::new(),
+            transport_commands: BTreeSet::new(),
+            builtin_transports: BTreeSet::from([crate::h3provider::BUILTIN.to_string()]),
+            profile_roots: Vec::new(),
+            kit_roots: Vec::new(),
+            max_pause_ms: None,
+            allow_memory_writes: false,
+        };
+        assert_eq!(
+            policy
+                .authorize_transport("control_transport", crate::h3provider::BUILTIN)
+                .unwrap(),
+            crate::h3provider::BUILTIN
+        );
+        assert!(
+            policy
+                .authorize_transport("control_transport", "builtin:other")
+                .is_err()
+        );
     }
 
     #[test]
@@ -507,6 +565,7 @@ mod tests {
         let policy = Policy {
             disposable_vm_ids: BTreeSet::new(),
             transport_commands: BTreeSet::from([allowed]),
+            builtin_transports: BTreeSet::new(),
             profile_roots: Vec::new(),
             kit_roots: Vec::new(),
             max_pause_ms: None,
@@ -541,6 +600,7 @@ mod tests {
         let policy = Policy {
             disposable_vm_ids: BTreeSet::from(["51749a1f-f939-44f5-b251-1251ef5b64a3".to_string()]),
             transport_commands: BTreeSet::from([allowed]),
+            builtin_transports: BTreeSet::new(),
             profile_roots: vec![normalized_path(&directory.canonicalize().unwrap())],
             kit_roots: Vec::new(),
             max_pause_ms: Some(600_000),
@@ -583,6 +643,7 @@ mod tests {
         let policy = Policy {
             disposable_vm_ids: BTreeSet::from(["51749a1f-f939-44f5-b251-1251ef5b64a3".to_string()]),
             transport_commands: BTreeSet::from([allowed]),
+            builtin_transports: BTreeSet::new(),
             profile_roots: vec![normalized_path(volume_root)],
             kit_roots: Vec::new(),
             max_pause_ms: Some(600_000),

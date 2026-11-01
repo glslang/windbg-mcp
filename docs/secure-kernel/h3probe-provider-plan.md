@@ -12,7 +12,11 @@ today and becomes an ordinary client. It keeps the
 lab: VM provisioning and disk reset, guest triggers, run orchestration, evidence audits and the
 driver service's lifecycle. It stops opening `\\.\H3Probe` itself.
 
-**Status, 2026-10-30: written; no phase started.** `FOLLOWUPS.md` item 133 tracks it.
+**Status, 2026-11-01: complete.** The repository-owned driver and both built-in providers passed
+their driver tier and the final acceptance on three fresh K3 boots. Sklab is now only the client and
+service-lifecycle owner: its policy names `builtin:h3probe`, its source opens no driver device, and
+its configuration pins the repository driver's measured hash. [The final result](#result-2026-11-01)
+records the live evidence that closed item 133.
 
 ## The decision this reverses, and what it keeps
 
@@ -330,6 +334,36 @@ The move is done only when all of these hold, with sklab at its Phase 7 tree:
   by a post-release audit;
 - the driver tier passes;
 - the `h3probe` service runs this repository's build, and sklab's pin matches it.
+
+### Result, 2026-11-01
+
+All four conditions passed. The three series boots were distinct and stayed healthy through every
+60-second post-release audit:
+
+| Boot | Boot identity | Live tier and audit | 25-cycle M8 and audit | Managed KD and audit |
+|---|---|---|---|---|
+| 1 | `4968:639291346330586921` | `20261101T125943-live-ambient-b67a0b`, `20261101T130052-validate-kd-post-audit-89fe79` | `20261101T130628-validate-m8-4f50c2`, `20261101T131254-validate-kd-post-audit-8e1783` | `20261101T133626-validate-kd-bbe1d7`, `20261101T133731-validate-kd-post-audit-980c69` |
+| 2 | `8092:639291371333002022` | `20261101T134002-live-ambient-33bda4`, `20261101T134033-validate-kd-post-audit-e44165` | `20261101T134156-validate-m8-609eb4`, `20261101T134821-validate-kd-post-audit-6ccf98` | `20261101T134940-validate-kd-cda5bb`, `20261101T135056-validate-kd-post-audit-3cd923` |
+| 3 | `12808:639291487623064385` | `20261101T165326-live-ambient-f4a489`, `20261101T165423-validate-kd-post-audit-7ea75e` | `20261101T165542-validate-m8-4f3e5c`, `20261101T170209-validate-kd-post-audit-22f078` | `20261101T170556-validate-kd-f6a3a1`, `20261101T170700-validate-kd-post-audit-6b041f` |
+
+Each M8 run recorded the initial stop and 25 ordered free-run/break-in cycles with no failed cycle.
+Each managed-KD run resolved `securekernel.pdb`, stopped naturally in
+`securekernel!KiVinaInterrupt`, stepped, unwound a symbolized stack and released the target. Boot 3
+found one orchestration race before its passing run: the guest trigger treated the debugger's brief
+owned VM pause as a dead target. It now waits for 500 ms of stable `Running` state within a bounded
+30-second window and never resumes the VM itself; the focused regression and the retry passed on the
+same boot identity.
+
+The ignored live driver tier passed its refusal and range corpus, concurrent callers, guarded write
+and restoration, killed provider, service stop/start and stale-identity checks. The installed service
+points at `drivers/h3probe/h3probe.sys`; its SHA-256 is
+`D4047FF950C917058618E1ACD602F52623A56B130625049CC4CBD4BE09AB871E`, exactly the sklab pin. Generated
+startup policies contain `builtin:h3probe` and no interpreter, and a source scan finds no
+`H3Probe`, `CreateFileW`, `DeviceIoControl`, `IOCTL_H3`, old provider script or interpreter reference
+under sklab's `src/`.
+
+The closeout suites passed `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`,
+1,634 Rust unit tests, 183 protocol/smoke tests and 40 sklab unit tests.
 
 ## Open questions
 

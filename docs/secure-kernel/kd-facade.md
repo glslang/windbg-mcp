@@ -123,10 +123,7 @@ the server starts. The JSON file fixes all authority that a client may select:
 ```json
 {
   "disposable_vm_ids": ["51749a1f-f939-44f5-b251-1251ef5b64a3"],
-  "transport_commands": [
-    "\"C:\\Python313\\python.exe\" \"D:\\windbg-mcp-private\\control.py\" --vm-id 51749a1f-f939-44f5-b251-1251ef5b64a3 --partition-id {partition_id} --vp {vp}",
-    "\"C:\\Python313\\python.exe\" \"D:\\windbg-mcp-private\\memory.py\" --vm-id 51749a1f-f939-44f5-b251-1251ef5b64a3 --partition-id {partition_id} --vp {vp} --cr3 {cr3} --vmwp-pid {vmwp_pid} --partition-handle {partition_handle}"
-  ],
+  "builtin_transports": ["builtin:h3probe"],
   "profile_roots": ["D:\\windbg-mcp-private\\profiles"],
   "kit_roots": ["C:\\Program Files (x86)\\Windows Kits\\10"],
   "max_pause_ms": 600000,
@@ -143,8 +140,9 @@ ordinary live-control stop and each managed-KD stop. The request cannot choose o
 optional `allow_memory_writes` defaults false and gates the ordinary live session's guarded write
 tool; the managed KD facade does not expose guest-memory writes. An
 invalid or absent policy fails before a VM lookup, provider load or worker spawn.
-A capture-only deployment may omit the three live-authority arrays and `max_pause_ms`; a live
-deployment must provide all three arrays together and a pause bound of at least 60,000 ms. The
+A capture-only deployment may omit the live-authority fields and `max_pause_ms`; a live deployment
+must provide disposable VM IDs, provider authority, profile roots, and a pause bound of at least
+60,000 ms. The
 smallest window leaves 30 seconds for service and a 30-second controller-cleanup reserve: the
 mandatory five-second unregister settle plus 25 seconds of headroom for the restoration, event
 completion, attach, unregister and deferred-cleanup work that precedes it.

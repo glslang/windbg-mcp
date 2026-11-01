@@ -197,6 +197,7 @@ reads — so the entry records the split as it was measured.
 - [Item 126](#126-dbgscope--windbg-mcp-a-command-that-fails-is-reported-by-its-hresult-alone--done-2026-10-14-dbgscope198) — [dbgscope + windbg-mcp] A command that fails is reported by its HRESULT alone — done (2026-10-14, dbgscope#198)
 - [Item 101](#101-dbgscope-the-vs-chunk-chain-drifts-0x10-and-not-from-where-it-starts--done-2026-10-14-dbgscope199) — [dbgscope] The VS chunk chain drifts 0x10, and not from where it starts — done (2026-10-14, dbgscope#199)
 - [Item 39](#39-windbg-mcp-the-eval-measures-single-questions-not-an-investigation--done-2026-10-17) — [windbg-mcp] The eval measures single questions, not an investigation — done (2026-10-17)
+- [Item 133](#133-windbg-mcp-the-live-vtl1-driver-and-its-providers-live-outside-this-repository--done-2026-11-01) — [windbg-mcp] The live VTL1 driver and its providers live outside this repository — done (2026-11-01)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -11610,3 +11611,75 @@ at one step leaves every later step unanswerable, and per-task scoring reports o
 harness refuses is work, and is item 131. A transcript past the model's own window is item 132.
 That every timing is one ARM64 Mac serving MLX builds is a caveat, and it went into
 `docs/local-model-eval.md`'s *What this does not cover*.
+
+## 133. [windbg-mcp] The live VTL1 driver and its providers live outside this repository — **done** (2026-11-01)
+
+**What it was filed for.** Every live Secure Kernel session depended on two Python providers this
+repository did not carry, `k4_control_provider.py` and `gpa_server.py`, over a driver it did not
+carry either, `h3probe.sys`. All three lived in `secure-kernel-lab` (sklab). Item 103 had kept the
+transport operator-supplied because the instrument was private; publishing sklab on 2026-10-31
+ended that reason while leaving the important boundary intact: the MCP supervisor must not load a
+vendor driver or own a live target, and one session must pay for a provider failure.
+
+**What landed.** The eight-phase plan in
+[`docs/secure-kernel/h3probe-provider-plan.md`](docs/secure-kernel/h3probe-provider-plan.md) is now
+implemented in both repositories.
+
+- `drivers/h3probe/` carries source, build script and operator documentation, but no driver binary.
+  The driver serializes its shared hypercall pages, allows only calls `0x50` and `0x51`, answers an
+  unknown IOCTL with `STATUS_INVALID_DEVICE_REQUEST`, uses `FILE_DEVICE_SECURE_OPEN` and an
+  administrators/system-only descriptor, and exposes only the six operations the retained client
+  needs.
+- `src/h3probe.rs` owns the typed driver ABI. `src/h3provider.rs` owns the memory and control
+  provider roles, each in a child process with its own handle. The startup policy admits the
+  reserved name `builtin:h3probe`; the worker expands that name to its own executable and selected
+  role, so it cannot accidentally pair a freshly replaced binary with an older provider script.
+  The supervisor still neither opens the device nor starts or stops its service.
+- The repository now owns the readiness probe and post-release audit, as well as a live driver tier
+  covering the mapped/refused/range corpus, concurrent callers, a guarded write and restoration,
+  killed provider, stop/start under load and stale identity after a VM restart.
+- Sklab keeps VM/service lifecycle, guest triggering and evidence orchestration. Its direct H3
+  modules, driver source and Python providers are gone. Its generated policy names only
+  `builtin:h3probe`; a source scan finds no device open, IOCTL, old provider script or interpreter
+  under `src/`.
+
+**What the live runs established.** The driver tier passed against the signed repository build.
+The installed `h3probe` service pointed at `drivers/h3probe/h3probe.sys`, whose SHA-256 was
+`D4047FF950C917058618E1ACD602F52623A56B130625049CC4CBD4BE09AB871E`; sklab's ignored local pin was
+the same. Then three distinct fresh K3 boots passed the live tier, an independent 60-second audit,
+the 25-cycle composite M8 gate and its audit, and the natural managed-KD symbol/unwind gate and its
+audit:
+
+| Boot identity | Live | M8 | Managed KD |
+|---|---|---|---|
+| `4968:639291346330586921` | pass | 25/25, audit pass | symbols, unwind, step, release, audit pass |
+| `8092:639291371333002022` | pass | 25/25, audit pass | symbols, unwind, step, release, audit pass |
+| `12808:639291487623064385` | pass | 25/25, audit pass | symbols, unwind, step, release, audit pass |
+
+The exact eighteen run directories and audit pairings are in the plan's
+[final result](docs/secure-kernel/h3probe-provider-plan.md#result-2026-11-01). Closeout passed
+`cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, 1,634 Rust unit tests, 183
+protocol/smoke tests and 40 sklab unit tests.
+
+**What building and measuring corrected.** Four details in the planned seam were wrong or missing,
+and each was found before the three-boot result was accepted.
+
+- The H3 register selector is not one uniform VTL byte. Ordinary VTL1 register requests, including
+  `VsmVpStatus`, use `0x11`; `ActiveVtl` alone uses `0x00`. Treating it as an ordinary VTL1 read
+  made every event look active in VTL1. The provider now has a dedicated read and a regression that
+  asserts the three emitted selectors.
+- One ambient interrupt entry was not enough for a repeatable live trigger. The gate now arms the
+  four measured entries at RVAs `0xe7670`, `0xe8f70`, `0xe8100` and `0xf6cc0`, and admits the
+  measured transition CR3 explicitly instead of mistaking that transition for an identity change.
+- `validate.kd` had no source-controlled natural-stop input when its local config omitted one.
+  Sklab now generates the config and a run-local natural profile, keeps the shared redirect profile
+  untouched, and launches the counted guest trigger only after the session reports running.
+- Even that phase is not proof the Hyper-V VM is presently `Running`: the debugger owns brief
+  `Paused` intervals while it establishes the stop. Boot 3's first managed-KD attempt completed its
+  symbolized natural stop and clean release, but its trigger rejected one such interval. The trigger
+  now waits, without calling `Resume-VM`, for 500 ms of stable `Running` state within 30 seconds.
+  Its regression and the managed-KD retry passed on the unchanged boot identity.
+
+**What it left open.** Moving ownership does not answer item 122's image/symbol question for the
+ordinary live session, and it does not close item 129's question about boot coordinates. Those
+remain separate items. This entry leaves no Python-provider or external-driver half behind.

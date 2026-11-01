@@ -497,6 +497,7 @@ impl Session {
             &partial,
             pending.target.expected_cr3.is_some(),
             None,
+            pending.allow_transition_cr3,
         )?;
         let (provider, skipped) = crate::skcontrol::ControlProcess::spawn_selected(
             &control_transport,
@@ -513,6 +514,7 @@ impl Session {
             &target,
             true,
             Some((self.dispatcher.vmwp_pid, found.partition_handle)),
+            pending.allow_transition_cr3,
         )?;
         self.dispatcher.bind_identity(
             found,
@@ -539,6 +541,7 @@ impl Session {
                 &partial,
                 additional.target.expected_cr3.is_some(),
                 None,
+                pending.allow_transition_cr3,
             )?;
             let (provider, provider_skipped) = crate::skcontrol::ControlProcess::spawn_selected(
                 &command,
@@ -1044,7 +1047,16 @@ fn expand_target_command(
     target: &TargetIdentity,
     cr3_known: bool,
     memory_handle: Option<(u32, u64)>,
+    allow_transition_cr3: bool,
 ) -> Result<String> {
+    if command == crate::h3provider::BUILTIN {
+        return crate::h3provider::builtin_command(
+            target,
+            cr3_known,
+            memory_handle,
+            allow_transition_cr3,
+        );
+    }
     let mut words = crate::livesrc::split_command(command);
     if words.is_empty() {
         bail!("the provider command line is empty");
@@ -7583,6 +7595,7 @@ mod tests {
                 &target,
                 true,
                 None,
+                false,
             )
             .unwrap(),
             "provider --partition 0x85 --vp 0 --cr3 0x1201000"
@@ -7597,6 +7610,7 @@ mod tests {
             &target,
             false,
             None,
+            false,
         )
         .unwrap();
         let words = crate::livesrc::split_command(&expanded);
@@ -7610,10 +7624,10 @@ mod tests {
         let target = target();
         let command = "memory --pid {vmwp_pid} --handle {partition_handle} --cr3 {cr3}";
         assert_eq!(
-            expand_target_command(command, &target, true, Some((4242, 0x2e0))).unwrap(),
+            expand_target_command(command, &target, true, Some((4242, 0x2e0)), false).unwrap(),
             "memory --pid 4242 --handle 0x2e0 --cr3 0x1201000"
         );
-        let error = expand_target_command(command, &target, true, None).unwrap_err();
+        let error = expand_target_command(command, &target, true, None, false).unwrap_err();
         assert!(error.to_string().contains("only the live-memory command"));
     }
 
@@ -7622,7 +7636,7 @@ mod tests {
         let target = target();
         let command = "memory --partition {partition_id} --cr3 {cr3}";
         assert_eq!(
-            expand_target_command(command, &target, true, Some((4242, 0))).unwrap(),
+            expand_target_command(command, &target, true, Some((4242, 0)), false).unwrap(),
             "memory --partition 0x85 --cr3 0x1201000"
         );
 
@@ -7631,6 +7645,7 @@ mod tests {
             &target,
             true,
             Some((4242, 0)),
+            false,
         )
         .unwrap_err();
         assert!(

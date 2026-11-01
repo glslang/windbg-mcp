@@ -1,8 +1,9 @@
 # Live VTL1 control provider contract
 
-`src/skcontrol.rs` defines the repository-owned half of the live Secure Kernel control boundary.
-The operator supplies the privileged provider as a child process. The repository ships no driver,
-private VID layout, or provider DLL.
+`src/skcontrol.rs` defines the live Secure Kernel control boundary. The executable includes an
+h3probe provider child role, selected as `builtin:h3probe`; an operator may still supply a custom
+provider command. The repository carries auditable driver source under `drivers/h3probe`, but no
+driver binary and no service lifecycle: the operator builds, signs, installs and starts it.
 
 `--sk-control-probe` validates a provider's startup identity, epoch, and capabilities.
 `src/sklive.rs` supplies the worker-side state machine over that contract, and `src/skdispatch.rs`
@@ -25,11 +26,12 @@ same recovery as an unresolved live worker.
 
 ## Process boundary
 
-The provider owns exact-partition VTL1 register access. It does not receive or complete VID
+Each provider owns exact-partition VTL1 register access. It does not receive or complete VID
 messages. The debugger owner attaches to the existing `vmwp`, observes the dispatcher holding the
 exception, and publishes that event to the provider. This keeps the private provider out
 of the MCP supervisor and leaves Windows' existing VM process responsible for boot, devices,
-message receipt, and native completion.
+message receipt, and native completion. Keeping the built-in implementation in a child also means a
+driver call that exits or wedges cannot take down the worker's session registry or engine thread.
 
 ```mermaid
 flowchart LR
@@ -149,11 +151,11 @@ at its ready banner instead of receiving a value outside its declared event sche
 
 ## Probe
 
-Run the non-mutating capability probe with an operator provider command:
+Run the non-mutating capability probe with the built-in provider:
 
 ```pwsh
 windbg-mcp --sk-control-probe `
-  --transport "python C:\private\provider.py ..." `
+  --transport builtin:h3probe `
   --vm-id <VM-GUID> `
   --partition-id 0x85 `
   --expected-cr3 0x1201000
@@ -169,7 +171,7 @@ Offline tests drive the complete running → arming → running → stopped → 
 fake provider, including guarded register reads and writes. They also pin fixed-width address
 encoding, running-state refusal, target validation, and the rule that every state transition must
 issue a session-unique epoch. A live acceptance still requires the disposable Hyper-V target and
-the operator-supplied provider.
+the operator-installed driver.
 
 ## Worker state machine
 
@@ -240,8 +242,8 @@ adapter uses an initial VM pause, the winning native event and, for a multi-prov
 proved VM pause to keep provider state stable:
 
 1. `open_sk_live_control` applies the startup policy, records the VM, primary `vp`, optional
-   `additional_vps`, profile and exact
-   provider command templates, resolves the current `vmwp` PID, loads the profile, and reserves the
+   `additional_vps`, profile and admitted provider names or exact custom command templates, resolves
+   the current `vmwp` PID, loads the profile, and reserves the
    VM. PID, dispatcher VND, partition id and CR3 are optional mismatch assertions. Every VP must be
    distinct, the selected set is bounded at 16, and every selected VP receives the same set of at
    most four hardware breakpoint slots. Opening does not pause,
