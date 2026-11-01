@@ -713,32 +713,49 @@ pub(crate) fn find_secure_kernel_base<D: Ioctl>(
     if handlers.is_empty() {
         bail!("the live VTL1 IDT contains no canonical handler address");
     }
-    let mut checked = std::collections::HashSet::new();
+    let found = find_matching_image_base(&handlers, expected, |candidate| {
+        guest
+            .read(candidate, PAGE)
+            .ok()
+            .and_then(|header| pe_identity(&header))
+    });
+    if let Some(candidate) = found {
+        return Ok(candidate);
+    }
+    bail!("no matching PE contains a VTL1 IDT handler within 16 MiB");
+}
+
+fn find_matching_image_base(
+    handlers: &[u64],
+    expected: Option<PeIdentity>,
+    mut identify: impl FnMut(u64) -> Option<PeIdentity>,
+) -> Option<u64> {
+    let mut identities = HashMap::new();
     for handler in handlers {
         let start = handler & !0xfff;
         for page in 0..=(16 * 1024 * 1024 / PAGE) {
             let Some(candidate) = start.checked_sub((page * PAGE) as u64) else {
                 break;
             };
-            if !checked.insert(candidate) {
-                continue;
-            }
-            let Ok(header) = guest.read(candidate, PAGE) else {
-                continue;
-            };
-            let Some(identity) = pe_identity(&header) else {
+            let identity = *identities
+                .entry(candidate)
+                .or_insert_with(|| identify(candidate));
+            let Some(identity) = identity else {
                 continue;
             };
-            if !(candidate..candidate + u64::from(identity.size_of_image)).contains(&handler) {
+            let Some(end) = candidate.checked_add(u64::from(identity.size_of_image)) else {
+                continue;
+            };
+            if !(candidate..end).contains(handler) {
                 continue;
             }
             if expected.is_some_and(|expected| expected != identity) {
                 continue;
             }
-            return Ok(candidate);
+            return Some(candidate);
         }
     }
-    bail!("no matching PE contains a VTL1 IDT handler within 16 MiB");
+    None
 }
 
 fn disk_pe_identity(path: &Path) -> Result<PeIdentity> {
@@ -816,7 +833,7 @@ fn put_u64(bytes: &mut [u8], at: usize, value: u64) {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
     use super::*;
 
@@ -846,6 +863,25 @@ mod tests {
         assert!(MemoryAnswer::parse(&answer, 8).is_err());
         put_u32(&mut answer, 4, 2);
         assert!(MemoryAnswer::parse(&answer, 8).is_err());
+    }
+
+    #[test]
+    fn a_cached_pe_is_reconsidered_for_each_idt_handler() {
+        let base = 0x10_0000;
+        let identity = PeIdentity {
+            machine: 0x8664,
+            timestamp: 0x1234_5678,
+            size_of_image: 0x2000,
+        };
+        let reads = Cell::new(0);
+        let found = find_matching_image_base(&[base + 0x3000, base + 0x1000], None, |candidate| {
+            (candidate == base).then(|| {
+                reads.set(reads.get() + 1);
+                identity
+            })
+        });
+        assert_eq!(found, Some(base));
+        assert_eq!(reads.get(), 1, "the parsed identity should be cached");
     }
 
     #[test]

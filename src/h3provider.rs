@@ -790,6 +790,65 @@ fn hex_bytes(bytes: &[u8]) -> String {
 
 /// Exercise the operator-installed driver's product ABI without starting or stopping its service.
 /// The ignored live tier wraps this role with killed-reader and service-lifecycle controls.
+fn qualify_write<D: Ioctl>(
+    probe: &Probe<D>,
+    target: MemoryTarget,
+    gpa: u64,
+    offset: u16,
+) -> Result<serde_json::Value> {
+    let address = gpa
+        .checked_add(u64::from(offset))
+        .context("qualification write address overflowed")?;
+    let (before_answer, before) = probe.read_memory(target, address, 1)?;
+    if before_answer.result != MemoryResult::Ok || before.len() != 1 {
+        bail!("qualification write source byte was not readable: {before_answer:?}");
+    }
+    let changed = [before[0] ^ 1];
+    let write_answer = probe.write_memory(target, address, &changed);
+    if !matches!(&write_answer, Ok(answer) if answer.result == MemoryResult::Ok) {
+        let restore_answer = probe.write_memory(target, address, &before);
+        let restored_read = probe.read_memory(target, address, 1);
+        let restoration = if matches!(
+            (&restore_answer, &restored_read),
+            (Ok(answer), Ok((read_answer, bytes)))
+                if answer.result == MemoryResult::Ok
+                    && read_answer.result == MemoryResult::Ok
+                    && bytes.as_slice() == before.as_slice()
+        ) {
+            "verified".into()
+        } else {
+            format!("write={restore_answer:?}, read={restored_read:?}")
+        };
+        bail!("qualification write failed ({write_answer:?}); restoration: {restoration}");
+    }
+
+    let changed_read = probe.read_memory(target, address, 1);
+    let restore_answer = probe.write_memory(target, address, &before);
+    let restored_read = probe.read_memory(target, address, 1);
+    if !matches!(
+        (&restore_answer, &restored_read),
+        (Ok(answer), Ok((read_answer, bytes)))
+            if answer.result == MemoryResult::Ok
+                && read_answer.result == MemoryResult::Ok
+                && bytes.as_slice() == before.as_slice()
+    ) {
+        bail!(
+            "qualification write could not prove restoration: write={restore_answer:?}, read={restored_read:?}"
+        );
+    }
+    let (changed_answer, changed_bytes) = changed_read?;
+    if changed_answer.result != MemoryResult::Ok || changed_bytes != changed {
+        bail!("qualification write did not read back before restoration");
+    }
+    Ok(serde_json::json!({
+        "gpa": format!("{gpa:#x}"),
+        "offset": offset,
+        "before": hex_bytes(&before),
+        "changed": hex_bytes(&changed),
+        "restored": true,
+    }))
+}
+
 pub(crate) fn run_qualify(args: &[String]) -> Result<()> {
     let args = QualifyArgs::parse(args)?;
     let probe = Probe::open()?;
@@ -843,40 +902,7 @@ pub(crate) fn run_qualify(args: &[String]) -> Result<()> {
 
     let write = match args.write {
         None => serde_json::Value::Null,
-        Some((gpa, offset)) => {
-            let address = gpa
-                .checked_add(u64::from(offset))
-                .context("qualification write address overflowed")?;
-            let (before_answer, before) = probe.read_memory(target, address, 1)?;
-            if before_answer.result != MemoryResult::Ok || before.len() != 1 {
-                bail!("qualification write source byte was not readable: {before_answer:?}");
-            }
-            let changed = [before[0] ^ 1];
-            let write_answer = probe.write_memory(target, address, &changed)?;
-            if write_answer.result != MemoryResult::Ok {
-                bail!("qualification write was refused: {write_answer:?}");
-            }
-            let changed_read = probe.read_memory(target, address, 1);
-            let restore_answer = probe.write_memory(target, address, &before)?;
-            let restored_read = probe.read_memory(target, address, 1)?;
-            if restore_answer.result != MemoryResult::Ok
-                || restored_read.0.result != MemoryResult::Ok
-                || restored_read.1 != before
-            {
-                bail!("qualification write could not prove restoration");
-            }
-            let (changed_answer, changed_bytes) = changed_read?;
-            if changed_answer.result != MemoryResult::Ok || changed_bytes != changed {
-                bail!("qualification write did not read back before restoration");
-            }
-            serde_json::json!({
-                "gpa": format!("{gpa:#x}"),
-                "offset": offset,
-                "before": hex_bytes(&before),
-                "changed": hex_bytes(&changed),
-                "restored": true,
-            })
-        }
+        Some((gpa, offset)) => qualify_write(&probe, target, gpa, offset)?,
     };
 
     println!(
@@ -1228,13 +1254,40 @@ fn parse_u64(value: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::io::Cursor;
+    use std::rc::Rc;
 
     struct FixedIoctl(Vec<u8>);
 
     impl Ioctl for FixedIoctl {
         fn ioctl(&self, _code: u32, _input: &[u8], _output_size: usize) -> Result<Vec<u8>> {
             Ok(self.0.clone())
+        }
+    }
+
+    struct AmbiguousWriteIoctl {
+        byte: Rc<Cell<u8>>,
+        writes: Rc<Cell<usize>>,
+    }
+
+    impl Ioctl for AmbiguousWriteIoctl {
+        fn ioctl(&self, _code: u32, input: &[u8], output_size: usize) -> Result<Vec<u8>> {
+            let mut answer = vec![0u8; output_size];
+            answer[0..4].copy_from_slice(&1u32.to_le_bytes());
+            answer[16..20].copy_from_slice(&1u32.to_le_bytes());
+            if output_size == 32 {
+                self.byte.set(input[40]);
+                let attempt = self.writes.get();
+                self.writes.set(attempt + 1);
+                if attempt == 0 {
+                    bail!("the first write reply was lost");
+                }
+            } else {
+                assert_eq!(output_size, 32 + PAGE);
+                answer[32] = self.byte.get();
+            }
+            Ok(answer)
         }
     }
 
@@ -1344,5 +1397,29 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
         assert!(output.starts_with("SHAPE cr3=0x1201000 kernel_base=0xFFFFF80720000000"));
         assert!(output.ends_with("NOTPRESENT\n"), "{output:?}");
+    }
+
+    #[test]
+    fn an_ambiguous_qualification_write_is_restored_before_it_fails() {
+        let byte = Rc::new(Cell::new(0x42));
+        let writes = Rc::new(Cell::new(0));
+        let probe = Probe::from_ioctl(AmbiguousWriteIoctl {
+            byte: Rc::clone(&byte),
+            writes: Rc::clone(&writes),
+        });
+        let error = qualify_write(
+            &probe,
+            MemoryTarget {
+                owner_pid: 4242,
+                partition_handle: 0x2e0,
+                partition_id: 0x85,
+            },
+            0x2000,
+            15,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("restoration: verified"));
+        assert_eq!(writes.get(), 2);
+        assert_eq!(byte.get(), 0x42);
     }
 }
