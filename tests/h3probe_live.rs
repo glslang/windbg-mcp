@@ -257,16 +257,24 @@ fn service_stop_under_load(config: &Config, identity: &Identity) {
 fn stale_identity_after_restart(config: &Config, old: &Identity) -> Identity {
     succeeded(&config.restart_command, "disposable VM restart");
     succeeded(&config.health_command, "post-restart health check");
-    let stale = run(&qualification_command(config, old, 8, 100, false));
-    assert!(
-        !stale.status.success(),
-        "pre-restart vmwp coordinates were accepted"
-    );
     let fresh = discovery(config);
     assert_ne!(
         fresh.vmwp_pid, old.vmwp_pid,
         "restart retained the vmwp identity"
     );
+    let mixed = Identity {
+        vmwp_pid: old.vmwp_pid,
+        partition_handle: old.partition_handle.clone(),
+        partition_id: fresh.partition_id.clone(),
+    };
+    let stale = succeeded(
+        &qualification_command(config, &mixed, 8, 100, false),
+        "typed stale-identity qualification",
+    );
+    let value: Value = serde_json::from_slice(&stale.stdout).expect("qualification returned JSON");
+    let first = &value["corpus"][0];
+    assert_eq!(first["translation"]["identity_matched"], false);
+    assert_eq!(first["memory"]["result"], "identity");
     fresh
 }
 
