@@ -1,8 +1,8 @@
-//! Versioned protocol for an operator-supplied VTL1 execution-control provider.
+//! Versioned protocol for a child VTL1 execution-control provider.
 //!
 //! This is the control counterpart to [`crate::livesrc`]. The repository owns the client and the
-//! validation rules, while the operator owns the privileged provider. The provider never consumes
-//! a VID message queue: a future dedicated debugger worker observes the existing `vmwp` dispatcher,
+//! validation rules and a built-in h3probe implementation; operators may supply another provider.
+//! The provider never consumes a VID message queue: a dedicated debugger worker observes the existing `vmwp` dispatcher,
 //! then publishes that exact held event here. The provider supplies guarded VTL1 register access.
 //!
 //! The provider prints [`READY_LINE`], followed by one JSON [`Hello`] line. Every request and reply
@@ -1193,21 +1193,6 @@ pub(crate) struct ControlProcess {
 }
 
 impl ControlProcess {
-    pub(crate) fn spawn(
-        transport: &str,
-        expected_target: TargetIdentity,
-    ) -> Result<(Self, Vec<String>)> {
-        Self::spawn_selected(
-            transport,
-            TargetSelector {
-                vm_id: expected_target.vm_id,
-                partition_id: expected_target.partition_id,
-                vp: expected_target.vp,
-                expected_cr3: Some(expected_target.expected_cr3),
-            },
-        )
-    }
-
     pub(crate) fn spawn_selected(
         transport: &str,
         expected_target: TargetSelector,
@@ -1500,7 +1485,7 @@ fn read_line(reader: &mut impl BufRead) -> Result<String> {
     Ok(line.trim_end_matches(['\r', '\n']).to_string())
 }
 
-/// One-shot handshake/capability probe for an operator-supplied provider.
+/// One-shot handshake/capability probe for a built-in or operator-supplied provider.
 pub(crate) fn run_probe(args: &[String]) -> Result<()> {
     let mut transport = None;
     let mut vm_id = None;
@@ -1540,16 +1525,30 @@ pub(crate) fn run_probe(args: &[String]) -> Result<()> {
             other => bail!("unknown argument {other:?}\n\n{}", usage()),
         }
     }
-    let transport = transport.context(usage())?;
-    let expected_target = TargetIdentity {
+    let mut transport = transport.context(usage())?;
+    let selector = TargetSelector {
         vm_id: vm_id.context("--vm-id is required")?,
         partition_id: HexU64(partition_id.context("--partition-id is required")?),
         vp,
-        vtl: 1,
-        expected_cr3: HexU64(expected_cr3.context("--expected-cr3 is required")?),
+        expected_cr3: expected_cr3.map(HexU64),
     };
-    expected_target.validate()?;
-    let (mut session, skipped) = ControlProcess::spawn(&transport, expected_target)?;
+    selector.validate()?;
+    if transport == crate::h3provider::BUILTIN {
+        let target = TargetIdentity {
+            vm_id: selector.vm_id.clone(),
+            partition_id: selector.partition_id,
+            vp: selector.vp,
+            vtl: 1,
+            expected_cr3: selector.expected_cr3.unwrap_or(HexU64(0x1000)),
+        };
+        transport = crate::h3provider::builtin_command(
+            &target,
+            selector.expected_cr3.is_some(),
+            None,
+            false,
+        )?;
+    }
+    let (mut session, skipped) = ControlProcess::spawn_selected(&transport, selector)?;
     for line in skipped {
         eprintln!("provider: {line}");
     }
@@ -1565,9 +1564,10 @@ pub(crate) fn run_probe(args: &[String]) -> Result<()> {
 fn usage() -> String {
     format!(
         "usage: windbg-mcp {CONTROL_PROBE_FLAG} --transport \"<command line>\" \
-         --vm-id <guid> --partition-id <number> --expected-cr3 <number> [--vp <number>]\n\n\
-         The operator supplies the provider and exact target. This command validates only its \
-         identity, epoch and capability handshake."
+         --vm-id <guid> --partition-id <number> [--expected-cr3 <number>] [--vp <number>]\n\n\
+         The operator supplies the provider and exact target; <command line> may be the built-in \
+         name builtin:h3probe. This command validates only its identity, epoch and capability \
+         handshake."
     )
 }
 

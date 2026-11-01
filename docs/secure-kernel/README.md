@@ -17,23 +17,22 @@ worker holds the file rather than a debuggee, and the debugger tools are refused
 engine beside it has at most `securekernel.exe` open for symbols —
 [`docs/sessions.md`](../sessions.md#secure-kernel-captures) is the caller's half. What that reaches
 is a **capture**: its session reads a file, and a file does not execute. The separate live-control
-session below drives a running guest through operator-supplied providers.
+session below drives a running guest through built-in or operator-supplied child providers.
 
 **A live decode source exists since gate S5w, as a command-line role rather than a tool.**
-`src/livesrc.rs` implements the same [`sk::RawSource`] seam over a transport the **operator**
-supplies — a child process speaking a line protocol on its stdio — and
-`windbg-mcp --sk-live --transport "<command>" --image <path>` runs gate S1's whole decode through
-it. This repository ships **no transport**: reading another partition's VTL1 live needs a kernel
-component it will not distribute, which is the same arrangement as the live-kernel tier's KDNET
-wiring. For a live-control session, an allowlisted memory command may name `{vmwp_pid}` and
-`{partition_handle}`; the worker expands both from its guarded discovery so an operator source can
-duplicate the VID object without making either value client authority. It is not a fifth tool on
-purpose — gate S5x measured a page of `securekernel.exe`'s
+`src/livesrc.rs` implements the same [`sk::RawSource`] seam over a child process speaking a line
+protocol on stdio. `--transport builtin:h3probe` selects this executable's memory-provider role;
+an ordinary command line still selects an operator provider. The repository carries the driver's
+source under `drivers/h3probe` but distributes no driver binary: the operator builds, test-signs,
+installs and starts it. For a live-control session, the worker passes `{vmwp_pid}` and
+`{partition_handle}` from guarded discovery without making either value client authority. It is
+not a fifth tool on purpose — gate S5x measured a page of `securekernel.exe`'s
 `.data` changing inside twenty seconds, so a live source cannot keep the promise a capture
 session's decode-on-open makes.
 
 **The live execution-control contract now exists too.** `src/skcontrol.rs` is a versioned JSON-line
-client for an operator-supplied provider. Exact VM/partition/VP/VTL/CR3 identity and an opaque epoch
+client with a built-in h3probe provider and an operator-provider escape hatch. Exact
+VM/partition/VP/VTL/CR3 identity and an opaque epoch
 travel on every request; reads and compare-and-write register updates are refused while running;
 and the debugger-owned process publishes the exact held dispatcher event without giving the
 provider a VID receive loop. `--sk-control-probe` validates the non-mutating handshake, and
@@ -272,10 +271,10 @@ happily. Running the identical scan in both guests settles it — 1 SK image and
 VBS guest, **0 and 0** in the VBS-off one, which yields *more* PE headers overall (152 against 112)
 and so is not simply failing to read.
 
-Reproducing the **live** route from gate 3 onward needs an isolated driver-development bench. The
-privileged instruments remain outside this repository, but the sibling `secure-kernel-lab`
-repository now carries the source and build for `h3probe.sys`, exact vmwp profiles, provider
-adapters, generated policies, M8 triggers, audits and qualification modules:
+Reproducing the **live** route from gate 3 onward needs an isolated driver-development bench. This
+repository carries the source and build for `h3probe.sys`, the built-in provider roles and their
+qualification. The sibling `secure-kernel-lab` remains the ordinary client: exact vmwp profiles,
+generated policy, VM/service lifecycle, M8 triggers, audits and run evidence.
 
 - **A host policy that admits the operator's locally built and signed test driver.** M8 does not
   change host security settings. In particular, do not disable HVCI merely because an unrelated

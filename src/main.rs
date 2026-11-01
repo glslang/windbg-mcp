@@ -11,9 +11,9 @@
 //! binary because each reads a format this crate defines, and a reader that could drift out of step
 //! with the writer is a reader that will. [`cast::RENDER_FLAG`] turns a recorded transcript into a
 //! terminal recording and exits, touching neither DbgEng nor MCP. [`livesrc::LIVE_FLAG`] drives the
-//! VTL1 decoder over an operator-supplied source, and [`skcontrol::CONTROL_PROBE_FLAG`] validates an
-//! operator-supplied live-control provider's non-mutating handshake; neither loads DbgEng or starts
-//! MCP.
+//! VTL1 decoder over a child source, and [`skcontrol::CONTROL_PROBE_FLAG`] validates a live-control
+//! provider's non-mutating handshake. [`h3provider`] supplies the two built-in child roles over an
+//! operator-installed driver; none loads DbgEng or starts MCP.
 //! [`hostclock::CLOCK_PROBE_FLAG`] emits the M7 cross-process clock test vector and likewise exits
 //! before either a debugger engine or the MCP runtime exists.
 //! [`skcorrelate::TRANSACTION_PROTOCOL_FLAG`] drives the M7 three-worker lifecycle over a typed
@@ -38,6 +38,8 @@ mod driver;
 mod engine;
 mod fault;
 mod framework;
+mod h3probe;
+mod h3provider;
 mod hazards;
 mod hostclock;
 mod hvtransition;
@@ -146,13 +148,22 @@ fn main() -> Result<()> {
     let is_sk_discovery = args
         .iter()
         .any(|arg| arg == skdispatch::DISCOVER_IDENTITY_FLAG);
+    let is_h3_provider = args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            h3provider::CONTROL_FLAG
+                | h3provider::MEMORY_FLAG
+                | h3provider::AUDIT_FLAG
+                | h3provider::QUALIFY_FLAG
+        )
+    });
     // A service has no console, so its stderr goes nowhere at all — and the failure most worth
     // seeing is a listener that refuses to start, which happens before `server_log` can be asked
     // anything. Decided here because logging is initialised before the role is acted on.
     let to_file =
         matches!(service::requested(&args), Some(service::Role::Run)).then(service::log_path);
     init_logging(
-        is_worker || is_live_control || is_sk_kd_target || is_sk_discovery,
+        is_worker || is_live_control || is_sk_kd_target || is_sk_discovery || is_h3_provider,
         to_file,
     );
     if args.iter().any(|arg| arg == hostclock::CLOCK_PROBE_FLAG) {
@@ -173,6 +184,25 @@ fn main() -> Result<()> {
         // The rest of the command line is the worker's half of the protocol channel — two
         // inherited pipe handles, which is why a worker started by hand cannot get anywhere.
         worker::run(&args);
+    }
+    if let Some(at) = args.iter().position(|arg| arg == h3provider::CONTROL_FLAG) {
+        // Engine-free child role: one typed h3probe handle and one line protocol, no MCP.
+        return h3provider::run_control(&args[at + 1..]);
+    }
+    if let Some(at) = args.iter().position(|arg| arg == h3provider::MEMORY_FLAG) {
+        // Like the operator-supplied transport it replaces, a wedged IOCTL remains outside the
+        // worker that owns the target and is bounded by that worker's child-process deadline.
+        return h3provider::run_memory(&args[at + 1..]);
+    }
+    if let Some(at) = args.iter().position(|arg| arg == h3provider::AUDIT_FLAG) {
+        // The caller pauses and resumes the VM; this bounded role owns every driver read made by
+        // the post-release audit and returns no privileged handle.
+        return h3provider::run_audit(&args[at + 1..]);
+    }
+    if let Some(at) = args.iter().position(|arg| arg == h3provider::QUALIFY_FLAG) {
+        // Live driver qualification is an explicit foreground role. It never changes service
+        // state; the opt-in harness owns stop/start and killed-child controls around it.
+        return h3provider::run_qualify(&args[at + 1..]);
     }
     if let Some(at) = args
         .iter()
@@ -217,8 +247,8 @@ fn main() -> Result<()> {
         .iter()
         .position(|arg| arg == skcontrol::CONTROL_PROBE_FLAG)
     {
-        // Contract probe only: the operator supplies the privileged provider, and this role checks
-        // its identity/epoch/capability handshake before any MCP runtime or DbgEng session exists.
+        // Contract probe only: check a built-in or operator-supplied provider's identity, epoch and
+        // capabilities before any MCP runtime or DbgEng session exists.
         return skcontrol::run_probe(&args[at + 1..]);
     }
     if let Some(at) = args.iter().position(|arg| arg == skinspect::INSPECT_FLAG) {

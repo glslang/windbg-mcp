@@ -13,6 +13,7 @@ $env:WINDBG_MCP_SMOKE_DUMP = "1"; cargo test --test mcp_smoke   # + the debugger
 $env:WINDBG_MCP_SMOKE_TTD  = "1"; cargo test --test mcp_smoke   # + the TTD tier (elevated)
 $env:WINDBG_MCP_SMOKE_SK_CAPTURE = "<a .vmrs>"; cargo test --test mcp_smoke   # + the capture tier
 $env:WINDBG_MCP_SMOKE_SK_LIVE = "<private config.json>"; cargo test --test mcp_smoke -- --ignored --exact a_live_secure_kernel_session_stops_steps_inspects_resumes_and_closes
+$env:WINDBG_MCP_SMOKE_H3PROBE = "<private driver config.json>"; cargo test --test h3probe_live -- --ignored --exact h3probe_driver_qualifies_on_a_disposable_vm --nocapture
 ```
 
 It builds and runs against `target/debug`, so it never touches the `target/release` exe a
@@ -46,6 +47,7 @@ clock says *some* tier had work to do; which one is a `RAN:`/`SKIPPED` line, not
 | **Live kernel** | `--ignored` + `WINDBG_MCP_SMOKE_KERNEL` | a live kernel target you can freeze — KDNET, or serial | that a kernel attach *lands*, coexists, and is let go — by `end_session` and by a disconnect; and that a `debug_batch` which patches a byte of the running kernel puts it back |
 | **Live hypervisor** | `--ignored` + `WINDBG_MCP_SMOKE_HYPERVISOR_PROFILE`; two more variables below | a disposable Microsoft hypervisor target, reached by its own configured profile | separate detach-only tests for default and experimental announcement attach; broader identity, inspection, step, and breakpoint-management test; [runbook, independent health checks, and limits](hypervisor-debugging.md#validation) |
 | **Live Secure Kernel** | `--ignored` + `WINDBG_MCP_SMOKE_SK_LIVE` | one exact disposable VBS VM, private provider commands and an exact-build `vmwp` profile | the typed MCP bind/arm/wait/inspect/step/continue/close lifecycle, optional multi-provider selection and worker isolation |
+| **h3probe driver** | `--ignored` + `WINDBG_MCP_SMOKE_H3PROBE` | the same disposable VM, operator-built service, typed GPA corpus and reserved write byte | ABI/refusal/range-map/concurrency/write restoration, killed provider, stop/start under load and stale identity after restart |
 | **M8 Secure Kernel debugger** | `--ignored` + `WINDBG_MCP_SMOKE_SK_KD` (composite) or `WINDBG_MCP_SMOKE_SK_KD_M8` (external) | the same disposable VM, matching Secure Kernel PDB, exact profile/providers, guest enclave trigger, and post-release audit | generic DbgEng tools, bounded free run and break-in through `open_sk_debugger`; Classic/WinDbgX hardware and guarded-INT3 packet compatibility |
 | **MessageManager CTF** | `--ignored` + live-kernel gate + `WINDBG_MCP_SMOKE_CTF=1` | the challenge VM, WinRM, full `nt` symbols | the real driver and retained `Tgsm` pool objects through the shipped MCP transport |
 | **TTD** | `WINDBG_MCP_SMOKE_TTD=1` | `TTD.exe`, **elevation**, and a WinDbg engine payload beside the binary to replay what it records — both benches' came from `setup.md`'s unpacked `.msixbundle` rather than from an installed package, the ARM64 one as of 2026-08-29 | that `record_trace` records the program it was given and reports a finished recording as one, and that a TTD query returns records rather than bare indices |
@@ -237,6 +239,21 @@ because `execute` is in `inspect`.
 The parser requires each answer to name the requested physical address. The tier asserts these
 paired observations, not boot continuity: interpreting them as protection also requires the
 independent audit to exclude a reboot between sessions, which would invalidate the saved GPA.
+
+**The h3probe tier qualifies the driver source carried here.**
+`WINDBG_MCP_SMOKE_H3PROBE` names a private JSON object with `disposable: true`, `vm_id`, `profile`,
+`service`, `vp`, a nonempty `corpus`, one reserved `write` byte, and exact `restart_command` and
+`health_command` arrays. Each corpus row has a hexadecimal `gpa`, the expected typed memory
+`result`, and expected VID `range` (`memory-block`, `other`, `none`, or `unknown`). The write object
+has a page `gpa` and in-page `offset` whose one-bit change is safe under the operator's disposable
+VM procedure.
+
+The test discovers the current vmwp/partition identity, runs `--sk-h3-qualify` to check the typed
+corpus, VID range map, unknown-IOCTL refusal, concurrent readers and exact write restoration,
+kills a ready memory-provider child and repeats qualification, then requests a service stop under
+load. It proves unload after killing the handle holder, restarts the service, runs the configured
+VM restart, requires the old vmwp handle identity to fail, rediscovers and qualifies the new boot.
+The server itself never starts or stops the service and never runs the configured commands.
 
 **The managed Secure Kernel KD tier uses the same disposable-machine boundary.**
 The complete setup and direct cargo contract are in

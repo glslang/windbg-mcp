@@ -1,4 +1,4 @@
-//! A [`sk::RawSource`] over a transport the **operator** supplies — `FOLLOWUPS.md` item 103.
+//! A [`sk::RawSource`] over a child transport — `FOLLOWUPS.md` items 103 and 133.
 //!
 //! Gate S1 decodes a guest's VTL1 out of a byte source and gate S3 holds one open as a session, and
 //! both have only ever been driven by a Hyper-V capture. The seam was built for this:
@@ -9,20 +9,18 @@
 //! this module there was no implementation, so `Refused` had never been produced by anything but a
 //! fixture.
 //!
-//! # Why a subprocess, and why this repository ships no transport
+//! # Why a subprocess
 //!
-//! Reading another partition's VTL1 live needs something this repository will not contain. Every
-//! route measured on the bench — an operator-owned kernel driver or a hypercall through a
-//! test-signed driver of our own — is a component the operator installs, test-signs and accepts the
-//! posture of. That is item 103's standing decision: **the repository distributes no driver and the
-//! operator supplies the transport.** It is the same shape as the live-kernel tier, which needs
-//! KDNET wiring and a local profile, and the engine bundle, which needs a one-time copy.
+//! Reading another partition's VTL1 live needs an operator-installed kernel driver. This repository
+//! carries the auditable source of its minimal `h3probe` driver and two provider roles, but no
+//! driver binary: the operator builds, test-signs, installs and starts it. Custom providers remain
+//! supported through the same command-line transport contract.
 //!
-//! So the seam is a **child process speaking a line protocol on its stdio**. What ships here is the
-//! client half, which contains no privileged code, links nothing, and can be read in one sitting.
-//! The operator's half can be anything that can read their guest. The first bench transport drove
-//! `hvlib`; the current one passes the worker-discovered VID partition handle *value* to the
-//! operator's memory driver, which uses it inside `vmwp` without duplicating it. A separate
+//! The seam remains a **child process speaking a line protocol on its stdio**. The built-in role
+//! issues typed IOCTLs from that child, so a driver failure or a call stuck in the kernel costs one
+//! provider and is bounded by the worker's child deadline. An operator's provider can be anything
+//! that can read their guest. The live path passes the worker-discovered VID partition handle
+//! *value* to the memory provider, which uses it inside `vmwp` without duplicating it. A separate
 //! `HvCallReadGpa` mode remains the negative control — it is the route that *refuses*.
 //!
 //! A DLL with an agreed export would have been the other option and is worse here: it would put
@@ -120,7 +118,7 @@ const MAX_BANNER_LINES: usize = 64;
 /// The most one line of a transport's output may be. See [`Transport::line`].
 const MAX_LINE_BYTES: u64 = 64 * 1024;
 
-/// Maximum wall time for one complete response from the operator-supplied transport.
+/// Maximum wall time for one complete response from a child transport.
 const EXCHANGE_WAIT: Duration = Duration::from_secs(60);
 
 /// Polling cadence while child stdout has no bytes available.
@@ -1052,11 +1050,17 @@ pub(crate) fn split_command(command: &str) -> Vec<String> {
     out
 }
 
-/// `--sk-live`: drive gate S1's decode against an operator-supplied live transport.
+/// `--sk-live`: drive gate S1's decode against a built-in or operator-supplied transport.
 pub(crate) fn run(args: &[String]) -> Result<()> {
     let mut transport = None;
     let mut image = None;
     let mut cross_check = false;
+    let mut vmwp_pid = None;
+    let mut partition_handle = None;
+    let mut partition_id = None;
+    let mut vp = 0u32;
+    let mut expected_cr3 = None;
+    let mut pages = "h3";
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -1069,11 +1073,91 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             }
             "--image" => image = Some(iter.next().context("--image needs a path")?.clone()),
             "--cross-check" => cross_check = true,
+            "--vmwp-pid" => {
+                vmwp_pid = Some(
+                    iter.next()
+                        .context("--vmwp-pid needs a value")?
+                        .parse::<u32>()
+                        .context("--vmwp-pid must be unsigned decimal")?,
+                )
+            }
+            "--partition-handle" => {
+                partition_handle = Some(cli_word(
+                    "partition-handle",
+                    iter.next().context("--partition-handle needs a value")?,
+                )?)
+            }
+            "--partition-id" => {
+                partition_id = Some(cli_word(
+                    "partition-id",
+                    iter.next().context("--partition-id needs a value")?,
+                )?)
+            }
+            "--vp" => {
+                vp = iter
+                    .next()
+                    .context("--vp needs a value")?
+                    .parse()
+                    .context("--vp must be unsigned decimal")?
+            }
+            "--expected-cr3" => {
+                expected_cr3 = Some(cli_word(
+                    "expected-cr3",
+                    iter.next().context("--expected-cr3 needs a value")?,
+                )?)
+            }
+            "--pages" => {
+                pages = iter.next().context("--pages needs h3 or hypercall")?;
+                if !matches!(pages, "h3" | "hypercall") {
+                    bail!("--pages must be h3 or hypercall");
+                }
+            }
             other => bail!("unknown argument {other:?}\n\n{}", usage()),
         }
     }
-    let transport = transport.context(usage())?;
+    let mut transport = transport.context(usage())?;
     let image = image.context("--image is required: identification is against it")?;
+    if transport == crate::h3provider::BUILTIN {
+        let partition_id = partition_id.context("builtin:h3probe requires --partition-id")?;
+        let exe = std::env::current_exe().context("finding the built-in provider executable")?;
+        let mut words = vec![
+            exe.to_string_lossy().into_owned(),
+            crate::h3provider::MEMORY_FLAG.into(),
+            "--pages".into(),
+            pages.into(),
+            "--partition-id".into(),
+            format!("{partition_id:#x}"),
+            "--vp".into(),
+            vp.to_string(),
+            "--image".into(),
+            image.clone(),
+        ];
+        if pages == "h3" {
+            let vmwp_pid = vmwp_pid.context("builtin:h3probe --pages h3 requires --vmwp-pid")?;
+            let partition_handle = partition_handle
+                .context("builtin:h3probe --pages h3 requires --partition-handle")?;
+            words.extend([
+                "--vmwp-pid".into(),
+                vmwp_pid.to_string(),
+                "--partition-handle".into(),
+                format!("{partition_handle:#x}"),
+            ]);
+        } else if vmwp_pid.is_some() || partition_handle.is_some() {
+            bail!("builtin:h3probe --pages hypercall does not accept vmwp coordinates");
+        }
+        if let Some(expected_cr3) = expected_cr3 {
+            words.extend(["--expected-cr3".into(), format!("{expected_cr3:#x}")]);
+        }
+        transport = crate::skpolicy::render_transport(&words);
+    } else if vmwp_pid.is_some()
+        || partition_handle.is_some()
+        || partition_id.is_some()
+        || vp != 0
+        || expected_cr3.is_some()
+        || pages != "h3"
+    {
+        bail!("the h3probe coordinate options are valid only with --transport builtin:h3probe");
+    }
 
     let disk = sk::DiskImage::open(std::path::Path::new(&image)).map_err(|e| anyhow::anyhow!(e))?;
     println!("build      {}", crate::BUILD_VERSION);
@@ -1124,10 +1208,24 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
 fn usage() -> String {
     format!(
         "usage: windbg-mcp {LIVE_FLAG} --transport \"<command line>\" --image <securekernel.exe> \
-         [--cross-check]\n\n\
-         The transport is a program the OPERATOR supplies, speaking the line protocol in \
-         src/livesrc.rs on its stdio. This repository ships none."
+         [--cross-check]\n       windbg-mcp {LIVE_FLAG} --transport builtin:h3probe \
+         --image <securekernel.exe> --vmwp-pid <pid> --partition-handle <handle> \
+         --partition-id <id> [--vp <number>] [--expected-cr3 <address>] \
+         [--pages <h3|hypercall>] [--cross-check]\n\n\
+         A command line selects an operator-supplied protocol provider. builtin:h3probe selects \
+         this executable's provider role over the operator-installed driver."
     )
+}
+
+fn cli_word(name: &str, value: &str) -> Result<u64> {
+    match value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        Some(hex) => u64::from_str_radix(hex, 16),
+        None => value.parse(),
+    }
+    .with_context(|| format!("--{name} must be hexadecimal with 0x or unsigned decimal"))
 }
 
 #[cfg(test)]

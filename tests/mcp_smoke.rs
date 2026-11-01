@@ -22588,6 +22588,7 @@ fn a_live_secure_kernel_session_stops_steps_inspects_resumes_and_closes() {
     // `inspect` as well, because the VTL0 half below runs `execute`, which lives there.
     let mut server = Server::started_with_args(&[], &["--tools", "securekernel,inspect"]);
     let mut session: Option<String> = None;
+    let mut trigger: Option<ConfiguredCommand> = None;
     // The coordinate the stopped read reported — its VTL1 address and the GPA the walk resolved —
     // carried out of the closure for the VTL0 half, which runs after this session is released.
     let mut vtl1_read: Option<(u64, u64)> = None;
@@ -22615,6 +22616,9 @@ fn a_live_secure_kernel_session_stops_steps_inspects_resumes_and_closes() {
         }
         let armed = server.tool_data("sk_live_arm", arm, TARGET_STEP);
         assert_eq!(armed["phase"], "running", "{armed}");
+        trigger = config
+            .get("trigger")
+            .map(|command| spawn_configured_command(command, "live natural-stop trigger"));
 
         let hardware = server.tool_data("sk_live_wait", json!({ "session_id": id }), TARGET_STEP);
         assert_eq!(
@@ -22813,6 +22817,17 @@ fn a_live_secure_kernel_session_stops_steps_inspects_resumes_and_closes() {
         let ended = server.tool_data("end_session", json!({ "session_id": id }), TARGET_STEP);
         assert_eq!(ended["released"], json!(true), "{ended}");
         assert_eq!(ended["target_left_running"], json!(true), "{ended}");
+    }
+    if run.is_ok()
+        && let Some(trigger) = trigger.take()
+    {
+        let output = trigger.wait(Duration::from_secs(120));
+        assert!(
+            output.status.success(),
+            "live natural-stop trigger exited {}:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
     if let Err(panic) = run {
         resume_unwind(panic);
@@ -23955,10 +23970,17 @@ fn managed_secure_kernel_kd_gate(symbol_gate: bool) {
         .expect("the profile has initial instruction bytes")
         .len() as u64;
     let mut kd_process: Option<Child> = None;
+    let trigger_command = config.get("trigger").cloned();
+    let mut trigger: Option<ConfiguredCommand> = None;
     let run = catch_unwind(AssertUnwindSafe(|| {
         let deadline = Instant::now() + TARGET_STEP;
         loop {
             let phase = state(&mut server);
+            if phase == "running" && trigger.is_none() {
+                trigger = trigger_command
+                    .as_ref()
+                    .map(|command| spawn_configured_command(command, "natural-stop trigger"));
+            }
             if matches!(phase.as_str(), "waiting_for_peer" | "stopped") {
                 break;
             }
@@ -24227,6 +24249,16 @@ fn managed_secure_kernel_kd_gate(symbol_gate: bool) {
         assert_eq!(ended["released"], true, "{ended}");
         assert_eq!(ended["target_left_running"], true, "{ended}");
 
+        if let Some(trigger) = trigger.take() {
+            let output = trigger.wait(Duration::from_secs(120));
+            assert!(
+                output.status.success(),
+                "natural-stop trigger exited {}:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
         let audit_command = required("post_release_audit");
         let audit_command = audit_command
             .as_array()
@@ -24289,13 +24321,13 @@ fn managed_secure_kernel_kd_gate(symbol_gate: bool) {
             3,
             "{audit}"
         );
-        assert_eq!(audit["target_after"]["valid"], true, "{audit}");
-        assert_eq!(
-            audit["target_after"]["target_rva"]
-                .as_str()
-                .and_then(hex_value),
-            Some(rva),
-            "the external audit must check this session's guarded instruction: {audit}"
+        assert_eq!(audit["health"]["heartbeat_ok"], true, "{audit}");
+        assert!(
+            audit["guarded_address"].as_str().is_some()
+                && audit["guarded_text"]
+                    .as_str()
+                    .is_some_and(|text| text.len() >= 8),
+            "the external audit must verify guarded Secure Kernel text: {audit}"
         );
         let dr7 = audit["debug_registers"]["dr7"]["low"]
             .as_str()

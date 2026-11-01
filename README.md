@@ -11,8 +11,9 @@ An [MCP](https://modelcontextprotocol.io) server that exposes **WinDbg/DbgEng** 
 serves the same tools to clients that are not on the machine DbgEng runs on. It drives a live
 debugger engine for **user-mode**, **kernel-mode**, **crash-dump**, and
 **Time Travel Debugging (TTD)** workflows — and reads a VBS guest's **Secure Kernel (VTL1)** out
-of a Hyper-V checkpoint or controls selected VPs in an exact disposable VBS VM through
-operator-supplied providers.
+of a Hyper-V checkpoint or controls selected VPs in an exact disposable VBS VM through built-in
+h3probe providers (or operator-supplied protocol providers). Driver source is included; driver
+binaries, signing, installation and service lifecycle remain operator-owned.
 
 The low-level engine bindings live in [`dbgscope`](https://github.com/glslang/dbgscope)
 (`src/dbgeng.rs`); this crate adds process-per-session engine supervision and the `rmcp` tool
@@ -100,7 +101,8 @@ are in
 guest without controlling it, and the `--sk-kd-target` role puts an installed WinDbg in front of the
 live-control session over a local named pipe, within the limits
 [`docs/secure-kernel/kd-facade.md`](docs/secure-kernel/kd-facade.md) records. Live decode, live
-control and the facade require operator-supplied transports this repository does not ship. The
+control and the facade include h3probe child providers; the operator supplies the built, signed,
+installed and running driver. Custom protocol providers remain supported. The
 VTL0 trace and guest harness are documented in
 [`docs/secure-kernel/vtl0-call-trace.md`](docs/secure-kernel/vtl0-call-trace.md); the intervening
 hypervisor trace is in
@@ -184,7 +186,7 @@ Eighty-nine tools in nine `--tools` groups; the rows below split some of those g
 | User Segment Heap | `allocator` | `heap_list`, `heap_allocations`, `heap_chunk`, `heap_census`, `heap_diagnostics` |
 | Structure walk | `allocator` | `walk_memory` |
 | Raw     | `inspect` | `execute` — run any debugger command, returns full text output |
-| Secure Kernel (extra) | `securekernel` | Capture: `open_sk_capture`, `sk_modules`, `sk_read_memory`, `sk_symbol`. Live selected-VP control: `open_sk_live_control`, `sk_live_arm`, `sk_live_wait`, `sk_live_break`, `sk_live_registers`, `sk_live_read_memory`, `sk_live_write_memory`, `sk_live_step`, `sk_live_continue_to_breakpoints`, `sk_live_continue_to_software_breakpoints`, `sk_live_continue`, plus the manifest-pinned `sk_service_trace` / `sk_service_trace_read` lifecycle, the managed `open_sk_kd` facade, and the one-handle `open_sk_debugger` composite. VTL0 call tracing on an ordinary kernel session: `sk_call_trace`, `sk_call_trace_read`. Hypervisor transitions in a distinct hypervisor KD session: `hv_transition_trace`, `hv_transition_trace_read`. A live session may arm additional selected VPs through independently validated providers. This extra group is omitted by default; name it or use `--tools all`. Capture needs an admitted Windows SDK saved-state provider root; live control needs startup policy, an operator-supplied privileged provider and an exact-build `vmwp` profile. Writes and software breakpoints additionally need explicit startup-policy authority and a bounded instruction-coherent transport capability; the first software-breakpoint slice and semantic tracer require a Hyper-V VM proved to have one vCPU. |
+| Secure Kernel (extra) | `securekernel` | Capture: `open_sk_capture`, `sk_modules`, `sk_read_memory`, `sk_symbol`. Live selected-VP control: `open_sk_live_control`, `sk_live_arm`, `sk_live_wait`, `sk_live_break`, `sk_live_registers`, `sk_live_read_memory`, `sk_live_write_memory`, `sk_live_step`, `sk_live_continue_to_breakpoints`, `sk_live_continue_to_software_breakpoints`, `sk_live_continue`, plus the manifest-pinned `sk_service_trace` / `sk_service_trace_read` lifecycle, the managed `open_sk_kd` facade, and the one-handle `open_sk_debugger` composite. VTL0 call tracing on an ordinary kernel session: `sk_call_trace`, `sk_call_trace_read`. Hypervisor transitions in a distinct hypervisor KD session: `hv_transition_trace`, `hv_transition_trace_read`. A live session may arm additional selected VPs through independently validated providers. This extra group is omitted by default; name it or use `--tools all`. Capture needs an admitted Windows SDK saved-state provider root; live control needs startup policy, an operator-installed h3probe driver (or custom provider) and an exact-build `vmwp` profile. Writes and software breakpoints additionally need explicit startup-policy authority and a bounded instruction-coherent transport capability; the first software-breakpoint slice and semantic tracer require a Hyper-V VM proved to have one vCPU. |
 
 The ordinary eight groups are served by default; the `securekernel` extra is opt-in. Explicit
 `--tools all` serves all eighty-nine. `--tools session,inspect,crash` cuts the surface to twenty-three

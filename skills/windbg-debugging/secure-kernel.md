@@ -6,11 +6,12 @@ state; ten low-level live-control operations stop, inspect, step and resume one 
 exposes the same controller as an ordinary DbgEng kernel session.
 
 **There are four routes.** A **capture** is a file, and its MCP tools read it with no driver, no
-debuggee, and nothing running. A **live decode** uses the `--sk-live` command-line role and an
-operator-supplied memory transport. **Low-level live execution control** is a separate MCP session
-using operator-supplied register and memory providers plus a build-matched `vmwp` adapter. The
+debuggee, and nothing running. A **live decode** uses the `--sk-live` command-line role and a child
+memory transport. **Low-level live execution control** is a separate MCP session using built-in or
+operator-supplied register and memory providers plus a build-matched `vmwp` adapter. The
 normal **debugger route** uses `open_sk_debugger` for generic MCP debugger tools or `open_sk_kd` for
-an external WinDbg client. This repository ships no privileged provider. For a running guest,
+an external WinDbg client. The built-in provider uses the operator-built and installed h3probe
+driver; a custom provider remains an escape hatch. For a running guest,
 choose live decode only for a current snapshot, low-level control for controller evidence, and the
 M8 debugger route for ordinary symbols, stack, disassembly, breakpoints and execution control.
 
@@ -161,10 +162,17 @@ Symbols are loaded against the **image** with no debuggee, at its preferred base
 base the decode found. So what a session with `symbols` buys is the **names**; the types are what
 the paragraph above is about, and the open's probes are what answer for the build in front of you.
 
-## The live route: the operator supplies the transport
+## The live route: built-in or custom transport
 
 ```console
 windbg-mcp --sk-live --transport "<command line>" --image <securekernel.exe> [--cross-check]
+```
+
+For the built-in provider, pass the boot-scoped coordinates returned by guarded discovery:
+
+```console
+windbg-mcp --sk-live --transport builtin:h3probe --image <securekernel.exe> \
+  --vmwp-pid <pid> --partition-handle <handle> --partition-id <id> [--vp <number>]
 ```
 
 That runs the same decode against a **running** guest. Three things about it decide how it can be
@@ -173,17 +181,11 @@ used, and all three matter:
 1. **It is not a tool.** It is a role of the server's own binary, so there is no MCP call for it, no
    `session_id`, and `session_status` never lists it. This skill can describe it and read what it
    printed; running it needs a shell on the debugger host.
-2. **This repository ships no transport, and the role will not start without one.** `--transport`
-   is required. Reading another partition's VTL1 *live* needs a kernel component this project will
-   not distribute — on the bench that has meant a test-signed driver issuing `HvCallReadGpa`, and
-   `hvlib.dll` with its own driver — so the operator supplies the transport and accepts whatever
-   posture **that** transport needs. Do not prescribe one here: which settings a host has to give
-   up depends on the transport, this project has nothing to say about a transport it does not
-   ship, and the one time that posture was guessed at on this bench it cost a protection for
-   nothing (HVCI, turned off because a Code Integrity event was read as naming it when the policy
-   id in it named something else, measured to change the failure not at all, and restored). What ships here is the **client** half: a
-   line protocol, no privileged code, no unsafe FFI. It is the same arrangement as the live-kernel
-   tier's KDNET wiring. **Without a transport there is no live route at all** — not a degraded one.
+2. **`--transport` is required.** `builtin:h3probe` re-executes this exact server image as a child,
+   which opens the operator-installed driver through a typed IOCTL ABI. The repository ships the
+   driver's source but no binary, signature, installation or startup action. A command line selects
+   a custom provider under the same protocol. Do not infer one provider's host posture from
+   another; the built-in driver's own README is authoritative for its build and install.
 3. **It is deliberately not a fifth tool.** `open_sk_capture` can hand back a whole decode at the
    open because a capture cannot change. A live guest can: 2 bytes of `securekernel.exe`'s `.data`
    were measured changing inside twenty seconds (gate S5x), so a session whose figures were taken
@@ -310,13 +312,13 @@ Things to know besides the numbers and the grammar:
 
 The `--sk-live` role above decodes a running guest once. It does not stop or resume anything. For a
 controlled VTL1 kernel-mode stop, use the ten live-control tools. They create a dedicated worker
-session whose DbgEng target is the host's `vmwp` and whose operator-supplied providers access the
-selected VP's VTL1 registers and memory. The repository ships neither provider and ordinary debugger
-tools are refused on this session so they cannot report `vmwp` state as guest state.
+session whose DbgEng target is the host's `vmwp` and whose child providers access the selected VP's
+VTL1 registers and memory. `builtin:h3probe` is the normal provider for both fields; ordinary
+debugger tools are refused on this session so they cannot report `vmwp` state as guest state.
 
 Use this route only for an exact, disposable VBS VM under an independent heartbeat, crash-record and
 unchanged-text audit. Before the server starts, set `WINDBG_MCP_SK_LIVE_POLICY` to an operator-owned
-file that admits the VM GUID, exact provider command templates and profile root. The worker resolves
+file that admits the VM GUID, `builtin:h3probe` (or exact custom commands), and profile root. The worker resolves
 the current `vmwp` PID, the register provider reports CR3 and the memory provider reports the Secure
 Kernel base, so `vmwp_pid` and `expected_cr3` are optional mismatch assertions. The per-boot
 dispatcher VND and partition id are discovered only when the profile carries a `discovery` section,
@@ -329,7 +331,8 @@ VM/`vmwp` binding, CR3, build and guarded instruction before it changes register
 The sequence is:
 
 1. `open_sk_live_control` with `profile`, `control_transport`, `live_transport`, `vm_id` and
-   optional `vp`. Supply `vmwp_pid`, `dispatcher_vnd`, `partition_id` or `expected_cr3` only when an
+   optional `vp`; normally both transport fields are `builtin:h3probe`. Supply `vmwp_pid`,
+   `dispatcher_vnd`, `partition_id` or `expected_cr3` only when an
    independent measurement should be enforced as a mismatch assertion — except that a profile with
    no `discovery` section requires `dispatcher_vnd` and `partition_id`, because nothing else
    supplies them.

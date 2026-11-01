@@ -30,6 +30,7 @@ package-lock.json
 # MSVC C build artifacts (examples/messagemanager exploit)
 *.obj
 *.exe
+*.sys
 
 # Local Claude Code config. `CLAUDE.md` itself lives here rather than at the repository root,
 # because the root is also the plugin root (`marketplace.json` names `"."`) and a `CLAUDE.md` there

@@ -81,8 +81,8 @@ M8 is a live target-control workflow. It requires all of the following before an
    `ExposeVirtualizationExtensions=false`; enabling K3's nested hypervisor removes K3's own VTL1
    from the outer provider view. A nested L2 target uses a different provider topology and is not
    an implicit fallback.
-3. A register/control provider and a live-memory provider admitted by startup policy. This
-   repository deliberately ships neither privileged provider.
+3. The built-in h3probe providers (or custom protocol providers) admitted by startup policy, with
+   an operator-built, signed, installed and running `h3probe.sys` for the built-in path.
 4. An exact-build `vmwp` dispatcher profile, a matching `securekernel.exe`, and a symbol store
    containing the matching `securekernel.pdb` when names and stacks are required.
 5. `WINDBG_MCP_SK_LIVE_POLICY` set before the MCP server starts. The `securekernel` tool group must
@@ -163,10 +163,7 @@ The startup policy fixes authority before a client can select anything:
 ```json
 {
   "disposable_vm_ids": ["51749a1f-f939-44f5-b251-1251ef5b64a3"],
-  "transport_commands": [
-    "\"C:\\Python313\\python.exe\" \"D:\\sklab\\control.py\" --vm-id 51749a1f-f939-44f5-b251-1251ef5b64a3 --partition-id {partition_id} --vp {vp}",
-    "\"C:\\Python313\\python.exe\" \"D:\\sklab\\memory.py\" --vm-id 51749a1f-f939-44f5-b251-1251ef5b64a3 --partition-id {partition_id} --vp {vp} --cr3 {cr3} --vmwp-pid {vmwp_pid} --partition-handle {partition_handle}"
-  ],
+  "builtin_transports": ["builtin:h3probe"],
   "profile_roots": ["D:\\sklab\\profiles"],
   "kit_roots": ["C:\\Program Files (x86)\\Windows Kits\\10"],
   "max_pause_ms": 600000,
@@ -174,20 +171,22 @@ The startup policy fixes authority before a client can select anything:
 }
 ```
 
-Paths and complete tokenized commands are canonicalized and compared with the allow-list. An
-allowed Python executable cannot be reused with another script or `-c` payload. Provider
-placeholders are expanded only from guarded discovery, after the corresponding identity exists.
+`builtin_transports` is separate from command authority. It admits only the exact provider roles
+inside the running server image, so a stale supervisor cannot launch a newer executable from the
+release path. Custom providers remain available through `transport_commands`; their paths and
+complete tokenized commands are canonicalized and compared with that allow-list. Provider
+coordinates are expanded only from guarded discovery, after the corresponding identity exists.
 
-The current reproducible sklab bench uses one demand-start host driver, `h3probe.sys`, built from
-sklab's source. It supplies VTL1 register/control operations, boot-scoped identity, and the direct
+The current reproducible bench uses one demand-start host driver, `h3probe.sys`, built from this
+repository's source under `drivers/h3probe`. It supplies VTL1 register/control operations, boot-scoped identity, and the direct
 guest-physical read/write path through the identity-bound VID partition handle. Sklab's migration
 off LiveCloudKd's `hvmm.sys` completed on 2026-10-29, and its final acceptance ran with the `hvmm`
 service uninstalled and no process holding `hvlib.dll`.
 
 The service must already be installed and running before `open_sk_debugger` or `open_sk_kd`.
-`windbg-mcp` never installs or starts a driver. The sklab runbook records build, signing, service,
-hash pinning, and start/stop commands. [`h3probe-provider-plan.md`](h3probe-provider-plan.md)
-moves the driver's source, and the providers that drive it, into this repository.
+`windbg-mcp` never installs or starts a driver. The
+[`driver README`](../../drivers/h3probe/README.md) records build, signing and service setup; the
+operator's lab retains hash pinning and start/stop policy.
 
 ## Open a managed MCP debugger
 
@@ -196,8 +195,8 @@ Start the server with the policy and tool group in its environment, then call:
 ```jsonc
 open_sk_debugger {
   "profile": "D:\\sklab\\profiles\\vmwp-dispatcher-profile-26100.9457.json",
-  "control_transport": "\"C:\\Python313\\python.exe\" \"D:\\sklab\\control.py\" --vm-id 51749a1f-f939-44f5-b251-1251ef5b64a3 --partition-id {partition_id} --vp {vp}",
-  "live_transport": "\"C:\\Python313\\python.exe\" \"D:\\sklab\\memory.py\" --vm-id 51749a1f-f939-44f5-b251-1251ef5b64a3 --partition-id {partition_id} --vp {vp} --cr3 {cr3} --vmwp-pid {vmwp_pid} --partition-handle {partition_handle}",
+  "control_transport": "builtin:h3probe",
+  "live_transport": "builtin:h3probe",
   "vm_id": "51749a1f-f939-44f5-b251-1251ef5b64a3",
   "vp": 0,
   "arm_mode": "redirect",

@@ -91,7 +91,6 @@ reopen it). An unmarked line is simply open.
 - [Item 130](#130-windbg-mcp-a-transcript-cannot-be-joined-to-the-clients-opentelemetry-trace) — [windbg-mcp] A transcript cannot be joined to the client's OpenTelemetry trace
 - [Item 131](#131-windbg-mcp-the-eval-never-runs-a-mutating-tool) — [windbg-mcp] The eval never runs a mutating tool
 - [Item 132](#132-windbg-mcp-no-scenario-has-outgrown-a-models-own-window) — [windbg-mcp] No scenario has outgrown a model's own window
-- [Item 133](#133-windbg-mcp-the-live-vtl1-driver-and-its-providers-live-outside-this-repository) — [windbg-mcp] The live VTL1 driver and its providers live outside this repository
 - [Item 134](#134-windbg-mcp-the-transition-drain-faults-on-an-unattributed-ntdlldbgbreakpoint-stop-in-vmwp) — [windbg-mcp] The transition drain faults on an unattributed `ntdll!DbgBreakPoint` stop in `vmwp`
 - [Item 135](#135-windbg-mcp-a-secure-kernel-debuggers-public-peer-is-kept-unresolved-after-its-controller-has-released) — [windbg-mcp] A Secure Kernel debugger's public peer is kept unresolved after its controller has released
 - [Item 136](#136-windbg-mcp-dispatcher-discovery-waits-sixty-seconds-for-one-arrival-that-sometimes-never-comes) — [windbg-mcp] Dispatcher discovery waits sixty seconds for one arrival that sometimes never comes
@@ -2341,28 +2340,6 @@ facts (a break with cause `answer` at the first fact that needed them), or degra
 - **Where it picks up:** `tools/eval_plan_scenario_reasoning.json` for the plan shape, and the
   break causes in `local_model_eval.grade_conversation`, whose `error` and `answer` are the two a
   window would produce.
-
-## 133. [windbg-mcp] The live VTL1 driver and its providers live outside this repository
-
-**Repo:** `windbg-mcp`, with the matching removals in `secure-kernel-lab` (sklab). **Origin:**
-preparing sklab for a public push on 2026-10-30.
-
-Every live Secure Kernel session runs two providers this repository does not carry,
-`k4_control_provider.py` and `gpa_server.py`, over a driver it does not carry either, `h3probe.sys`.
-All three are in sklab. They were kept out by item 103's standing decision that the repository
-distributes no driver and the operator supplies the transport. Its reason was privacy, and that
-reason ended when sklab was published on 2026-10-31. The plan keeps the rest of the posture: no binary is
-distributed, the server never installs or starts a driver, and the providers stay child processes.
-
-- **Why deferred:** it is eight phases, most of them with live runs on the disposable VM, and the
-  path through sklab works today.
-- **What would close it:** the final acceptance in
-  [`docs/secure-kernel/h3probe-provider-plan.md`](docs/secure-kernel/h3probe-provider-plan.md).
-  The policy admits `builtin:h3probe` and no interpreter; the live tier, the KD gate and sklab's M8
-  acceptance pass on three fresh boots; and sklab's `src/` opens no device.
-- **Where it picks up:** the plan's Phase 0, a protocol transcript and memory corpus from the Python
-  providers on one boot. Item 129 removes one row of the plan's map outright: the coordinates sklab
-  reads before an open.
 
 ## 134. [windbg-mcp] The transition drain faults on an unattributed `ntdll!DbgBreakPoint` stop in `vmwp`
 
