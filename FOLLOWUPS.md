@@ -91,7 +91,7 @@ reopen it). An unmarked line is simply open.
 - [Item 130](#130-windbg-mcp-a-transcript-cannot-be-joined-to-the-clients-opentelemetry-trace) — [windbg-mcp] A transcript cannot be joined to the client's OpenTelemetry trace
 - [Item 131](#131-windbg-mcp-the-eval-never-runs-a-mutating-tool) — [windbg-mcp] The eval never runs a mutating tool
 - [Item 132](#132-windbg-mcp-no-scenario-has-outgrown-a-models-own-window) — [windbg-mcp] No scenario has outgrown a model's own window
-- [Item 134](#134-windbg-mcp-the-transition-drain-faults-on-an-unattributed-ntdlldbgbreakpoint-stop-in-vmwp) — [windbg-mcp] The transition drain faults on an unattributed `ntdll!DbgBreakPoint` stop in `vmwp`
+- [Item 134](#134-windbg-mcp-the-transition-drain-faults-on-an-unattributed-ntdlldbgbreakpoint-stop-in-vmwp) — [windbg-mcp] The transition drain faults on an unattributed `ntdll!DbgBreakPoint` stop in `vmwp` — **implementation landed; live drain unexercised**
 - [Item 135](#135-windbg-mcp-a-secure-kernel-debuggers-public-peer-is-kept-unresolved-after-its-controller-has-released) — [windbg-mcp] A Secure Kernel debugger's public peer is kept unresolved after its controller has released
 - [Item 136](#136-windbg-mcp-dispatcher-discovery-waits-sixty-seconds-for-one-arrival-that-sometimes-never-comes) — [windbg-mcp] Dispatcher discovery waits sixty seconds for one arrival that sometimes never comes
 
@@ -2391,23 +2391,46 @@ DbgEng's native-return breakpoint, removed but already queued. The other candida
 break-in's own `SetInterrupt` (`kdtarget::WaitWaker::spawn_interrupt`). The log does not say whether
 cycle 6's wake went that way, or took the path `WaitActivity::enter` returns without an interrupt.
 
-- **What would close it:** first, make the stop attributable. `UnownedStop` should carry the event
-  as fields: the thread id, that thread's start address, the exception code and the first-chance
-  flag. A RIP in prose is not enough. This applies to this pump and to the running disarm's
-  `disarm_pump_step`, which has the same `(None, _)` arm under the same slices.
+- **Started 2026-11-03:** the attribution half has landed. Both bounded pump paths now preserve an
+  unowned stop's DbgEng event process/thread ids, selected OS thread id, Win32 thread start address,
+  exception code and first-chance flag beside the instruction pointer. A failed evidence read is
+  named as an inspection error instead of replacing the original stop, and every such stop remains
+  fail-closed. The next live occurrence is still needed before the adapter may consume anything.
+- **Remaining implementation, 2026-11-04:** a direct watchdog measurement on a disposable local
+  `ping.exe`, using pinned dbgscope `aea1f900` and system dbgeng 10.0.26100.1, produced
+  `Deadline`, first-chance `0x80000003` at exact `ntdll!DbgBreakPoint`, on a thread whose Win32
+  start resolved exactly to `ntdll!DbgUiRemoteBreakin`. Both pumps now mint a one-slice provenance
+  token only when their own deadline coincides with an event-site arrival. The next natural stop is
+  consumed with `gh` only when all of those measured fields match; the token is spent on that next
+  slice whether it matches or not, and every mismatch remains fail-closed. The disposable M8 bench
+  variables were absent from the parent shell; the generated workflow which supplies them and its
+  live result are recorded below.
+- **K3 requalification, 2026-11-04:** the generated sklab workflow was available after all; the
+  absent environment variables were not a bench limitation because `validate.m8` generates and
+  injects them. The current tree passed the required 75/75 cycles on three clean K3 boots in runs
+  `20261104T195945-validate-m8-3592f8`, `20261104T200849-validate-m8-501fc4` and
+  `20261104T201714-validate-m8-62dca3`. Their `vmwp` PIDs were 9888, 7084 and 7832, their partition
+  ids were `0x46`, `0x47` and `0x48`, and their Secure Kernel bases were respectively
+  `0xfffff8051541a000`, `0xfffff8037741a000` and `0xfffff8012a95a000`. Every release audit kept
+  its boot and `vmwp` identity, reported a healthy heartbeat at 0, 30 and 60 seconds, restored
+  DR0--DR3 to zero and DR7 to `0x400`, and preserved the guarded text. Five further 25-cycle
+  batches on the third boot also passed in runs beginning `20261104T202529`, `203356`, `204130`,
+  `204905` and `205639`: 200/200 new cycles in all. None logged an unowned stop or
+  `dispatcher drained its queued deadline break`, so the rare live branch was not exercised; the
+  clean result is requalification evidence, not a claim that the recurrence was captured.
 
-  If the next occurrence turns out to be the engine's own break-in, consume it handled, the way the
-  native-return drain does. Match it on what makes it provably this adapter's: a DbgEng break-in
-  thread at `DbgBreakPoint`, after a deadline break this pump raised. Every other stop stays
-  fail-closed. If it is not the adapter's, the item becomes the question of what raised a breakpoint
-  in `vmwp`.
+- **What would close it:** capture the new attribution and handled-drain marker on a live vmwp
+  recurrence. The current tree has passed M8's three-clean-boot composite gate; what remains is the
+  rare branch itself. If the attributed stop is not the exact break-in signature above, it remains
+  fail-closed and the item becomes the question of what raised a breakpoint in `vmwp`.
 - **Why deferred:** the failure fails safe: recovery restored the target and the audit passed. It has
-  been seen once in 57 free-run break-ins attempted under that build. That count is the six before
-  it, the failure itself, and 25 on each of the other two composite boots under the build. Boot 1's
-  25 ran under a different build, which the origin record below explains. A drain matched on a
-  guess could consume a stop that belongs to someone else, so the attribution comes first. M8's
-  acceptance in [`docs/secure-kernel/m8-debugger.md`](docs/secure-kernel/m8-debugger.md) (three
-  clean boots, 75/75) is a pass on three boots, not a failure rate.
+  been seen once in 57 free-run break-ins attempted under that build, and zero times in the 200
+  current-tree cycles above. The original count is the six before it, the failure itself, and 25
+  on each of the other two composite boots under that build. Boot 1's 25 ran under a different
+  build, which the origin record below explains. A drain matched on a guess could consume a stop
+  that belongs to someone else, so the attribution comes first. M8's acceptance in
+  [`docs/secure-kernel/m8-debugger.md`](docs/secure-kernel/m8-debugger.md) (three clean boots,
+  75/75) is a pass on three boots, not a failure rate.
 - **Where it picks up:**
   - `pump_pending_transition_before_pause`, `transition_pump_step` and `disarm_pump_step` in
     `src/skdispatch.rs`, with `queued_owned_native_return_event` as the precedent;

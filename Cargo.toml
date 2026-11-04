@@ -76,6 +76,9 @@ windows-sys = { version = "0.61", features = [
     # for compatibility but is too coarse to order the measured transition rate.
     "Win32_System_Performance",
     "Win32_System_Threading",
+    # `NtQueryInformationThread(ThreadQuerySetWin32StartAddress)` attributes an unexpected vmwp
+    # pump stop to the thread DbgEng selected for it (FOLLOWUPS.md item 134).
+    "Wdk_System_Threading",
     # `IsWow64Process2`, which is how `src/target.rs` reads the architecture of a *live* process
     # before a worker is spawned for it. The call itself is in `Win32_System_Threading` above; this
     # feature is here for its `IMAGE_FILE_MACHINE` out-parameters, which are gated by module path
