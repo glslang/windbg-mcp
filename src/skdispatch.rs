@@ -24,16 +24,18 @@ use dbgscope::dbgeng::{
     WaitOutcome,
 };
 use iced_x86::{Decoder, DecoderOptions};
+use windows_sys::Wdk::System::Threading::{
+    NtQueryInformationThread, ThreadQuerySetWin32StartAddress,
+};
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
 #[cfg(target_arch = "x86_64")]
 use windows_sys::Win32::System::Diagnostics::Debug::{
     CONTEXT, CONTEXT_ALL_AMD64, CONTEXT_FULL_AMD64, GetThreadContext, SetThreadContext,
 };
-use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::System::Threading::{CreateMutexW, OpenThread, THREAD_QUERY_INFORMATION};
 #[cfg(target_arch = "x86_64")]
 use windows_sys::Win32::System::Threading::{
-    OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION,
-    THREAD_SET_CONTEXT, THREAD_SUSPEND_RESUME,
+    ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_SET_CONTEXT, THREAD_SUSPEND_RESUME,
 };
 
 use crate::sk;
@@ -77,6 +79,8 @@ pub(crate) const MIN_PAUSE_MS: u64 = CLEANUP_RESERVE.as_millis() as u64 * 2;
 const POLL: Duration = Duration::from_millis(20);
 const EVENT_TYPE_VECTOR: u64 = 0x0100_0002;
 const STATUS_BREAKPOINT: u32 = 0x8000_0003;
+const DBG_BREAKPOINT_SYMBOL: &str = "ntdll!DbgBreakPoint";
+const DBG_UI_REMOTE_BREAKIN_SYMBOL: &str = "ntdll!DbgUiRemoteBreakin";
 const DEBUG_VECTOR: u8 = 1;
 const BREAKPOINT_VECTOR: u8 = 3;
 const MAX_AMD64_INSTRUCTION_BYTES: usize = 15;
@@ -120,6 +124,115 @@ fn is_first_chance_breakpoint_at(
                 exception.code == STATUS_BREAKPOINT && exception.address == address
             })
     })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UnownedStop {
+    instruction_pointer: u64,
+    instruction_symbol: Option<(String, u64)>,
+    event_process_id: Option<u32>,
+    event_thread_id: Option<u32>,
+    thread_id: Option<u32>,
+    thread_start_address: Option<u64>,
+    thread_start_symbol: Option<(String, u64)>,
+    exception_code: Option<u32>,
+    exception_address: Option<u64>,
+    first_chance: Option<bool>,
+    inspection_errors: Vec<String>,
+}
+
+impl UnownedStop {
+    /// A deadline break this pump raised is owned only when the next unowned stop has the exact
+    /// user-mode DbgEng break-in signature measured on this host: a first-chance breakpoint at
+    /// `ntdll!DbgBreakPoint` on a thread whose Win32 start is `ntdll!DbgUiRemoteBreakin`.
+    fn is_owned_pump_deadline_break(&self, pump_raised_deadline_break: bool) -> bool {
+        pump_raised_deadline_break
+            && self.event_thread_id.is_some()
+            && self.thread_id.is_some()
+            && self.exception_code == Some(STATUS_BREAKPOINT)
+            && self.exception_address == Some(self.instruction_pointer)
+            && self.first_chance == Some(true)
+            && exact_symbol(&self.instruction_symbol, DBG_BREAKPOINT_SYMBOL)
+            && exact_symbol(&self.thread_start_symbol, DBG_UI_REMOTE_BREAKIN_SYMBOL)
+    }
+}
+
+impl fmt::Display for UnownedStop {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "instruction_pointer={:#x}, instruction_symbol={}, event_process_id={}, \
+             event_thread_id={}, thread_id={}, thread_start_address={}, thread_start_symbol={}, \
+             exception_code={}, exception_address={}, first_chance={}",
+            self.instruction_pointer,
+            optional_symbol(self.instruction_symbol.as_ref()),
+            optional_hex_u32(self.event_process_id),
+            optional_hex_u32(self.event_thread_id),
+            optional_hex_u32(self.thread_id),
+            optional_hex_u64(self.thread_start_address),
+            optional_symbol(self.thread_start_symbol.as_ref()),
+            optional_hex_u32(self.exception_code),
+            optional_hex_u64(self.exception_address),
+            self.first_chance
+                .map_or_else(|| "unknown".into(), |value| value.to_string()),
+        )?;
+        if !self.inspection_errors.is_empty() {
+            write!(f, ", inspection_errors={:?}", self.inspection_errors)?;
+        }
+        Ok(())
+    }
+}
+
+fn optional_hex_u32(value: Option<u32>) -> String {
+    value.map_or_else(|| "unknown".into(), |value| format!("{value:#x}"))
+}
+
+fn optional_hex_u64(value: Option<u64>) -> String {
+    value.map_or_else(|| "unknown".into(), |value| format!("{value:#x}"))
+}
+
+fn optional_symbol(symbol: Option<&(String, u64)>) -> String {
+    symbol.map_or_else(
+        || "unknown".into(),
+        |(name, displacement)| format!("{name}+{displacement:#x}"),
+    )
+}
+
+fn exact_symbol(symbol: &Option<(String, u64)>, expected: &str) -> bool {
+    symbol
+        .as_ref()
+        .is_some_and(|(name, displacement)| name == expected && *displacement == 0)
+}
+
+fn thread_start_address(thread_id: u32) -> Result<u64> {
+    // SAFETY: the id came from DbgEng for the stopped local vmwp target. The handle is used only
+    // for this query and closed before the function returns.
+    let thread = unsafe { OpenThread(THREAD_QUERY_INFORMATION, 0, thread_id) };
+    if thread.is_null() {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("opening vmwp thread {thread_id:#x} for attribution"));
+    }
+    let mut address = 0usize;
+    // SAFETY: `thread` has query access and `address` is a correctly sized writable pointer for
+    // ThreadQuerySetWin32StartAddress. No return-length pointer is required for this fixed result.
+    let status = unsafe {
+        NtQueryInformationThread(
+            thread,
+            ThreadQuerySetWin32StartAddress,
+            std::ptr::from_mut(&mut address).cast(),
+            std::mem::size_of::<usize>() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    // SAFETY: closes the non-null handle returned by OpenThread above.
+    unsafe { CloseHandle(thread) };
+    if status < 0 {
+        bail!(
+            "querying vmwp thread {thread_id:#x} start address failed with NTSTATUS {:#010x}",
+            status as u32
+        );
+    }
+    Ok(address as u64)
 }
 
 fn debug_wait_remaining(deadline: Instant, activity: Option<&WaitActivity>) -> Duration {
@@ -2899,6 +3012,26 @@ enum TransitionPumpStep {
     UnownedStop,
 }
 
+/// Provenance for one possible late delivery. A deadline break is eligible only for the next pump
+/// slice after the slice where an event-site arrival won; beginning that next slice consumes the
+/// token whether its stop matches or not.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct QueuedDeadlineBreak {
+    before_next_slice: bool,
+}
+
+impl QueuedDeadlineBreak {
+    fn begin_slice(&mut self) -> bool {
+        std::mem::take(&mut self.before_next_slice)
+    }
+
+    fn observe_slice(&mut self, cut_short: Option<&Interruption>, at_event_site: bool) {
+        debug_assert!(!self.before_next_slice);
+        self.before_next_slice =
+            at_event_site && matches!(cut_short, Some(Interruption::Deadline { .. }));
+    }
+}
+
 /// An arrival at the event site wins over every other reading of the slice, because the event is
 /// outstanding whatever else happened and nothing but this adapter may carry it. `pause` is the
 /// helper's verdict so far: `None` while it is still running, `Some(true)` once the VM is paused.
@@ -3793,6 +3926,9 @@ impl VmwpDispatcher<'_> {
         );
         let bound = deadline
             .unwrap_or_else(|| Instant::now() + Duration::from_millis(u64::from(DEBUG_WAIT)));
+        let mut resume_handled = false;
+        let mut drained_deadline_breaks = 0usize;
+        let mut queued_deadline_break = QueuedDeadlineBreak::default();
         loop {
             let remaining = bound.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -3804,14 +3940,39 @@ impl VmwpDispatcher<'_> {
             }
             let slice = remaining.min(DISARM_PUMP_SLICE);
             let timeout = slice.as_millis().clamp(1, u128::from(u32::MAX)) as u32;
+            let pump_raised_deadline_break = queued_deadline_break.begin_slice();
+            let command = if std::mem::take(&mut resume_handled) {
+                "gh"
+            } else {
+                "g"
+            };
             let run = self
                 .engine
-                .execute_and_wait("g", timeout)
+                .execute_and_wait(command, timeout)
                 .map_err(debugger)?;
             if run.target_gone {
                 bail!("vmwp left the debugger during the running disarm");
             }
             let rip = self.engine.instruction_pointer().map_err(debugger)?;
+            let at_event_site = rip == event_site;
+            let unowned_stop =
+                (run.cut_short.is_none() && !at_event_site).then(|| self.unowned_stop(rip));
+            if let Some(stop) = unowned_stop
+                .as_ref()
+                .filter(|stop| stop.is_owned_pump_deadline_break(pump_raised_deadline_break))
+            {
+                drained_deadline_breaks += 1;
+                resume_handled = true;
+                tracing::info!(
+                    target: "windbg_mcp::secure_kernel_mutation",
+                    address = format_args!("{rip:#x}"),
+                    drained = drained_deadline_breaks,
+                    thread_id = stop.thread_id,
+                    thread_start_address = stop.thread_start_address.map(|address| format!("{address:#x}")),
+                    "dispatcher drained its queued deadline break during the running disarm"
+                );
+                continue;
+            }
             let pause = match self.state.completion_kick.as_mut() {
                 Some(kick) => kick.try_finish(),
                 None => Some(Ok(())),
@@ -3834,7 +3995,7 @@ impl VmwpDispatcher<'_> {
                     ));
                 }
             };
-            match disarm_pump_step(run.cut_short.as_ref(), rip == event_site, pause) {
+            match disarm_pump_step(run.cut_short.as_ref(), at_event_site, pause) {
                 DisarmPumpStep::HoldEvent => {
                     if let Some((event_pointer, event)) =
                         self.classify_event_at_site(targets, event_site)?
@@ -3880,11 +4041,15 @@ impl VmwpDispatcher<'_> {
                     self.state.phase = DispatcherPhase::ReadyForStopInterrupted;
                     bail!("the running disarm was interrupted on request");
                 }
-                DisarmPumpStep::UnownedStop => bail!(
-                    "vmwp stopped at {rip:#x} for an event the live-control adapter does not own \
-                     during the running disarm"
-                ),
+                DisarmPumpStep::UnownedStop => {
+                    let stop = unowned_stop.unwrap_or_else(|| self.unowned_stop(rip));
+                    bail!(
+                        "vmwp stopped for an event the live-control adapter does not own during \
+                         the running disarm; {stop}"
+                    )
+                }
             }
+            queued_deadline_break.observe_slice(run.cut_short.as_ref(), at_event_site);
         }
     }
 
@@ -3916,8 +4081,10 @@ impl VmwpDispatcher<'_> {
         );
         let bound = deadline
             .unwrap_or_else(|| Instant::now() + Duration::from_millis(u64::from(DEBUG_WAIT)));
-        let mut handle_native_return = false;
+        let mut resume_handled = false;
         let mut drained_native_returns = 0usize;
+        let mut drained_deadline_breaks = 0usize;
+        let mut queued_deadline_break = QueuedDeadlineBreak::default();
         loop {
             let remaining = bound.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -3929,7 +4096,8 @@ impl VmwpDispatcher<'_> {
             }
             let slice = remaining.min(DISARM_PUMP_SLICE);
             let timeout = slice.as_millis().clamp(1, u128::from(u32::MAX)) as u32;
-            let command = if std::mem::take(&mut handle_native_return) {
+            let pump_raised_deadline_break = queued_deadline_break.begin_slice();
+            let command = if std::mem::take(&mut resume_handled) {
                 "gh"
             } else {
                 "g"
@@ -3942,7 +4110,8 @@ impl VmwpDispatcher<'_> {
                 bail!("vmwp left the debugger while draining the prior Hyper-V transition");
             }
             let rip = self.engine.instruction_pointer().map_err(debugger)?;
-            if rip == event_site
+            let at_event_site = rip == event_site;
+            if at_event_site
                 && let Some((event_pointer, event)) =
                     self.classify_event_at_site(targets, event_site)?
             {
@@ -3966,13 +4135,32 @@ impl VmwpDispatcher<'_> {
             // address remains fail-closed.
             if let Some(event) = self.queued_owned_native_return_event(rip, event_site)? {
                 drained_native_returns += 1;
-                handle_native_return = true;
+                resume_handled = true;
                 tracing::info!(
                     target: "windbg_mcp::secure_kernel_mutation",
                     address = format_args!("{rip:#x}"),
                     drained = drained_native_returns,
                     thread = event.thread,
                     "dispatcher drained a queued owned native-return breakpoint while pumping the prior Hyper-V transition"
+                );
+                continue;
+            }
+
+            let unowned_stop =
+                (run.cut_short.is_none() && !at_event_site).then(|| self.unowned_stop(rip));
+            if let Some(stop) = unowned_stop
+                .as_ref()
+                .filter(|stop| stop.is_owned_pump_deadline_break(pump_raised_deadline_break))
+            {
+                drained_deadline_breaks += 1;
+                resume_handled = true;
+                tracing::info!(
+                    target: "windbg_mcp::secure_kernel_mutation",
+                    address = format_args!("{rip:#x}"),
+                    drained = drained_deadline_breaks,
+                    thread_id = stop.thread_id,
+                    thread_start_address = stop.thread_start_address.map(|address| format!("{address:#x}")),
+                    "dispatcher drained its queued deadline break while pumping the prior Hyper-V transition"
                 );
                 continue;
             }
@@ -3994,11 +4182,7 @@ impl VmwpDispatcher<'_> {
                     ));
                 }
             }
-            match transition_pump_step(
-                run.cut_short.as_ref(),
-                rip == event_site,
-                transition_finished,
-            ) {
+            match transition_pump_step(run.cut_short.as_ref(), at_event_site, transition_finished) {
                 TransitionPumpStep::HoldEvent => {
                     // An event-site stop which did not decode as a selected event belongs to the
                     // native handler and was carried above. Once the prior transition has ended,
@@ -4023,11 +4207,53 @@ impl VmwpDispatcher<'_> {
                     self.state.phase = DispatcherPhase::ReadyForStopInterrupted;
                     bail!("draining the prior Hyper-V transition was interrupted on request");
                 }
-                TransitionPumpStep::UnownedStop => bail!(
-                    "vmwp stopped at {rip:#x} for an event the live-control adapter does not own \
-                     while draining the prior Hyper-V transition"
-                ),
+                TransitionPumpStep::UnownedStop => {
+                    let stop = unowned_stop.unwrap_or_else(|| self.unowned_stop(rip));
+                    bail!(
+                        "vmwp stopped for an event the live-control adapter does not own while \
+                         draining the prior Hyper-V transition; {stop}"
+                    )
+                }
             }
+            queued_deadline_break.observe_slice(run.cut_short.as_ref(), at_event_site);
+        }
+    }
+
+    fn unowned_stop(&self, instruction_pointer: u64) -> UnownedStop {
+        let mut inspection_errors = Vec::new();
+        let event = match self.engine.last_event() {
+            Ok(event) => event,
+            Err(error) => {
+                inspection_errors.push(format!("last_event: {error}"));
+                None
+            }
+        };
+        let thread_id = match self.engine.current_thread_system_id() {
+            Ok(thread_id) => Some(thread_id),
+            Err(error) => {
+                inspection_errors.push(format!("current_thread_system_id: {error}"));
+                None
+            }
+        };
+        let thread_start_address = thread_id.and_then(|thread_id| {
+            thread_start_address(thread_id)
+                .map_err(|error| inspection_errors.push(format!("thread_start_address: {error:#}")))
+                .ok()
+        });
+        let exception = event.as_ref().and_then(|event| event.exception.as_ref());
+        UnownedStop {
+            instruction_pointer,
+            instruction_symbol: self.engine.symbol_for(instruction_pointer),
+            event_process_id: event.as_ref().map(|event| event.process),
+            event_thread_id: event.as_ref().map(|event| event.thread),
+            thread_id,
+            thread_start_address,
+            thread_start_symbol: thread_start_address
+                .and_then(|address| self.engine.symbol_for(address)),
+            exception_code: exception.map(|exception| exception.code),
+            exception_address: exception.map(|exception| exception.address),
+            first_chance: exception.map(|_| event.as_ref().is_some_and(|event| event.first_chance)),
+            inspection_errors,
         }
     }
 
@@ -8782,6 +9008,123 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_unowned_pump_stop_reports_attribution_fields() {
+        let stop = UnownedStop {
+            instruction_pointer: 0x7ff8_7060_3f40,
+            instruction_symbol: Some((DBG_BREAKPOINT_SYMBOL.into(), 0)),
+            event_process_id: Some(3),
+            event_thread_id: Some(7),
+            thread_id: Some(0x1234),
+            thread_start_address: Some(0x7ff8_7061_1000),
+            thread_start_symbol: Some((DBG_UI_REMOTE_BREAKIN_SYMBOL.into(), 0)),
+            exception_code: Some(STATUS_BREAKPOINT),
+            exception_address: Some(0x7ff8_7060_3f40),
+            first_chance: Some(true),
+            inspection_errors: Vec::new(),
+        };
+        assert_eq!(
+            stop.to_string(),
+            "instruction_pointer=0x7ff870603f40, instruction_symbol=ntdll!DbgBreakPoint+0x0, \
+             event_process_id=0x3, event_thread_id=0x7, thread_id=0x1234, \
+             thread_start_address=0x7ff870611000, \
+             thread_start_symbol=ntdll!DbgUiRemoteBreakin+0x0, exception_code=0x80000003, \
+             exception_address=0x7ff870603f40, first_chance=true"
+        );
+
+        let source = include_str!("skdispatch.rs");
+        let implementation = source
+            .split_once("mod tests {")
+            .expect("the test module follows the implementation")
+            .0;
+        assert_eq!(
+            implementation
+                .matches(".then(|| self.unowned_stop(rip))")
+                .count(),
+            2,
+            "both bounded pump paths must attribute an unowned stop"
+        );
+    }
+
+    /// Measured 2026-11-04 with the pinned dbgscope revision and dbgeng 10.0.26100.1: a watchdog
+    /// deadline on an attached disposable `ping.exe` stopped first-chance at exactly
+    /// `ntdll!DbgBreakPoint`, on a thread starting exactly at `ntdll!DbgUiRemoteBreakin`.
+    #[test]
+    fn only_the_next_exact_dbgeng_break_in_is_an_owned_pump_deadline_break() {
+        let deadline = Interruption::Deadline { after_ms: 250 };
+        let mut queued = QueuedDeadlineBreak::default();
+        queued.observe_slice(Some(&deadline), true);
+        assert!(queued.begin_slice());
+        assert!(
+            !queued.begin_slice(),
+            "the provenance token is one slice only"
+        );
+        queued.observe_slice(Some(&deadline), false);
+        assert!(!queued.begin_slice());
+        queued.observe_slice(Some(&Interruption::OnRequest), true);
+        assert!(!queued.begin_slice());
+
+        let stop = UnownedStop {
+            instruction_pointer: 0x7ff8_7060_3f40,
+            instruction_symbol: Some((DBG_BREAKPOINT_SYMBOL.into(), 0)),
+            event_process_id: Some(0),
+            event_thread_id: Some(6),
+            thread_id: Some(0x3090),
+            thread_start_address: Some(0x7ff8_7061_6440),
+            thread_start_symbol: Some((DBG_UI_REMOTE_BREAKIN_SYMBOL.into(), 0)),
+            exception_code: Some(STATUS_BREAKPOINT),
+            exception_address: Some(0x7ff8_7060_3f40),
+            first_chance: Some(true),
+            inspection_errors: Vec::new(),
+        };
+        assert!(stop.is_owned_pump_deadline_break(true));
+        assert!(!stop.is_owned_pump_deadline_break(false));
+
+        for field in 0..7 {
+            let mut changed = stop.clone();
+            match field {
+                0 => changed.event_thread_id = None,
+                1 => changed.thread_id = None,
+                2 => changed.exception_code = Some(0x8000_0004),
+                3 => changed.exception_address = Some(changed.instruction_pointer + 1),
+                4 => changed.first_chance = Some(false),
+                5 => changed.instruction_symbol = Some((DBG_BREAKPOINT_SYMBOL.into(), 1)),
+                6 => changed.thread_start_symbol = Some(("ntdll!RtlUserThreadStart".into(), 0)),
+                _ => unreachable!(),
+            }
+            assert!(
+                !changed.is_owned_pump_deadline_break(true),
+                "field {field} was not required"
+            );
+        }
+
+        let source = include_str!("skdispatch.rs").replace("\r\n", "\n");
+        let disarm = source
+            .split_once("    fn pause_or_hold_running_target(\n")
+            .expect("the running disarm exists")
+            .1
+            .split_once("    fn pump_pending_transition_before_pause(\n")
+            .expect("the transition pump follows it")
+            .0;
+        let transition = source
+            .split_once("    fn pump_pending_transition_before_pause(\n")
+            .expect("the transition pump exists")
+            .1
+            .split_once("    fn unowned_stop(")
+            .expect("the attribution reader follows it")
+            .0;
+        for pump in [disarm, transition] {
+            let recognise = pump
+                .find("is_owned_pump_deadline_break(")
+                .expect("the pump recognises its exact queued deadline break");
+            pump[recognise..]
+                .find("resume_handled = true;")
+                .expect("the recognised exception is marked handled");
+            assert!(pump.contains("std::mem::take(&mut resume_handled)"));
+            assert!(pump.contains("\"gh\""));
+        }
+    }
+
     /// Measured 2026-10-24 (M7.1a run 20261024T210251): with the trace armed, the stop path ran a
     /// settle that accepted only its own deadline, and the event that arrived inside it faulted the
     /// session. An arrival is the disarm point whatever else the slice reports.
@@ -8937,7 +9280,7 @@ mod tests {
             .find("VmTransition::immediate(")
             .expect("the pump asks Hyper-V to pause");
         let first_slice = pump
-            .find("execute_and_wait(\"g\"")
+            .find("execute_and_wait(command,")
             .expect("the pump runs vmwp");
         assert!(
             pause < first_slice,
