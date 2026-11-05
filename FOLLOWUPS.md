@@ -2407,7 +2407,8 @@ cycle 6's wake went that way, or took the path `WaitActivity::enter` returns wit
   live result are recorded below.
 - **K3 requalification, 2026-11-04:** the generated sklab workflow was available after all; the
   absent environment variables were not a bench limitation because `validate.m8` generates and
-  injects them. The current tree passed the required 75/75 cycles on three clean K3 boots in runs
+  injects them. The tree then on the bench, which answered as `0.23.0+g740fb5c4-dirty.17e266ef`,
+  passed the required 75/75 cycles on three clean K3 boots in runs
   `20261104T195945-validate-m8-3592f8`, `20261104T200849-validate-m8-501fc4` and
   `20261104T201714-validate-m8-62dca3`. Their `vmwp` PIDs were 9888, 7084 and 7832, their partition
   ids were `0x46`, `0x47` and `0x48`, and their Secure Kernel bases were respectively
@@ -2415,20 +2416,37 @@ cycle 6's wake went that way, or took the path `WaitActivity::enter` returns wit
   its boot and `vmwp` identity, reported a healthy heartbeat at 0, 30 and 60 seconds, restored
   DR0--DR3 to zero and DR7 to `0x400`, and preserved the guarded text. Five further 25-cycle
   batches on the third boot also passed in runs beginning `20261104T202529`, `203356`, `204130`,
-  `204905` and `205639`: 200/200 new cycles in all. None logged an unowned stop or
-  `dispatcher drained its queued deadline break`, so the rare live branch was not exercised; the
-  clean result is requalification evidence, not a claim that the recurrence was captured.
+  `204905` and `205639`: 125 more cycles, 200/200 across the eight runs. None logged an unowned
+  stop or `dispatcher drained its queued deadline break`, so the rare live branch was not
+  exercised; the clean result is requalification evidence, not a claim that the recurrence was
+  captured.
+- **Final-tree run, 2026-11-05:** the two review commits that followed, `6b5abff8` and `68a3b8e5`,
+  changed the pump again after the eight runs above. The second moved the token out of each pump
+  and into dispatcher state, so a run to an owned breakpoint now spends it too. Merged `main`,
+  answering as a clean `0.23.0+g68a3b8e5`, passed one composite on a fresh K3 boot in run
+  `20261105T153332-validate-m8-c5c319`. That run completed 25/25 cycles, released with
+  `recovery_required: false`, and ran on `vmwp` PID 7744, partition id `0x49` and Secure Kernel
+  base `0xfffff8036651a000`. Its audit, `20261105T154000-validate-kd-post-audit-6d2573`, passed:
+  - heartbeat OK on the same boot and `vmwp` at 0, 30 and 60 seconds;
+  - DR0--DR3 zero, DR7 `0x400`, and TF and RF clear;
+  - the guarded text unchanged.
+
+  This run also logged no unowned stop and no `dispatcher drained its queued deadline break`. Its
+  `dispatcher passed an event it does not own at the site` lines number 431, where `3592f8` logged
+  429 and `abf7a6` 432.
 
 - **What would close it:** capture the new attribution and handled-drain marker on a live vmwp
-  recurrence. The current tree has passed M8's three-clean-boot composite gate; what remains is the
-  rare branch itself. If the attributed stop is not the exact break-in signature above, it remains
-  fail-closed and the item becomes the question of what raised a breakpoint in `vmwp`.
+  recurrence. The tree before review passed M8's three-clean-boot composite gate, and merged
+  `main` passed one further boot; what remains is the rare branch itself. If the attributed stop is
+  not the exact break-in signature above, it remains fail-closed and the item becomes the question
+  of what raised a breakpoint in `vmwp`.
 - **Why deferred:** the observed failure recovered safely: it restored the target and passed its
   audit. It has been seen once in 57 free-run break-ins attempted under that build, and zero times
-  in the 200 current-tree cycles above. The original count is the six before it, the failure itself,
-  and 25 on each of the other two composite boots under that build. Boot 1's 25 ran under a
-  different build, which the origin record below explains. A drain matched on a guess could consume
-  a stop that belongs to someone else, so the attribution comes first. M8's acceptance in
+  in the 225 cycles since: 200 on the 2026-11-04 tree and 25 on merged `main`. The original count
+  is the six before it, the failure itself, and 25 on each of the other two composite boots under
+  that build. Boot 1's 25 ran under a different build, which the origin record below explains. A
+  drain matched on a guess could consume a stop that belongs to someone else, so the attribution
+  comes first. M8's acceptance in
   [`docs/secure-kernel/m8-debugger.md`](docs/secure-kernel/m8-debugger.md) (three clean boots,
   75/75) is a pass on three boots, not a failure rate.
 - **Where it picks up:**
