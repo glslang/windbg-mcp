@@ -158,6 +158,7 @@ impl UnownedStop {
 }
 
 impl fmt::Display for UnownedStop {
+    /// Render every attribution field, preserving unknowns and secondary inspection failures.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -183,14 +184,17 @@ impl fmt::Display for UnownedStop {
     }
 }
 
+/// Render an optional 32-bit attribution field as hexadecimal or `unknown`.
 fn optional_hex_u32(value: Option<u32>) -> String {
     value.map_or_else(|| "unknown".into(), |value| format!("{value:#x}"))
 }
 
+/// Render an optional 64-bit attribution field as hexadecimal or `unknown`.
 fn optional_hex_u64(value: Option<u64>) -> String {
     value.map_or_else(|| "unknown".into(), |value| format!("{value:#x}"))
 }
 
+/// Render a resolved symbol and displacement, preserving an unresolved value as `unknown`.
 fn optional_symbol(symbol: Option<&(String, u64)>) -> String {
     symbol.map_or_else(
         || "unknown".into(),
@@ -198,12 +202,14 @@ fn optional_symbol(symbol: Option<&(String, u64)>) -> String {
     )
 }
 
+/// Match only the named symbol at zero displacement; partial symbol evidence is not ownership.
 fn exact_symbol(symbol: &Option<(String, u64)>, expected: &str) -> bool {
     symbol
         .as_ref()
         .is_some_and(|(name, displacement)| name == expected && *displacement == 0)
 }
 
+/// Read the selected local vmwp thread's Win32 start address for stop attribution.
 fn thread_start_address(thread_id: u32) -> Result<u64> {
     // SAFETY: the id came from DbgEng for the stopped local vmwp target. The handle is used only
     // for this query and closed before the function returns.
@@ -3021,10 +3027,12 @@ struct QueuedDeadlineBreak {
 }
 
 impl QueuedDeadlineBreak {
+    /// Consume provenance at the start of the one slice for which it is valid.
     fn begin_slice(&mut self) -> bool {
         std::mem::take(&mut self.before_next_slice)
     }
 
+    /// Remember only a deadline which raced an event-site arrival in the completed slice.
     fn observe_slice(&mut self, cut_short: Option<&Interruption>, at_event_site: bool) {
         debug_assert!(!self.before_next_slice);
         self.before_next_slice =
@@ -4219,6 +4227,7 @@ impl VmwpDispatcher<'_> {
         }
     }
 
+    /// Collect best-effort attribution without replacing the original stop with an inspection error.
     fn unowned_stop(&self, instruction_pointer: u64) -> UnownedStop {
         let mut inspection_errors = Vec::new();
         let event = match self.engine.last_event() {
@@ -9114,6 +9123,22 @@ mod tests {
             .expect("the attribution reader follows it")
             .0;
         for pump in [disarm, transition] {
+            for (call, message) in [
+                (
+                    "let pump_raised_deadline_break = queued_deadline_break.begin_slice();",
+                    "the pump consumes provenance at the start of its next slice",
+                ),
+                (
+                    ".filter(|stop| stop.is_owned_pump_deadline_break(pump_raised_deadline_break))",
+                    "the pump passes its consumed provenance to the exact ownership gate",
+                ),
+                (
+                    "queued_deadline_break.observe_slice(run.cut_short.as_ref(), at_event_site);",
+                    "the pump records a deadline race only after completing the slice",
+                ),
+            ] {
+                assert_eq!(pump.matches(call).count(), 1, "{message}");
+            }
             let recognise = pump
                 .find("is_owned_pump_deadline_break(")
                 .expect("the pump recognises its exact queued deadline break");
