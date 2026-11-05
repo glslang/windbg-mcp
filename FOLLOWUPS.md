@@ -2423,12 +2423,12 @@ cycle 6's wake went that way, or took the path `WaitActivity::enter` returns wit
   recurrence. The current tree has passed M8's three-clean-boot composite gate; what remains is the
   rare branch itself. If the attributed stop is not the exact break-in signature above, it remains
   fail-closed and the item becomes the question of what raised a breakpoint in `vmwp`.
-- **Why deferred:** the failure fails safe: recovery restored the target and the audit passed. It has
-  been seen once in 57 free-run break-ins attempted under that build, and zero times in the 200
-  current-tree cycles above. The original count is the six before it, the failure itself, and 25
-  on each of the other two composite boots under that build. Boot 1's 25 ran under a different
-  build, which the origin record below explains. A drain matched on a guess could consume a stop
-  that belongs to someone else, so the attribution comes first. M8's acceptance in
+- **Why deferred:** the observed failure recovered safely: it restored the target and passed its
+  audit. It has been seen once in 57 free-run break-ins attempted under that build, and zero times
+  in the 200 current-tree cycles above. The original count is the six before it, the failure itself,
+  and 25 on each of the other two composite boots under that build. Boot 1's 25 ran under a
+  different build, which the origin record below explains. A drain matched on a guess could consume
+  a stop that belongs to someone else, so the attribution comes first. M8's acceptance in
   [`docs/secure-kernel/m8-debugger.md`](docs/secure-kernel/m8-debugger.md) (three clean boots,
   75/75) is a pass on three boots, not a failure rate.
 - **Where it picks up:**
