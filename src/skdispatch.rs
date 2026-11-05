@@ -1962,6 +1962,9 @@ pub(crate) struct VmwpDispatcherState {
     last_registered_context: Option<u64>,
     scratch_allocated: bool,
     breakpoint: Option<OwnedBreakpoint>,
+    /// One-shot provenance for a deadline break which may arrive on the next DbgEng wait, even
+    /// when an event-site stop leaves the pump before that wait occurs.
+    queued_deadline_break: QueuedDeadlineBreak,
     /// Queued hits on the discovery entry, taken by other vmwp threads before its breakpoint was
     /// removed and continued handled while the partition call ran.
     late_discovery_hits: u32,
@@ -2027,6 +2030,7 @@ impl VmwpDispatcherState {
             last_registered_context: None,
             scratch_allocated: false,
             breakpoint: None,
+            queued_deadline_break: QueuedDeadlineBreak::default(),
             late_discovery_hits: 0,
             phase: DispatcherPhase::Fresh,
             attached: false,
@@ -3936,7 +3940,6 @@ impl VmwpDispatcher<'_> {
             .unwrap_or_else(|| Instant::now() + Duration::from_millis(u64::from(DEBUG_WAIT)));
         let mut resume_handled = false;
         let mut drained_deadline_breaks = 0usize;
-        let mut queued_deadline_break = QueuedDeadlineBreak::default();
         loop {
             let remaining = bound.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -3948,7 +3951,7 @@ impl VmwpDispatcher<'_> {
             }
             let slice = remaining.min(DISARM_PUMP_SLICE);
             let timeout = slice.as_millis().clamp(1, u128::from(u32::MAX)) as u32;
-            let pump_raised_deadline_break = queued_deadline_break.begin_slice();
+            let pump_raised_deadline_break = self.state.queued_deadline_break.begin_slice();
             let command = if std::mem::take(&mut resume_handled) {
                 "gh"
             } else {
@@ -3963,6 +3966,9 @@ impl VmwpDispatcher<'_> {
             }
             let rip = self.engine.instruction_pointer().map_err(debugger)?;
             let at_event_site = rip == event_site;
+            self.state
+                .queued_deadline_break
+                .observe_slice(run.cut_short.as_ref(), at_event_site);
             let unowned_stop =
                 (run.cut_short.is_none() && !at_event_site).then(|| self.unowned_stop(rip));
             if let Some(stop) = unowned_stop
@@ -4057,7 +4063,6 @@ impl VmwpDispatcher<'_> {
                     )
                 }
             }
-            queued_deadline_break.observe_slice(run.cut_short.as_ref(), at_event_site);
         }
     }
 
@@ -4092,7 +4097,6 @@ impl VmwpDispatcher<'_> {
         let mut resume_handled = false;
         let mut drained_native_returns = 0usize;
         let mut drained_deadline_breaks = 0usize;
-        let mut queued_deadline_break = QueuedDeadlineBreak::default();
         loop {
             let remaining = bound.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -4104,7 +4108,7 @@ impl VmwpDispatcher<'_> {
             }
             let slice = remaining.min(DISARM_PUMP_SLICE);
             let timeout = slice.as_millis().clamp(1, u128::from(u32::MAX)) as u32;
-            let pump_raised_deadline_break = queued_deadline_break.begin_slice();
+            let pump_raised_deadline_break = self.state.queued_deadline_break.begin_slice();
             let command = if std::mem::take(&mut resume_handled) {
                 "gh"
             } else {
@@ -4119,6 +4123,9 @@ impl VmwpDispatcher<'_> {
             }
             let rip = self.engine.instruction_pointer().map_err(debugger)?;
             let at_event_site = rip == event_site;
+            self.state
+                .queued_deadline_break
+                .observe_slice(run.cut_short.as_ref(), at_event_site);
             if at_event_site
                 && let Some((event_pointer, event)) =
                     self.classify_event_at_site(targets, event_site)?
@@ -4223,7 +4230,6 @@ impl VmwpDispatcher<'_> {
                     )
                 }
             }
-            queued_deadline_break.observe_slice(run.cut_short.as_ref(), at_event_site);
         }
     }
 
@@ -6602,6 +6608,7 @@ impl VmwpDispatcher<'_> {
                 bail!("the debugger did not reach the owned breakpoint before its deadline");
             }
             let timeout = remaining.as_millis().clamp(1, u128::from(u32::MAX)) as u32;
+            let pump_raised_deadline_break = self.state.queued_deadline_break.begin_slice();
             let command = if resume_handled { "gh" } else { "g" };
             let run = self
                 .engine
@@ -6616,13 +6623,14 @@ impl VmwpDispatcher<'_> {
             if run.target_gone {
                 bail!("vmwp left the debugger while an owned breakpoint was pending");
             }
+            let rip = self.engine.instruction_pointer().map_err(debugger)?;
             if let Some(interruption) = run.cut_short {
                 match interruption {
                     Interruption::OnRequest => {
                         // The event-site breakpoint may have won the race with the request. Keep
                         // that real guest stop; treating it as a wake would discard the native
                         // event that the controller is already at the exact owned site to retain.
-                        if self.engine.instruction_pointer().map_err(debugger)? == expected {
+                        if rip == expected {
                             return Ok(());
                         }
                         if matches!(self.state.phase, DispatcherPhase::ReadyForStop) {
@@ -6638,9 +6646,7 @@ impl VmwpDispatcher<'_> {
                         }
                         bail!("the debugger wait was interrupted on request")
                     }
-                    Interruption::Deadline { .. }
-                        if self.engine.instruction_pointer().map_err(debugger)? == expected =>
-                    {
+                    Interruption::Deadline { .. } if rip == expected => {
                         return Ok(());
                     }
                     Interruption::Deadline { .. }
@@ -6658,8 +6664,22 @@ impl VmwpDispatcher<'_> {
                     }
                 }
             }
-            if self.engine.instruction_pointer().map_err(debugger)? == expected {
+            if rip == expected {
                 return Ok(());
+            }
+            if pump_raised_deadline_break {
+                let stop = self.unowned_stop(rip);
+                if stop.is_owned_pump_deadline_break(true) {
+                    resume_handled = true;
+                    tracing::info!(
+                        target: "windbg_mcp::secure_kernel_mutation",
+                        address = format_args!("{rip:#x}"),
+                        thread_id = stop.thread_id,
+                        thread_start_address = stop.thread_start_address.map(|address| format!("{address:#x}")),
+                        "dispatcher drained its queued deadline break before an owned breakpoint"
+                    );
+                    continue;
+                }
             }
             if let Some(retired) = retired
                 && self.is_queued_retired_hit(retired)?
@@ -9125,7 +9145,7 @@ mod tests {
         for pump in [disarm, transition] {
             for (call, message) in [
                 (
-                    "let pump_raised_deadline_break = queued_deadline_break.begin_slice();",
+                    "let pump_raised_deadline_break = self.state.queued_deadline_break.begin_slice();",
                     "the pump consumes provenance at the start of its next slice",
                 ),
                 (
@@ -9133,8 +9153,8 @@ mod tests {
                     "the pump passes its consumed provenance to the exact ownership gate",
                 ),
                 (
-                    "queued_deadline_break.observe_slice(run.cut_short.as_ref(), at_event_site);",
-                    "the pump records a deadline race only after completing the slice",
+                    ".observe_slice(run.cut_short.as_ref(), at_event_site);",
+                    "the pump records a deadline race immediately after completing the slice",
                 ),
             ] {
                 assert_eq!(pump.matches(call).count(), 1, "{message}");
@@ -9147,7 +9167,34 @@ mod tests {
                 .expect("the recognised exception is marked handled");
             assert!(pump.contains("std::mem::take(&mut resume_handled)"));
             assert!(pump.contains("\"gh\""));
+            let waited = pump
+                .find(".execute_and_wait(command, timeout)")
+                .expect("the pump performs its bounded wait");
+            let observed = pump
+                .find(".observe_slice(run.cut_short.as_ref(), at_event_site);")
+                .expect("the pump records the completed slice");
+            let processed = pump[observed..]
+                .find("self.classify_event_at_site(")
+                .map(|offset| observed + offset)
+                .expect("the pump processes an event-site stop after its bounded wait");
+            assert!(
+                waited < observed && observed < processed,
+                "deadline provenance is recorded before event processing can wait or return"
+            );
         }
+
+        let owned_wait = source
+            .split_once("    fn run_to_owned_breakpoint(\n")
+            .expect("the owned-breakpoint wait exists")
+            .1
+            .split_once("    /// A stop that is a breakpoint taken before")
+            .expect("the owned-breakpoint wait ends")
+            .0;
+        assert!(owned_wait.contains(
+            "let pump_raised_deadline_break = self.state.queued_deadline_break.begin_slice();"
+        ));
+        assert!(owned_wait.contains("stop.is_owned_pump_deadline_break(true)"));
+        assert!(owned_wait.contains("resume_handled = true;"));
     }
 
     /// Measured 2026-10-24 (M7.1a run 20261024T210251): with the trace armed, the stop path ran a
