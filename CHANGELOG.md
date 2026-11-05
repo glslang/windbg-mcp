@@ -7,7 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-11-05
+
 ### Added
+
+- **The `h3probe` driver and its two providers now live in this repository, selected as
+  `builtin:h3probe`** (`FOLLOWUPS.md` item 133). Live Secure Kernel sessions used to need two Python
+  providers and a driver kept in `secure-kernel-lab`. `drivers/h3probe/` now carries the driver's
+  source, build script and operator notes, and no binary: the operator still builds, installs and
+  starts it. Its generic hypercall IOCTL accepts only `HvCallGetVpRegisters` and
+  `HvCallSetVpRegisters`, an unknown IOCTL is refused, and the device opens only to administrators
+  and SYSTEM, with `FILE_DEVICE_SECURE_OPEN`. The startup policy admits the reserved transport name
+  `builtin:h3probe`, and the worker expands it to its own executable with `--sk-h3-control` or
+  `--sk-h3-memory`. Each role runs in a child process with its
+  own device handle, so a stuck `DeviceIoControl` costs one session, and a replaced binary is never
+  paired with an older provider. The supervisor still never opens the device or starts or stops
+  its service, and an operator-supplied provider is still accepted. `--sk-h3-audit` is the
+  post-release audit and `--sk-h3-qualify` the driver qualification. The ignored
+  `tests/h3probe_live.rs` tier runs both against a disposable VM: a mapped, refused and range
+  corpus, concurrent callers, a guarded write and its restoration, a killed provider, a service
+  stop under load, and a stale identity after a VM restart. Passed on three fresh K3 boots on
+  2026-11-01, each followed by M8's 25-cycle composite gate and the managed-KD symbol and unwind
+  gate.
 
 - **`windbg-mcp --sk-discover-identity` runs live control's vmwp discovery on its own.** It pauses
   the VM, attaches, samples the dispatcher entry and calls `VidGetHvPartitionId` on a hijacked
@@ -383,6 +404,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   2026-09-10; no dependency moves here.
 
 ### Fixed
+
+- **The live-control pump drains its own deadline break-in and attributes any other stop it does
+  not own** (`FOLLOWUPS.md` item 134). A pump slice is a bounded `g`, and dbgscope ends one that
+  reaches its bound with a DbgEng break-in. If that deadline lands just as the site event arrives,
+  the wait can return for the event and leave the break queued for the next `g`. That is the
+  leading explanation, not an established one, for the one failure in 57 M8 free-run break-ins in
+  which the transition drain stopped at `ntdll!DbgBreakPoint` and failed the session into
+  recovery. When a pump's own deadline coincides with a site arrival, the dispatcher
+  now keeps a one-slice token. The next run, whether another pump slice or the run to an owned
+  breakpoint, consumes a stop with `gh` only if it matches the signature measured on a local
+  process: first-chance `0x80000003` at `ntdll!DbgBreakPoint`, on a thread started at
+  `ntdll!DbgUiRemoteBreakin`. That run spends the token whether or not the stop matches. Every
+  other unowned stop still fails closed, and now carries its event process and thread ids, OS
+  thread id, thread start address, exception code and first-chance flag beside the RIP. Before the
+  token moved into the dispatcher, the change passed 75/75 on three clean K3 boots and 125 further
+  cycles, and the final tree passed 25/25 on a fourth boot on 2026-11-05. None of them reached this
+  branch, so the drain has not yet fired live and the item stays open.
 
 - **A queued hit on the discovery entry no longer contains vmwp.** Two dispatcher threads can take
   the entry breakpoint before the first event is reported, and the second hit is delivered on the
@@ -7378,7 +7416,8 @@ Initial release, packaged as a single-plugin Claude Code marketplace.
 - Crash-dump `!analyze` support via automatic WinDbg extension DLL loading.
 - Windows CI (format, clippy, build, test) and walkthrough docs with sample dumps.
 
-[Unreleased]: https://github.com/glslang/windbg-mcp/compare/v0.23.0...HEAD
+[Unreleased]: https://github.com/glslang/windbg-mcp/compare/v0.24.0...HEAD
+[0.24.0]: https://github.com/glslang/windbg-mcp/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/glslang/windbg-mcp/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/glslang/windbg-mcp/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/glslang/windbg-mcp/compare/v0.20.0...v0.21.0
