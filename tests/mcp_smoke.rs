@@ -20964,19 +20964,20 @@ fn ttd_queries_answer_with_the_fields_they_promise() {
 /// 151 ms against a 1 ms bound and came back `S_OK` at the breakpoint — no wedge, and no bound
 /// either.
 ///
-/// **Where the interrupted replay is left is printed, not asserted**, and that is item 125. TTD's
-/// banner says "approximately how far we had gone". Measured thirteen times with a breakpoint
-/// ahead, eleven runs were left past it — at the trace's boundary, wherever the position was read,
-/// and reported as nothing in particular — and two at the breakpoint itself, with no
-/// `Breakpoint 0 hit`. Neither is where the replay was when it was broken in, and which a run gets
-/// is TTD's to decide, so an assertion either way would be a coin. The breakpoint is what makes the
-/// line mean something: the unbounded control stops at it, so a cut-short run that is not at it and
-/// then goes on to the end without meeting it has skipped it.
+/// **And the interrupted replay is put back where it started** (item 125). TTD's banner says
+/// "approximately how far we had gone", and then leaves the replay somewhere of its own choosing:
+/// measured thirteen times on ARM64 with a breakpoint ahead, eleven runs past it at the trace's
+/// boundary and two at the breakpoint itself with no `Breakpoint 0 hit` — so this test used to
+/// print the landing, an assertion either way being a coin. With the run put back, the landing is
+/// this server's, and it is asserted three ways: the stop says `rewound` at the position it
+/// started from, the instruction pointer is the one read before the run, and **going on reaches
+/// the breakpoint** — which is the property, since what TTD did was skip it. The breakpoint is what
+/// makes that last one mean something: the unbounded control stops at it.
 ///
 /// `ntdll!RtlExitUserProcess` because every process passes it once, near the end of the trace, and
 /// it is an export, so it resolves on a host with no symbol server. `run_to_address` is aimed at
-/// the image's own header instead, which nothing executes, so its verdict cannot be a hit whichever
-/// way TTD lands.
+/// the image's own header instead, which nothing executes, so its verdict cannot be a hit; it is put
+/// back the same way, through dbgscope's `run_to_address` rather than its `settle`.
 ///
 /// [#226]: https://github.com/glslang/windbg-mcp/issues/226
 #[test]
@@ -21016,6 +21017,9 @@ fn ttd_a_replay_broken_in_at_its_bound_says_so_and_leaves_the_session_usable() {
         "an unbounded `go` should stop where the process exits: {control}"
     );
     rewind(&mut server);
+    let started_at = server.tool_data("registers", json!({ "session_id": &session }), TARGET_STEP)
+        ["instruction_pointer"]
+        .clone();
 
     // A millisecond against a replay of about a hundred: the watchdog fires while TTD is still
     // replaying, so the pump has to come back with a deadline rather than a stop.
@@ -21048,23 +21052,38 @@ fn ttd_a_replay_broken_in_at_its_bound_says_so_and_leaves_the_session_usable() {
         "the session is unusable after a replay that was broken in: {after}"
     );
 
-    // Item 125: where TTD left it, read off the breakpoint rather than off TTD's position text.
-    // Going on and coming back are asserted, because a session that answers `registers` and then
-    // cannot move is the other half of what #226 found.
-    let left_at = address_of(&stop["stopped_at"]);
+    // Item 125: put back where the run started, and said so as a value. The position is TTD's own
+    // `Sequence:Steps`, so it is checked for shape and for agreeing with the instruction pointer
+    // rather than against a number this trace happens to produce.
+    let replay = &stop["replay"];
+    assert_eq!(
+        replay["rewound"], true,
+        "a replay broken in must be put back where it started, not left where TTD put it: \
+         {waited}"
+    );
+    assert!(
+        replay["position"]
+            .as_str()
+            .is_some_and(|position| position.split_once(':').is_some()),
+        "the position travelled back to, as `Sequence:Steps`: {waited}"
+    );
+    assert_eq!(
+        stop["stopped_at"], started_at,
+        "put back means at the instruction the run started from: {waited}"
+    );
+    // And the property itself: going on reaches the breakpoint TTD's landing used to skip. Moving
+    // on and back is also the other half of what #226 found — a session that answers `registers`
+    // and then cannot move.
     let on = server.tool_data("go", json!({ "session_id": &session }), TARGET_STEP);
     assert_eq!(
         on["timed_out"], false,
         "the replay should still move forward: {on}"
     );
-    let landing = if left_at == exit {
-        "AT the breakpoint, with no hit reported"
-    } else if address_of(&on["stopped_at"]) == exit {
-        "SHORT of the breakpoint, which going on then reached"
-    } else {
-        "PAST the breakpoint, which going on never reached"
-    };
-    println!("item 125: a replay broken in at its bound was left {landing}");
+    assert_eq!(
+        address_of(&on["stopped_at"]),
+        exit,
+        "going on from a replay put back must reach the breakpoint ahead of it: {on}"
+    );
     let back = server.tool_data("reverse_go", json!({ "session_id": &session }), TARGET_STEP);
     assert_eq!(
         back["timed_out"], false,
@@ -21092,10 +21111,18 @@ fn ttd_a_replay_broken_in_at_its_bound_says_so_and_leaves_the_session_usable() {
         TARGET_STEP,
     );
     assert_eq!(run_to["verdict"], "timeout", "{run_to}");
+    assert_eq!(
+        run_to["replay"]["rewound"], true,
+        "a `run_to_address` cut short on a replay is put back as a `go` is: {run_to}"
+    );
     let after = server.call_tool("registers", json!({ "session_id": &session }), TARGET_STEP);
     assert!(
         !is_tool_error(&after),
         "the session is unusable after a `run_to_address` that timed out on a replay: {after}"
+    );
+    assert_eq!(
+        after["result"]["structuredContent"]["instruction_pointer"], started_at,
+        "put back to the same start the first run was: {after}"
     );
 
     server.tool_text("end_session", json!({ "session_id": session }), TARGET_STEP);

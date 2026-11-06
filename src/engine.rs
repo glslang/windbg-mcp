@@ -3337,8 +3337,9 @@ impl Sessions {
     ///
     /// The graceful counterpart to [`Self::end`], and the reason both exist: `end_session` also
     /// ends a runaway command, but by throwing away the target it was running against. Here the
-    /// operation returns to *its own* caller — with whatever it had reached — and the session is
-    /// ready for the next call.
+    /// operation returns to *its own* caller — with whatever it had reached, or on a TTD replay
+    /// put back where it started (`StopReport::replay`) — and the session is ready for the next
+    /// call.
     ///
     /// Its own short budget rather than the call timeout, because this waits on nothing that can
     /// run long. The worker answers from its request reader, which is never blocked by the engine
@@ -8302,6 +8303,7 @@ mod tests {
                     processor: None,
                     interrupted: false,
                     timed_out: false,
+                    replay: None,
                     target_gone: false,
                     output: String::new(),
                 },
@@ -8557,6 +8559,7 @@ mod tests {
                         processor: None,
                         interrupted: false,
                         timed_out: false,
+                        replay: None,
                         target_gone: false,
                         output: String::new(),
                     },

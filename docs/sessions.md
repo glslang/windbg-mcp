@@ -67,7 +67,10 @@ Ctrl+Break does at a WinDbg prompt, and leaves the session and its target alone.
 slow call is still outstanding — it travels on the session's queue but is answered by the worker's
 *request reader*, so it does not queue behind the operation it is meant to stop. That operation ends
 at the debugger's next poll and returns whatever it had reached **to the call that started it**,
-marked as cut short, and the session takes the next call immediately. It is bound to the job that
+marked as cut short, and the session takes the next call immediately. A run on a **TTD replay** is
+the exception: TTD does not leave an interrupted replay where it had got to but moves it somewhere
+of its own choosing — usually past every breakpoint ahead — so the run is put back where it
+started, and its stop's `replay` field says so (`rewound`, and the position). It is bound to the job that
 was running when it arrived, so it can never land on the one after it; with nothing running it says
 so and does nothing. Two things it cannot reach, both properties of the debugger: an operation that
 never polls for the break, and the parked kernel attach below.

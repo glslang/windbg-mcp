@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A TTD replay that is broken in is put back where its run started, and the stop says so**
+  (`FOLLOWUPS.md` item 125). TTD does not leave an interrupted replay where it had got to: it
+  prints "the current position is approximately how far we had gone" and then, measured on ARM64
+  and x64, usually moves it to the trace's end, past every breakpoint the run had not reached, with
+  no hit reported. A caller then concluded a breakpoint ahead was never hit. Now every bounded
+  resume on a replay reads the position first, through the debugger data model, and a run cut short
+  at its bound, by `break_in` or by `interrupt` travels back to it and reads the position and thread
+  again to confirm. That covers `go`, the steps, the reverses, `continue_async`, `run_to_address`,
+  `debug_batch` resumes and a raw `execute` of `g`. The stop and the `run_to_address` verdict carry
+  a `replay` field (`rewound`, `position`, and `started_at` when the travel back failed), and the
+  text replaces the "where it happened to be" wording. A replay `run_to_address` timeout no longer
+  suggests the input does not reach the address. Needs dbgscope's `ttd_position` and
+  `ReplayLanding`.
+
 ## [0.24.0] - 2026-11-05
 
 ### Added

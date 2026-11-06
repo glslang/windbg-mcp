@@ -351,9 +351,9 @@ None of these is a bug. They are recorded because they were invisible, and
    |---|---:|---:|---:|
    | `allocator` | 12 | 19,807 | 14.2% |
    | `ioctl` | 11 | 16,088 | 11.5% |
-   | `securekernel` | 23 | 35,941 | 25.8% |
+   | `securekernel` | 23 | 35,941 | 25.7% |
    | `exec` | 10 | 15,087 | 10.8% |
-   | `session` | 10 | 14,208 | 10.2% |
+   | `session` | 10 | 14,380 | 10.3% |
    | `inspect` | 10 | 13,485 | 9.7% |
    | `batch` | 1 | 10,296 | 7.4% |
    | `crash` | 3 | 7,473 | 5.4% |
@@ -361,11 +361,11 @@ None of these is a bug. They are recorded because they were invisible, and
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 66 | 103,534 |
-   | `all` | 89 | 139,475 |
-   | `session,inspect,exec,crash` | 33 | 49,332 |
-   | `session,inspect,crash` | 23 | 34,092 |
-   | `crash` | 13 | 20,515 |
+   | *(absent)* | 66 | 103,706 |
+   | `all` | 89 | 139,647 |
+   | `session,inspect,exec,crash` | 33 | 49,504 |
+   | `session,inspect,crash` | 23 | 34,264 |
+   | `crash` | 13 | 20,687 |
 
    M2's direct `sk_live_break` addition moves the complete surface from 79 tools and 125,448 B to
    **80 tools and 125,938 B**. On the wire it moves 354,262 -> **359,927 B**: 5,242 B for the new
@@ -426,17 +426,20 @@ None of these is a bug. They are recorded because they were invisible, and
    adds 146 B to both current totals, bringing the surface to **139,560 B** and the payload to
    **414,076 B**. Deleting `sk_live_continue_to_breakpoints`'s sentence saying the facade did not
    route `g` through it, which M8.0 made untrue, then takes 85 B from both, to **139,475 B** and
-   **413,991 B**. The model and wire ceilings remain **142,000 B** and **420,000 B**, leaving 2,525
-   B (1.8%) and 6,009 B (1.4%) respectively.
+   **413,991 B**. Item 125 (2026-11-06) adds 172 B to `interrupt`'s description — the sentence
+   saying a run on a TTD replay is put back where it started — and 249 B to each of the eight output
+   schemas that carry a stop (`StopReport::replay`, and `RunToReport::replay` on `run_to_address`),
+   which no model sees: **139,647 B** and **416,155 B**. The model and wire ceilings remain
+   **142,000 B** and **420,000 B**, leaving 2,353 B (1.7%) and 3,845 B (0.9%) respectively.
 
    **The two tables do not reconcile, and that is the point of item 41.** The first is each group's
    share of the whole surface; the second is what a spec actually serves, which is less — `crash`
-   is 20,515 rather than the 21,681 its two rows sum to, because the cross-references leave with
+   is 20,687 rather than the 21,853 its two rows sum to, because the cross-references leave with
    the tools they name — 1,166 B of them, pointing at `modules`, `debug_batch`, `backtrace`,
    `continue_async` and `break_in`.
 
    `session` is in every surface because every other tool routes by a `session_id` this server is
-   the only issuer of — 12,910 B is the floor, and `crash` is thirteen tools rather than three. The
+   the only issuer of — 14,380 B is the floor, and `crash` is thirteen tools rather than three. The
    flag is a **run's** choice, and on a listener it is the *default*: a named client may be
    configured with a spec of its own (`WINDBG_MCP_TOOLS_<NAME>`), so the figures above are per
    client rather than per server — which is what lets a local model and a hosted client share one
@@ -461,7 +464,7 @@ put in a group would vanish from the default and every named-group surface witho
 explicit `all` would still carry it. And
 `a_narrowed_tool_surface_serves_only_what_it_was_asked_for` starts a server with `--tools crash` and
 checks the three things that makes true: thirteen tools, a refusal by name for a tool that exists
-and is not served, and a figure under half the whole surface (currently 20,515 B).
+and is not served, and a figure under half the whole surface (currently 20,687 B).
 
 Beside them, `output_schemas_carry_constraints_not_prose` is the
 assertion that finding 1 stays fixed. It reads `tools/list` off the wire, so it catches the way that

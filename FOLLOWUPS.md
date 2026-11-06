@@ -84,7 +84,6 @@ reopen it). An unmarked line is simply open.
 - [Item 117](#117-windbg-mcp-the-kd-facade-pipe-has-only-the-default-acl-no-client-authentication-and-no-break-in) — [windbg-mcp] The KD facade pipe has only the default ACL, no client authentication and no break-in
 - [Item 121](#121-windbg-mcp-tracing-pool-allocations-on-an-x86-kernel) — [windbg-mcp] Tracing pool allocations on an x86 kernel — **half landed** (the x86 reader, measured in user mode, 2026-10-13; a trace on a live x86 kernel is what is left)
 - [Item 122](#122-windbg-mcp-a-live-secure-kernel-session-has-no-image-to-resolve-names-or-instructions-against) — [windbg-mcp] A live Secure Kernel session has no image to resolve names or instructions against
-- [Item 125](#125-windbg-mcp--dbgscope-an-interrupted-replay-is-left-where-ttd-puts-it-not-where-it-had-got-to) — [windbg-mcp + dbgscope] An interrupted replay is left where TTD puts it, not where it had got to
 - [Item 127](#127-windbg-mcp-the-code-scans-decode-by-the-stops-effective-machine-not-the-images) — [windbg-mcp] The code scans decode by the stop's effective machine, not the image's
 - [Item 128](#128-windbg-mcp-the-ttd-tier-records-whichever-hostname-the-shells-path-resolves) — [windbg-mcp] The TTD tier records whichever hostname the shell's PATH resolves
 - [Item 129](#129-windbg-mcp-the-live-secure-kernel-tier-takes-a-boots-coordinates-from-a-private-prep-the-kd-gate-discovers-for-itself) — [windbg-mcp] The live Secure Kernel tier takes a boot's coordinates from a private prep the KD gate discovers for itself
@@ -1992,77 +1991,6 @@ process down mid-run (Hyper-V event 3040, "could not initialize"), ending the gu
   test in `tests/mcp_smoke.rs`; and the live-tier field list in
   [`docs/smoke-test.md`](./docs/smoke-test.md).
 
-## 125. [windbg-mcp + dbgscope] An interrupted replay is left where TTD puts it, not where it had got to
-
-**What happens.** On a TTD replay target, a run that is broken in — at its own bound
-(`timed_out`) or by a `break_in` (`interrupted`) — is not left where the replay was when the break
-landed. TTD prints *"Replay was interrupted by the user. The current position is approximately how
-far we had gone."*, and then, in eleven of thirteen runs measured with a breakpoint ahead, the
-cursor is **past** that breakpoint: at the trace's end for a forward run and at its start for a
-reverse one, wherever the position was read. The other two stopped *at* the breakpoint, with no
-`Breakpoint 0 hit` in the output. Neither is "how far we had gone": a 2 s bound on a replay that
-takes 16.6 s unbounded left the cursor at `Percent: 100.000000`.
-
-**Why it matters more than it looks.** The breakpoint is skipped silently. The stop reads
-`timed_out: true` at the end-of-trace IP, and the *next* `go` answers `TTD: End of trace reached.`
-with `timed_out: false` — an ordinary stop, from which a caller concludes the breakpoint is never
-hit. `reverse_go` then finds it, which is the only recovery, and nothing points there. This
-server's model-visible prose says the opposite: `interrupt`'s description and the detail
-`worker::interrupt_running` returns both say an interrupted operation "returns whatever it had
-reached". On a live target that is true; on a replay it is not. `StopReport::interrupted`'s doc
-comment said the same and now carries the exception; the two client-facing sentences are left for
-the fix, to be reworded against whichever behaviour it lands rather than ahead of it.
-
-**Measured** on the ARM64 bench, 2026-10-13, through the service's shipped tools at
-`0.22.0+gbfd1f388`, TTD 1.11.610.0, `dbgeng` 10.0.29617.1000. The traces are `cmd.exe /c for /L`
-loops of 200,000 and 1,000,000 iterations, and `hostname.exe`:
-
-| Trace | Breakpoint ahead | Unbounded | Broken in | Left at |
-| --- | --- | --- | --- | --- |
-| 692 MB, unindexed | `ntdll!LdrShutdownProcess`, `6E00C:DB3` | hit at 16,760 ms | `continue_async`, `max_run_ms: 2000` — 2,035 ms | `6E01E:0`, the end |
-| same | same | — | `break_in` at about 2.5 s | `6E01E:0`, the end |
-| same, `g-` from the end | `kernel32!BaseThreadInitThunk` | hit at 16,695 ms | `debug_batch` `resume` step, 2,000 ms — 2,049 ms | the start-of-trace IP |
-| 172 MB, **indexed** | `ntdll!LdrShutdownProcess`, `165EB:DB3` | hit at 106 ms | `max_run_ms: 1` — 128 ms | `165FB:0`, the end |
-| `hostname.exe`, two recordings | `LdrShutdownProcess`, then `RtlExitUserProcess` | hit | `max_run_ms: 1`, five runs by hand | the end, all five |
-| `hostname.exe`, the TTD tier's test | `ntdll!RtlExitUserProcess` | hit | `max_run_ms: 1`, four runs | past it twice, **at** it twice |
-
-Every run *without* a breakpoint ahead — five, both directions, bounds of 1 ms to 2 s — was left at
-the boundary too. So it is not the index, not the direction and not who asked for the break, and
-it is not this server: the position is the engine's own (`dx @$curthread.TTD.Position`).
-
-**What would close it is a choice, which is why it was filed rather than done with item 47.**
-
-- **Put the cursor back.** Read the position before a resume on a replay target and, when the run
-  comes back cut short, travel back to it and say so. A cut-short replay has then made no progress
-  — which is the truth, since TTD threw the progress away — no breakpoint is skipped, and the
-  caller retries with a longer bound. It wants a typed position read and seek in dbgscope (a new
-  primitive is a typed method there, never the `execute` text hatch), which TTD exposes through the
-  data model (`@$curthread.TTD.Position` and its `SeekTo`) and dbgscope does not bind yet. All
-  three bounded paths end in dbgscope's `pump` — `execute_and_wait`, `settle`, `run_to_address` —
-  so that is where it belongs, rather than in three callers here.
-- **Report it.** A typed field on the stop saying the position is TTD's rather than where the run
-  was, so a caller knows to reverse. Cheaper, and leaves the trap armed for any caller that does
-  not read the field.
-
-The first is the one that makes "returns whatever it had reached" true on every target; the second
-is what to fall back to if the seek turns out to cost something on a large unindexed trace, which
-nobody has measured.
-
-**The x64 bench answers the same way** (2026-10-13, the dev build at `008bfa6`, the tier run from
-PowerShell): the test's own line read `item 125: a replay broken in at its bound was left PAST the
-breakpoint, which going on never reached` — the eleven-of-thirteen case above, on a `hostname.exe`
-trace. One run, so it says the behaviour is not ARM64's alone and nothing about how often each
-landing occurs there. The tier's test prints its landing on every run (`item 125: …` under
-`--nocapture`).
-
-**Where it picks up.** dbgscope's `DebugEngine::pump` and the three of its callers a run goes
-through, in `src/dbgeng.rs`;
-here `worker::resumed`, `worker::pump_a_resume` and `worker::run_to_address`; `StopReport` in
-`src/structured.rs`; `interrupt`'s description in `src/server.rs` and the detail in
-`worker::interrupt_running`; and `ttd_a_replay_broken_in_at_its_bound_says_so_and_leaves_the_session_usable`
-in `tests/mcp_smoke.rs`, whose printed line is the measurement to turn into an assertion once there
-is a behaviour to assert.
-
 ## 127. [windbg-mcp] The code scans decode by the stop's effective machine, not the image's
 
 **Repo:** `windbg-mcp`. **Origin:** item 121's measurement, 2026-10-13.
@@ -2736,7 +2664,7 @@ changes CR3 rather than carried over it (123), and a review of what a passing ru
 establishes, which found that every assertion is of the Secure Kernel being *readable* and none of
 the memory being *protected* (124). Items 123 and 124 are now in [`DONE.md`](./DONE.md).
 Item 125 came from closing item 47 (2026-10-13): asking whether a replay can be broken in at its
-bound found that it can, and that TTD then leaves it somewhere it never reached.
+bound found that it can, and that TTD then leaves it somewhere it never reached — now in [`DONE.md`](./DONE.md).
 Item 126 came from closing item 105 the same day: the `||1s` failure item 102 could not explain
 had a reason all along, which `cdb` prints and this server did not pass on — now in
 [`DONE.md`](./DONE.md).
