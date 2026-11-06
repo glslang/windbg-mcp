@@ -860,8 +860,60 @@ pub struct RunToReport {
     pub stopped_at: Option<String>,
     /// The wait this verdict was reached under.
     pub timeout_ms: u32,
+    /// Where a TTD replay was put when this run timed out on one, as [`StopReport::replay`] has
+    /// it. Absent on every other target and every other verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay: Option<ReplayLanding>,
     /// The debugger text captured across the run.
     pub output: String,
+}
+
+/// Where a **TTD replay** was put when a run on it was cut short — at its bound, or by a break
+/// somebody asked for (`FOLLOWUPS.md` item 125).
+///
+/// TTD does not leave an interrupted replay where it had got to. It says *"the current position is
+/// approximately how far we had gone"* and then moves it somewhere of its own choosing — measured,
+/// usually the trace's end for a forward run, past every breakpoint ahead, and now and then a
+/// breakpoint itself, with no hit reported for any of them. A caller reading that as progress
+/// concludes the breakpoint is never hit. So the run is put back where it started, which makes a
+/// cut-short replay one that made no progress: the truth, since TTD threw the progress away.
+///
+/// A value here as well as a sentence in the text, because a client forwarding
+/// `structuredContent` drops the text, and this is the field that says the stop's position is not
+/// one the run reached.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReplayLanding {
+    /// Whether the replay was travelled back to where the run started, and confirmed there — the
+    /// position and the current thread both read back. `false` is the travel failing, which
+    /// leaves it wherever TTD put it.
+    pub rewound: bool,
+    /// Where the replay is now, as `Sequence:Steps` in hex — the form TTD prints a position in and
+    /// travels to. Absent when it could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<String>,
+    /// Where the run started, given only when the replay was **not** put back there: any
+    /// breakpoint between this and [`Self::position`] may have been passed without being hit.
+    /// Absent when it was put back (it is [`Self::position`] then), or could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+}
+
+impl From<dbgscope::dbgeng::ReplayLanding> for ReplayLanding {
+    fn from(landing: dbgscope::dbgeng::ReplayLanding) -> Self {
+        use dbgscope::dbgeng::ReplayLanding as Engine;
+        match landing {
+            Engine::Rewound { to } => Self {
+                rewound: true,
+                position: Some(to.to_string()),
+                started_at: None,
+            },
+            Engine::NotRewound { from, left_at } => Self {
+                rewound: false,
+                position: left_at.map(|at| at.to_string()),
+                started_at: from.map(|at| at.to_string()),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -910,9 +962,9 @@ pub struct StopReport {
     /// position is real either way, but it is where an `interrupt` landed rather than where the
     /// target was going, which is a different answer to "where did this stop?".
     ///
-    /// **Except on a TTD replay**, where it is not where the break landed either: TTD moves an
-    /// interrupted replay to a position of its own choosing — usually the trace's end, past every
-    /// breakpoint the run had not reached — whatever its own banner says (`FOLLOWUPS.md` item 125).
+    /// **Except on a TTD replay**, where it is where the run *started*: TTD moves an interrupted
+    /// replay to a position of its own choosing, usually past every breakpoint ahead, so the run is
+    /// put back — see [`Self::replay`] (`FOLLOWUPS.md` item 125).
     pub interrupted: bool,
     /// Whether this call's own wait ran out with the target still going, so the debugger broke it
     /// in at the bound.
@@ -924,6 +976,11 @@ pub struct StopReport {
     /// Defaulted so a record written before this field existed still reads.
     #[serde(default)]
     pub timed_out: bool,
+    /// Where a TTD replay was put when this run was cut short on one: back where the run started,
+    /// or — if that failed — wherever TTD left it. Absent on every other target and on a run that
+    /// was not cut short. See [`ReplayLanding`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay: Option<ReplayLanding>,
     /// Whether the target **went away** rather than stopping: the process ran to completion, or
     /// the command released it. Terminal, and not a failure — running a program to its end is
     /// what a `go` is for.

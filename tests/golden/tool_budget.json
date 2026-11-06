@@ -213,8 +213,8 @@
       "inputSchema": 343,
       "modelVisible": 469,
       "name": "go",
-      "outputSchema": 1567,
-      "wire": 2185
+      "outputSchema": 1816,
+      "wire": 2434
     },
     {
       "annotations": 118,
@@ -299,12 +299,12 @@
     },
     {
       "annotations": 132,
-      "description": 2560,
+      "description": 2732,
       "inputSchema": 343,
-      "modelVisible": 2953,
+      "modelVisible": 3125,
       "name": "interrupt",
       "outputSchema": 0,
-      "wire": 3100
+      "wire": 3272
     },
     {
       "annotations": 89,
@@ -501,8 +501,8 @@
       "inputSchema": 343,
       "modelVisible": 480,
       "name": "reverse_go",
-      "outputSchema": 1567,
-      "wire": 2201
+      "outputSchema": 1816,
+      "wire": 2450
     },
     {
       "annotations": 114,
@@ -510,8 +510,8 @@
       "inputSchema": 1823,
       "modelVisible": 2407,
       "name": "run_to_address",
-      "outputSchema": 1595,
-      "wire": 4147
+      "outputSchema": 1844,
+      "wire": 4396
     },
     {
       "annotations": 75,
@@ -708,8 +708,8 @@
       "inputSchema": 343,
       "modelVisible": 467,
       "name": "step_back",
-      "outputSchema": 1567,
-      "wire": 2181
+      "outputSchema": 1816,
+      "wire": 2430
     },
     {
       "annotations": 109,
@@ -717,8 +717,8 @@
       "inputSchema": 343,
       "modelVisible": 427,
       "name": "step_into",
-      "outputSchema": 1567,
-      "wire": 2134
+      "outputSchema": 1816,
+      "wire": 2383
     },
     {
       "annotations": 109,
@@ -726,8 +726,8 @@
       "inputSchema": 343,
       "modelVisible": 439,
       "name": "step_over",
-      "outputSchema": 1567,
-      "wire": 2146
+      "outputSchema": 1816,
+      "wire": 2395
     },
     {
       "annotations": 121,
@@ -735,8 +735,8 @@
       "inputSchema": 343,
       "modelVisible": 470,
       "name": "step_over_back",
-      "outputSchema": 1567,
-      "wire": 2189
+      "outputSchema": 1816,
+      "wire": 2438
     },
     {
       "annotations": 65,
@@ -780,8 +780,8 @@
       "inputSchema": 850,
       "modelVisible": 1559,
       "name": "wait_for_stop",
-      "outputSchema": 1929,
-      "wire": 3594
+      "outputSchema": 2178,
+      "wire": 3843
     },
     {
       "annotations": 125,
@@ -804,14 +804,14 @@
   ],
   "totals": {
     "annotations": 10036,
-    "description": 51322,
+    "description": 51494,
     "inputSchema": 83340,
     "instructions": 2022,
-    "modelVisible": 139475,
-    "outputSchema": 261861,
-    "payload": 413991,
+    "modelVisible": 139647,
+    "outputSchema": 263853,
+    "payload": 416155,
     "tools": 89,
-    "wire": 413891,
+    "wire": 416055,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10296
   }

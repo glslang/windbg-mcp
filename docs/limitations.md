@@ -544,14 +544,17 @@
   `timed_out` is set in the structured result and the text says so. It is not an error and not an
   `interrupt` — nobody asked — and the next move is to run the target on, or to give it something
   to stop at.
-- **On a TTD trace, a replay that is broken in is left where TTD puts it, not where it had got
-  to** — at its bound, through `break_in`, or by `interrupt` alike. TTD's banner says "the current
-  position is approximately how far we had gone"; measured on the ARM64 bench (TTD 1.11.610.0), it
-  is usually the trace's end for a forward run and its start for a reverse one, **past** any
-  breakpoint the run had not reached, and occasionally that breakpoint itself with no hit reported.
-  So after a `timed_out` or `interrupted` stop on a trace, a breakpoint ahead may have been skipped:
-  a `go` that then answers *End of trace reached* is not evidence that it is never hit, and
-  `reverse_go` finds it if it was passed. `FOLLOWUPS.md` item 125.
+- **On a TTD trace, a replay that is broken in makes no progress: it is put back where the run
+  started** — at its bound, through `break_in`, or by `interrupt` alike, and on `run_to_address`
+  and a raw `execute` of `g` as well as the typed resumes. TTD does not leave an interrupted replay
+  where it had got to, whatever its banner's "approximately how far we had gone" says: measured on
+  ARM64 (TTD 1.11.610.0) and x64 (1.11.617.0), it is usually the trace's end for a forward run,
+  **past** every breakpoint the run had not reached, and now and then that breakpoint itself with no
+  hit reported. So the server reads the position before the run and travels back to it, and the stop
+  says so in its `replay` field — `rewound: true` and the position. A cut-short replay is therefore
+  one to run again with a longer bound, and no breakpoint is skipped. If the travel back fails, the
+  field says `rewound: false` with both positions, and a breakpoint between them may have been passed
+  without a hit: `reverse_go` finds it. `FOLLOWUPS.md` item 125.
 - **A raw `execute` of an execution-control command works, and is not the same as the typed tool.**
   `g`, `p`, `t`, `bp X; g` and anything else that reaches execution moves the target: the server
   asks the engine whether a command left it running and pumps it if so, under the same 60s bound.

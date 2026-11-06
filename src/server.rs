@@ -2652,6 +2652,36 @@ fn describe_stop(stop: &structured::StopReport) -> String {
                 the way there.\n"
             .to_string();
     }
+    // Ahead of the two below, each of which says the position is where the target happened to be
+    // — which on a replay it is not (`FOLLOWUPS.md` item 125).
+    if let Some(replay) = &stop.replay {
+        let how = match stop.timed_out {
+            true => "It reached its bound without stopping",
+            false => "It was broken in on request",
+        };
+        let at = |position: &Option<String>| {
+            position
+                .as_deref()
+                .map(|position| format!(" ({position})"))
+                .unwrap_or_default()
+        };
+        return match replay.rewound {
+            true => format!(
+                "  {how}. It is a Time Travel replay, which TTD moves somewhere of its own \
+                 choosing when it is broken in — usually past every breakpoint ahead — so it was \
+                 travelled back to where the run started{}, and is stopped{where_}. No progress \
+                 was made and no breakpoint was passed: run it again, allowing it longer.\n",
+                at(&replay.position)
+            ),
+            false => format!(
+                "  {how}. It is a Time Travel replay, and travelling it back to where the run \
+                 started{} failed, so it is where TTD put it{}{where_} — not where the run had \
+                 got to. A breakpoint between the two may have been passed without being hit.\n",
+                at(&replay.started_at),
+                at(&replay.position)
+            ),
+        };
+    }
     if stop.interrupted {
         return format!(
             "  It was broken in on request, so it is stopped{where_} — where it happened to be, \
@@ -5629,7 +5659,9 @@ impl WindbgServer {
     /// This is a Ctrl+Break, exactly as at a WinDbg prompt. The interrupted operation ends at the
     /// debugger's next poll and returns whatever it had reached *to the call that started it*, not
     /// to this one — so partial output is preserved, marked as cut short, and the session takes the
-    /// next call immediately. This call answers as soon as the break is raised.
+    /// next call immediately. This call answers as soon as the break is raised. One exception: TTD
+    /// moves an interrupted replay somewhere of its own choosing, so a run on a Time Travel trace
+    /// is put back where it started instead, and its stop says so.
     ///
     /// Issue it while the other call is still outstanding; it does not queue behind it. With
     /// nothing running it reports exactly that and does nothing.
@@ -9048,6 +9080,7 @@ mod tests {
             processor: None,
             interrupted: false,
             timed_out: false,
+            replay: None,
             target_gone: false,
             output: String::new(),
         };
@@ -9097,6 +9130,49 @@ mod tests {
         assert!(
             gone.contains("ending rather than a failure"),
             "running a program to completion is what a resume is for: {gone}"
+        );
+    }
+
+    /// A replay cut short says where it was put — back where the run started, or, failing that,
+    /// where TTD left it with a breakpoint possibly passed — instead of the "where it happened to
+    /// be" that both other cut-short endings say, which on a replay is untrue (`FOLLOWUPS.md` item
+    /// 125).
+    #[test]
+    fn a_replay_cut_short_says_where_it_was_put_rather_than_where_it_happened_to_be() {
+        let rewound = describe_stop(&stop(|r| {
+            r.timed_out = true;
+            r.replay = Some(structured::ReplayLanding {
+                rewound: true,
+                position: Some("E:0".to_string()),
+                started_at: None,
+            });
+        }));
+        assert!(rewound.contains("reached its bound"), "{rewound}");
+        assert!(
+            rewound.contains("travelled back to where the run started (E:0)"),
+            "{rewound}"
+        );
+        assert!(
+            !rewound.contains("where it happened to be"),
+            "a replay put back is where the run started, not where the break landed: {rewound}"
+        );
+
+        let stranded = describe_stop(&stop(|r| {
+            r.interrupted = true;
+            r.replay = Some(structured::ReplayLanding {
+                rewound: false,
+                position: Some("8E6:0".to_string()),
+                started_at: Some("E:0".to_string()),
+            });
+        }));
+        assert!(stranded.contains("broken in on request"), "{stranded}");
+        assert!(
+            stranded.contains("started (E:0) failed") && stranded.contains("TTD put it (8E6:0)"),
+            "both positions, so a caller can travel back between them: {stranded}"
+        );
+        assert!(
+            stranded.contains("passed without being hit"),
+            "the hazard the travel back exists to prevent, said when it did not happen: {stranded}"
         );
     }
 
@@ -10354,6 +10430,7 @@ mod tests {
                 target: structured::addr(0xfffff803_1ab10000),
                 stopped_at: Some(structured::addr(0xfffff803_1ab10000)),
                 timeout_ms: 60_000,
+                replay: None,
                 output: String::new(),
             },
         )))

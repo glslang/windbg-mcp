@@ -25,11 +25,11 @@ windbg-mcp.exe --tools session,inspect,crash
 
 | `--tools` | Tools | Model context |
 |---|---:|---:|
-| *(absent)* — ordinary groups | 66 | 103,534 B |
-| `all` | 89 | 139,475 B |
-| `session,inspect,exec,crash` | 33 | 49,332 B |
-| `session,inspect,crash` | 23 | 34,092 B |
-| `crash` | 13 | 20,515 B |
+| *(absent)* — ordinary groups | 66 | 103,706 B |
+| `all` | 89 | 139,647 B |
+| `session,inspect,exec,crash` | 33 | 49,504 B |
+| `session,inspect,crash` | 23 | 34,264 B |
+| `crash` | 13 | 20,687 B |
 
 The spec is a comma-separated list of the group names in the [tool table](../README.md#tools), of
 individual tool names, or `all`. `securekernel` is marked as an extra: it must be named explicitly

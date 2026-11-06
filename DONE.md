@@ -198,6 +198,7 @@ reads — so the entry records the split as it was measured.
 - [Item 101](#101-dbgscope-the-vs-chunk-chain-drifts-0x10-and-not-from-where-it-starts--done-2026-10-14-dbgscope199) — [dbgscope] The VS chunk chain drifts 0x10, and not from where it starts — done (2026-10-14, dbgscope#199)
 - [Item 39](#39-windbg-mcp-the-eval-measures-single-questions-not-an-investigation--done-2026-10-17) — [windbg-mcp] The eval measures single questions, not an investigation — done (2026-10-17)
 - [Item 133](#133-windbg-mcp-the-live-vtl1-driver-and-its-providers-live-outside-this-repository--done-2026-11-01) — [windbg-mcp] The live VTL1 driver and its providers live outside this repository — done (2026-11-01)
+- [Item 125](#125-windbg-mcp--dbgscope-an-interrupted-replay-is-left-where-ttd-puts-it-not-where-it-had-got-to--done-2026-11-06-dbgscope202) — [windbg-mcp + dbgscope] A replay broken in is put back where its run started — done (2026-11-06, dbgscope#202)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -11683,3 +11684,136 @@ and each was found before the three-boot result was accepted.
 **What it left open.** Moving ownership does not answer item 122's image/symbol question for the
 ordinary live session, and it does not close item 129's question about boot coordinates. Those
 remain separate items. This entry leaves no Python-provider or external-driver half behind.
+
+## 125. [windbg-mcp + dbgscope] An interrupted replay is left where TTD puts it, not where it had got to — **done** (2026-11-06, dbgscope#202)
+
+**What happens.** On a TTD replay target, a run that is broken in — at its own bound
+(`timed_out`) or by a `break_in` (`interrupted`) — is not left where the replay was when the break
+landed. TTD prints *"Replay was interrupted by the user. The current position is approximately how
+far we had gone."*, and then, in eleven of thirteen runs measured with a breakpoint ahead, the
+cursor is **past** that breakpoint: at the trace's end for a forward run and at its start for a
+reverse one, wherever the position was read. The other two stopped *at* the breakpoint, with no
+`Breakpoint 0 hit` in the output. Neither is "how far we had gone": a 2 s bound on a replay that
+takes 16.6 s unbounded left the cursor at `Percent: 100.000000`.
+
+**Why it matters more than it looks.** The breakpoint is skipped silently. The stop reads
+`timed_out: true` at the end-of-trace IP, and the *next* `go` answers `TTD: End of trace reached.`
+with `timed_out: false` — an ordinary stop, from which a caller concludes the breakpoint is never
+hit. `reverse_go` then finds it, which is the only recovery, and nothing points there. This
+server's model-visible prose says the opposite: `interrupt`'s description and the detail
+`worker::interrupt_running` returns both say an interrupted operation "returns whatever it had
+reached". On a live target that is true; on a replay it is not. `StopReport::interrupted`'s doc
+comment said the same and now carries the exception; the two client-facing sentences are left for
+the fix, to be reworded against whichever behaviour it lands rather than ahead of it.
+
+**Measured** on the ARM64 bench, 2026-10-13, through the service's shipped tools at
+`0.22.0+gbfd1f388`, TTD 1.11.610.0, `dbgeng` 10.0.29617.1000. The traces are `cmd.exe /c for /L`
+loops of 200,000 and 1,000,000 iterations, and `hostname.exe`:
+
+| Trace | Breakpoint ahead | Unbounded | Broken in | Left at |
+| --- | --- | --- | --- | --- |
+| 692 MB, unindexed | `ntdll!LdrShutdownProcess`, `6E00C:DB3` | hit at 16,760 ms | `continue_async`, `max_run_ms: 2000` — 2,035 ms | `6E01E:0`, the end |
+| same | same | — | `break_in` at about 2.5 s | `6E01E:0`, the end |
+| same, `g-` from the end | `kernel32!BaseThreadInitThunk` | hit at 16,695 ms | `debug_batch` `resume` step, 2,000 ms — 2,049 ms | the start-of-trace IP |
+| 172 MB, **indexed** | `ntdll!LdrShutdownProcess`, `165EB:DB3` | hit at 106 ms | `max_run_ms: 1` — 128 ms | `165FB:0`, the end |
+| `hostname.exe`, two recordings | `LdrShutdownProcess`, then `RtlExitUserProcess` | hit | `max_run_ms: 1`, five runs by hand | the end, all five |
+| `hostname.exe`, the TTD tier's test | `ntdll!RtlExitUserProcess` | hit | `max_run_ms: 1`, four runs | past it twice, **at** it twice |
+
+Every run *without* a breakpoint ahead — five, both directions, bounds of 1 ms to 2 s — was left at
+the boundary too. So it is not the index, not the direction and not who asked for the break, and
+it is not this server: the position is the engine's own (`dx @$curthread.TTD.Position`).
+
+**What would close it is a choice, which is why it was filed rather than done with item 47.**
+
+- **Put the cursor back.** Read the position before a resume on a replay target and, when the run
+  comes back cut short, travel back to it and say so. A cut-short replay has then made no progress
+  — which is the truth, since TTD threw the progress away — no breakpoint is skipped, and the
+  caller retries with a longer bound. It wants a typed position read and seek in dbgscope (a new
+  primitive is a typed method there, never the `execute` text hatch), which TTD exposes through the
+  data model (`@$curthread.TTD.Position` and its `SeekTo`) and dbgscope does not bind yet. All
+  three bounded paths end in dbgscope's `pump` — `execute_and_wait`, `settle`, `run_to_address` —
+  so that is where it belongs, rather than in three callers here.
+- **Report it.** A typed field on the stop saying the position is TTD's rather than where the run
+  was, so a caller knows to reverse. Cheaper, and leaves the trap armed for any caller that does
+  not read the field.
+
+The first is the one that makes "returns whatever it had reached" true on every target; the second
+is what to fall back to if the seek turns out to cost something on a large unindexed trace, which
+nobody has measured.
+
+**The x64 bench answers the same way** (2026-10-13, the dev build at `008bfa6`, the tier run from
+PowerShell): the test's own line read `item 125: a replay broken in at its bound was left PAST the
+breakpoint, which going on never reached` — the eleven-of-thirteen case above, on a `hostname.exe`
+trace. One run, so it says the behaviour is not ARM64's alone and nothing about how often each
+landing occurs there. The tier's test prints its landing on every run (`item 125: …` under
+`--nocapture`).
+
+**Where it picks up.** dbgscope's `DebugEngine::pump` and the three of its callers a run goes
+through, in `src/dbgeng.rs`;
+here `worker::resumed`, `worker::pump_a_resume` and `worker::run_to_address`; `StopReport` in
+`src/structured.rs`; `interrupt`'s description in `src/server.rs` and the detail in
+`worker::interrupt_running`; and `ttd_a_replay_broken_in_at_its_bound_says_so_and_leaves_the_session_usable`
+in `tests/mcp_smoke.rs`, whose printed line is the measurement to turn into an assertion once there
+is a behaviour to assert.
+
+**What landed (2026-11-06, [dbgscope#202](https://github.com/glslang/dbgscope/pull/202) and this
+server's half beside it).** The first of the two shapes, the cursor put back, with the second's
+field alongside it.
+
+- **dbgscope's three bounded paths put a cut-short replay back.** `execute_and_wait`, `settle` and
+  `run_to_address` read the position before the run (`DebugEngine::ttd_position`, a typed
+  `TtdPosition` read through `@$curthread.TTD.Position`). When a deadline or a host's break cuts
+  the run short, they call that position object's own `SeekTo`, then read the position and the
+  current thread again. `CommandRun::replay` and `RunToResult::replay` carry the outcome as a
+  `ReplayLanding`: `Rewound { to }`, or `NotRewound { from, left_at }` when the travel back failed.
+  The travel back is the pump's, not this server's: every path here that resumes a replay goes
+  through one of the three. That covers `go`, the steps, the reverses, `continue_async`, a
+  `debug_batch` resume, `run_to_address` and a raw `execute` of `g`.
+- **It travels as a value.** `StopReport::replay` and `RunToReport::replay` carry `rewound`,
+  `position`, and `started_at` when the replay was not put back, because a structured client drops
+  the text. In the text, `told_moving`, `describe_stop` and the `run_to_address` verdict replace
+  "where it happened to be". A replay's `run_to_address` timeout no longer says the input does not
+  reach the address, since a replay runs the same execution every time.
+- **The two sentences the entry held back are reworded.** `interrupt`'s description and
+  `worker::interrupt_running`'s detail now name the exception, and so does `docs/sessions.md`.
+  `docs/limitations.md`'s bullet describes the fixed behaviour.
+- **The tier test's printed line became assertions.** The stop says `rewound` with a
+  `Sequence:Steps` position. `stopped_at` is the instruction pointer read before the run. And a
+  `go` from there reaches `ntdll!RtlExitUserProcess`, which is the property, since what TTD did was
+  skip it. `run_to_address`'s timeout asserts `replay.rewound` and the same start. A mutant that
+  reports `Rewound` without seeking fails that test, with the stop left at the end-of-trace
+  instruction pointer.
+
+**What building it found.**
+
+- **A trace is not a dump to the target type.** Opened by `open_trace`, a `.run` answers class 2,
+  **qualifier 2**: `DEBUG_USER_WINDOWS_IDNA`, iDNA being TTD's name before it shipped. A user
+  minidump answers 2 / 1024 (x64, 2026-11-06). `worker.rs`'s fingerprint table had the trace row as
+  `2 / dump`, and is corrected. That made the gate a typed predicate (`DebuggeeType::is_ttd_replay`)
+  rather than a data-model probe on every dump-class target. A live target pays one
+  `GetDebuggeeType` per resume and never touches the model.
+- **The seek is the held object's, and on these traces it was cheap.** A position object read
+  before a run `SeekTo`s back to its own position after it. That took about 1.5 ms on traces of 28
+  and 48 MiB, left the engine at `DEBUG_STATUS_BREAK` with nothing to pump, and left the thread
+  unchanged. The cost the entry feared on a large unindexed trace did not show here, but it is still
+  unmeasured on one of the 692 MB class.
+- **`settle` can take its mark after the command.** It is handed an engine that a command has
+  already set running. But `Execute("g")` on a replay leaves `DEBUG_STATUS_GO` with the position
+  still readable, where the replay stood, because only the pump moves it.
+- **The "at the breakpoint" landing is put back too.** On the `hostname` trace, one 5 ms bound and
+  both 20 ms bounds left the replay at the breakpoint with no hit printed, which is the
+  two-of-thirteen case. Nothing tells that landing apart from TTD's choice of position, so it is
+  rewound like the rest, and going on hits it. `run_to_address` alone keeps its old rule, that a
+  deadline landing on the address is a hit, because the address is what it was asked to reach. It
+  reads that before the travel, so a run put back to a start that *was* the address is not counted
+  as a hit.
+- **The x64 bench answers the way ARM64 did for a forward run**: every 1 ms run, six of six, was
+  left at the trace's end. A 1 ms `g-` from the breakpoint was left one step back, not at the
+  trace's start as on ARM64. It is put back either way.
+
+**What it left open.** No test reaches the `NotRewound` path, because a failing `SeekTo` could not
+be arranged on a real trace. The variant's mapping and wording are asserted (`describe_stop`'s unit
+test), and nothing measures how often it fires. A command that travels inside `Execute` itself,
+`!tt`, is not a run and is not put back; that is what `goto_position` sends, and an interrupted one
+has not been measured. `goto_position` could now be a typed seek backed by `ttd_position` rather
+than `!tt` text, but nothing has asked for that.

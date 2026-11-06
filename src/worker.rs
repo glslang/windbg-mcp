@@ -50,7 +50,7 @@ use std::time::{Duration, Instant};
 use dbgscope::dbgeng::{
     BreakpointAt, BreakpointSpec, CommandRun, DataAccess, DataWatch, DbgEngError, DebugEngine,
     DebuggeeType, Disassembly, FunctionExtent, Instruction, InterruptHandle, Interruption,
-    RunToOutcome, WaitOutcome,
+    ReplayLanding, RunToOutcome, WaitOutcome,
 };
 use dbgscope::heap::{self as heap_query, HeapAllocation, HeapBackend, HeapState, HeapWalk};
 use dbgscope::pool::query::{self, PoolPageFilter, PoolWalk};
@@ -2575,8 +2575,10 @@ fn interrupt_running(bound: Option<u64>) -> Result<(Interrupted, String), String
         Interrupted::Raised,
         "Interrupted. Ctrl+Break was raised on this session's engine, so the operation it was \
          running stops at its next poll and returns whatever it had reached — to the call that \
-         started it, not to this one. A command that never polls, and a live-kernel attach whose \
-         target has not connected, cannot be reached this way; `end_session` is what ends those."
+         started it, not to this one. A run on a Time Travel replay is put back where it started \
+         instead, because TTD moves an interrupted replay somewhere of its own choosing, and its \
+         stop says so. A command that never polls, and a live-kernel attach whose target has not \
+         connected, cannot be reached this way; `end_session` is what ends those."
             .to_string(),
     ))
 }
@@ -2677,7 +2679,7 @@ fn refuse_when_the_target_is_gone(e: &DebugEngine, op: &EngineOp) -> Option<Fail
 /// | `open_dump`, user | 2 / 1024 | the file | the dumped pid | — | **dumps** |
 /// | `open_dump`, kernel | 1 / 1024+ | the file | — | — | **dumps** |
 /// | `open_dump`, a PE image | 3 / 1027 | the image | `[0xf0f0f0f0]` | — | **dumps** |
-/// | `open_trace` | 2 / dump | the `.run` | the pid | — | **dumps** |
+/// | `open_trace` | 2 / 2 | the `.run` | the pid | — | **dumps** |
 /// | `attach_process`, `launch` | 2 / 0 | `[]` | `[the pid]` | — | **processes** |
 /// | `attach_kernel_local` | 1 / 1 | `[]` | — | — | **qualifier** |
 /// | `attach_kernel`, live | 1 / 0 | `[]` | — | `KdSrv:…` | **connection** |
@@ -2698,6 +2700,11 @@ fn refuse_when_the_target_is_gone(e: &DebugEngine, op: &EngineOp) -> Option<Fail
 /// the engine's `0xf0f0f0f0` placeholder rather than anything on this machine. It is identified by
 /// the file like the other two, so nothing about replacement detection turns on it; what the row
 /// buys is that the opener is *covered* rather than assumed to behave like a dump.
+///
+/// The **trace** row's qualifier is not a dump's, though a trace is opened like one: it is
+/// `DEBUG_USER_WINDOWS_IDNA` (2), iDNA being TTD's name before it shipped — measured on an x64
+/// host, 2026-11-06, for `FOLLOWUPS.md` item 125, where this row had said `dump`. It is what
+/// dbgscope's `DebuggeeType::is_ttd_replay` reads. The identity is still the file.
 ///
 /// **A second system on the same file is a switch this cannot see.** These reads answer for
 /// the engine's *current* system, and `.opendump` *adds* a system rather than replacing one — the
@@ -4766,6 +4773,19 @@ fn told_moving(run: CommandRun) -> String {
     if run.target_gone {
         return appended(run.output, Some(TARGET_GONE.to_string()));
     }
+    // A replay cut short is not where the break landed, whichever origin it had, so it is told
+    // apart from both of the sentences below — each of which says the position is where the target
+    // happened to be.
+    if let Some(landing) = run.replay {
+        let why = match run.cut_short {
+            Some(Interruption::Deadline { after_ms }) => format!(
+                "the replay had not stopped after {after_ms} ms, so the debugger broke in \
+                 (Ctrl+Break)"
+            ),
+            _ => "the replay was broken in on request".to_string(),
+        };
+        return appended(run.output, Some(replay_note(&why, landing)));
+    }
     let note = match run.cut_short {
         Some(Interruption::Deadline { after_ms }) => Some(format!(
             "[windbg-mcp] the target had not stopped after {after_ms} ms, so the debugger broke in \
@@ -4775,6 +4795,33 @@ fn told_moving(run: CommandRun) -> String {
         _ => None,
     };
     appended(run.output, note)
+}
+
+/// What a caller is told about a TTD replay whose run was cut short, after `why` says how.
+///
+/// The output above it usually carries TTD's own line — *"the current position is approximately
+/// how far we had gone"* — and this has to contradict it, because that is the line a caller would
+/// otherwise believe (`FOLLOWUPS.md` item 125). It names no tool, for [`told_moving`]'s reason.
+fn replay_note(why: &str, landing: ReplayLanding) -> String {
+    match landing {
+        ReplayLanding::Rewound { to } => format!(
+            "[windbg-mcp] {why}. TTD does not leave an interrupted replay where it had got to — \
+             it moves it somewhere of its own choosing, usually past every breakpoint ahead, \
+             whatever its own message says — so it was travelled back to {to}, where this run \
+             started. No progress was made and no breakpoint was passed: run it on again, allowing \
+             it longer."
+        ),
+        ReplayLanding::NotRewound { from, left_at } => {
+            let from = from.map(|at| format!(" ({at})")).unwrap_or_default();
+            let left_at = left_at.map(|at| format!(", {at}")).unwrap_or_default();
+            format!(
+                "[windbg-mcp] {why}, and travelling back to where this run started{from} failed. \
+                 It is where TTD put it{left_at}, which is not where the run had got to: a \
+                 breakpoint between the two may have been passed without being hit, and running \
+                 backward from here finds it."
+            )
+        }
+    }
 }
 
 /// What a caller is told when the target ended rather than stopped.
@@ -4910,10 +4957,14 @@ fn settled(
     // is "now stopped" somewhere: there is no position to read, and the sentence would describe a
     // session that no longer exists.
     let ending = settled.target_gone;
+    // And a replay cut short has had its position told already, by `told_moving`: put back where
+    // the command started, or left where TTD put it. "This command moved the target" would be
+    // false of the first and say nothing true of the second.
+    let replay = settled.replay;
     // The pump's capture apart from this server's sentences about the run, so a failed command can
     // keep the two apart. A successful one shows them in this order either way.
     let printed = std::mem::take(&mut settled.output);
-    let said = match ending {
+    let said = match ending || replay.is_some() {
         true => told_moving(settled),
         false => appended(told_moving(settled), Some(moved_note(e, forced))),
     };
@@ -4926,6 +4977,8 @@ fn settled(
             // hands back an ordinary success and the batch runs on, which is the same defect
             // this fixes for a `resume` step, on the sibling path.
             run.target_gone |= ending;
+            // The same for where a replay was put: the pump's, and the run's to carry.
+            run.replay = run.replay.or(replay);
             Ok(run)
         }
         // The command failed *and* left the target running. Both facts: dropping the second would
@@ -5183,6 +5236,7 @@ fn pump_a_resume(
                 // The command itself can take the target away — `.detach`, `q`, `qd` — and there
                 // is no pump here to notice, so this is the only place it can be read.
                 target_gone: !e.has_target().unwrap_or(true),
+                replay: None,
             },
         ));
     }
@@ -5195,6 +5249,7 @@ fn pump_a_resume(
         output,
         cut_short: None,
         target_gone: false,
+        replay: None,
     };
     let pumped = match settled {
         Ok(Some(run)) => run,
@@ -5260,6 +5315,7 @@ fn stop_report(
     let interrupted = matches!(run.cut_short, Some(Interruption::OnRequest));
     let timed_out = matches!(run.cut_short, Some(Interruption::Deadline { .. }));
     let target_gone = run.target_gone;
+    let replay = run.replay.map(structured::ReplayLanding::from);
     let text = told_moving(run.clone());
     (
         text,
@@ -5270,6 +5326,7 @@ fn stop_report(
             processor,
             interrupted,
             timed_out,
+            replay,
             target_gone,
             output: run.output,
         },
@@ -9824,6 +9881,14 @@ fn run_to_address(e: &DebugEngine, address: &str, wait: u32) -> Result<Output, F
             fmt_addr(stopped_at),
             fmt_addr(target)
         ),
+        // A replay runs the same execution every time, so its timeout is not evidence about the
+        // input: it says only that the replay had not got there yet.
+        RunToOutcome::Timeout if res.replay.is_some() => format!(
+            "VERDICT: TIMEOUT — did not reach {} within {wait} ms\n  \
+             (this is a Time Travel replay, which runs the same execution every time, so this says \
+             only that it had not got there yet — not that it never does)\n",
+            fmt_addr(target)
+        ),
         RunToOutcome::Timeout => format!(
             "VERDICT: TIMEOUT — did not reach {} within {wait} ms\n  \
              (the current input/state likely does not drive execution to this block)\n",
@@ -9838,6 +9903,17 @@ fn run_to_address(e: &DebugEngine, address: &str, wait: u32) -> Result<Output, F
             fmt_addr(target)
         ),
     };
+    // Where the replay was put once the run was cut short, said the way a `go`'s stop says it.
+    // Carried by a timeout and by a host's break alike — both are a break TTD answers by moving the
+    // replay — and by nothing that landed on the address.
+    if let Some(landing) = res.replay {
+        let why = match res.outcome {
+            RunToOutcome::Timeout => "the replay was broken in at the bound",
+            _ => "the replay was broken in on request",
+        };
+        msg = appended(msg, Some(replay_note(why, landing)));
+        msg.push('\n');
+    }
     if !res.output.trim().is_empty() {
         msg.push_str("---- debugger output ----\n");
         msg.push_str(&res.output);
@@ -9861,6 +9937,7 @@ fn run_to_address(e: &DebugEngine, address: &str, wait: u32) -> Result<Output, F
             target: structured::addr(target),
             stopped_at: stopped_at.map(structured::addr),
             timeout_ms: wait,
+            replay: res.replay.map(structured::ReplayLanding::from),
             output: res.output,
         },
     ))
@@ -18052,6 +18129,7 @@ mod tests {
             output: "Evaluate expression: 4096 = 00000000`00001000".to_string(),
             cut_short: None,
             target_gone: false,
+            replay: None,
         };
         assert!(finished(ran).expect("nothing stopped it").is_some());
         for (why, category) in [
@@ -18070,6 +18148,7 @@ mod tests {
                 output: "Evaluate expression: 4096 = 00000000`0000".to_string(),
                 cut_short: Some(why),
                 target_gone: false,
+                replay: None,
             };
             assert_eq!(
                 finished(broken).expect_err("a stopped run is not a value"),
@@ -20598,6 +20677,7 @@ mod tests {
             output: "partial output\n".to_string(),
             cut_short: Some(Interruption::Deadline { after_ms: 30_000 }),
             target_gone: false,
+            replay: None,
         });
         assert!(note.starts_with("partial output"), "{note}");
         assert!(note.contains("30000 ms"), "{note}");
@@ -20621,9 +20701,59 @@ mod tests {
                 output: "partial output\n".to_string(),
                 cut_short: None,
                 target_gone: false,
+                replay: None,
             }),
             "partial output\n"
         );
+    }
+
+    /// A replay cut short is told where it was put, and not "where it happened to be" — which is
+    /// what both other cut-short sentences say, and what TTD's own message implies (`FOLLOWUPS.md`
+    /// item 125). Both origins, and the travel back failing, which no tier can arrange.
+    #[test]
+    fn a_replay_cut_short_is_told_where_it_was_put() {
+        use dbgscope::dbgeng::TtdPosition;
+        let at = |sequence, steps| TtdPosition { sequence, steps };
+        let run = |cut_short, replay| CommandRun {
+            output: "TTD: Replay was interrupted by the user.\n".to_string(),
+            cut_short: Some(cut_short),
+            target_gone: false,
+            replay: Some(replay),
+        };
+
+        let rewound = told_moving(run(
+            Interruption::Deadline { after_ms: 1 },
+            ReplayLanding::Rewound { to: at(0xE, 0) },
+        ));
+        assert!(
+            rewound.starts_with("TTD: Replay was interrupted"),
+            "{rewound}"
+        );
+        assert!(rewound.contains("after 1 ms"), "{rewound}");
+        assert!(rewound.contains("travelled back to E:0"), "{rewound}");
+        assert!(rewound.contains("No progress was made"), "{rewound}");
+        assert!(
+            !rewound.contains("where it happened to be"),
+            "the live-target sentence is untrue of a replay: {rewound}"
+        );
+
+        let asked = told_moving(run(
+            Interruption::OnRequest,
+            ReplayLanding::Rewound { to: at(0xE, 0) },
+        ));
+        assert!(asked.contains("broken in on request"), "{asked}");
+        assert!(asked.contains("travelled back to E:0"), "{asked}");
+
+        let stranded = told_moving(run(
+            Interruption::Deadline { after_ms: 1 },
+            ReplayLanding::NotRewound {
+                from: Some(at(0xE, 0)),
+                left_at: Some(at(0x8E6, 0)),
+            },
+        ));
+        assert!(stranded.contains("started (E:0) failed"), "{stranded}");
+        assert!(stranded.contains("TTD put it, 8E6:0"), "{stranded}");
+        assert!(stranded.contains("passed without being hit"), "{stranded}");
     }
 
     /// A cut-short result keeps what it reached and gains the reason — which is the whole point of
@@ -22456,6 +22586,7 @@ mod tests {
                 output: "0:000> the command said this".to_string(),
                 cut_short: None,
                 target_gone: false,
+                replay: None,
             })
         };
 
@@ -22513,6 +22644,7 @@ mod tests {
                 output: "0:000> g".to_string(),
                 cut_short: None,
                 target_gone: false,
+                replay: None,
             })
         };
 

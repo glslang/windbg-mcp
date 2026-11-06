@@ -114,19 +114,24 @@ routing, because it is the case where the two gates a handle passes have to wide
 Backing either half out alone was tried, and the end-to-end test fails identically both ways, since
 widening one only moves the refusal to a place with no caller to explain it to.
 
-**A replay broken in is not left where it was, and the stop cannot say so** (`FOLLOWUPS.md` item
-125). TTD moves an interrupted replay to a position of its own choosing — usually the trace's end,
-or its start going backward, past every breakpoint the run had not reached; now and then that
-breakpoint itself with no hit reported — whatever its banner claims. So `StopReport`'s "the
-position is real" holds on a live target and not on a trace, and three things follow for this seam.
-A test cannot assert the landing, being TTD's choice (eleven of thirteen past, two at), which is
-why `ttd_a_replay_broken_in_at_its_bound_says_so_and_leaves_the_session_usable` prints it. A
-replay's bound is reached only through a **caller's** clock — `go`'s minute wants an unindexed
-trace of some 2.5 GB on the ARM64 bench — so a test of it uses `continue_async`, `run_to_address` or
-a batch step. And the one time the pre-#226 finite wait was put back, it ignored its bound on a
-replay outright (151 ms against 1 ms, `S_OK` at the breakpoint), so "a finite wait wedges the
-session" is measured on live targets and not on traces. All of it is ARM64; the x64 bench has not
-been asked.
+**A replay broken in is put back where the run started, by dbgscope, and the stop says so**
+(`FOLLOWUPS.md` item 125, closed 2026-11-06). TTD moves an interrupted replay to a position of its
+own choosing — usually the trace's end, past every breakpoint the run had not reached; now and then
+that breakpoint itself with no hit reported — whatever its banner claims, on ARM64 and x64 alike.
+So dbgscope's three bounded paths (`execute_and_wait`, `settle`, `run_to_address`) read the
+position before the run (`ttd_position`, through the data model) and, when the run is cut short,
+`SeekTo` it back and read the position and thread again to confirm; `CommandRun::replay` and
+`RunToResult::replay` carry the landing, and this server forwards it as `StopReport::replay` and
+`RunToReport::replay`. Four things follow for this seam. **The travel back is the pump's, not this
+server's**: a new path that resumes a replay gets it by going through one of those three, and loses
+it by calling `Execute` and `WaitForEvent` some other way. **A trace is not a dump** to
+the target type: it answers class 2, qualifier 2 (`DEBUG_USER_WINDOWS_IDNA`,
+`DebuggeeType::is_ttd_replay`), which is the gate — a live target pays one `GetDebuggeeType` per
+resume and never touches the data model. A replay's bound is reached only through a **caller's**
+clock — `go`'s minute wants an unindexed trace of some 2.5 GB on the ARM64 bench — so a test of it
+uses `continue_async`, `run_to_address` or a batch step. And the one time the pre-#226 finite wait
+was put back, it ignored its bound on a replay outright (151 ms against 1 ms, `S_OK` at the
+breakpoint), so "a finite wait wedges the session" is measured on live targets and not on traces.
 
 **And a live target has a lifetime, which is what makes a launch test different from every other
 one here.** A dump does not go away mid-test; a process does. `go` on `cmd.exe /c ping -n 30` runs

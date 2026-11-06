@@ -1,7 +1,7 @@
 //! Which of this server's eighty-nine tools a run advertises.
 //!
 //! The tool surface is paid **once per conversation, before anything is debugged**, and it is
-//! 139,475 bytes — roughly 35k tokens (measured 2026-10-30; every figure here moves with any edit
+//! 139,647 bytes — roughly 35k tokens (measured 2026-11-06; every figure here moves with any edit
 //! to a description, so re-derive rather than cite). Seven tenths of that is prose, and the prose is what tells
 //! a model how to drive the tools, so there is no strip here the way there was in
 //! [`crate::schema`]: `FOLLOWUPS.md` item 24 measured it and the only honest lever left is the one
@@ -24,7 +24,7 @@
 //!   allocator       12   19,807  pool and heap walks, a driver's pool allocation trace, and
 //!                                  `walk_memory`
 //!   inspect         10   13,485  registers, stacks, memory, modules, symbols, location, raw commands
-//!   session         10   14,208  opening a target, ending it, and watching this server
+//!   session         10   14,380  opening a target, ending it, and watching this server
 //!   exec            10   15,087  breakpoints and execution control
 //!   batch            1   10,296  `debug_batch`
 //!   crash            3    7,473  a bug check, a user-mode fault, and an error code
@@ -41,7 +41,7 @@
 //! Re-derive rather than quoting them.
 //!
 //! **Those are shares of the whole surface, and they do not sum to a narrowed one.** `crash` reads
-//! 20,515 bytes, not the 21,681 its two rows add to, because the thirteen tools it keeps also stop
+//! 20,687 bytes, not the 21,853 its two rows add to, because the thirteen tools it keeps also stop
 //! carrying the sentences that pointed at `modules`, `debug_batch`, `backtrace`, `continue_async`
 //! and `break_in` — 1,166 bytes of them. A spec is always cheaper than its rows suggest, never
 //! dearer.
@@ -50,8 +50,8 @@
 //!
 //! Not a convenience: every other tool here routes by a `session_id`, and this server is the only
 //! thing that can issue one. A surface with `registers` and no opener cannot be used at all, so a
-//! spec that leaves one out is asking for something that does not exist. On its own it is 14,208
-//! bytes (2026-10-12), and that is the floor of any usable surface — `--tools crash` is thirteen tools, not three,
+//! spec that leaves one out is asking for something that does not exist. On its own it is 14,380
+//! bytes (2026-11-06), and that is the floor of any usable surface — `--tools crash` is thirteen tools, not three,
 //! and the startup line says so rather than leaving the addition to be discovered.
 //!
 //! # Who a surface belongs to
