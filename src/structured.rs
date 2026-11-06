@@ -860,8 +860,10 @@ pub struct RunToReport {
     pub stopped_at: Option<String>,
     /// The wait this verdict was reached under.
     pub timeout_ms: u32,
-    /// Where a TTD replay was put when this run timed out on one, as [`StopReport::replay`] has
-    /// it. Absent on every other target and every other verdict.
+    /// Where a TTD replay was put when this run was cut short on one, as [`StopReport::replay`]
+    /// has it: on a `timeout`, and on a `stopped_elsewhere` that a break somebody asked for ended,
+    /// whose [`Self::stopped_at`] is then where the run was put back to. Absent on every other
+    /// target, on a `hit` and on a `target_gone`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay: Option<ReplayLanding>,
     /// The debugger text captured across the run.
