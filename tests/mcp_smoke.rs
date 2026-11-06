@@ -21016,10 +21016,18 @@ fn ttd_a_replay_broken_in_at_its_bound_says_so_and_leaves_the_session_usable() {
         exit,
         "an unbounded `go` should stop where the process exits: {control}"
     );
+    // Where the replay stands, read typed and required to be there: an absent pointer on both
+    // sides of a comparison would pass it as `null == null`, whatever the travel back did.
+    let ip_now = |server: &mut Server| {
+        let registers =
+            server.tool_data("registers", json!({ "session_id": &session }), TARGET_STEP);
+        registers["instruction_pointer"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a stopped replay has an instruction pointer: {registers}"))
+            .to_string()
+    };
     rewind(&mut server);
-    let started_at = server.tool_data("registers", json!({ "session_id": &session }), TARGET_STEP)
-        ["instruction_pointer"]
-        .clone();
+    let started_at = ip_now(&mut server);
 
     // A millisecond against a replay of about a hundred: the watchdog fires while TTD is still
     // replaying, so the pump has to come back with a deadline rather than a stop.
@@ -21068,7 +21076,8 @@ fn ttd_a_replay_broken_in_at_its_bound_says_so_and_leaves_the_session_usable() {
         "the position travelled back to, as `Sequence:Steps`: {waited}"
     );
     assert_eq!(
-        stop["stopped_at"], started_at,
+        stop["stopped_at"].as_str(),
+        Some(started_at.as_str()),
         "put back means at the instruction the run started from: {waited}"
     );
     // And the property itself: going on reaches the breakpoint TTD's landing used to skip. Moving
@@ -21105,6 +21114,7 @@ fn ttd_a_replay_broken_in_at_its_bound_says_so_and_leaves_the_session_usable() {
         .map(|module| address_of(&module["start"]))
         .unwrap_or_else(|| panic!("the recorded program is in its own trace: {modules}"));
     rewind(&mut server);
+    let before_run_to = ip_now(&mut server);
     let run_to = server.tool_data(
         "run_to_address",
         json!({ "session_id": &session, "address": format!("0x{header:x}"), "timeout_ms": 1 }),
@@ -21115,14 +21125,22 @@ fn ttd_a_replay_broken_in_at_its_bound_says_so_and_leaves_the_session_usable() {
         run_to["replay"]["rewound"], true,
         "a `run_to_address` cut short on a replay is put back as a `go` is: {run_to}"
     );
+    // Both runs started from the same `goto_position`, so the position each was put back to is
+    // the same one — a check on the reported position from outside this call.
+    assert!(
+        run_to["replay"]["position"].is_string()
+            && run_to["replay"]["position"] == stop["replay"]["position"],
+        "put back to the start the first run was put back to: {run_to} against {waited}"
+    );
     let after = server.call_tool("registers", json!({ "session_id": &session }), TARGET_STEP);
     assert!(
         !is_tool_error(&after),
         "the session is unusable after a `run_to_address` that timed out on a replay: {after}"
     );
     assert_eq!(
-        after["result"]["structuredContent"]["instruction_pointer"], started_at,
-        "put back to the same start the first run was: {after}"
+        ip_now(&mut server),
+        before_run_to,
+        "put back means at the instruction the run started from: {run_to}"
     );
 
     server.tool_text("end_session", json!({ "session_id": session }), TARGET_STEP);
