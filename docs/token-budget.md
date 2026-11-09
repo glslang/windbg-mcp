@@ -429,8 +429,12 @@ None of these is a bug. They are recorded because they were invisible, and
    **413,991 B**. Item 125 (2026-11-06) adds 172 B to `interrupt`'s description — the sentence
    saying a run on a TTD replay is put back where it started — and 249 B to each of the eight output
    schemas that carry a stop (`StopReport::replay`, and `RunToReport::replay` on `run_to_address`),
-   which no model sees: **139,647 B** and **416,155 B**. The model and wire ceilings remain
-   **142,000 B** and **420,000 B**, leaving 2,353 B (1.7%) and 3,845 B (0.9%) respectively.
+   which no model sees: **139,647 B** and **416,155 B**. rmcp 3.9.0 (#533, 2026-11-09) then
+   generates output schemas for what `Serialize` writes rather than what `Deserialize` accepts, so
+   an always-written `Option` or `#[serde(default)]` field is listed as `required`: 450 B across
+   sixteen tools' output schemas and nothing model-visible, to **139,647 B** and **416,605 B**. The
+   model and wire ceilings remain **142,000 B** and **420,000 B**, leaving 2,353 B (1.7%) and
+   3,395 B (0.8%) respectively.
 
    **The two tables do not reconcile, and that is the point of item 41.** The first is each group's
    share of the whole surface; the second is what a spec actually serves, which is less — `crash`
