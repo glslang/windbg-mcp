@@ -3003,6 +3003,6 @@ mod tests {
         // This conservative standalone measurement remains a ratchet beside the registered
         // tools/list golden, whose shared schema definitions make its exact delta smaller.
         assert_eq!(model, 2_937);
-        assert_eq!(wire, 15_794);
+        assert_eq!(wire, 15_893);
     }
 }

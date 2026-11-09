@@ -2669,6 +2669,7 @@
             "required": [
               "image",
               "image_base",
+              "label",
               "limits",
               "manifest_id",
               "schema",
@@ -2722,8 +2723,10 @@
               "full",
               "image",
               "image_base",
+              "label",
               "limits",
               "manifest_id",
+              "pending_phase",
               "records",
               "schema",
               "selected_service",
