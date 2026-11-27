@@ -8022,7 +8022,9 @@ impl rmcp::ServerHandler for WindbgServer {
         request: rmcp::model::GetSkillRequestParams,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::GetSkillResult, ErrorData> {
-        crate::skills::get(&self.surface, &request.uri)
+        crate::skills::get(&self.surface, &request.uri, || {
+            crate::toolset::Toolset::widening(self.client.name(), self.chosen)
+        })
     }
 
     /// `resources/list`: the `SKILL.md` of each served skill, which is every resource this server
@@ -9063,7 +9065,9 @@ mod tests {
                 "`--no-skills`",
             ),
         ] {
-            let answers = exchange(server, &calls[..4]).await;
+            // Through `resources/read` of a file the default surface reads, so the read's own
+            // off-switch is exercised and not only the listings'.
+            let answers = exchange(server, &calls[..5]).await;
             let capabilities = &answers[0]["result"]["capabilities"];
             assert!(
                 capabilities["extensions"].is_null(),

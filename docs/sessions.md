@@ -14,8 +14,9 @@ beside it has open for symbols. It counts against the same limit, ends the same 
 
 `open_sk_live_control` is the eighth. Its worker binds operator-supplied providers and an
 exact-build `vmwp` debugger adapter to a selected VP set in an explicitly disposable VBS VM. Opening
-validates the request, profile and register-provider handshake but does not pause, attach to or
-inspect the VM. The first arm validates the live target under pause before it mutates state.
+validates the request and profile but starts no provider and does not pause, attach to or inspect
+the VM. The first arm starts and checks the register provider, then validates the live target under
+pause before it mutates state.
 See [Live Secure Kernel control](secure-kernel/sessions.md#live-secure-kernel-control).
 
 Sessions are independent. Opening a second target does not disturb the first, a call against one
@@ -23,8 +24,11 @@ does not queue behind work in another, and ending one leaves the rest alone. Up 
 the limit a new open reclaims the oldest **idle** session, and if every session has a call in flight
 the open is refused with the list rather than picking a victim. A disconnect attempts the same
 release as `end_session`, with a shorter grace. **Unresolved remote kernel and live Secure Kernel
-controllers are exceptions: their workers, reservations and session slots are retained**, including
-after lease expiry or supervisor loss. End a healthy live controller explicitly and check its
+controllers are exceptions: their workers are never killed for it**, not by reclamation, lease
+expiry, shutdown or the loss of the supervisor, and while that supervisor runs it keeps their
+session slots and reservations as well. Those are the supervisor's and end with it — a live Secure
+Kernel worker also holds its VM's reservation itself, which outlives it — so after supervisor loss
+an orphan worker needs operator recovery. End a healthy live controller explicitly and check its
 release result.
 
 **What ending a session does to its target depends on which tool opened it.** A dump or a trace is

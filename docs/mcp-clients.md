@@ -113,8 +113,9 @@ A skill also carries the pages it links to. A plugin install is the repository, 
 `docs/` resolves there; over MCP a skill is only what it serves, so each page a playbook links to
 directly is served inside the skill, at `docs/…` under it, and the served links are pointed at those
 copies. A link to anything else — the bundled pages' own links, mostly — is served as a GitHub URL
-at the commit the binary was built from, so it can still be followed and still describes that
-build. The files on disk are not changed.
+at the release tag of the binary's version, so it can still be followed. A tag rather than the
+commit, because a client binds its approval of a skill to the exact bytes served: a rebuild of the
+same version serves the same skill and is not asked about again. The files on disk are not changed.
 
 `--no-skills` turns them off on stdio, which is what the plugin passes. A listener has no plugin
 beside it, so the flag is refused there.

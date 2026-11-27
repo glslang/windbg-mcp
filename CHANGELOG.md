@@ -20,7 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--no-skills`, since it installs the same files itself. `msrc-patch-diff` stays plugin-only.
   rmcp's floor moves to 3.11.0. A skill carries the `docs/` pages its playbooks link to, served
   inside it with the links pointed at them, and every other relative link is served as a GitHub URL
-  at the build's commit; those pages are build inputs too, and `skills/` and `docs/**/*.md` are
+  at the version's release tag — not the commit, so a rebuild does not make a client approve the
+  skill again; those pages are build inputs too, and `skills/` and `docs/**/*.md` are
   checked out with LF everywhere so a Windows build serves the same bytes and digests as any other.
 
 ### Changed
