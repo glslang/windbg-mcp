@@ -19,10 +19,9 @@
 //! those links resolve, because the plugin *is* the repository. Over MCP a skill is only what its
 //! manifest lists, so a page it links to directly is served inside it, at `docs/…` under the skill,
 //! and [`relink`] points each link at where its target is served: between two served files, at the
-//! other's path inside the skill; to anything else, at that file on GitHub **at the commit this
-//! binary was built from**, so a deeper link is still one a client can follow and still describes
-//! this build. The files on disk are untouched; only what is served is rewritten, and the digests
-//! are of what is served. Only one level is bundled, deliberately: the closure of those pages' own
+//! other's path inside the skill; to anything else, at that file on GitHub **at this version's
+//! release tag** ([`PIN`]), so a deeper link is still one a client can follow. The files on disk are
+//! untouched; only what is served is rewritten, and the digests are of what is served. Only one level is bundled, deliberately: the closure of those pages' own
 //! links is most of the repository, crash dumps included.
 //!
 //! **Served per client, by the rule the instructions and descriptions already keep**: nothing
@@ -170,7 +169,7 @@ impl Entry {
 static CATALOG: LazyLock<Vec<Entry>> = LazyLock::new(|| {
     SOURCES
         .iter()
-        .filter_map(|bundle| match assemble(bundle, pinned()) {
+        .filter_map(|bundle| match assemble(bundle, PIN) {
             Ok(entry) => Some(entry),
             Err(reason) => {
                 tracing::error!("not serving the built-in skill {}: {reason}", bundle.name);
@@ -180,19 +179,18 @@ static CATALOG: LazyLock<Vec<Entry>> = LazyLock::new(|| {
         .collect()
 });
 
-/// The commit this binary was built from, which a link to an unserved file is pinned to — or
-/// `None` where `build.rs` could not ask git, and such a link is then served as written.
+/// The ref a link to an unserved file is pinned to: this version's release tag, `v0.24.0`.
 ///
-/// A dirty build pins the commit under its changes, which is the nearest state a reader can fetch.
-fn pinned() -> Option<&'static str> {
-    let sha = env!("WINDBG_MCP_BUILD")
-        .strip_prefix('g')?
-        .split('-')
-        .next()?;
-    (!sha.is_empty() && sha.bytes().all(|b| b.is_ascii_hexdigit())).then_some(sha)
-}
+/// **Not the commit**, which it was first, because a host's approval of a skill is bound to the
+/// bytes served and every link carries the pin: pinned to the commit, every rebuild was a new
+/// version of every skill, and Claude Code asked again after each redeploy with no skill text
+/// changed. The tag moves when the version does, which is when a release changes what is served
+/// anyway. What it costs is that a build between two releases links a deeper page as the last
+/// release had it — the pages a skill links to directly are bundled, and those are always this
+/// build's own.
+const PIN: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
-fn assemble(bundle: &Bundle, pinned: Option<&str>) -> Result<Entry, String> {
+fn assemble(bundle: &Bundle, pin: &str) -> Result<Entry, String> {
     let manifest = bundle.files.first().ok_or("a skill with no files")?;
     if manifest.at != SKILL_MD {
         return Err(format!(
@@ -206,7 +204,7 @@ fn assemble(bundle: &Bundle, pinned: Option<&str>) -> Result<Entry, String> {
         .map(|file| {
             (
                 format!("{SCHEME}{}/{}", bundle.name, file.at),
-                relink(file.text, file, bundle.files, pinned),
+                relink(file.text, file, bundle.files, pin),
             )
         })
         .collect();
@@ -239,14 +237,14 @@ fn assemble(bundle: &Bundle, pinned: Option<&str>) -> Result<Entry, String> {
 
 /// `text` as served from `from`: every relative Markdown link pointed at where its target is
 /// served. A link between two files this skill serves becomes the path from one to the other inside
-/// the skill; a link to anything else in the repository becomes that file on GitHub at `pinned`, or
-/// stays as written when there is no commit to pin to. Absolute URLs and same-page fragments are
-/// left alone.
+/// the skill; a link to anything else in the repository becomes that file on GitHub at `pin`.
+/// Absolute URLs and same-page fragments are left alone.
 ///
-/// Only inline `[text](target)` links are read — no served file defines a relative
-/// reference-style one, and `no_served_link_points_outside_what_is_served` would fail on the first
-/// that did, since it reads the served text and not this function's intent.
-fn relink(text: &str, from: &Source, files: &[Source], pinned: Option<&str>) -> String {
+/// Only inline `[text](target)` links without a title are rewritten. A relative link in either of
+/// the other forms, a reference-style definition or an inline link with a title, would be served
+/// as written, which no served file does: `no_served_file_uses_a_link_form_relink_leaves_alone`
+/// fails on the first that did, rather than this growing a Markdown parser for forms nobody writes.
+fn relink(text: &str, from: &Source, files: &[Source], pin: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(open) = rest.find("](") {
@@ -257,7 +255,7 @@ fn relink(text: &str, from: &Source, files: &[Source], pinned: Option<&str>) -> 
             break;
         };
         let target = &tail[..close];
-        match retarget(target, from, files, pinned) {
+        match retarget(target, from, files, pin) {
             Some(moved) => out.push_str(&moved),
             None => out.push_str(target),
         }
@@ -268,7 +266,7 @@ fn relink(text: &str, from: &Source, files: &[Source], pinned: Option<&str>) -> 
 }
 
 /// Where one link target should point once served, or `None` to leave it as written.
-fn retarget(target: &str, from: &Source, files: &[Source], pinned: Option<&str>) -> Option<String> {
+fn retarget(target: &str, from: &Source, files: &[Source], pin: &str) -> Option<String> {
     if target.is_empty()
         || target.starts_with('#')
         || target.contains("://")
@@ -282,9 +280,8 @@ fn retarget(target: &str, from: &Source, files: &[Source], pinned: Option<&str>)
     if let Some(to) = files.iter().find(|file| file.disk == resolved) {
         return Some(format!("{}{fragment}", relative(parent(from.at), to.at)));
     }
-    let sha = pinned?;
     let repository = env!("CARGO_PKG_REPOSITORY");
-    Some(format!("{repository}/blob/{sha}/{resolved}{fragment}"))
+    Some(format!("{repository}/blob/{pin}/{resolved}{fragment}"))
 }
 
 /// The directory part of a `/`-separated relative path; `""` for a file at the root.
@@ -408,8 +405,14 @@ pub fn list(surface: &Toolset) -> ListSkillsResult {
 }
 
 /// `skills/get`. `-32602` for a URI that is not a skill here, and for one this surface is not
-/// served — the second saying so, since the remedy is a wider `--tools` and not a different URI.
-pub fn get(surface: &Toolset, uri: &str) -> Result<GetSkillResult, ErrorData> {
+/// served, the second carrying `widening`'s remedy, since what to change is the surface and not
+/// the URI. That remedy is the tool refusal's own: on a listener a client's surface may be its
+/// credential's rather than the run's, and only the caller knows which.
+pub fn get(
+    surface: &Toolset,
+    uri: &str,
+    widening: impl FnOnce() -> String,
+) -> Result<GetSkillResult, ErrorData> {
     let entry = CATALOG
         .iter()
         .find(|entry| entry.skill.uri == uri)
@@ -418,7 +421,8 @@ pub fn get(surface: &Toolset, uri: &str) -> Result<GetSkillResult, ErrorData> {
         return Err(ErrorData::invalid_params(
             format!(
                 "{uri} is not served to this client: it names tools outside this client's tool \
-                 surface (`--tools`)"
+                 surface. {}",
+                widening()
             ),
             None,
         ));
@@ -463,9 +467,8 @@ mod tests {
     /// is either in [`SOURCES`] or here, so a new one is a decision rather than an omission.
     const PLUGIN_ONLY: &[&str] = &["msrc-patch-diff"];
 
-    /// A commit for the relinking tests, so they say the same thing whether or not this build could
-    /// ask git for its own.
-    const SHA: &str = "0123abcd";
+    /// A pin for the relinking tests, so they say the same thing whatever version this is.
+    const TAG: &str = "v0.0.0";
 
     fn repo() -> &'static std::path::Path {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -641,7 +644,7 @@ mod tests {
         for bundle in SOURCES {
             let served: Vec<&str> = bundle.files.iter().map(|file| file.at).collect();
             for file in bundle.files {
-                let text = relink(file.text, file, bundle.files, Some(SHA));
+                let text = relink(file.text, file, bundle.files, TAG);
                 for target in targets(&text) {
                     if target.is_empty()
                         || target.starts_with('#')
@@ -698,6 +701,69 @@ mod tests {
         }
     }
 
+    /// The two Markdown link forms [`relink`] does not rewrite, refused rather than supported: a
+    /// relative inline link with a title, and a relative reference-style definition. Either would
+    /// be served pointing where the file sits on disk, and both link checks above would pass it,
+    /// since they read inline targets and skip one with a title in it.
+    #[test]
+    fn no_served_file_uses_a_link_form_relink_leaves_alone() {
+        let relative = |target: &str| {
+            !target.is_empty()
+                && !target.starts_with('#')
+                && !target.contains("://")
+                && !target.starts_with("mailto:")
+        };
+        // A title is a quoted string, or a parenthesised one, that ends the link: `setup.md`'s
+        // PowerShell `[xml](Get-Content "…" -Raw)` cast has a quote in it and is not a link.
+        let titled = |text: &str| -> Vec<String> {
+            targets(text)
+                .into_iter()
+                .filter(|target| {
+                    let Some((path, title)) = target.split_once(char::is_whitespace) else {
+                        return false;
+                    };
+                    let title = title.trim();
+                    let closed = |quote: char| {
+                        title.len() >= 2 && title.starts_with(quote) && title.ends_with(quote)
+                    };
+                    relative(path) && (closed('"') || closed('\'') || title.starts_with('('))
+                })
+                .map(str::to_string)
+                .collect()
+        };
+        let definitions = |text: &str| -> Vec<String> {
+            text.lines()
+                .filter(|line| line.len() - line.trim_start().len() <= 3)
+                .filter_map(|line| {
+                    let line = line.trim_start().strip_prefix('[')?;
+                    let (label, rest) = line.split_once("]:")?;
+                    let target = rest.split_whitespace().next()?;
+                    (!label.contains(']') && relative(target)).then(|| target.to_string())
+                })
+                .collect()
+        };
+        for file in SOURCES.iter().flat_map(|bundle| bundle.files) {
+            let found: Vec<String> = titled(file.text)
+                .into_iter()
+                .chain(definitions(file.text))
+                .collect();
+            assert!(
+                found.is_empty(),
+                "{} has relative links relink serves unchanged: {found:?}",
+                file.disk
+            );
+        }
+        // And the check sees both forms, so its silence above means something.
+        assert_eq!(
+            titled(r#"[a](../x.md "t") [b](https://e.com "t") [xml](Get-Content "$w\x" -Raw)"#),
+            [r#"../x.md "t""#]
+        );
+        assert_eq!(
+            definitions("[a]: ../x.md\n[b]: https://e.com\n    [c]: ../y.md"),
+            ["../x.md"]
+        );
+    }
+
     /// And the links are the **only** thing served differently from the file on disk.
     #[test]
     fn relinking_changes_link_targets_and_nothing_else() {
@@ -710,7 +776,7 @@ mod tests {
         };
         for bundle in SOURCES {
             for file in bundle.files {
-                let served = relink(file.text, file, bundle.files, Some(SHA));
+                let served = relink(file.text, file, bundle.files, TAG);
                 assert_eq!(blank(&served), blank(file.text), "{}", file.disk);
             }
         }
@@ -736,30 +802,25 @@ mod tests {
             },
         ];
         let [skill, _, page] = &files;
-        let from = |source: &Source, text: &str, sha| relink(text, source, &files, sha);
+        let from = |source: &Source, text: &str| relink(text, source, &files, TAG);
         let repository = env!("CARGO_PKG_REPOSITORY");
 
         // Into a bundled page, with its fragment.
         assert_eq!(
-            from(skill, "[p](../../docs/a/page.md#part)", Some(SHA)),
+            from(skill, "[p](../../docs/a/page.md#part)"),
             "[p](docs/a/page.md#part)"
         );
         // Back out of a page into the skill's own files.
         assert_eq!(
-            from(page, "see [setup](../../skills/s/setup.md).", Some(SHA)),
+            from(page, "see [setup](../../skills/s/setup.md)."),
             "see [setup](../../setup.md)."
         );
         // A sibling is already right.
-        assert_eq!(from(skill, "[s](setup.md)", Some(SHA)), "[s](setup.md)");
-        // Anything else in the repository goes to GitHub at the build's commit...
+        assert_eq!(from(skill, "[s](setup.md)"), "[s](setup.md)");
+        // Anything else in the repository goes to GitHub at the pin.
         assert_eq!(
-            from(page, "[r](../../README.md#top)", Some(SHA)),
-            format!("[r]({repository}/blob/{SHA}/README.md#top)")
-        );
-        // ...or, with no commit to pin to, stays as written.
-        assert_eq!(
-            from(page, "[r](../../README.md)", None),
-            "[r](../../README.md)"
+            from(page, "[r](../../README.md#top)"),
+            format!("[r]({repository}/blob/{TAG}/README.md#top)")
         );
         // Absolute links, fragments, titles and paths that climb out of the repository are left alone.
         for kept in [
@@ -768,17 +829,33 @@ mod tests {
             "[x](../../README.md \"title\")",
             "[x](../../../../outside.md)",
         ] {
-            assert_eq!(from(page, kept, Some(SHA)), kept);
+            assert_eq!(from(page, kept), kept);
         }
     }
 
+    /// **What is served depends on the version and not on the commit**, which is the property the
+    /// pin exists for: a host binds its approval of a skill to the served bytes, so a pin that moved
+    /// with every commit made every rebuild a new version of every skill. Asserted on the served
+    /// text rather than on [`PIN`]'s spelling, because the leak would be a build stamp reaching a
+    /// link however it got there.
     #[test]
-    fn the_build_commit_is_read_out_of_the_build_stamp() {
-        let build = env!("WINDBG_MCP_BUILD");
-        match pinned() {
-            Some(sha) => assert!(build.starts_with(&format!("g{sha}")), "{build}"),
-            None => assert!(!build.starts_with('g'), "{build}"),
+    fn a_served_skill_carries_no_build_stamp() {
+        // `g<short sha>`, optionally `-dirty.<digest>`; nothing at all where build.rs had no git.
+        let commit = env!("WINDBG_MCP_BUILD")
+            .strip_prefix('g')
+            .and_then(|stamp| stamp.split('-').next())
+            .filter(|sha| sha.len() >= 7);
+        for entry in CATALOG.iter() {
+            for (uri, text) in &entry.files {
+                if let Some(sha) = commit {
+                    assert!(
+                        !text.contains(&format!("/blob/{sha}")),
+                        "{uri} links a page at this build's commit {sha}"
+                    );
+                }
+            }
         }
+        assert_eq!(PIN, concat!("v", env!("CARGO_PKG_VERSION")));
     }
 
     /// Which client gets which skill. The default surface is the case the split was for: it gets
@@ -847,14 +924,29 @@ mod tests {
     fn a_skill_outside_the_surface_is_refused_and_unreadable() {
         let crash = surface("crash");
         let uri = "skill://windbg-debugging/SKILL.md";
-        let refused = get(&crash, uri).expect_err("`crash` is not served windbg-debugging");
+        let widen = |chosen| move || Toolset::widening("bench", chosen);
+        let refused = get(&crash, uri, widen(crate::toolset::Chosen::ForTheRun))
+            .expect_err("`crash` is not served windbg-debugging");
         assert_eq!(refused.code, rmcp::model::ErrorCode::INVALID_PARAMS);
         assert!(refused.message.contains("--tools"), "{}", refused.message);
+        // A listener client whose surface is its own credential's is pointed at that, not at the
+        // run's `--tools`, which would change nothing for it.
+        let refused = get(&crash, uri, widen(crate::toolset::Chosen::ForThisClient))
+            .expect_err("`crash` is not served windbg-debugging");
+        assert!(
+            refused.message.contains(crate::client::TOOLS_ENV) && refused.message.contains("bench"),
+            "{}",
+            refused.message
+        );
         assert!(read(&crash, uri).is_none());
         assert!(resources(&crash).resources.is_empty());
 
-        let unknown =
-            get(&Toolset::default(), "skill://nothing-here/SKILL.md").expect_err("no such skill");
+        let unknown = get(
+            &Toolset::default(),
+            "skill://nothing-here/SKILL.md",
+            widen(crate::toolset::Chosen::ForTheRun),
+        )
+        .expect_err("no such skill");
         assert_eq!(unknown.code, rmcp::model::ErrorCode::INVALID_PARAMS);
         assert!(!unknown.message.contains("--tools"), "{}", unknown.message);
     }

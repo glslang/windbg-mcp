@@ -53,9 +53,10 @@ server from the VM id and CR3 is reported by the register provider, so `vmwp_pid
 are discovered by the worker only when the profile carries a `discovery` section, which makes
 `dispatcher_vnd` and `partition_id` assertions too — a profile without one still takes both as
 required inputs. The repository supplies neither privileged provider.
-The worker validates the request, profile and register provider's declared identity and
-capabilities before it accepts the session; opening itself does not change guest execution. The
-first `sk_live_arm` pauses the VM,
+Opening validates the request and the profile and takes the VM's reservation; it starts no
+provider and does not change guest execution. The register provider is started, and its declared
+identity and capabilities checked, when the first `sk_live_arm` prepares the session — so a
+provider that is wrong is refused there, not at open. That arm also pauses the VM,
 validates the VM-to-`vmwp` binding, live-memory CR3, guarded instructions and local `vmwp.exe`
 build, and proceeds to register or breakpoint mutation only after those checks pass.
 
@@ -105,8 +106,12 @@ refused while running.
 Teardown is fail-closed. A confirmed `end_session` restores every selected VP, completes any owned
 event through the native dispatcher, removes the temporary handler, detaches from `vmwp` and leaves
 the VM running. If any of that is unconfirmed, `session_status` reports
-`live_control_unresolved`; the worker, exact VM/`vmwp` reservation and session slot survive idle and
-capacity reclamation, lease expiry, shutdown and supervisor loss. The unresolved session refuses
+`live_control_unresolved`, and the worker is never killed for it: not by idle or capacity
+reclamation, lease expiry, shutdown or the loss of its supervisor. The worker holds the VM's
+reservation itself, so that outlives the supervisor too. The session slot does not: it is the
+supervisor's, kept through reclamation and lease expiry while that supervisor runs, and gone with
+it — after a shutdown or supervisor loss no server lists the session, and recovery works from the
+retained worker, out of band. The unresolved session refuses
 further control work and cannot be treated as released. Inspect or discard the disposable VM out of
 band before allowing another controller to own it.
 

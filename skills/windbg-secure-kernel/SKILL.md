@@ -14,9 +14,11 @@ exposes the same controller as an ordinary DbgEng kernel session.
 server started with no `--tools` leaves out, so a call to one is refused with `-32602` naming
 `--tools` — a configuration answer, not a missing feature. Widen the surface first: `--tools all`,
 or `securekernel` beside the groups you use (the M8 route below also needs `inspect` and `exec`).
-On a listener that is the client's own credential entry rather than the command line. Everything
-else about the server — engine bundling, symbols, elevation, sessions — is the `windbg-debugging`
-skill's, and applies here unchanged.
+On a listener either works: the listener's own `--tools` is every client's default, and a
+client's credential entry, where it has one, replaces that default for that client. Engine
+bundling and symbol setup are the server's in general rather than this skill's: the
+`windbg-debugging` skill covers them where the surface also serves the ordinary groups, as
+`--tools all` does, and the elevation and prerequisites these tools add are below.
 
 ## Tool map
 

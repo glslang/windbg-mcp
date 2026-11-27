@@ -475,24 +475,32 @@ impl Toolset {
                 Chosen::ForThisClient => format!("it serves `{client}`"),
             },
             self.summary(),
-            match chosen {
-                Chosen::ForTheRun =>
-                    format!("Widen `{FLAG}`, or use `{FLAG} {ALL}` to serve every tool."),
-                // **Both sources, because only one of them exists on any given host.** The
-                // command edits the credential file a *service* reads and refuses outright where
-                // no service is installed — so naming it alone is advice a foreground listener's
-                // operator cannot take, and that is the deployment a narrowed client is most
-                // likely to be on (review on #196).
-                Chosen::ForThisClient => format!(
-                    "That is `{client}`'s own surface rather than this run's, so widening it is a \
+            Self::widening(client, chosen),
+        )
+    }
+
+    /// How a caller's operator widens the surface it was served: the half of a refusal that names
+    /// which configuration to change. Shared with [`crate::skills`], whose refusal for a skill
+    /// outside the surface has exactly this remedy.
+    pub fn widening(client: &str, chosen: Chosen) -> String {
+        match chosen {
+            Chosen::ForTheRun => {
+                format!("Widen `{FLAG}`, or use `{FLAG} {ALL}` to serve every tool.")
+            }
+            // **Both sources, because only one of them exists on any given host.** The
+            // command edits the credential file a *service* reads and refuses outright where
+            // no service is installed — so naming it alone is advice a foreground listener's
+            // operator cannot take, and that is the deployment a narrowed client is most
+            // likely to be on (review on #196).
+            Chosen::ForThisClient => format!(
+                "That is `{client}`'s own surface rather than this run's, so widening it is a \
                      change to this listener's client list: `{} {client} {FLAG} <spec>` under a \
                      service, or `{}_{}` for a foreground one. Neither needs a restart.",
-                    crate::service::SET_CLIENT_TOOLS_FLAG,
-                    crate::client::TOOLS_ENV,
-                    client.to_ascii_uppercase(),
-                ),
-            }
-        )
+                crate::service::SET_CLIENT_TOOLS_FLAG,
+                crate::client::TOOLS_ENV,
+                client.to_ascii_uppercase(),
+            ),
+        }
     }
 }
 
