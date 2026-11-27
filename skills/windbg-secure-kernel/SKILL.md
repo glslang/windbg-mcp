@@ -14,11 +14,19 @@ exposes the same controller as an ordinary DbgEng kernel session.
 server started with no `--tools` leaves out, so a call to one is refused with `-32602` naming
 `--tools` — a configuration answer, not a missing feature. Widen the surface first: `--tools all`,
 or `securekernel` beside the groups you use (the M8 route below also needs `inspect` and `exec`).
-On a listener either works: the listener's own `--tools` is every client's default, and a
-client's credential entry, where it has one, replaces that default for that client. Engine
-bundling and symbol setup are the server's in general rather than this skill's: the
-`windbg-debugging` skill covers them where the surface also serves the ordinary groups, as
-`--tools all` does, and the elevation and prerequisites these tools add are below.
+On a listener either works: the listener's own `--tools` is every client's default, and a tool
+spec in a client's credential entry, where the entry has one, replaces that default for that
+client; an entry without one inherits it. Engine bundling and symbol setup are the server's in
+general rather than this skill's: the `windbg-debugging` skill covers them where the surface also
+serves the ordinary groups, as `--tools all` does, and the elevation and prerequisites these tools
+add are below.
+
+**Symbols need the engine's own helpers beside it.** A name, stack or symbolic breakpoint on the
+Secure Kernel needs the `securekernel.pdb` matching the guest's `securekernel.exe`, and the engine
+loads one only with `symsrv.dll` and `msdia140.dll` bundled next to the server binary: the in-box
+engine in `System32` comes with neither, so a `srv*` symbol path downloads nothing and names
+silently fall back to exports. Take both from a WinDbg or Windows SDK installation of the server's
+architecture.
 
 ## Tool map
 
