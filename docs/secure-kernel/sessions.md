@@ -54,9 +54,12 @@ are discovered by the worker only when the profile carries a `discovery` section
 `dispatcher_vnd` and `partition_id` assertions too — a profile without one still takes both as
 required inputs. The repository supplies neither privileged provider.
 Opening validates the request and the profile and takes the VM's reservation; it starts no
-provider and does not change guest execution. The register provider is started, and its declared
-identity and capabilities checked, when the first `sk_live_arm` prepares the session — so a
-provider that is wrong is refused there, not at open. That arm also pauses the VM,
+provider and does not change guest execution. The first `sk_live_arm` prepares the session, in an
+order that depends on the profile. With a `discovery` section, the VM is paused and discovery runs
+against `vmwp` first, and only then is the register provider started and its declared identity and
+capabilities checked — so a provider that is wrong is refused after that pause, not before it.
+Without one, the provider is started and checked first. Either way a wrong provider is refused at
+the first arm, not at open. The arm then pauses the VM where it has not already,
 validates the VM-to-`vmwp` binding, live-memory CR3, guarded instructions and local `vmwp.exe`
 build, and proceeds to register or breakpoint mutation only after those checks pass.
 
