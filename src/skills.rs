@@ -240,10 +240,10 @@ fn assemble(bundle: &Bundle, pin: &str) -> Result<Entry, String> {
 /// the skill; a link to anything else in the repository becomes that file on GitHub at `pin`.
 /// Absolute URLs and same-page fragments are left alone.
 ///
-/// Only inline `[text](target)` links without a title are rewritten. A relative link in either of
-/// the other forms, a reference-style definition or an inline link with a title, would be served
-/// as written, which no served file does: `no_served_file_uses_a_link_form_relink_leaves_alone`
-/// fails on the first that did, rather than this growing a Markdown parser for forms nobody writes.
+/// Only inline `[text](target)` links without a title are rewritten. A link in a reference-style
+/// definition, or a relative inline link with a title, would be served as written, which no served
+/// file does: `no_served_file_uses_a_link_form_relink_leaves_alone` fails on the first that did,
+/// rather than this growing a Markdown parser for forms nobody writes.
 fn relink(text: &str, from: &Source, files: &[Source], pin: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -702,8 +702,8 @@ mod tests {
     }
 
     /// The two Markdown link forms [`relink`] does not rewrite, refused rather than supported: a
-    /// relative inline link with a title, and a relative reference-style definition. Either would
-    /// be served pointing where the file sits on disk, and both link checks above would pass it,
+    /// relative inline link with a title, and any reference-style definition. Either would be
+    /// served pointing where the file sits on disk, and both link checks above would pass it,
     /// since they read inline targets and skip one with a title in it.
     #[test]
     fn no_served_file_uses_a_link_form_relink_leaves_alone() {
@@ -731,14 +731,15 @@ mod tests {
                 .map(str::to_string)
                 .collect()
         };
+        // **Any** reference-style definition, not only a relative one: no served file uses the form,
+        // and CommonMark lets its destination sit on the next line, so a check that read the
+        // destination would have to follow the grammar line by line to be right about it.
         let definitions = |text: &str| -> Vec<String> {
             text.lines()
                 .filter(|line| line.len() - line.trim_start().len() <= 3)
                 .filter_map(|line| {
-                    let line = line.trim_start().strip_prefix('[')?;
-                    let (label, rest) = line.split_once("]:")?;
-                    let target = rest.split_whitespace().next()?;
-                    (!label.contains(']') && relative(target)).then(|| target.to_string())
+                    let label = line.trim_start().strip_prefix('[')?.split_once("]:")?.0;
+                    (!label.is_empty() && !label.contains(']')).then(|| line.trim().to_string())
                 })
                 .collect()
         };
@@ -758,9 +759,10 @@ mod tests {
             titled(r#"[a](../x.md "t") [b](https://e.com "t") [xml](Get-Content "$w\x" -Raw)"#),
             [r#"../x.md "t""#]
         );
+        // A destination on the next line is still a definition; four spaces in is a code block.
         assert_eq!(
-            definitions("[a]: ../x.md\n[b]: https://e.com\n    [c]: ../y.md"),
-            ["../x.md"]
+            definitions("[a]: ../x.md\n[b]:\n  ../y.md\n[c]: https://e.com\n    [d]: ../z.md"),
+            ["[a]: ../x.md", "[b]:", "[c]: https://e.com"]
         );
     }
 
