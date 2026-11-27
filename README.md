@@ -97,7 +97,7 @@ a fixed **capture**, eleven tools for selected-VP **live control**, the managed 
 tools that trace VTL0 secure-service entries in an ordinary kernel session, and two tools for a
 separate hypervisor transition trace; the session contracts
 are in
-[`docs/sessions.md`](docs/sessions.md). The separate `--sk-live` command-line role decodes a running
+[`docs/secure-kernel/sessions.md`](docs/secure-kernel/sessions.md). The separate `--sk-live` command-line role decodes a running
 guest without controlling it, and the `--sk-kd-target` role puts an installed WinDbg in front of the
 live-control session over a local named pipe, within the limits
 [`docs/secure-kernel/kd-facade.md`](docs/secure-kernel/kd-facade.md) records. Live decode, live

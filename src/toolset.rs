@@ -363,20 +363,14 @@ impl Toolset {
         })
     }
 
-    /// Every tool this server has, for the assertions that have to range over all of them.
+    /// Every tool this server has, for whatever has to range over all of them.
     ///
-    /// `GROUPS` is the table and stays private - this is the read-only view of it that
-    /// `src/server.rs` needs to check that no client's `instructions` name a tool it is not
-    /// served.
-    ///
-    /// **`cfg(test)` because every caller is an assertion**, all of them in `src/server.rs`'s
-    /// test module: the prose checks that no description, fragment or note names a tool its own
-    /// surface does not serve. Nothing in a shipping build ranges over the whole table - a
-    /// surface answers `includes` for the tools it was asked about - so without the gate this is
-    /// dead code in the `windbg-mcp` binary, which `cargo clippy -- -D warnings` fails on. CI
-    /// runs clippy without `-D warnings`, so the gate is what keeps the stricter local command
-    /// (the one `CLAUDE.md` prescribes) green.
-    #[cfg(test)]
+    /// `GROUPS` is the table and stays private - this is the read-only view of it. Its callers are
+    /// the prose checks in `src/server.rs`'s tests, which assert that no description, fragment or
+    /// note names a tool its own surface does not serve, and [`crate::skills`], which makes the
+    /// same decision at run time: a built-in skill is served to a client only when every tool its
+    /// files name is one that client may call. It was `cfg(test)` until that second caller, since
+    /// nothing else in a shipping build ranges over the whole table.
     pub fn every_tool() -> impl Iterator<Item = &'static str> {
         GROUPS.iter().flat_map(|group| group.tools.iter().copied())
     }
@@ -531,6 +525,56 @@ pub enum Chosen {
     /// This client's own entry in the listener's configuration — a `WINDBG_MCP_TOOLS_<NAME>`
     /// variable, or a `tools` field in the credential file.
     ForThisClient,
+}
+
+/// Whether prose **names a tool** — the check the instructions, the descriptions and the built-in
+/// skills are all held to, and the one thing that has to be right for any of them to mean anything.
+///
+/// Here rather than beside the tests that grew it because [`crate::skills`] reads it at run time:
+/// a skill is served only to a client that may call every tool it names, which is these tests'
+/// property decided per client instead of asserted per spec.
+///
+/// Two rules, each because the other alone gets a real sentence here wrong:
+///
+/// - **Written as code**: a backtick span that *is* the name, or that opens a call with it
+///   (`execute { "command": "k" }`). Plain containment cannot be the rule, because several of
+///   these names are also English — `crash_triage` says frames are "attributed to modules",
+///   `end_session` says a stuck session "does not let go" — and a rule that forbids the words
+///   *modules* and *go* is not one anyone can write prose under. Nor can "anywhere inside a
+///   code span" be it: the TTD tools quote the expression they run,
+///   `dx @$cursession.TTD.Calls(...)`, which names the debugger command `dx` is built on and
+///   not the `dx` tool.
+/// - **Or bare, if the name has an underscore**: `step_back`'s description said "Reverse of
+///   step_into.", as copyable as any backticked name and invisible to the first rule. An
+///   underscored name is an identifier and never an English word, so this half needs no
+///   exceptions.
+/// - **Or in double quotes**, which is the third rule and the one the other two leave a hole
+///   between: `Call "execute" instead` is as copyable as any of them and matches neither —
+///   not the first, which wants a backtick span, and not the second, which `execute` has no
+///   underscore for. Raised on review of
+///   [#456](https://github.com/glslang/windbg-mcp/pull/456) against the input-schema walk, and
+///   fixed here instead because the hole is in the predicate and all three channels read it.
+///   Measured 2026-10-05 before adding it: **no** description, instruction fragment or schema
+///   string on the 75-tool surface writes a tool's name in double quotes, so this costs
+///   nothing today. What it will cost is a value that happens to be spelled like a tool —
+///   `{"access": "execute", …}` is a [`crate::structured::WatchAccess`] — which is the same trade
+///   `debug_batch`'s steps took when their exemption was deleted: such a value is documented
+///   by the schema that declares it rather than spelled in prose.
+pub fn names_tool(text: &str, tool: &str) -> bool {
+    let as_code = text.split('`').skip(1).step_by(2).any(|span| {
+        span == tool
+            || span
+                .strip_prefix(tool)
+                .is_some_and(|rest| rest.starts_with(" {"))
+    });
+    let boundary = |c: Option<char>| c.is_none_or(|c| !c.is_alphanumeric() && c != '_');
+    as_code
+        || text.contains(&format!("\"{tool}\""))
+        || (tool.contains('_')
+            && text.match_indices(tool).any(|(at, _)| {
+                boundary(text[..at].chars().next_back())
+                    && boundary(text[at + tool.len()..].chars().next())
+            }))
 }
 
 #[cfg(test)]

@@ -67,6 +67,7 @@ mod skcall;
 mod skcontrol;
 mod skcorrelate;
 mod skdispatch;
+mod skills;
 mod skinspect;
 mod skjoin;
 mod sklive;
@@ -259,6 +260,18 @@ fn main() -> Result<()> {
         return skinspect::run(&args[at + 1..]);
     }
 
+    // The plugin's off switch for the built-in skills (`skills::NO_SKILLS_FLAG`), which is stdio's
+    // alone: a plugin launches the server on stdio, and a listener or a service has no plugin beside
+    // it shipping the same files. Refused elsewhere rather than ignored, because there it would be
+    // a flag that silently changes nothing.
+    let no_skills = args.iter().any(|arg| arg == skills::NO_SKILLS_FLAG);
+    if no_skills && (service::requested(&args).is_some() || listen::requested(&args).is_some()) {
+        anyhow::bail!(
+            "`{}` applies to the stdio server only, where a plugin ships the same skills",
+            skills::NO_SKILLS_FLAG
+        );
+    }
+
     // Also before the runtime, and for a sharper reason than the renderer's. Installing touches the
     // SCM and nothing else. Running *as* a service has to build its runtime inside the SCM's own
     // dispatcher thread rather than around it, so the one thing this must not do is start one here.
@@ -316,7 +329,7 @@ fn main() -> Result<()> {
                 // from. Its clients come from the environment it was started with, which is a set
                 // that cannot change without the process changing too.
                 Some(addr) => serve_http(addr, tools, None, std::future::pending(), || {}).await,
-                None => serve(tools).await,
+                None => serve(tools, no_skills).await,
             }
         })
 }
@@ -481,7 +494,7 @@ fn init_logging(is_worker: bool, to_file: Option<std::path::PathBuf>) {
     }
 }
 
-async fn serve(tools: toolset::Toolset) -> Result<()> {
+async fn serve(tools: toolset::Toolset, no_skills: bool) -> Result<()> {
     // Opened before anything is served, so the transcript's first record is this run starting
     // rather than whatever the first tool call happened to be.
     let sessions = Sessions::new(call_timeout()).recording(record::Recorder::from_env());
@@ -489,6 +502,11 @@ async fn serve(tools: toolset::Toolset) -> Result<()> {
     // `ForTheRun` without a branch: stdio has one client by construction and no configuration to
     // give it a surface of its own, so `--tools` is the only thing that can have narrowed this.
     let server = WindbgServer::new(sessions.clone()).with_tools(tools, toolset::Chosen::ForTheRun);
+    let server = if no_skills {
+        server.without_skills()
+    } else {
+        server
+    };
 
     tracing::info!("windbg-mcp starting on stdio, serving {surface}");
     let service = server.serve(stdio()).await?;

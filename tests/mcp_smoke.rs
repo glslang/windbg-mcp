@@ -1948,14 +1948,17 @@ fn a_discover_probe_leaves_the_connection_free_to_initialize() {
 /// absent.
 ///
 /// Every field of rmcp's `ServerCapabilities` is `skip_serializing_if = "Option::is_none"`, so the
-/// object on the wire is exactly what `get_info` builds — one key today. Naming the absent ones
-/// cannot catch a capability nobody here has heard of, and that is the shape the next one arrives
-/// in: `ServerCapabilities` is `#[non_exhaustive]`, and tasks
+/// object on the wire is exactly what `get_info` builds: `tools`, plus — for a client served any
+/// built-in skill — `resources` and the skills extension (SEP-2640), which rides on them. Naming
+/// the absent ones cannot catch a capability nobody here has heard of, and that is the shape the
+/// next one arrives in: `ServerCapabilities` is `#[non_exhaustive]`, and tasks
 /// (`io.modelcontextprotocol/tasks`, SEP-2663) would appear as `extensions` under the SEP rmcp
 /// implements but as a first-class `tasks` field if rmcp follows the reference TypeScript SDK,
 /// which still spells it that way (`FOLLOWUPS.md` item 8). The four-names-plus-`extensions` check
 /// this replaced covered the first of those two routes and would have passed the second in silence.
-fn assert_only_tools_advertised(capabilities: &Value, whose: &str) {
+/// So the extensions are a whole key set too, and the skills one carries no `directoryRead` and
+/// `resources` no `subscribe` or `listChanged`: neither method is implemented.
+fn assert_advertises_exactly(capabilities: &Value, whose: &str, skills: bool) {
     assert!(
         !capabilities["tools"].is_null(),
         "{whose} must advertise tools: {capabilities}"
@@ -1966,14 +1969,31 @@ fn assert_only_tools_advertised(capabilities: &Value, whose: &str) {
         .keys()
         .map(String::as_str)
         .collect();
+    let expected = if skills {
+        std::collections::BTreeSet::from(["extensions", "resources", "tools"])
+    } else {
+        std::collections::BTreeSet::from(["tools"])
+    };
     assert_eq!(
-        advertised,
-        std::collections::BTreeSet::from(["tools"]),
-        "this server implements tools and no other capability, so `tools` is the whole of what \
-         {whose} may advertise — anything else here is a door clients will open onto a \
-         method_not_found. If an SDK bump switched one on, implement it or suppress it rather than \
-         shipping the advertisement: {capabilities}"
+        advertised, expected,
+        "this server implements tools, and resources only to carry its skills, so these are the \
+         whole of what {whose} may advertise — anything else here is a door clients will open onto \
+         a method_not_found. If an SDK bump switched one on, implement it or suppress it rather \
+         than shipping the advertisement: {capabilities}"
     );
+    if skills {
+        assert_eq!(
+            capabilities["extensions"],
+            json!({ "io.modelcontextprotocol/skills": {} }),
+            "{whose} declares the skills extension and nothing else, without directoryRead"
+        );
+        assert_eq!(
+            capabilities["resources"],
+            json!({}),
+            "{whose} serves resources/list and resources/read, and neither subscriptions nor \
+             change notifications"
+        );
+    }
 }
 
 /// Advertising a capability the server does not implement is worse than not advertising it:
@@ -1999,7 +2019,7 @@ fn capabilities_advertise_only_what_is_implemented() {
     // The handshake lifecycle.
     let mut server = Server::spawn();
     let result = server.initialize(SUPPORTED_REVISIONS[0]);
-    assert_only_tools_advertised(&result["capabilities"], "`initialize`");
+    assert_advertises_exactly(&result["capabilities"], "`initialize`", true);
 
     // And the behaviour agreeing with the advertisement, for the extension most likely to arrive
     // first. Deliberately a second assertion rather than a consequence of the one above: rmcp
@@ -2019,13 +2039,69 @@ fn capabilities_advertise_only_what_is_implemented() {
     let mut discovered = Server::spawn();
     let response = discovered.stateless_request("server/discover", json!({}), STEP);
     assert_no_error(&response, "server/discover");
-    assert_only_tools_advertised(&response["result"]["capabilities"], "`server/discover`");
+    assert_advertises_exactly(
+        &response["result"]["capabilities"],
+        "`server/discover`",
+        true,
+    );
 
     let tasks = discovered.stateless_request("tasks/get", json!({ "taskId": "nope" }), STEP);
     assert_eq!(
         tasks["error"]["code"], -32601,
         "an unimplemented extension method must be method_not_found for a discover-first client \
          too, got {tasks}"
+    );
+
+    // The skills the advertisement promises, on the lifecycle where 2026-07-28's cache fields are
+    // required: listed, and readable at the URI the listing names.
+    let listed = discovered.stateless_request("skills/list", json!({}), STEP);
+    assert_no_error(&listed, "skills/list");
+    let uri = listed["result"]["skills"][0]["uri"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the default surface is served windbg-debugging: {listed}"));
+    assert_eq!(uri, "skill://windbg-debugging/SKILL.md", "{listed}");
+    let read = discovered.stateless_request("resources/read", json!({ "uri": uri }), STEP);
+    assert_no_error(&read, "resources/read");
+    assert!(
+        read["result"]["contents"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("---\nname: windbg-debugging")),
+        "{read}"
+    );
+
+    // `--no-skills`, which the plugin passes: the server it was before there were skills, on both
+    // lifecycles, with the methods unimplemented rather than empty.
+    let mut plain = Server::spawn_with_args(&[], &["--no-skills"]);
+    let result = plain.initialize(SUPPORTED_REVISIONS[0]);
+    assert_advertises_exactly(
+        &result["capabilities"],
+        "`initialize` under `--no-skills`",
+        false,
+    );
+    let mut plain = Server::spawn_with_args(&[], &["--no-skills"]);
+    let response = plain.stateless_request("server/discover", json!({}), STEP);
+    assert_advertises_exactly(
+        &response["result"]["capabilities"],
+        "`server/discover` under `--no-skills`",
+        false,
+    );
+    let listed = plain.stateless_request("skills/list", json!({}), STEP);
+    assert_eq!(listed["error"]["code"], -32601, "{listed}");
+}
+
+/// `--no-skills` is the plugin's, and the plugin launches stdio: beside `--listen` it would change
+/// nothing, so it is refused at startup rather than accepted and ignored.
+#[test]
+fn no_skills_is_refused_beside_a_listener() {
+    let refused = Command::new(EXE)
+        .args(["--no-skills", "--listen", "127.0.0.1:0"])
+        .output()
+        .expect("start the server");
+    assert!(!refused.status.success(), "accepted `--no-skills --listen`");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("--no-skills") && stderr.contains("stdio"),
+        "the refusal names the flag and where it applies: {stderr}"
     );
 }
 
@@ -5336,6 +5412,60 @@ fn a_listener_serves_the_narrowed_surface_it_was_started_with() {
     assert!(
         log.contains("serving 13 of 89 tools (session, crash)"),
         "the listener does not report the surface it ended up with: {log}"
+    );
+}
+
+/// Two clients on one listener get two skill catalogues, for the reason the test below gets two
+/// `tools/list` answers: which skills a client is offered is its surface's decision, and a surface
+/// resolved from the wrong client is the item-29 bug again — offering `bench` a playbook that names
+/// twenty tools it cannot call, or telling `local` the server has no skills at all.
+#[test]
+fn two_clients_on_one_listener_are_offered_two_skill_catalogues() {
+    let bench_token = format!("smoke-bench-skills-{}", std::process::id());
+    let mut server = Listener::start_with_args(
+        &[
+            ("WINDBG_MCP_LISTEN_TOKEN_BENCH", &bench_token),
+            ("WINDBG_MCP_TOOLS_BENCH", "crash"),
+        ],
+        &[],
+    );
+    let local_token = server.token.clone();
+    assert!(
+        server.wait_for_stderr(
+            "except bench serves 13 of 89 tools (session, crash)",
+            Duration::from_secs(30)
+        ),
+        "the listener did not come up with bench narrowed:\n{}",
+        server.stderr()
+    );
+    let local_mcp = server.initialize_as(&local_token);
+    let bench_mcp = server.initialize_as(&bench_token);
+
+    let to_local = server.call_as(&local_token, Some(&local_mcp), "skills/list", json!({}));
+    assert_eq!(to_local.status, 200, "{}", to_local.body);
+    let to_local = to_local.payload.clone().expect("a JSON-RPC payload");
+    let names: Vec<&str> = to_local["result"]["skills"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the default surface lists skills: {to_local}"))
+        .iter()
+        .filter_map(|skill| skill["frontmatter"]["name"].as_str())
+        .collect();
+    assert_eq!(names, ["windbg-debugging"], "{to_local}");
+
+    // `crash` is served no skill, so for `bench` the extension is not there at all.
+    let to_bench = server.call_as(&bench_token, Some(&bench_mcp), "skills/list", json!({}));
+    let to_bench = to_bench.payload.clone().expect("a JSON-RPC payload");
+    assert_eq!(to_bench["error"]["code"], -32601, "{to_bench}");
+    let read = server.call_as(
+        &bench_token,
+        Some(&bench_mcp),
+        "resources/read",
+        json!({ "uri": "skill://windbg-debugging/SKILL.md" }),
+    );
+    let read = read.payload.clone().expect("a JSON-RPC payload");
+    assert!(
+        read["result"].is_null(),
+        "bench read a skill its surface is not offered: {read}"
     );
 }
 

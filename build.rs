@@ -56,7 +56,28 @@ use std::process::Command;
 
 /// The build inputs: what goes into the binary or the tests, and nothing else. The watch list, the
 /// dirty check and the dirty digest all read this, so they cannot disagree about what a build is.
-const INPUTS: [&str; 5] = ["src", "tests", "build.rs", "Cargo.toml", "Cargo.lock"];
+///
+/// `skills` since the built-in skills (`src/skills.rs`): they are compiled into the binary with
+/// `include_str!`, so a skill edit changes what the binary serves and has to change what it calls
+/// itself too, or two builds serving different skills would report one identity. The `docs/` pages
+/// below are the ones those skills bundle, named one by one rather than as `docs` so that an edit
+/// to a page no skill carries leaves a build clean; `skills::tests::every_served_file_is_a_build_input`
+/// fails when a skill bundles a page this list does not name.
+const INPUTS: [&str; 13] = [
+    "src",
+    "tests",
+    "build.rs",
+    "Cargo.toml",
+    "Cargo.lock",
+    "skills",
+    "docs/crash-dump-walkthrough.md",
+    "docs/driver-ioctl-walkthrough.md",
+    "docs/hevd-ioctl-walkthrough.md",
+    "docs/secure-kernel/README.md",
+    "docs/secure-kernel/kd-facade.md",
+    "docs/secure-kernel/m8-debugger.md",
+    "docs/secure-kernel/sessions.md",
+];
 
 fn main() {
     for input in INPUTS {

@@ -1,18 +1,16 @@
 ---
 name: windbg-debugging
-description: Drive WinDbg/DbgEng via the `windbg` MCP server to debug Windows crash dumps, live user-mode and kernel targets, and Time Travel Debugging (.run) traces, and to inspect or control a VBS guest's Secure Kernel (VTL1). Use when analyzing a .dmp, attaching to a process or the kernel, recording/navigating/analyzing a TTD trace, inspecting a saved state's Secure Kernel, or stopping, stepping and resuming an exact disposable VTL1 target.
+description: Drive WinDbg/DbgEng via the `windbg` MCP server to debug Windows crash dumps, live user-mode and kernel targets, and Time Travel Debugging (.run) traces. Use when analyzing a .dmp, attaching to a process or the kernel, or recording/navigating/analyzing a TTD trace.
 ---
 
 # WinDbg debugging via the `windbg` MCP server
 
 This skill drives the `windbg` MCP server, which wraps WinDbg/DbgEng for four kinds of
 Windows debugging: **crash-dump** analysis, **live user-mode** debugging, **kernel**
-debugging, and **Time Travel Debugging (TTD)** of `.run` traces. It also reads a fifth
-kind of target that is not a debuggee at all — a **Hyper-V checkpoint's Secure Kernel
-(VTL1)**, where nothing executes and the tools only read — plus an isolated live-control session
-for one selected VTL1 VP in an exact disposable VBS VM.
-The same controller can be exposed as M8's ordinary composite DbgEng session, so generic debugger
-tools work on Secure Kernel, or as a managed local pipe for Classic WinDbg/WinDbgX.
+debugging, and **Time Travel Debugging (TTD)** of `.run` traces.
+A VBS guest's **Secure Kernel (VTL1)** — read from a Hyper-V checkpoint, or controlled live in a
+disposable VM — has a skill of its own, `windbg-secure-kernel`, because its tools are a group the
+server does not serve unless asked to.
 
 **Verify the environment first.** Most failures are setup, not debugging — wrong engine
 DLL, missing symbols, or no elevation. Read **[setup.md](setup.md)** before the first
@@ -28,8 +26,8 @@ session of a workflow you haven't run yet in this environment.
 | Walk kernel pools or user Segment Heaps | [heap-walking.md](heap-walking.md) |
 | Record / open / navigate / analyze a `.run` trace | [ttd.md](ttd.md) |
 | Enumerate a driver's IOCTLs & test user-mode reachability | [driver-ioctl.md](driver-ioctl.md) |
-| Inspect a captured Secure Kernel or control an exact disposable live VTL1 VP | [secure-kernel.md](secure-kernel.md) |
-| Compare Windows component builds for an MSRC CVE with BN Personal | [MSRC patch-diff skill](../msrc-patch-diff/SKILL.md) |
+| Inspect a captured Secure Kernel or control an exact disposable live VTL1 VP | the `windbg-secure-kernel` skill |
+| Compare Windows component builds for an MSRC CVE with BN Personal | the `msrc-patch-diff` skill |
 
 ## Tool map
 
@@ -46,7 +44,6 @@ already does the job.
 | TTD analysis | `ttd_calls`, `ttd_memory`, `ttd_events`, `index_trace`, `record_trace` |
 | Kernel pool | `pool_find_tag`, `pool_chunk`, `pool_census`, `pool_diagnostics`; live: `pool_trace`, `pool_trace_read` |
 | User Segment Heap | `heap_list`, `heap_allocations`, `heap_chunk`, `heap_census`, `heap_diagnostics` |
-| Secure Kernel | Capture: `open_sk_capture`, `sk_modules`, `sk_read_memory`, `sk_symbol`. Live control opener: `open_sk_live_control`; ten operations: `sk_live_arm`, `sk_live_wait`, `sk_live_break`, `sk_live_registers`, `sk_live_read_memory`, optional policy-gated `sk_live_write_memory`, `sk_live_step`, `sk_live_continue_to_breakpoints`, `sk_live_continue_to_software_breakpoints`, `sk_live_continue`. Traces: `sk_service_trace`, `sk_service_trace_read`, `sk_call_trace`, `sk_call_trace_read`, `hv_transition_trace`, `hv_transition_trace_read`. Debuggers: `open_sk_debugger` creates a managed MCP DbgEng session paired with its Secure Kernel controller; `open_sk_kd` exposes a standalone pipe for external WinDbg. Capture, live-control and standalone KD sessions refuse ordinary debugger tools; the managed debugger exposes them. `end_session` still applies |
 | Server | `server_log` — the server's own records: the supervisor's, plus your own sessions' workers, tagged by session |
 | Raw | `execute` — run any debugger command, returns full text output |
 
@@ -209,17 +206,5 @@ where its stderr is not on your screen.
   annotated destructive and retires your `session_id` when the expression touches command
   execution. Ordinary TTD queries don't trip it.
 - **TTD is user-mode only** (a Microsoft limitation) — you cannot time-travel a kernel target.
-- **Secure Kernel capture, live decode, low-level live control and M8 debugging are four distinct routes.** An
-  `open_sk_capture` session reads a fixed Hyper-V checkpoint, so nothing executes. `--sk-live` is a
-  command-line decode role using an operator-supplied memory transport, with no MCP session. The
-  live-control opener and ten MCP operations instead bind operator-supplied register and memory providers plus an
-  exact-build `vmwp` adapter to one selected VP in a disposable VBS VM; they stop, inspect, step and
-  resume through epoch-bound operations. `open_sk_debugger` layers an ordinary DbgEng worker over
-  that controller and returns one composite session on which the generic debugger tools work;
-  `open_sk_kd` gives the same facade to external WinDbg. Capture, low-level control and standalone
-  KD handles refuse generic debugger tools; only the managed composite admits them. All session
-  routes must be closed with `end_session`; an unresolved controller teardown retains its worker
-  and target reservation for operator recovery. [secure-kernel.md](secure-kernel.md) has the
-  prerequisites and routing rules.
 - **Each tool call is bounded by a per-call timeout** (~60s for load/exec waits); a `go`
   against a long-running live target may hit it.

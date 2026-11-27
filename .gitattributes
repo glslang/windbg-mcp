@@ -1,1 +1,7 @@
 drivers/h3probe/build.cmd text eol=crlf
+# The skills are compiled into the binary (`src/skills.rs`) and served with a digest over their
+# exact bytes, so they must not depend on who checked them out: Git for Windows defaults to
+# `core.autocrlf=true`, which would make a Windows build serve CRLF and different digests than a
+# Mac build of the same commit. The `docs/` pages a skill bundles are served the same way.
+skills/** text eol=lf
+docs/**/*.md text eol=lf

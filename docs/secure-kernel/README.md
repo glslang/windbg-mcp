@@ -15,7 +15,7 @@ and S2).
 `sk_symbol`, the `--tools securekernel` group): a capture opens as a **session of its own** whose
 worker holds the file rather than a debuggee, and the debugger tools are refused on it because the
 engine beside it has at most `securekernel.exe` open for symbols —
-[`docs/sessions.md`](../sessions.md#secure-kernel-captures) is the caller's half. What that reaches
+[`docs/secure-kernel/sessions.md`](sessions.md#secure-kernel-captures) is the caller's half. What that reaches
 is a **capture**: its session reads a file, and a file does not execute. The separate live-control
 session below drives a running guest through built-in or operator-supplied child providers.
 

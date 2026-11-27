@@ -459,8 +459,11 @@ before 3.5.1 let the probe commit the connection for good and refused everything
 handshake (upstream #1248) — the fourth reason the floor sits there, and it fails against 3.5.0,
 checked by pinning it.
 
-**Capability honesty.** `tools` is advertised and asserted to be the **whole** key set of
-`capabilities` on the wire, rather than a list of the keys that must be absent — because a list can
+**Capability honesty.** What is advertised is asserted to be the **whole** key set of
+`capabilities` on the wire: `tools`, plus `resources` and exactly one extension, the skills one
+(SEP-2640, no `directoryRead`), for a client served a built-in skill — and `tools` alone under
+`--no-skills`, which the plugin passes. A whole set rather than a list of the keys that must be
+absent — because a list can
 only catch a capability it already names, and the next one arrives under a key nobody here has
 heard of: rmcp's `ServerCapabilities` is `#[non_exhaustive]`, and tasks would appear as
 `extensions` under the SEP rmcp implements but as a first-class `tasks` field if rmcp follows the
