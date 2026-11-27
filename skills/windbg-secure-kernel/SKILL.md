@@ -21,12 +21,14 @@ general rather than this skill's: the `windbg-debugging` skill covers them where
 serves the ordinary groups, as `--tools all` does, and the elevation and prerequisites these tools
 add are below.
 
-**Symbols need the engine's own helpers beside it.** A name, stack or symbolic breakpoint on the
-Secure Kernel needs the `securekernel.pdb` matching the guest's `securekernel.exe`, and the engine
-loads one only with `symsrv.dll` and `msdia140.dll` bundled next to the server binary: the in-box
-engine in `System32` comes with neither, so a `srv*` symbol path downloads nothing and names
-silently fall back to exports. Take both from a WinDbg or Windows SDK installation of the server's
-architecture.
+**Symbols need more than the in-box engine.** A name, stack or symbolic breakpoint on the Secure
+Kernel needs the `securekernel.pdb` matching the guest's `securekernel.exe`. The engine in
+`System32` ships `dbghelp.dll` without `symsrv.dll`, so a `srv*` symbol path fetches nothing there
+and names fall back to exports. Bundle a debugger package's engine beside the server binary with
+its `symsrv.dll`, plus `msdia140.dll` where that package's `dbghelp.dll` needs one to parse a PDB:
+the WinDbg package carries both, while the Windows SDK's Debugging Tools carry no `msdia140.dll`
+and their `dbghelp.dll` has been measured reading PDBs without it. Confirm that names resolve
+rather than assuming either way.
 
 ## Tool map
 

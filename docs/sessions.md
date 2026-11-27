@@ -14,9 +14,11 @@ beside it has open for symbols. It counts against the same limit, ends the same 
 
 `open_sk_live_control` is the eighth. Its worker binds operator-supplied providers and an
 exact-build `vmwp` debugger adapter to a selected VP set in an explicitly disposable VBS VM. Opening
-validates the request and profile but starts no provider and does not pause, attach to or inspect
-the VM. The first arm starts and checks the register provider, then validates the live target under
-pause before it mutates state.
+validates the request and profile and asks Hyper-V which `vmwp` owns the VM, failing when a
+`vmwp_pid` assertion disagrees; it starts no provider and does not pause, attach to or inspect the
+VM. The first arm starts and checks the register provider — after pausing the VM for discovery,
+when the profile asks for discovery — then validates the live target under pause before it mutates
+state.
 See [Live Secure Kernel control](secure-kernel/sessions.md#live-secure-kernel-control).
 
 Sessions are independent. Opening a second target does not disturb the first, a call against one
