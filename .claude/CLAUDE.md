@@ -65,7 +65,9 @@ than this server's code are scoped to that thing — a `Cargo.toml`, a `.md`, a 
 `measurement-provenance.md` the exception that binds **both**, because what counts as evidence is
 the same question in a doc and in a guard. The rest about the code share **one** scope:
 `src/**/*.rs`, `tests/**/*.rs` and `build.rs` — which is
-`build.rs`'s own `INPUTS` less the two manifests, those having a rule of their own. That trigger is
+`build.rs`'s own `INPUTS` less the two manifests, those having a rule of their own, and less
+`skills/` and the `docs/` pages the skills bundle, which are Markdown the binary compiles in and
+`markdown-and-docs.md` already covers. That trigger is
 a **read**, not a grep, so if you are about to reason about a subsystem from search results alone,
 open the rule first.
 
@@ -121,9 +123,13 @@ them — read it to pick the one you want.
 | `/handoff` | updating the handoff docs, closing a `FOLLOWUPS.md` item, or writing prose that states a rule about how this code behaves |
 
 Three things about this layout that are easy to get wrong. **`skills/` at the repo root is not
-`.claude/skills/`**: the first is the *shipped* plugin skill (`windbg-debugging`, published through
-`.claude-plugin/plugin.json` to whoever installs this server), the second is this repo's own working
-guidance and ships nowhere. Put nothing about editing this codebase in `skills/`. **A rule's prose
+`.claude/skills/`**: the first is the *shipped* skill set (`windbg-debugging`,
+`windbg-secure-kernel`, `msrc-patch-diff`), published through `.claude-plugin/plugin.json` to
+whoever installs the plugin and — all but the last — compiled into the binary and served over MCP
+by `src/skills.rs`; the second is this repo's own working guidance and ships nowhere. Put nothing
+about editing this codebase in `skills/`. A file added to a served skill must also be added to
+`skills::SOURCES`, and so must a `docs/` page one links to — which then also goes in `build.rs`'s
+`INPUTS` — and a tool name written into any of them decides which clients are offered the skill. **A rule's prose
 is not linted** — CI's markdownlint globs cover `docs/**` and `skills/**`, and `.claude/**` is in
 neither. And **this file lives in `.claude/`, not at the repository root**, because the root is
 also the plugin root (`marketplace.json` names `"."`) and a `CLAUDE.md` there draws a

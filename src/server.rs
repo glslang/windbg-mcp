@@ -100,6 +100,9 @@ pub struct WindbgServer {
     /// Whether that was this run's choice or this client's, which is the only half of a refusal a
     /// caller can act on — see [`crate::toolset::Chosen`].
     chosen: crate::toolset::Chosen,
+    /// Whether the built-in skills are served at all. Which of them a client gets is its
+    /// `surface`'s to decide; this is only the plugin's off switch ([`crate::skills`]).
+    skills: bool,
 }
 
 fn text_result(s: String) -> Result<CallToolResult, ErrorData> {
@@ -3212,7 +3215,22 @@ impl WindbgServer {
             client,
             surface: crate::toolset::Toolset::default(),
             chosen: crate::toolset::Chosen::ForTheRun,
+            skills: true,
         }
+    }
+
+    /// The same server, serving none of the built-in skills — see [`crate::skills::NO_SKILLS_FLAG`]
+    /// for who asks for that and why.
+    pub fn without_skills(mut self) -> Self {
+        self.skills = false;
+        self
+    }
+
+    /// Whether this client is served any skill, which is what declares the `resources` capability
+    /// and the skills extension — so a client served none sees exactly the server it saw before
+    /// there were any, rather than an extension with an empty catalog.
+    fn serves_skills(&self) -> bool {
+        self.skills && crate::skills::any(&self.surface)
     }
 
     /// The same server, advertising only the tools it was narrowed to — and knowing **whose
@@ -7964,16 +7982,83 @@ impl rmcp::ServerHandler for WindbgServer {
     /// built, including the `name`, which left to the default reads `rmcp` at the SDK's version
     /// because `Implementation::from_build_env()` resolves its `env!`s inside rmcp.
     fn get_info(&self) -> rmcp::model::ServerConfig {
-        rmcp::model::ServerConfig::new(
+        // Two chains rather than one with a condition in it: the builder's typestate wants
+        // `resources` enabled before `tools`, so neither half can be added to the other later.
+        let capabilities = if self.serves_skills() {
+            rmcp::model::ServerCapabilities::builder()
+                .enable_resources()
+                .enable_tools()
+                .enable_skills()
+                .build()
+        } else {
             rmcp::model::ServerCapabilities::builder()
                 .enable_tools()
-                .build(),
-        )
-        .with_server_info(rmcp::model::Implementation::new(
-            "windbg-mcp",
-            crate::BUILD_VERSION,
-        ))
-        .with_instructions(self.instructions())
+                .build()
+        };
+        rmcp::model::ServerConfig::new(capabilities)
+            .with_server_info(rmcp::model::Implementation::new(
+                "windbg-mcp",
+                crate::BUILD_VERSION,
+            ))
+            .with_instructions(self.instructions())
+    }
+
+    /// `skills/list` (SEP-2640): the built-in skills this client's surface is served.
+    ///
+    /// Reached only when [`Self::get_info`] declared the extension — rmcp answers `-32601` itself
+    /// otherwise — so there is no off-switch check here. This and the three methods after it are
+    /// the whole of the extension; [`crate::skills`] has what they serve and why.
+    async fn list_skills(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListSkillsResult, ErrorData> {
+        Ok(crate::skills::list(&self.surface))
+    }
+
+    /// `skills/get`: one skill's entry by the URI of its `SKILL.md`.
+    async fn get_skill(
+        &self,
+        request: rmcp::model::GetSkillRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::GetSkillResult, ErrorData> {
+        crate::skills::get(&self.surface, &request.uri)
+    }
+
+    /// `resources/list`: the `SKILL.md` of each served skill, which is every resource this server
+    /// has. Not gated by rmcp the way the skills methods are, so the off switch is checked here.
+    async fn list_resources(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListResourcesResult, ErrorData> {
+        if !self.serves_skills() {
+            return Err(ErrorData::method_not_found::<
+                rmcp::model::ListResourcesRequestMethod,
+            >());
+        }
+        Ok(crate::skills::resources(&self.surface))
+    }
+
+    /// `resources/read`: a file of a served skill — the only read path the extension has.
+    async fn read_resource(
+        &self,
+        request: rmcp::model::ReadResourceRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ReadResourceResponse, ErrorData> {
+        if !self.serves_skills() {
+            return Err(ErrorData::method_not_found::<
+                rmcp::model::ReadResourceRequestMethod,
+            >());
+        }
+        crate::skills::read(&self.surface, &request.uri)
+            .map(Into::into)
+            .ok_or_else(|| {
+                ErrorData::resource_not_found(
+                    format!("no resource is served at {}", request.uri),
+                    None,
+                )
+            })
     }
 
     /// Every tool call, recorded on its way through.
@@ -8085,6 +8170,7 @@ fn text_of(result: &CallToolResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::toolset::names_tool;
 
     #[test]
     fn kernel_announcement_attach_requires_explicit_opt_in() {
@@ -8194,52 +8280,6 @@ mod tests {
             }
         }
         text
-    }
-
-    /// Whether prose **names a tool** — the check both the instructions and the descriptions are
-    /// held to, and the one thing that has to be right for either to mean anything.
-    ///
-    /// Two rules, each because the other alone gets a real sentence here wrong:
-    ///
-    /// - **Written as code**: a backtick span that *is* the name, or that opens a call with it
-    ///   (`execute { "command": "k" }`). Plain containment cannot be the rule, because several of
-    ///   these names are also English — `crash_triage` says frames are "attributed to modules",
-    ///   `end_session` says a stuck session "does not let go" — and a rule that forbids the words
-    ///   *modules* and *go* is not one anyone can write prose under. Nor can "anywhere inside a
-    ///   code span" be it: the TTD tools quote the expression they run,
-    ///   `dx @$cursession.TTD.Calls(...)`, which names the debugger command `dx` is built on and
-    ///   not the `dx` tool.
-    /// - **Or bare, if the name has an underscore**: `step_back`'s description said "Reverse of
-    ///   step_into.", as copyable as any backticked name and invisible to the first rule. An
-    ///   underscored name is an identifier and never an English word, so this half needs no
-    ///   exceptions.
-    /// - **Or in double quotes**, which is the third rule and the one the other two leave a hole
-    ///   between: `Call "execute" instead` is as copyable as any of them and matches neither —
-    ///   not the first, which wants a backtick span, and not the second, which `execute` has no
-    ///   underscore for. Raised on review of
-    ///   [#456](https://github.com/glslang/windbg-mcp/pull/456) against the input-schema walk, and
-    ///   fixed here instead because the hole is in the predicate and all three channels read it.
-    ///   Measured 2026-10-05 before adding it: **no** description, instruction fragment or schema
-    ///   string on the 75-tool surface writes a tool's name in double quotes, so this costs
-    ///   nothing today. What it will cost is a value that happens to be spelled like a tool —
-    ///   `{"access": "execute", …}` is a [`structured::WatchAccess`] — which is the same trade
-    ///   `debug_batch`'s steps took when their exemption was deleted: such a value is documented
-    ///   by the schema that declares it rather than spelled in prose.
-    fn names_tool(text: &str, tool: &str) -> bool {
-        let as_code = text.split('`').skip(1).step_by(2).any(|span| {
-            span == tool
-                || span
-                    .strip_prefix(tool)
-                    .is_some_and(|rest| rest.starts_with(" {"))
-        });
-        let boundary = |c: Option<char>| c.is_none_or(|c| !c.is_alphanumeric() && c != '_');
-        as_code
-            || text.contains(&format!("\"{tool}\""))
-            || (tool.contains('_')
-                && text.match_indices(tool).any(|(at, _)| {
-                    boundary(text[..at].chars().next_back())
-                        && boundary(text[at + tool.len()..].chars().next())
-                }))
     }
 
     /// The third rule above, both ways round: a quoted name is a name, and the words around it are
@@ -8881,6 +8921,163 @@ mod tests {
             requires_nothing,
             "`session_status` must not require any argument, got {required:?}"
         );
+    }
+
+    /// The skills extension on the wire, for the three servers that answer it differently: the
+    /// default surface (served `windbg-debugging`), a narrowed one (served nothing), and the
+    /// plugin's `--no-skills`. Over a real duplex with hand-written `2026-07-28` JSON-RPC, because
+    /// two of the claims are about rmcp's dispatch rather than this crate's functions — that a
+    /// server which did not declare the extension answers `skills/list` with `-32601`, and that
+    /// what `list_skills` returns passes the SDK's own validation of an entry on its way out.
+    #[tokio::test]
+    async fn skills_are_served_per_surface_on_the_wire() {
+        use std::time::Duration;
+
+        use rmcp::ServiceExt;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        const STEP: Duration = Duration::from_secs(30);
+
+        /// Sends each request in turn and returns each answer, `result` or `error`.
+        async fn exchange(
+            server: WindbgServer,
+            requests: &[(&str, serde_json::Value)],
+        ) -> Vec<serde_json::Value> {
+            let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+            let (client_rx, mut client_tx) = tokio::io::split(client_io);
+            let mut client_rx = tokio::io::BufReader::new(client_rx);
+            let serving = tokio::spawn(server.serve(server_io));
+            let mut answers = Vec::new();
+            for (id, (method, params)) in requests.iter().enumerate() {
+                let mut params = params.clone();
+                params["_meta"] = serde_json::json!({
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                });
+                let request = serde_json::json!({
+                    "jsonrpc": "2.0", "id": id, "method": method, "params": params,
+                });
+                client_tx
+                    .write_all(format!("{request}\n").as_bytes())
+                    .await
+                    .expect("write a request");
+                let mut line = String::new();
+                tokio::time::timeout(STEP, client_rx.read_line(&mut line))
+                    .await
+                    .unwrap_or_else(|_| panic!("{method} should be answered"))
+                    .expect("read an answer");
+                let answer: serde_json::Value =
+                    serde_json::from_str(&line).unwrap_or_else(|e| panic!("{method}: {e}: {line}"));
+                assert_eq!(answer["id"], id, "{method} answered out of order: {line}");
+                answers.push(answer);
+            }
+            drop(client_tx);
+            serving.abort();
+            answers
+        }
+
+        let skill = "skill://windbg-debugging/SKILL.md";
+        let calls = [
+            ("server/discover", serde_json::json!({})),
+            ("skills/list", serde_json::json!({})),
+            ("skills/get", serde_json::json!({ "uri": skill })),
+            ("resources/list", serde_json::json!({})),
+            ("resources/read", serde_json::json!({ "uri": skill })),
+            (
+                "resources/read",
+                serde_json::json!({ "uri": "skill://windbg-debugging/ttd.md" }),
+            ),
+            (
+                "skills/get",
+                serde_json::json!({ "uri": "skill://windbg-secure-kernel/SKILL.md" }),
+            ),
+        ];
+
+        // The default surface: declared, listed, gettable, readable — and the Secure Kernel
+        // playbook, whose tools this surface does not have, refused by name.
+        let answers = exchange(WindbgServer::new(Sessions::new(STEP)), &calls).await;
+        let capabilities = &answers[0]["result"]["capabilities"];
+        assert_eq!(
+            capabilities["extensions"]["io.modelcontextprotocol/skills"],
+            serde_json::json!({}),
+            "declared without directoryRead: {capabilities}"
+        );
+        assert!(
+            !capabilities["resources"].is_null(),
+            "skills ride on resources: {capabilities}"
+        );
+        let listed = &answers[1]["result"];
+        assert_eq!(
+            listed["skills"].as_array().map(Vec::len),
+            Some(1),
+            "{listed}"
+        );
+        assert_eq!(listed["skills"][0]["uri"], skill);
+        assert_eq!(
+            listed["skills"][0]["frontmatter"]["name"],
+            "windbg-debugging"
+        );
+        assert_eq!(
+            listed["cacheScope"], "private",
+            "a listing is per client: {listed}"
+        );
+        let manifest = listed["skills"][0]["resources"]
+            .as_array()
+            .expect("a full manifest");
+        assert!(
+            manifest.iter().all(|file| file["digest"]
+                .as_str()
+                .is_some_and(|d| d.starts_with("sha256:"))),
+            "every file carries a digest: {listed}"
+        );
+        assert_eq!(
+            answers[2]["result"]["skill"], listed["skills"][0],
+            "get agrees with list"
+        );
+        assert_eq!(answers[3]["result"]["resources"][0]["uri"], skill);
+        let read = &answers[4]["result"]["contents"][0];
+        assert_eq!(read["mimeType"], "text/markdown");
+        assert!(
+            read["text"]
+                .as_str()
+                .is_some_and(|t| t.starts_with("---\nname: windbg-debugging")),
+            "{read}"
+        );
+        assert!(
+            answers[5]["result"]["contents"][0]["text"].is_string(),
+            "{}",
+            answers[5]
+        );
+        assert_eq!(answers[6]["error"]["code"], -32602, "{}", answers[6]);
+
+        // A surface served no skill is the server it was before skills existed: no extension, no
+        // resources, and the methods unimplemented rather than empty.
+        let narrowed = WindbgServer::new(Sessions::new(STEP)).with_tools(
+            crate::toolset::Toolset::parse("crash").expect("a valid spec"),
+            crate::toolset::Chosen::ForTheRun,
+        );
+        for (server, what) in [
+            (narrowed, "`--tools crash`"),
+            (
+                WindbgServer::new(Sessions::new(STEP)).without_skills(),
+                "`--no-skills`",
+            ),
+        ] {
+            let answers = exchange(server, &calls[..4]).await;
+            let capabilities = &answers[0]["result"]["capabilities"];
+            assert!(
+                capabilities["extensions"].is_null(),
+                "{what}: {capabilities}"
+            );
+            assert!(
+                capabilities["resources"].is_null(),
+                "{what}: {capabilities}"
+            );
+            assert!(!capabilities["tools"].is_null(), "{what}: {capabilities}");
+            for answer in &answers[1..] {
+                assert_eq!(answer["error"]["code"], -32601, "{what}: {answer}");
+            }
+        }
     }
 
     /// A `2026-07-28` client may skip the handshake entirely: it opens the connection with

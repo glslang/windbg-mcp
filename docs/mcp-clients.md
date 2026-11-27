@@ -57,8 +57,9 @@ decide whether it fits.
 ## As a Claude Code plugin
 
 This repo is also a [Claude Code marketplace](https://code.claude.com/docs/en/plugin-marketplaces)
-with two plugins. `windbg-mcp` registers the `windbg` MCP server **and** a `windbg-debugging` skill
-that knows how to drive it (setup, crash-dump, live/kernel, and TTD playbooks):
+with two plugins. `windbg-mcp` registers the `windbg` MCP server **and** the skills that know how to
+drive it — `windbg-debugging` (setup, crash-dump, live/kernel, and TTD playbooks),
+`windbg-secure-kernel`, and `msrc-patch-diff`:
 
 ```text
 /plugin marketplace add glslang/windbg-mcp
@@ -71,6 +72,10 @@ place — download a prebuilt release or build from source — and (for `.run` r
 walks through it, and it mirrors the [*Build or download*](./install.md#build-or-download) and
 [*Bundling the WinDbg engine*](./install.md#bundling-the-windbg-engine) sections of the install
 guide. Then `/reload-plugins` to connect the server. The plugin points at `${CLAUDE_PLUGIN_ROOT}/target/release/windbg-mcp.exe`.
+
+The plugin starts the server with `--no-skills`, because it installs the same skills itself: served
+over MCP as well, each would appear twice under two names. See [*Skills over MCP*](#skills-over-mcp)
+for every other client.
 
 `windbg-pane` is a mod — a plugin of hooks rather than of a server — that draws a WinDbg-style pane
 beside the conversation from the server's tool calls as they happen: disassembly with the stop
@@ -87,6 +92,32 @@ Then `/reload-plugins`; the pane opens on the first `windbg` call, and `/windbg-
 and clears it. [`mods/windbg-pane/README.md`](../mods/windbg-pane/README.md) is its own document.
 It is versioned apart from the server, because what it has to keep up with is the Claude Code build
 rather than DbgEng — [*Releasing the pane mod*](./releasing.md#releasing-the-pane-mod) says how.
+
+## Skills over MCP
+
+The server also serves its playbooks itself, through the MCP skills extension
+([SEP-2640](https://modelcontextprotocol.io/extensions/skills/overview),
+`io.modelcontextprotocol/skills`), so a client with no plugin — one reaching a listener, an install
+from the release zip, Scoop or the registry, or a host that is not Claude Code — can still find and
+load them. In Claude Code they appear as `/<server>:<skill>`, for example `/windbg:windbg-debugging`.
+
+They are compiled into the binary, so they always describe the build that serves them, and they are
+served **per client**, by the rule the tool descriptions keep: a client is offered a skill only when
+it can call every tool that skill names. The default surface gets `windbg-debugging`;
+`windbg-secure-kernel` needs the `securekernel` group plus `inspect` and `exec` (or `--tools all`);
+a narrower surface such as `--tools crash` gets none, and its server then declares neither the
+extension nor the `resources` capability. `msrc-patch-diff` is not served: it ships only with the
+plugin.
+
+A skill also carries the pages it links to. A plugin install is the repository, so a link into
+`docs/` resolves there; over MCP a skill is only what it serves, so each page a playbook links to
+directly is served inside the skill, at `docs/…` under it, and the served links are pointed at those
+copies. A link to anything else — the bundled pages' own links, mostly — is served as a GitHub URL
+at the commit the binary was built from, so it can still be followed and still describes that
+build. The files on disk are not changed.
+
+`--no-skills` turns them off on stdio, which is what the plugin passes. A listener has no plugin
+beside it, so the flag is refused there.
 
 ## From the official MCP registry
 

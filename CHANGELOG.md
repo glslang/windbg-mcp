@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The server serves its own skills over MCP** (the skills extension, SEP-2640,
+  `io.modelcontextprotocol/skills`). `skills/list`, `skills/get` and `resources/read` carry the
+  playbooks the Claude Code plugin installs, so a client with no plugin — a listener's remote
+  callers, a release-zip, Scoop or registry install, a host that is not Claude Code — can find and
+  load them. They are compiled into the binary, so a skill always describes the build serving it,
+  and `skills/` is now a build input. They are served per client: a skill is offered only to a
+  surface that can call every tool it names, and a surface offered none (`--tools crash`, say)
+  declares neither the extension nor `resources`. The plugin passes the new stdio-only
+  `--no-skills`, since it installs the same files itself. `msrc-patch-diff` stays plugin-only.
+  rmcp's floor moves to 3.11.0. A skill carries the `docs/` pages its playbooks link to, served
+  inside it with the links pointed at them, and every other relative link is served as a GitHub URL
+  at the build's commit; those pages are build inputs too, and `skills/` and `docs/**/*.md` are
+  checked out with LF everywhere so a Windows build serves the same bytes and digests as any other.
+
+### Changed
+
+- **The Secure Kernel playbook is a skill of its own, `windbg-secure-kernel`**, moved out of
+  `windbg-debugging` with its tool map and elevation rows. Its tools are the `securekernel` group,
+  which the default surface leaves out, so inside `windbg-debugging` it named tools most clients
+  cannot call — and under the per-client rule above would have kept that skill from every client
+  but `--tools all`.
+- **The Secure Kernel sections of `docs/sessions.md` are a page of their own,
+  `docs/secure-kernel/sessions.md`.** The Secure Kernel skill links to them, and so now carries
+  them; the rest of `docs/sessions.md` names TTD, IOCTL and batch tools, which would have kept that
+  skill from any surface without those groups too.
+
 ### Fixed
 
 - **A TTD replay that is broken in is put back where its run started, and the stop says so**

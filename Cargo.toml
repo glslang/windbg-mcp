@@ -28,7 +28,12 @@ dbgscope = { git = "https://github.com/glslang/dbgscope", rev = "92a1fe60617fb0f
 # never carries; 3.5.1 answers the probe without committing (upstream #1248). The smoke tier asserts
 # all four, so a build that resolved an older release would fail it rather than merely serve the
 # older shape — which is what makes this a floor.
-rmcp = { version = "3.5.1", features = [
+#
+# And 3.11.0 on top of those, for a fifth: `src/skills.rs` serves the skills extension (SEP-2640)
+# through rmcp's own types and handler methods. Upstream lists the extension from 3.9.0 and its
+# directory loader from 3.10.0; 3.11.0 is the release the code was written and checked against, so
+# it is the floor this file can vouch for.
+rmcp = { version = "3.11.0", features = [
     "server",
     "transport-io",
     "macros",
@@ -148,3 +153,9 @@ windows-sys = { version = "0.61", features = [
 # timing exact. Kept out of the shipped binary by the edition-2024 resolver, which does not unify
 # dev-dependency features into a normal build.
 tokio = { version = "1", features = ["test-util"] }
+# `skills-fs` for rmcp's own skill loader, which `src/skills.rs`'s tests use as an oracle: the
+# catalog compiled into the binary has to be exactly what rmcp reads out of `skills/`, frontmatter
+# parsed as YAML and the directory walked. The shipped binary never reads skills from disk, and the
+# edition-2024 resolver keeps this feature — and the `cap-std` and YAML crates it pulls in — out of
+# a normal build.
+rmcp = { version = "3.11.0", features = ["skills-fs"] }

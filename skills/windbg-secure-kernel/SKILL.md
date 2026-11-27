@@ -1,11 +1,46 @@
-# Playbook: the Secure Kernel (VTL1)
+---
+name: windbg-secure-kernel
+description: Inspect, control or debug a VBS guest's Secure Kernel (VTL1) through the `windbg` MCP server - read a Hyper-V checkpoint's VTL1 modules, memory and symbols, stop, step and resume one VP of an exact disposable VBS VM, or debug VTL1 as an ordinary DbgEng session or from external WinDbg. Use when inspecting a saved state's Secure Kernel, or stopping, stepping and resuming a live VTL1 target.
+---
+
+# The Secure Kernel (VTL1) via the `windbg` MCP server
 
 **Goal:** inspect, control, or ordinarily debug a Windows guest's **Secure Kernel** — the VBS VTL1
 side, memory a running Windows cannot read about itself. Four capture tools read a Hyper-V saved
 state; ten low-level live-control operations stop, inspect, step and resume one selected VP; M8
 exposes the same controller as an ordinary DbgEng kernel session.
 
-**There are four routes.** A **capture** is a file, and its MCP tools read it with no driver, no
+**These tools are not served by default.** They are the server's `securekernel` group, which a
+server started with no `--tools` leaves out, so a call to one is refused with `-32602` naming
+`--tools` — a configuration answer, not a missing feature. Widen the surface first: `--tools all`,
+or `securekernel` beside the groups you use (the M8 route below also needs `inspect` and `exec`).
+On a listener that is the client's own credential entry rather than the command line. Everything
+else about the server — engine bundling, symbols, elevation, sessions — is the `windbg-debugging`
+skill's, and applies here unchanged.
+
+## Tool map
+
+| Route | Tools |
+|-------|-------|
+| Capture | `open_sk_capture`, `sk_modules`, `sk_read_memory`, `sk_symbol` |
+| Live control | opener `open_sk_live_control`; ten operations: `sk_live_arm`, `sk_live_wait`, `sk_live_break`, `sk_live_registers`, `sk_live_read_memory`, optional policy-gated `sk_live_write_memory`, `sk_live_step`, `sk_live_continue_to_breakpoints`, `sk_live_continue_to_software_breakpoints`, `sk_live_continue` |
+| Traces | `sk_service_trace`, `sk_service_trace_read`, `sk_call_trace`, `sk_call_trace_read`, `hv_transition_trace`, `hv_transition_trace_read` |
+| Debuggers | `open_sk_debugger` creates a managed MCP DbgEng session paired with its Secure Kernel controller; `open_sk_kd` exposes a standalone pipe for external WinDbg |
+
+Capture, live-control and standalone KD sessions refuse ordinary debugger tools; the managed
+debugger exposes them. Every route's session must be closed with `end_session`, and an unresolved
+controller teardown retains its worker and target reservation for operator recovery.
+
+## Elevation
+
+| Operation | Administrator? |
+|-----------|----------------|
+| Capture (`open_sk_capture`) | No — but it needs the Windows SDK's `vmsavedstatedumpprovider.dll` and read access to the checkpoint. Naming the capture as a `vm` rather than as a path asks Hyper-V where it lives, so that needs the role installed on this host and an account that may ask about that VM ([below](#what-the-capture-route-needs-on-the-host)) |
+| Live control (`open_sk_live_control`) | **Yes** — plus an exact disposable VBS VM, operator-supplied register and memory providers, and a build-matched `vmwp` profile ([below](#live-execution-control-a-separate-mcp-session)) |
+
+## The four routes
+
+A **capture** is a file, and its MCP tools read it with no driver, no
 debuggee, and nothing running. A **live decode** uses the `--sk-live` command-line role and a child
 memory transport. **Low-level live execution control** is a separate MCP session using built-in or
 operator-supplied register and memory providers plus a build-matched `vmwp` adapter. The
@@ -449,7 +484,7 @@ and WinDbgX each passed 100 hardware and 100 guarded-INT3 hits. The remaining li
 
 ## Where the rest of it is
 
-- [`docs/sessions.md`](../../docs/sessions.md) — the caller's half: what capture and live-control
+- [`docs/secure-kernel/sessions.md`](../../docs/secure-kernel/sessions.md) — the caller's half: what capture and live-control
   sessions are, and what ending one does.
 - [`docs/secure-kernel/kd-facade.md`](../../docs/secure-kernel/kd-facade.md) — WinDbg in front of
   the live controller: the connection string, what it can do today, and what it is told that the
